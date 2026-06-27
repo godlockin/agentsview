@@ -20,7 +20,7 @@ AIR_BIN := $(shell if command -v air >/dev/null 2>&1; then command -v air; \
 	elif [ -x "$(GOPATH_FIRST)/bin/air" ]; then printf "%s" "$(GOPATH_FIRST)/bin/air"; \
 	fi)
 
-.PHONY: build build-release install frontend frontend-dev dev check-air air-install desktop-dev desktop-build desktop-macos-app desktop-macos-dmg desktop-windows-installer desktop-linux-appimage desktop-app docs-install docs-build docs-serve docs-check docs-screenshots docs-assets-branch docs-generated-assets-branch docs-deploy-staging docs-deploy test test-short bench-backends test-postgres test-postgres-ci postgres-up postgres-down test-ssh test-ssh-ci ssh-up ssh-down e2e e2e-duckdb vet lint lint-ci lint-golangci lint-golangci-ci nilaway nilaway-golangci-build lint-tools tidy clean release release-darwin-arm64 release-darwin-amd64 release-linux-amd64 install-hooks ensure-embed-dir pricing-snapshot dev-snapshot help
+.PHONY: build build-release install frontend frontend-dev dev check-air air-install desktop-dev desktop-build desktop-macos-app desktop-macos-dmg desktop-windows-installer desktop-linux-appimage desktop-app docs-install docs-build docs-serve docs-check docs-screenshots docs-assets-branch docs-generated-assets-branch docs-deploy-staging docs-deploy test test-short bench-backends test-postgres test-postgres-ci postgres-up postgres-down test-ssh test-ssh-ci ssh-up ssh-down e2e e2e-duckdb vet lint lint-ci lint-golangci lint-golangci-ci nilaway nilaway-golangci-build lint-tools tidy clean release release-darwin-arm64 release-darwin-amd64 release-universal-apple build-local-apple-silicon release-linux-amd64 install-hooks ensure-embed-dir pricing-snapshot dev-snapshot help
 
 # Ensure go:embed has at least one file (no-op if frontend is built)
 ensure-embed-dir:
@@ -406,6 +406,48 @@ release-linux-amd64: pricing-snapshot frontend
 	GOOS=linux GOARCH=amd64 CGO_ENABLED=1 go build -tags fts5 \
 		-ldflags="$(LDFLAGS_RELEASE)" -trimpath \
 		-o dist/agentsview-linux-amd64 ./cmd/agentsview
+
+# Build a single macOS universal (arm64 + amd64) binary using lipo.
+# Output: dist/agentsview-darwin-universal
+# Requires Xcode Command Line Tools for lipo (ships with macOS by default).
+release-universal-apple: pricing-snapshot frontend
+	@if [ "$$(uname -s)" != "Darwin" ]; then \
+		echo "error: release-universal-apple must be run on macOS (lipo required)" >&2; \
+		exit 1; \
+	fi
+	@command -v lipo >/dev/null 2>&1 || { \
+		echo "error: lipo not found; install Xcode Command Line Tools" >&2; \
+		exit 1; \
+	}
+	@mkdir -p dist
+	GOOS=darwin GOARCH=arm64 CGO_ENABLED=1 go build -tags fts5 \
+		-ldflags="$(LDFLAGS_RELEASE)" -trimpath \
+		-o dist/agentsview-darwin-arm64 ./cmd/agentsview
+	GOOS=darwin GOARCH=amd64 CGO_ENABLED=1 go build -tags fts5 \
+		-ldflags="$(LDFLAGS_RELEASE)" -trimpath \
+		-o dist/agentsview-darwin-amd64 ./cmd/agentsview
+	lipo -create -output dist/agentsview-darwin-universal \
+		dist/agentsview-darwin-arm64 dist/agentsview-darwin-amd64
+	@echo "Universal binary: dist/agentsview-darwin-universal"
+	@file dist/agentsview-darwin-universal
+
+# Build the current host as Apple Silicon (arm64) optimized binary.
+# Convenience target when developing on an M-series Mac and you only
+# need a native binary. Skips lipo merge.
+build-local-apple-silicon: pricing-snapshot frontend
+	@if [ "$$(uname -s)" != "Darwin" ]; then \
+		echo "error: build-local-apple-silicon requires macOS" >&2; \
+		exit 1; \
+	fi
+	@if [ "$$(uname -m)" != "arm64" ]; then \
+		echo "warning: host is $$(uname -m), not arm64; cross-compiling to darwin/arm64 anyway" >&2; \
+	fi
+	@mkdir -p dist
+	GOOS=darwin GOARCH=arm64 CGO_ENABLED=1 go build -tags fts5 \
+		-ldflags="$(LDFLAGS_RELEASE)" -trimpath \
+		-o dist/agentsview-darwin-arm64 ./cmd/agentsview
+	@echo "Apple Silicon binary: dist/agentsview-darwin-arm64"
+	@file dist/agentsview-darwin-arm64
 
 # Install pre-commit and pre-push hooks via prek
 install-hooks:
