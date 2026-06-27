@@ -20,7 +20,7 @@ AIR_BIN := $(shell if command -v air >/dev/null 2>&1; then command -v air; \
 	elif [ -x "$(GOPATH_FIRST)/bin/air" ]; then printf "%s" "$(GOPATH_FIRST)/bin/air"; \
 	fi)
 
-.PHONY: build build-release install frontend frontend-dev dev check-air air-install desktop-dev desktop-build desktop-macos-app desktop-macos-dmg desktop-windows-installer desktop-linux-appimage desktop-app docs-install docs-build docs-serve docs-check docs-screenshots docs-assets-branch docs-generated-assets-branch docs-deploy-staging docs-deploy test test-short bench-backends test-postgres test-postgres-ci postgres-up postgres-down test-ssh test-ssh-ci ssh-up ssh-down e2e e2e-duckdb vet lint lint-ci lint-golangci lint-golangci-ci nilaway nilaway-golangci-build lint-tools tidy clean release release-darwin-arm64 release-darwin-amd64 release-universal-apple build-local-apple-silicon release-linux-amd64 install-hooks ensure-embed-dir pricing-snapshot dev-snapshot help
+.PHONY: build build-release install frontend frontend-dev dev check-air air-install desktop-dev desktop-build desktop-macos-app desktop-macos-dmg desktop-windows-installer desktop-linux-appimage desktop-app docs-install docs-build docs-serve docs-check docs-screenshots docs-assets-branch docs-generated-assets-branch docs-deploy-staging docs-deploy test test-short bench-backends test-postgres test-postgres-ci postgres-up postgres-down test-ssh test-ssh-ci ssh-up ssh-down e2e e2e-duckdb vet lint lint-ci lint-golangci lint-golangci-ci nilaway nilaway-golangci-build lint-tools tidy clean release release-darwin-arm64 release-darwin-amd64 release-universal-apple build-local-apple-silicon run-offline run-offline-universal release-linux-amd64 install-hooks ensure-embed-dir pricing-snapshot dev-snapshot help
 
 # Ensure go:embed has at least one file (no-op if frontend is built)
 ensure-embed-dir:
@@ -449,6 +449,35 @@ build-local-apple-silicon: pricing-snapshot frontend
 	@echo "Apple Silicon binary: dist/agentsview-darwin-arm64"
 	@file dist/agentsview-darwin-arm64
 
+# Build a single-arch binary on the current host and run it locally with
+# every optional external network call disabled. Designed for air-gapped use:
+#   - AGENTSVIEW_TELEMETRY_ENABLED=false  (disable PostHog ping; default off)
+#   - --no-update-check                    (disable GitHub self-update check)
+#   - --host 127.0.0.1                     (loopback only)
+# Pricing catalog refresh still runs every hour in the background, but it
+# only logs a warning on failure and falls back to the embedded snapshot.
+# Use PORT= to override the listen port (default 8080).
+PORT ?= 8080
+run-offline: build
+	@mkdir -p dist
+	AGENTSVIEW_TELEMETRY_ENABLED=false \
+	./agentsview serve \
+		--no-update-check \
+		--host 127.0.0.1 \
+		--port $(PORT) \
+		--no-browser
+
+# Build a macOS universal binary on the current Mac and run it offline.
+# Equivalent to release-universal-apple + run-offline against the merged binary.
+run-offline-universal: release-universal-apple
+	@mkdir -p dist
+	AGENTSVIEW_TELEMETRY_ENABLED=false \
+	./dist/agentsview-darwin-universal serve \
+		--no-update-check \
+		--host 127.0.0.1 \
+		--port $(PORT) \
+		--no-browser
+
 # Install pre-commit and pre-push hooks via prek
 install-hooks:
 	@if ! command -v prek >/dev/null 2>&1; then \
@@ -465,6 +494,10 @@ help:
 	@echo "  build-release  - Release build (optimized, stripped)"
 	@echo "  pricing-snapshot - Restore LiteLLM snapshot from artifact branch"
 	@echo "  install        - Build and install to ~/.local/bin or GOPATH"
+	@echo ""
+	@echo "  build-local-apple-silicon - Build darwin/arm64 binary on macOS (M-series)"
+	@echo "  release-universal-apple - Build macOS universal binary (arm64+amd64 via lipo)"
+	@echo "  run-offline    - Build local binary and serve with all external calls disabled"
 	@echo ""
 	@echo "  dev            - Run Go server with live reload via air (use with frontend-dev)"
 	@echo "  dev-snapshot   - Run agentsview against a fresh snapshot of prod sessions.db"
