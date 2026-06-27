@@ -473,8 +473,8 @@ func buildCSPPolicy(
 			"script-src %[1]s; "+
 			"connect-src 'self' http: https: ws: wss:; "+
 			"img-src %[1]s data:; "+
-			"style-src %[1]s 'unsafe-inline' https://fonts.googleapis.com; "+
-			"font-src %[1]s data: https://fonts.gstatic.com; "+
+			"style-src %[1]s 'unsafe-inline'; "+
+			"font-src %[1]s data:; "+
 			"object-src 'none'; "+
 			"base-uri %[2]s; "+
 			"frame-ancestors 'none'",
