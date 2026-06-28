@@ -337,7 +337,7 @@ func TestLoad_DefaultsWithoutFlags(t *testing.T) {
 	require.NoError(t, err)
 
 	assert.Equal(t, "127.0.0.1", cfg.Host)
-	assert.Equal(t, 8080, cfg.Port)
+	assert.Equal(t, 9765, cfg.Port)
 	assert.Empty(t, cfg.PublicOrigins)
 }
 

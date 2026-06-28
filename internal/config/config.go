@@ -303,7 +303,7 @@ func Default() (Config, error) {
 
 	return Config{
 		Host:                           "127.0.0.1",
-		Port:                           8080,
+		Port:                           9765,
 		DataDir:                        dataDir,
 		DBPath:                         filepath.Join(dataDir, "sessions.db"),
 		WriteTimeout:                   30 * time.Second,
@@ -407,7 +407,7 @@ func loadPGServeBase() (Config, error) {
 	// namespace exists, only explicit pg-serve flags should shape its
 	// network/proxy behavior.
 	cfg.Host = "127.0.0.1"
-	cfg.Port = 8080
+	cfg.Port = 9765
 	cfg.PublicURL = ""
 	cfg.PublicOrigins = nil
 	cfg.Proxy = ProxyConfig{}
@@ -937,7 +937,7 @@ func (f *stringListFlag) Type() string {
 // The caller must call fs.Parse before passing fs to Load.
 func RegisterServeFlags(fs *flag.FlagSet) {
 	fs.String("host", "127.0.0.1", "Host to bind to")
-	fs.Int("port", 8080, "Port to listen on")
+	fs.Int("port", 9765, "Port to listen on")
 	fs.String(
 		"public-url", "",
 		"Public URL to trust and open for hostname or proxy access",
@@ -1001,7 +1001,7 @@ func RegisterServeFlags(fs *flag.FlagSet) {
 // RegisterServePFlags registers serve-command flags on fs.
 func RegisterServePFlags(fs *pflag.FlagSet) {
 	fs.String("host", "127.0.0.1", "Host to bind to")
-	fs.Int("port", 8080, "Port to listen on")
+	fs.Int("port", 9765, "Port to listen on")
 	fs.String(
 		"public-url", "",
 		"Public URL to trust and open for hostname or proxy access",
