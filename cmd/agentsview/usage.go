@@ -272,18 +272,19 @@ func printSyncSummaryStderr(stats sync.SyncStats, t time.Time) {
 }
 
 // seedPricing ensures fallback rates are present in
-// model_pricing, then kicks off a background LiteLLM refresh.
+// model_pricing, then kicks off a background multi-source
+// pricing refresh.
 //
 // Fallback rates are only upserted when the stored seed
 // version differs from pricing.FallbackVersion (or is
-// absent). This avoids overwriting live LiteLLM rates on
+// absent). This avoids overwriting live upstream rates on
 // every restart while still propagating corrected fallback
 // rates when the binary is upgraded.
 func seedPricing(database *db.DB) {
 	if err := seedFallbackPricing(database); err != nil {
 		log.Printf("pricing seed: %v", err)
 	}
-	go refreshPricingFromLiteLLM(database)
+	go refreshPricingFromSources(database)
 }
 
 func seedFallbackPricing(database *db.DB) error {
@@ -303,10 +304,57 @@ func seedFallbackPricing(database *db.DB) error {
 	return database.SetPricingMeta(metaKey, pricing.FallbackVersion)
 }
 
-// refreshPricingFromLiteLLM fetches the upstream LiteLLM
-// catalog and upserts it over whatever is in the table. Called
-// from a goroutine after the synchronous fallback seed so a
-// slow or failing fetch never blocks server startup.
+// refreshPricingFromSources walks the default pricing source
+// list and upserts whichever catalogs respond. LiteLLM is
+// tried first because it is the most complete for the public
+// models agentsview normally parses; OpenRouter is tried next
+// because its public /models endpoint frequently lists
+// fork-tuned and private model prices LiteLLM has not yet
+// picked up. Each fetch failure is logged but never aborts
+// the loop, so a partial outage of one upstream does not
+// prevent the other from seeding. All successful results are
+// merged (first non-zero field wins per model_pattern) and
+// upserted as a single batch.
+func refreshPricingFromSources(database *db.DB) {
+	fetched := make(map[string][]pricing.ModelPricing)
+	for _, src := range pricing.DefaultPricingSources() {
+		prices, err := src.Fetch()
+		if err != nil {
+			log.Printf(
+				"pricing refresh: %s fetch failed: %v",
+				src.Name, err,
+			)
+			continue
+		}
+		fetched[src.Name] = prices
+		log.Printf(
+			"pricing refresh: %s returned %d model rows",
+			src.Name, len(prices),
+		)
+	}
+	if len(fetched) == 0 {
+		log.Printf(
+			"pricing refresh: every source failed; " +
+				"keeping embedded fallback pricing",
+		)
+		return
+	}
+	merged := pricing.MergePricing(fetched)
+	flat := make([]pricing.ModelPricing, 0, len(merged))
+	for _, p := range merged {
+		flat = append(flat, p)
+	}
+	if err := upsertPricing(database, flat); err != nil {
+		log.Printf("pricing refresh: upsert failed: %v", err)
+	}
+}
+
+// refreshPricingFromLiteLLM is the single-source refresh
+// helper used by the CLI's statusline path. It does not
+// fan out to OpenRouter so the CLI stays cheap. Kept as a
+// thin wrapper around refreshPricingFromSources with only
+// the LiteLLM entry for callers that want the old
+// single-source behaviour.
 func refreshPricingFromLiteLLM(database *db.DB) {
 	prices, err := pricing.FetchLiteLLMPricing()
 	if err != nil {
