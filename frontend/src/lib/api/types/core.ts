@@ -3,6 +3,7 @@ export interface VersionInfo {
   version: string;
   commit: string;
   build_date: string;
+  insight_generation_available?: boolean;
   read_only?: boolean;
 }
 
@@ -62,6 +63,7 @@ export interface Session {
   // Detail-only fields (from enriched detail response)
   health_score_basis?: string[] | null;
   health_penalties?: Record<string, number> | null;
+  transcript_fidelity?: string;
   created_at: string;
 }
 

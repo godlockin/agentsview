@@ -66,6 +66,12 @@ func withWriteTimeout(d time.Duration) setupOption {
 	return func(c *config.Config) { c.WriteTimeout = d }
 }
 
+type readOnlyTestStore struct {
+	db.Store
+}
+
+func (readOnlyTestStore) ReadOnly() bool { return true }
+
 func withPublicOrigins(origins ...string) setupOption {
 	return func(c *config.Config) {
 		c.PublicOrigins = append([]string(nil), origins...)
@@ -200,7 +206,7 @@ func setupPGMode(t *testing.T) *testEnv {
 		DBPath:       dbPath,
 		WriteTimeout: 30 * time.Second,
 	}
-	srv := server.New(cfg, database, nil)
+	srv := server.New(cfg, readOnlyTestStore{Store: database}, nil)
 
 	return &testEnv{
 		srv:         srv,
@@ -1790,30 +1796,52 @@ func TestSearch_WithResults(t *testing.T) {
 func TestSearch_Limits(t *testing.T) {
 	te := setup(t)
 	te.requireFTS(t)
-	// Seed 600 distinct sessions, each with one matching message.
+	// Seed enough distinct sessions to prove clamping at the maximum.
 	// Under session-grouped search, each session produces exactly one result,
 	// so limit/pagination operates at the session level.
-	const totalSessions = 600
+	const totalSessions = db.MaxSearchLimit + 1
+	writes := make([]db.SessionBatchWrite, 0, totalSessions)
+	content := "common search term"
 	for i := range totalSessions {
 		id := fmt.Sprintf("limit-test-%04d", i)
-		te.seedSession(t, id, "my-app", 1)
-		te.seedMessages(t, id, 1, func(_ int, m *db.Message) {
-			m.Content = "common search term"
-			m.ContentLength = 18
+		writes = append(writes, db.SessionBatchWrite{
+			Session: db.Session{
+				ID:               id,
+				Project:          "my-app",
+				Machine:          "test",
+				Agent:            "claude",
+				MessageCount:     1,
+				UserMessageCount: 1,
+				StartedAt:        new(tsSeed),
+				EndedAt:          new(tsSeedEnd),
+				FirstMessage:     new("Hello world"),
+			},
+			Messages: []db.Message{{
+				SessionID:     id,
+				Ordinal:       0,
+				Role:          "user",
+				Content:       content,
+				ContentLength: len(content),
+				Timestamp:     tsSeed,
+			}},
 		})
 	}
+	result, err := te.db.WriteSessionBatchAtomic(writes)
+	require.NoError(t, err)
+	require.Equal(t, totalSessions, result.WrittenSessions)
+	require.Equal(t, totalSessions, result.WrittenMessages)
 
 	tests := []struct {
 		name      string
 		queryVal  string
 		wantCount int
 	}{
-		{"DefaultLimit", "", 50},          // default
-		{"ExplicitLimit", "limit=10", 10}, // explicit
-		{"ZeroLimit", "limit=0", 50},      // treat as default
-		{"LargeLimit", "limit=1000", 500}, // clamped to 500
-		{"ExactMax", "limit=500", 500},    // max allowed
-		{"JustOver", "limit=501", 500},    // clamped to 500
+		{"DefaultLimit", "", db.DefaultSearchLimit},
+		{"ExplicitLimit", "limit=10", 10},
+		{"ZeroLimit", "limit=0", db.DefaultSearchLimit},
+		{"LargeLimit", "limit=1000", db.MaxSearchLimit},
+		{"ExactMax", fmt.Sprintf("limit=%d", db.MaxSearchLimit), db.MaxSearchLimit},
+		{"JustOver", fmt.Sprintf("limit=%d", db.MaxSearchLimit+1), db.MaxSearchLimit},
 	}
 
 	for _, tt := range tests {
@@ -2167,7 +2195,7 @@ func TestCORSAllowsMutatingFromKnownOrigin(t *testing.T) {
 }
 
 func TestSyncEndpointLocalNoSyncDaemonUsesOnDemandEngine(t *testing.T) {
-	te := setupPGMode(t)
+	te := setupNoSyncMode(t)
 
 	w := te.post(t, "/api/v1/sync", "{}")
 
@@ -2176,7 +2204,7 @@ func TestSyncEndpointLocalNoSyncDaemonUsesOnDemandEngine(t *testing.T) {
 }
 
 func TestPGPushLocalNoSyncDaemonReachesConfigValidation(t *testing.T) {
-	te := setupPGMode(t)
+	te := setupNoSyncMode(t)
 
 	w := te.post(t, "/api/v1/push/pg", `{"full":false}`)
 
@@ -2947,6 +2975,52 @@ func TestGetSettings_UsesGitHubCLIAuthTokenFallback(t *testing.T) {
 	assertStatus(t, w, http.StatusOK)
 	resp := decode[settingsConfigResponse](t, w)
 	assert.True(t, resp.GithubConfigured)
+}
+
+func TestSettingsRemainLockedInPGMode(t *testing.T) {
+	te := setupPGMode(t)
+	te.srv.SetGithubToken("settings-test-token")
+
+	w := te.get(t, "/api/v1/settings")
+	assertStatus(t, w, http.StatusOK)
+	type readOnlySettingsResponse struct {
+		ReadOnly bool `json:"read_only"`
+	}
+	resp := decode[readOnlySettingsResponse](t, w)
+	assert.True(t, resp.ReadOnly)
+
+	req := httptest.NewRequest(http.MethodPut, "/api/v1/settings",
+		strings.NewReader(`{"require_auth":true}`))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Origin", "http://127.0.0.1:0")
+	w = httptest.NewRecorder()
+	te.handler.ServeHTTP(w, req)
+	assertStatus(t, w, http.StatusNotImplemented)
+	assertBodyContains(t, w, "settings cannot be modified")
+}
+
+func TestSettingsRemainWritableInLocalNoSyncMode(t *testing.T) {
+	te := setupNoSyncMode(t)
+	te.srv.SetGithubToken("settings-test-token")
+
+	w := te.get(t, "/api/v1/settings")
+	assertStatus(t, w, http.StatusOK)
+	type readOnlySettingsResponse struct {
+		ReadOnly bool `json:"read_only"`
+	}
+	resp := decode[readOnlySettingsResponse](t, w)
+	assert.False(t, resp.ReadOnly)
+
+	req := httptest.NewRequest(http.MethodPut, "/api/v1/settings",
+		strings.NewReader(`{"require_auth":true}`))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Origin", "http://127.0.0.1:0")
+	w = httptest.NewRecorder()
+	te.handler.ServeHTTP(w, req)
+	assertStatus(t, w, http.StatusOK)
+
+	resp = decode[readOnlySettingsResponse](t, w)
+	assert.False(t, resp.ReadOnly)
 }
 
 func TestPublishSession_DoesNotUseGitHubCLIAuthTokenFallbackForForwardedRequest(t *testing.T) {
@@ -3894,9 +3968,26 @@ func parseSSEDoneStats(
 
 func TestListSessions_Limits(t *testing.T) {
 	te := setup(t)
-	for i := range db.MaxSessionLimit + 5 {
-		te.seedSession(t, fmt.Sprintf("s%d", i), "my-app", 1)
+	totalSessions := db.MaxSessionLimit + 5
+	writes := make([]db.SessionBatchWrite, 0, totalSessions)
+	for i := range totalSessions {
+		writes = append(writes, db.SessionBatchWrite{
+			Session: db.Session{
+				ID:               fmt.Sprintf("s%d", i),
+				Project:          "my-app",
+				Machine:          "test",
+				Agent:            "claude",
+				MessageCount:     1,
+				UserMessageCount: 2,
+				StartedAt:        new(tsSeed),
+				EndedAt:          new(tsSeedEnd),
+				FirstMessage:     new("Hello world"),
+			},
+		})
 	}
+	result, err := te.db.WriteSessionBatchAtomic(writes)
+	require.NoError(t, err)
+	require.Equal(t, totalSessions, result.WrittenSessions)
 
 	tests := []struct {
 		name      string
@@ -3990,9 +4081,10 @@ func TestHandleWatchSession_UnknownID_Returns404(t *testing.T) {
 
 func TestGetVersion(t *testing.T) {
 	v := server.VersionInfo{
-		Version:   "v1.2.3",
-		Commit:    "abc1234",
-		BuildDate: "2025-01-15T00:00:00Z",
+		Version:                    "v1.2.3",
+		Commit:                     "abc1234",
+		BuildDate:                  "2025-01-15T00:00:00Z",
+		InsightGenerationAvailable: true,
 	}
 	te := setupWithServerOpts(t, []server.Option{
 		server.WithVersion(v),
@@ -4014,6 +4106,7 @@ func TestGetVersion(t *testing.T) {
 			resp.BuildDate,
 		)
 	}
+	assert.True(t, resp.InsightGenerationAvailable)
 	assert.Equal(t, 1, resp.APIVersion)
 	assert.Equal(t, db.CurrentDataVersion(), resp.DataVersion)
 }

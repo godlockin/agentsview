@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 )
@@ -53,6 +54,7 @@ const sessionBaseCols = `id, project, machine, agent,
 	no_code_context_count, runaway_tool_loop_count,
 	data_version,
 	cwd, git_branch, source_session_id, source_version,
+	transcript_fidelity,
 	parser_malformed_lines, is_truncated,
 	deleted_at, termination_status, created_at`
 
@@ -82,6 +84,7 @@ const sessionPruneCols = `id, project, machine, agent,
 	no_code_context_count, runaway_tool_loop_count,
 	data_version,
 	cwd, git_branch, source_session_id, source_version,
+	transcript_fidelity,
 	parser_malformed_lines, is_truncated,
 	deleted_at, termination_status, file_path, file_size, created_at`
 
@@ -110,6 +113,7 @@ const sessionFullCols = `id, project, machine, agent,
 	no_code_context_count, runaway_tool_loop_count,
 	data_version,
 	cwd, git_branch, source_session_id, source_version,
+	transcript_fidelity,
 	parser_malformed_lines, is_truncated,
 	deleted_at, termination_status, file_path, file_size, file_mtime,
 	next_ordinal, last_entry_uuid,
@@ -158,6 +162,7 @@ func scanSessionRow(rs rowScanner) (Session, error) {
 		&s.DataVersion,
 		&s.Cwd, &s.GitBranch,
 		&s.SourceSessionID, &s.SourceVersion,
+		&s.TranscriptFidelity,
 		&s.ParserMalformedLines, &s.IsTruncated,
 		&s.DeletedAt, &s.TerminationStatus, &s.CreatedAt,
 	)
@@ -312,6 +317,7 @@ type Session struct {
 	GitBranch                   string          `json:"git_branch,omitempty"`
 	SourceSessionID             string          `json:"source_session_id,omitempty"`
 	SourceVersion               string          `json:"source_version,omitempty"`
+	TranscriptFidelity          string          `json:"transcript_fidelity,omitempty"`
 	ParserMalformedLines        int             `json:"parser_malformed_lines,omitempty"`
 	IsTruncated                 bool            `json:"is_truncated,omitempty"`
 
@@ -1044,6 +1050,7 @@ func (db *DB) GetSessionFull(
 		&s.DataVersion,
 		&s.Cwd, &s.GitBranch,
 		&s.SourceSessionID, &s.SourceVersion,
+		&s.TranscriptFidelity,
 		&s.ParserMalformedLines, &s.IsTruncated,
 		&s.DeletedAt, &s.TerminationStatus, &s.FilePath, &s.FileSize,
 		&s.FileMtime, &s.NextOrdinal, &s.LastEntryUUID,
@@ -1194,12 +1201,13 @@ const upsertSessionSQL = `
 			is_automated,
 			termination_status,
 			cwd, git_branch, source_session_id,
-			source_version, parser_malformed_lines,
+			source_version, transcript_fidelity,
+			parser_malformed_lines,
 			is_truncated,
 			file_path, file_size, file_mtime,
 			next_ordinal, last_entry_uuid,
 			file_inode, file_device, file_hash
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(id) DO UPDATE SET
 			project = excluded.project,
 			machine = excluded.machine,
@@ -1224,6 +1232,7 @@ const upsertSessionSQL = `
 			git_branch = excluded.git_branch,
 			source_session_id = excluded.source_session_id,
 			source_version = excluded.source_version,
+			transcript_fidelity = excluded.transcript_fidelity,
 			parser_malformed_lines = excluded.parser_malformed_lines,
 			is_truncated = excluded.is_truncated,
 			file_path = excluded.file_path,
@@ -1253,7 +1262,8 @@ func upsertSessionArgs(s Session) []any {
 		sessionIsAutomated(s),
 		s.TerminationStatus,
 		s.Cwd, s.GitBranch, s.SourceSessionID,
-		s.SourceVersion, s.ParserMalformedLines,
+		s.SourceVersion, s.TranscriptFidelity,
+		s.ParserMalformedLines,
 		s.IsTruncated,
 		s.FilePath, s.FileSize, s.FileMtime,
 		s.NextOrdinal, s.LastEntryUUID,
@@ -1915,6 +1925,149 @@ func (db *DB) ListSessionIDsByFilePath(path, agent string) ([]string, error) {
 	return ids, nil
 }
 
+const storedSourcePathHintRootBatchSize = 100
+
+// ListStoredSourcePathHints returns active source paths for agent whose stored
+// file_path falls under any watched root. It is used by provider changed-path
+// comparison to avoid losing sessions when the changed path is a sidecar or a
+// root-scoped database event rather than the exact persisted source path.
+func (db *DB) ListStoredSourcePathHints(
+	agent string,
+	roots []string,
+) ([]string, error) {
+	if agent == "" {
+		return nil, nil
+	}
+	roots = normalizeStoredSourcePathHintRoots(roots)
+	if len(roots) == 0 {
+		return nil, nil
+	}
+
+	seen := make(map[string]struct{})
+	var hints []string
+	for start := 0; start < len(roots); start += storedSourcePathHintRootBatchSize {
+		end := min(start+storedSourcePathHintRootBatchSize, len(roots))
+		batch := roots[start:end]
+		query, args := storedSourcePathHintQuery(agent, batch)
+		rows, err := db.getReader().Query(query, args...)
+		if err != nil {
+			return nil, fmt.Errorf("listing stored source path hints: %w", err)
+		}
+		for rows.Next() {
+			var path string
+			if err := rows.Scan(&path); err != nil {
+				_ = rows.Close()
+				return nil, fmt.Errorf("scanning stored source path hint: %w", err)
+			}
+			path = cleanStoredSourcePathHint(path)
+			if !storedSourcePathHintInAnyRoot(path, batch) {
+				continue
+			}
+			if _, ok := seen[path]; ok {
+				continue
+			}
+			seen[path] = struct{}{}
+			hints = append(hints, path)
+		}
+		if err := rows.Close(); err != nil {
+			return nil, fmt.Errorf("closing stored source path hint rows: %w", err)
+		}
+		if err := rows.Err(); err != nil {
+			return nil, fmt.Errorf("iterating stored source path hints: %w", err)
+		}
+	}
+	sort.Strings(hints)
+	return hints, nil
+}
+
+func normalizeStoredSourcePathHintRoots(roots []string) []string {
+	seen := make(map[string]struct{}, len(roots))
+	out := make([]string, 0, len(roots))
+	for _, root := range roots {
+		root = cleanStoredSourcePathHint(root)
+		if root == "" || root == "." {
+			continue
+		}
+		if _, ok := seen[root]; ok {
+			continue
+		}
+		seen[root] = struct{}{}
+		out = append(out, root)
+	}
+	sort.Strings(out)
+	return out
+}
+
+func storedSourcePathHintQuery(agent string, roots []string) (string, []any) {
+	clauses := make([]string, 0, len(roots))
+	args := []any{agent}
+	for _, root := range roots {
+		root = cleanStoredSourcePathHint(root)
+		if root == "" || root == "." {
+			continue
+		}
+		likeRoot := sqliteLikeEscape(root)
+		clauses = append(clauses,
+			`(file_path = ? OR
+			  file_path LIKE ? ESCAPE '!' OR
+			  file_path LIKE ? ESCAPE '!')`,
+		)
+		args = append(args,
+			root,
+			likeRoot+string(filepath.Separator)+"%",
+			likeRoot+"#%",
+		)
+	}
+	if len(clauses) == 0 {
+		return `SELECT file_path FROM sessions WHERE 0`, nil
+	}
+	query := `SELECT file_path
+		FROM sessions
+		WHERE agent = ?
+		  AND file_path IS NOT NULL
+		  AND deleted_at IS NULL
+		  AND (` + strings.Join(clauses, " OR ") + `)
+		ORDER BY file_path`
+	return query, args
+}
+
+func cleanStoredSourcePathHint(path string) string {
+	return filepath.Clean(path)
+}
+
+func storedSourcePathHintInAnyRoot(path string, roots []string) bool {
+	for _, root := range roots {
+		if storedSourcePathHintInRoot(path, root) {
+			return true
+		}
+	}
+	return false
+}
+
+func storedSourcePathHintInRoot(path, root string) bool {
+	path = cleanStoredSourcePathHint(path)
+	root = cleanStoredSourcePathHint(root)
+	if path == root || strings.HasPrefix(path, root+string(filepath.Separator)) {
+		return true
+	}
+	suffix, ok := strings.CutPrefix(path, root+"#")
+	return ok &&
+		storedSourcePathHintAllowsVirtualSuffix(root) &&
+		suffix != "" &&
+		!strings.ContainsAny(suffix, `/\`)
+}
+
+func storedSourcePathHintAllowsVirtualSuffix(root string) bool {
+	return filepath.Ext(root) != ""
+}
+
+func sqliteLikeEscape(value string) string {
+	value = strings.ReplaceAll(value, `!`, `!!`)
+	value = strings.ReplaceAll(value, `%`, `!%`)
+	value = strings.ReplaceAll(value, `_`, `!_`)
+	return value
+}
+
 // GetDataVersionByPath returns the minimum data_version for
 // sessions matching a file_path. Returns 0 when no session
 // exists for the path.
@@ -2381,6 +2534,7 @@ func (db *DB) FindPruneCandidates(
 			&s.DataVersion,
 			&s.Cwd, &s.GitBranch,
 			&s.SourceSessionID, &s.SourceVersion,
+			&s.TranscriptFidelity,
 			&s.ParserMalformedLines, &s.IsTruncated,
 			&s.DeletedAt, &s.TerminationStatus, &s.FilePath, &s.FileSize, &s.CreatedAt,
 		)
@@ -2769,6 +2923,7 @@ func (db *DB) ListSessionsModifiedBetween(
 			&s.DataVersion,
 			&s.Cwd, &s.GitBranch,
 			&s.SourceSessionID, &s.SourceVersion,
+			&s.TranscriptFidelity,
 			&s.ParserMalformedLines, &s.IsTruncated,
 			&s.DeletedAt, &s.TerminationStatus, &s.FilePath, &s.FileSize,
 			&s.FileMtime, &s.NextOrdinal, &s.LastEntryUUID,

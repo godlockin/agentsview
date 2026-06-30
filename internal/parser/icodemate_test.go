@@ -1,6 +1,7 @@
 package parser
 
 import (
+	"context"
 	"path/filepath"
 	"testing"
 
@@ -8,7 +9,11 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-func TestParseIcodemateFileRelabelsOpenCodeSession(t *testing.T) {
+// TestIcodemateProviderParseRelabelsOpenCodeSession exercises the migrated
+// path: IcodeMate is provider-authoritative and reuses the shared
+// OpenCode-format provider, which parses the storage session and relabels
+// it onto the icodemate: ID prefix.
+func TestIcodemateProviderParseRelabelsOpenCodeSession(t *testing.T) {
 	root := t.TempDir()
 	sessionPath := filepath.Join(
 		root, "storage", "session_diff", "global", "ses_icode.json",
@@ -46,9 +51,24 @@ func TestParseIcodemateFileRelabelsOpenCodeSession(t *testing.T) {
 		},
 	})
 
-	sess, msgs, err := ParseIcodemateFile(sessionPath, "testmachine")
+	provider, ok := NewProvider(AgentIcodemate, ProviderConfig{
+		Roots:   []string{root},
+		Machine: "testmachine",
+	})
+	require.True(t, ok)
+
+	sources, err := provider.Discover(context.Background())
 	require.NoError(t, err)
-	require.NotNil(t, sess)
+	require.Len(t, sources, 1)
+
+	outcome, err := provider.Parse(context.Background(), ParseRequest{
+		Source: sources[0],
+	})
+	require.NoError(t, err)
+	require.Len(t, outcome.Results, 1)
+
+	sess := outcome.Results[0].Result.Session
+	msgs := outcome.Results[0].Result.Messages
 	require.Len(t, msgs, 1)
 
 	assert.Equal(t, "icodemate:ses_icode", sess.ID)
@@ -56,28 +76,6 @@ func TestParseIcodemateFileRelabelsOpenCodeSession(t *testing.T) {
 	assert.Equal(t, AgentIcodemate, sess.Agent)
 	assert.Equal(t, "icodeapp", sess.Project)
 	assert.Equal(t, "Hello from IcodeMate", msgs[0].Content)
-}
-
-func TestDiscoverIcodemateSessions(t *testing.T) {
-	root := t.TempDir()
-	sessionPath := filepath.Join(
-		root, "storage", "session_diff", "global", "ses_icode.json",
-	)
-	writeOpenCodeStorageFile(t, sessionPath, map[string]any{
-		"id":        "ses_icode",
-		"directory": "/home/user/code/icodeapp",
-		"time": map[string]any{
-			"created": 1700000000000,
-			"updated": 1700000060000,
-		},
-	})
-
-	files := DiscoverIcodemateSessions(root)
-	require.Len(t, files, 1)
-
-	assert.Equal(t, sessionPath, files[0].Path)
-	assert.Equal(t, "icodeapp", files[0].Project)
-	assert.Equal(t, AgentIcodemate, files[0].Agent)
 }
 
 func TestParseIcodemateSQLiteVirtualPath(t *testing.T) {
@@ -92,20 +90,4 @@ func TestParseIcodemateSQLiteVirtualPath(t *testing.T) {
 		filepath.Join(t.TempDir(), "opencode.db") + "#ses_icode",
 	)
 	assert.False(t, ok)
-}
-
-func TestDiscoverIcodemateSessionsEmptyDir(t *testing.T) {
-	root := t.TempDir()
-	files := DiscoverIcodemateSessions(root)
-	assert.Empty(t, files)
-}
-
-func TestDiscoverIcodemateSessionsNoSessionDiff(t *testing.T) {
-	root := t.TempDir()
-	writeOpenCodeStorageFile(t,
-		filepath.Join(root, "storage", "other", "x.json"),
-		map[string]any{"id": "x"},
-	)
-	files := DiscoverIcodemateSessions(root)
-	assert.Empty(t, files)
 }

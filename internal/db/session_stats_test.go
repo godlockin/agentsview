@@ -655,6 +655,38 @@ func TestWindowBounds(t *testing.T) {
 	})
 }
 
+func TestParseWindowPoint(t *testing.T) {
+	now := time.Date(2026, 4, 18, 12, 0, 0, 0, time.UTC)
+
+	tests := []struct {
+		name             string
+		in               string
+		want             time.Time
+		wantErrSubstring string
+	}{
+		{name: "Nd duration anchors at now", in: "7d",
+			want: time.Date(2026, 4, 11, 12, 0, 0, 0, time.UTC)},
+		{name: "Nh duration", in: "48h",
+			want: time.Date(2026, 4, 16, 12, 0, 0, 0, time.UTC)},
+		{name: "bare date is start of UTC day", in: "2026-04-01",
+			want: time.Date(2026, 4, 1, 0, 0, 0, 0, time.UTC)},
+		{name: "garbage is a hard error", in: "7x",
+			wantErrSubstring: "Nd, Nh, or YYYY-MM-DD"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := ParseWindowPoint(tc.in, now)
+			if tc.wantErrSubstring != "" {
+				require.Error(t, err, "expected an error")
+				assert.Contains(t, err.Error(), tc.wantErrSubstring)
+				return
+			}
+			require.NoError(t, err)
+			assert.True(t, got.Equal(tc.want), "got %v want %v", got, tc.want)
+		})
+	}
+}
+
 func TestGetSessionStats_Distributions(t *testing.T) {
 	d := testDB(t)
 	ctx := context.Background()
@@ -2001,10 +2033,13 @@ func TestGetSessionStats_Temporal_EmptyWindowEmptySlice(t *testing.T) {
 	assert.NotNil(t, stats.Temporal.HourlyUTC,
 		"hourly_utc must be a non-nil empty slice, got nil")
 	assert.Len(t, stats.Temporal.HourlyUTC, 0, "hourly_utc: got len")
-	// Reporter timezone should still be populated (claim in the spec).
-	assert.NotEmpty(t, stats.Temporal.ReporterTimezone,
-		"reporter_timezone must be populated even when "+
-			"hourly_utc is empty")
+	// Reporter timezone may now be empty when the host only exposes the
+	// Local sentinel; otherwise it must still be a loadable IANA name.
+	if stats.Temporal.ReporterTimezone != "" {
+		_, tzErr := time.LoadLocation(stats.Temporal.ReporterTimezone)
+		assert.NoError(t, tzErr,
+			"reporter_timezone must stay loadable when populated")
+	}
 	// JSON encoding must emit [] not null.
 	raw, err := json.Marshal(stats.Temporal.HourlyUTC)
 	require.NoError(t, err, "json.Marshal")
@@ -2033,6 +2068,8 @@ func TestReporterTimezone_Precedence(t *testing.T) {
 			_ = os.Unsetenv("TZ")
 		}
 	})
+	oldLocal := time.Local
+	t.Cleanup(func() { time.Local = oldLocal })
 
 	// Filter wins over env.
 	err := os.Setenv("TZ", "Europe/Berlin")
@@ -2045,12 +2082,18 @@ func TestReporterTimezone_Precedence(t *testing.T) {
 	assert.Equal(t, "Europe/Berlin",
 		reporterTimezone(StatsFilter{}), "env wins")
 
-	// No filter, no env → time.Local fallback.
+	// No filter, no env, valid local name → local wins.
 	err = os.Unsetenv("TZ")
 	require.NoError(t, err, "unset TZ")
-	got := reporterTimezone(StatsFilter{})
-	assert.NotEmpty(t, got, "time.Local fallback: got empty string")
-	assert.Equal(t, time.Local.String(), got, "time.Local fallback")
+	time.Local = time.FixedZone("America/New_York", -5*60*60)
+	assert.Equal(t, "America/New_York",
+		reporterTimezone(StatsFilter{}),
+		"valid local name should pass through")
+
+	// No filter, no env, Local sentinel → emit empty fallback.
+	time.Local = time.FixedZone("Local", 0)
+	assert.Equal(t, "", reporterTimezone(StatsFilter{}),
+		"Local sentinel should not be published")
 }
 
 func TestGetSessionStats_Temporal_FilterByAgentFlowsThrough(t *testing.T) {

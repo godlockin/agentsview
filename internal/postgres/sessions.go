@@ -23,6 +23,9 @@ type Store struct {
 	cursorMu     sync.RWMutex
 	cursorSecret []byte
 
+	insightCapabilityMu        sync.RWMutex
+	insightGenerationAvailable bool
+
 	pricingMu     sync.Mutex
 	pricingLoadMu sync.Mutex
 	pricingLoad   *pricingLoad
@@ -55,7 +58,7 @@ const pgSessionCols = `id, project, machine, agent,
 	no_code_context_count, runaway_tool_loop_count,
 	data_version,
 	cwd, git_branch, source_session_id, source_version,
-	parser_malformed_lines, is_truncated,
+	transcript_fidelity, parser_malformed_lines, is_truncated,
 	secret_leak_count, secrets_rules_version,
 	deleted_at, termination_status`
 
@@ -214,7 +217,7 @@ func scanPGSession(
 		&s.DataVersion,
 		&s.Cwd, &s.GitBranch,
 		&s.SourceSessionID, &s.SourceVersion,
-		&s.ParserMalformedLines, &s.IsTruncated,
+		&s.TranscriptFidelity, &s.ParserMalformedLines, &s.IsTruncated,
 		&s.SecretLeakCount, &s.SecretsRulesVersion,
 		&deletedAt, &s.TerminationStatus,
 	)

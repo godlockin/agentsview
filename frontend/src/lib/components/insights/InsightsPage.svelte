@@ -81,11 +81,12 @@
   );
   const loading = $derived(analytics.loading.signals);
   const error = $derived(analytics.errors.signals);
-  const readOnly = $derived(
-    sync.serverVersion?.read_only === true,
+  const insightGenerationAvailable = $derived(
+    sync.serverVersion?.insight_generation_available === true ||
+      sync.serverVersion?.read_only !== true,
   );
   const generationUnavailable = $derived(
-    sync.serverVersion === null || readOnly,
+    sync.serverVersion === null || !insightGenerationAvailable,
   );
   const earliestSession = $derived(sync.stats?.earliest_session ?? null);
   const rangeSelection = $derived(
@@ -785,6 +786,17 @@
           </div>
           <h2 id="actions-title">{m.insights_page_deterministic_recommendations()}</h2>
         </div>
+        <p class="insights-help">
+          {m.insights_page_insights_help_intro()}
+          <a
+            href="https://www.agentsview.io/insights/"
+            target="_blank"
+            rel="noopener noreferrer"
+            class="insights-help-link"
+          >
+            {m.insights_page_insights_help_docs()}
+          </a>
+        </p>
       </div>
 
       {#if recommendations.length === 0}
@@ -1093,7 +1105,7 @@
         <button
           class="generate-action"
           disabled={generationUnavailable}
-          title={readOnly
+          title={sync.serverVersion !== null && !insightGenerationAvailable
             ? m.insights_page_generate_disabled()
             : m.insights_page_generate_title()}
           onclick={handleGenerateCanned}
@@ -1393,6 +1405,26 @@
 
   .section-heading.compact {
     align-items: center;
+  }
+
+  .section-heading p.insights-help {
+    max-width: 58ch;
+    margin: 0;
+    display: flex;
+    flex-wrap: wrap;
+    justify-content: flex-end;
+    gap: 4px;
+    text-align: right;
+    line-height: 1.35;
+  }
+
+  .insights-help-link {
+    color: var(--accent-blue);
+  }
+
+  .insights-help-link:hover {
+    color: color-mix(in srgb, var(--accent-blue) 70%, var(--text-primary));
+    text-underline-offset: 2px;
   }
 
   .section-heading h2 {
@@ -2281,6 +2313,11 @@
     }
 
     .section-heading p {
+      text-align: left;
+    }
+
+    .section-heading p.insights-help {
+      justify-content: flex-start;
       text-align: left;
     }
 

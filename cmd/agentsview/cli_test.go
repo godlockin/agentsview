@@ -72,11 +72,30 @@ func TestRootHelpShowsDuckDBEnvironment(t *testing.T) {
 	assert.NotContains(t, help, "env-token")
 }
 
+func TestRootHelpDocumentsCopilotExportDir(t *testing.T) {
+	help, err := executeCommand(newRootCommand(), "--help")
+	require.NoError(t, err, "Execute")
+	assert.Contains(t, help,
+		"COPILOT_DIR             Copilot sessions or exported JetBrains Copilot directory")
+}
+
 func TestDuckDBPushHelpShowsProjectFlags(t *testing.T) {
 	help, err := executeCommand(newRootCommand(), "duckdb", "push", "--help")
 	require.NoError(t, err, "Execute")
 	for _, want := range []string{
 		"--full",
+		"--projects",
+		"--exclude-projects",
+		"--all-projects",
+	} {
+		assert.Contains(t, help, want)
+	}
+}
+
+func TestPGStatusHelpShowsProjectFlags(t *testing.T) {
+	help, err := executeCommand(newRootCommand(), "pg", "status", "--help")
+	require.NoError(t, err, "Execute")
+	for _, want := range []string{
 		"--projects",
 		"--exclude-projects",
 		"--all-projects",
@@ -277,7 +296,14 @@ func TestExecuteCLIWithLegacyFlagCompatWarnsOnce(t *testing.T) {
 func TestRootHelpDocumentsRemoteHosts(t *testing.T) {
 	help, err := executeCommand(newRootCommand(), "--help")
 	require.NoError(t, err, "Execute")
-	for _, want := range []string{"remote_hosts", "passwordless"} {
+	for _, want := range []string{
+		"remote_hosts",
+		"passwordless",
+		"transport = \"http\"",
+		"daemon_idle_timeout",
+		"Top-level daemon_idle_timeout",
+		"Tailscale",
+	} {
 		assert.Contains(t, help, want,
 			"root help should document %q", want)
 	}

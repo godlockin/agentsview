@@ -21,10 +21,10 @@ import (
 	"go.kenn.io/agentsview/internal/config"
 	"go.kenn.io/agentsview/internal/db"
 	"go.kenn.io/agentsview/internal/parser"
+	"go.kenn.io/agentsview/internal/remotesync"
 	"go.kenn.io/agentsview/internal/secrets"
 	"go.kenn.io/agentsview/internal/server"
 	"go.kenn.io/agentsview/internal/signals"
-	"go.kenn.io/agentsview/internal/ssh"
 	"go.kenn.io/agentsview/internal/sync"
 	"go.kenn.io/agentsview/internal/telemetry"
 )
@@ -37,7 +37,6 @@ var (
 
 const (
 	periodicSyncInterval  = 15 * time.Minute
-	daemonIdleTimeout     = 20 * time.Minute
 	telemetryPingInterval = 24 * time.Hour
 	unwatchedPollInterval = 2 * time.Minute
 	watcherDebounce       = 500 * time.Millisecond
@@ -85,7 +84,12 @@ func warnMissingDirs(dirs []string, label string) {
 	}
 }
 
-func runServe(cfg config.Config) {
+type serveOptions struct {
+	ReplaceDaemon  bool
+	NoSyncExplicit bool
+}
+
+func runServe(cfg config.Config, opts serveOptions) {
 	start := time.Now()
 	setupLogFile(cfg.DataDir)
 
@@ -93,13 +97,13 @@ func runServe(cfg config.Config) {
 		fatal("invalid serve config: %v", err)
 	}
 
-	// When auth is required, ensure a token exists before publishing
-	// startup state so waiting CLI probes can authenticate the first
-	// protected /api/ping after startup completes.
+	// Remote sync archive endpoints always require bearer auth, even when
+	// general API auth is disabled. Ensure a token exists before publishing
+	// startup state so daemon probes and remote collectors share one token.
+	if err := ensureServeAuthToken(&cfg); err != nil {
+		log.Fatalf("Failed to generate auth token: %v", err)
+	}
 	if cfg.RequireAuth {
-		if err := cfg.EnsureAuthToken(); err != nil {
-			log.Fatalf("Failed to generate auth token: %v", err)
-		}
 		// A background child redirects stdout to serve.log; printing the
 		// token there would persist it to a file. The parent already
 		// printed the token to the invoking terminal, so the child stays
@@ -108,6 +112,21 @@ func runServe(cfg config.Config) {
 			fmt.Printf("Auth enabled. Token: %s\n", cfg.AuthToken)
 		}
 	}
+
+	cont, releaseForegroundReplacement, err := prepareForegroundServeDaemon(
+		&cfg,
+		serveReplacementOptions{
+			Replace:        opts.ReplaceDaemon,
+			NoSyncExplicit: opts.NoSyncExplicit,
+		},
+	)
+	if err != nil {
+		fatal("%v", err)
+	}
+	if !cont {
+		return
+	}
+	defer releaseForegroundReplacement()
 
 	// Acquire the daemon start lock immediately after config setup,
 	// before opening the DB, so token-use never sees a window
@@ -145,7 +164,7 @@ func runServe(cfg config.Config) {
 		context.Background(), os.Interrupt, syscall.SIGTERM,
 	)
 	defer stop()
-	idleTracker := newDaemonIdleTracker(stop)
+	idleTracker := newDaemonIdleTracker(cfg, stop)
 
 	telemetryReporter := telemetry.NewReporterOrDisabled(telemetry.Options{
 		DataDir: cfg.DataDir,
@@ -264,6 +283,7 @@ func runServe(cfg config.Config) {
 		runtimeRecordDataDir = rt.Cfg.DataDir
 		UnmarkDaemonStarting(rt.Cfg.DataDir)
 	}
+	releaseForegroundReplacement()
 	if idleTracker != nil {
 		idleTracker.Touch()
 		go idleTracker.Run(ctx)
@@ -305,11 +325,18 @@ func runServe(cfg config.Config) {
 	}
 }
 
-func newDaemonIdleTracker(stop context.CancelFunc) *server.IdleTracker {
+func ensureServeAuthToken(cfg *config.Config) error {
+	if cfg == nil || cfg.AuthToken != "" {
+		return nil
+	}
+	return cfg.EnsureAuthToken()
+}
+
+func newDaemonIdleTracker(cfg config.Config, stop context.CancelFunc) *server.IdleTracker {
 	if !runningAsBackgroundChild() {
 		return nil
 	}
-	timeout := daemonIdleTimeout
+	timeout := cfg.DaemonIdleTimeout
 	if raw := os.Getenv("AGENTSVIEW_DAEMON_IDLE_TIMEOUT"); raw != "" {
 		parsed, err := time.ParseDuration(raw)
 		if err != nil {
@@ -461,7 +488,9 @@ func rejectLiveWritableDaemonBeforeDirectWrite(cfg config.Config) error {
 				"or run `agentsview serve stop` first",
 		)
 	}
-	if isBackgroundLaunchActive(dataDir) && !runningAsBackgroundChild() {
+	if isBackgroundLaunchActive(dataDir) &&
+		!ownsForegroundReplacementLaunchLock(dataDir) &&
+		!runningAsBackgroundChild() {
 		return fmt.Errorf(
 			"local daemon launch is in progress and owns the SQLite archive; " +
 				"refusing to write directly. Retry once it is ready " +
@@ -820,6 +849,9 @@ func printSyncProgress(p sync.Progress) {
 func formatSyncProgress(p sync.Progress) string {
 	if p.Detail != "" {
 		detail := p.Detail
+		if p.BytesDone > 0 || p.BytesTotal > 0 {
+			detail = fmt.Sprintf("%s: %s", detail, formatByteProgress(p))
+		}
 		if p.SessionsTotal > 0 {
 			detail = fmt.Sprintf(
 				"%s: %d/%d sessions (%.0f%%) · %d messages",
@@ -840,6 +872,17 @@ func formatSyncProgress(p sync.Progress) string {
 		)
 	}
 	return ""
+}
+
+func formatByteProgress(p sync.Progress) string {
+	if p.BytesTotal > 0 {
+		return fmt.Sprintf(
+			"%s/%s (%.0f%%)",
+			formatBytes(p.BytesDone), formatBytes(p.BytesTotal),
+			float64(p.BytesDone)/float64(p.BytesTotal)*100,
+		)
+	}
+	return formatBytes(p.BytesDone)
 }
 
 func startFileWatcher(
@@ -935,43 +978,132 @@ func collectWatchRoots(cfg config.Config) (roots []watchRoot, unwatchedDirs []st
 			continue
 		}
 		for _, d := range cfg.ResolveDirs(def.Type) {
-			if def.ShallowWatchRootsFunc != nil {
-				for _, watchDir := range def.ShallowWatchRootsFunc(d) {
-					if _, err := os.Stat(watchDir); err == nil {
-						addRoot(d, watchDir, true)
-					}
-				}
-			}
-			if def.WatchRootsFunc != nil {
-				watchDirs := def.WatchRootsFunc(d)
-				if len(watchDirs) == 0 {
-					unwatchedDirs = append(unwatchedDirs, d)
-					continue
-				}
-				for _, watchDir := range watchDirs {
-					if _, err := os.Stat(watchDir); err == nil {
-						addRoot(d, watchDir, def.ShallowWatch)
-						continue
-					}
-					unwatchedDirs = append(unwatchedDirs, d)
-				}
+			if providerWatched, providerUnwatched := collectProviderWatchRoots(def, d, addRoot); providerWatched {
+				unwatchedDirs = append(unwatchedDirs, providerUnwatched...)
 				continue
 			}
-			if len(def.WatchSubdirs) == 0 {
-				if _, err := os.Stat(d); err == nil {
-					addRoot(d, d, def.ShallowWatch)
-				}
-				continue
-			}
-			for _, sub := range def.WatchSubdirs {
-				watchDir := filepath.Join(d, sub)
-				if _, err := os.Stat(watchDir); err == nil {
-					addRoot(d, watchDir, def.ShallowWatch)
-				}
-			}
+			fallbackUnwatched := collectLegacyWatchRoots(def, d, addRoot)
+			unwatchedDirs = append(unwatchedDirs, fallbackUnwatched...)
 		}
 	}
 	return roots, unwatchedDirs
+}
+
+func collectProviderWatchRoots(
+	def parser.AgentDef,
+	dir string,
+	addRoot func(dir, root string, shallow bool),
+) (bool, []string) {
+	factory, ok := parser.ProviderFactoryByType(def.Type)
+	if !ok {
+		return false, nil
+	}
+	provider := factory.NewProvider(parser.ProviderConfig{
+		Roots: []string{dir},
+	})
+	plan, err := provider.WatchPlan(context.Background())
+	if err != nil || len(plan.Roots) == 0 {
+		if err != nil && !errors.Is(err, parser.ErrUnsupportedProviderFeature) {
+			log.Printf("%s provider watch plan: %v", def.Type, err)
+		}
+		return false, nil
+	}
+	added := false
+	var addedRoots []watchRoot
+	var missingRoots []string
+	for _, providerRoot := range plan.Roots {
+		root := filepath.Clean(providerRoot.Path)
+		if root == "" || root == "." {
+			continue
+		}
+		if _, err := os.Stat(root); err == nil {
+			addRoot(dir, root, !providerRoot.Recursive)
+			added = true
+			addedRoots = append(addedRoots, watchRoot{
+				root:    root,
+				shallow: !providerRoot.Recursive,
+			})
+			continue
+		}
+		missingRoots = append(missingRoots, root)
+	}
+	if !added {
+		return false, nil
+	}
+	// A watch target that does not exist yet but lives under an already-watched
+	// root needs no separate polling only when the ancestor is recursive or
+	// when a shallow root can observe creation of the missing root itself. A
+	// shallow ancestor sees only immediate child creation, so it cannot cover a
+	// missing nested provider root.
+	for _, missing := range missingRoots {
+		if !pathCoveredByAnyWatchRootCreation(missing, addedRoots) {
+			return true, []string{dir}
+		}
+	}
+	return true, nil
+}
+
+// pathCoveredByAnyWatchRootCreation reports whether path is covered by an
+// existing watch root strongly enough to observe creation of the missing root.
+// Recursive roots cover the whole subtree. Shallow roots only cover direct
+// children because fsnotify can report that immediate directory creation, after
+// which the next watcher setup can add the provider's deeper watch root.
+func pathCoveredByAnyWatchRootCreation(path string, roots []watchRoot) bool {
+	for _, root := range roots {
+		if root.shallow {
+			if filepath.Dir(path) == root.root {
+				return true
+			}
+			continue
+		}
+		if path == root.root ||
+			strings.HasPrefix(path, root.root+string(filepath.Separator)) {
+			return true
+		}
+	}
+	return false
+}
+
+func collectLegacyWatchRoots(
+	def parser.AgentDef,
+	dir string,
+	addRoot func(dir, root string, shallow bool),
+) []string {
+	var unwatchedDirs []string
+	if def.ShallowWatchRootsFunc != nil {
+		for _, watchDir := range def.ShallowWatchRootsFunc(dir) {
+			if _, err := os.Stat(watchDir); err == nil {
+				addRoot(dir, watchDir, true)
+			}
+		}
+	}
+	if def.WatchRootsFunc != nil {
+		watchDirs := def.WatchRootsFunc(dir)
+		if len(watchDirs) == 0 {
+			return append(unwatchedDirs, dir)
+		}
+		for _, watchDir := range watchDirs {
+			if _, err := os.Stat(watchDir); err == nil {
+				addRoot(dir, watchDir, def.ShallowWatch)
+				continue
+			}
+			unwatchedDirs = append(unwatchedDirs, dir)
+		}
+		return unwatchedDirs
+	}
+	if len(def.WatchSubdirs) == 0 {
+		if _, err := os.Stat(dir); err == nil {
+			addRoot(dir, dir, def.ShallowWatch)
+		}
+		return unwatchedDirs
+	}
+	for _, sub := range def.WatchSubdirs {
+		watchDir := filepath.Join(dir, sub)
+		if _, err := os.Stat(watchDir); err == nil {
+			addRoot(dir, watchDir, def.ShallowWatch)
+		}
+	}
+	return unwatchedDirs
 }
 
 func startPeriodicSync(
@@ -1019,9 +1151,7 @@ func startRemoteHostSync(
 ) {
 	syncFn := remoteHostSyncFunc(
 		ctx, cfg, database, engine, rh,
-		func(ctx context.Context, rs *ssh.RemoteSync) (ssh.SyncStats, error) {
-			return rs.Run(ctx)
-		},
+		runRemoteSyncTransport,
 	)
 	runRemoteHostSyncLoop(ctx, rh.Host, rh.Interval, syncFn, emitter, idleTracker, nil)
 }
@@ -1030,7 +1160,13 @@ type remoteSyncExclusiveRunner interface {
 	RunExclusive(func() error) error
 }
 
-type remoteSyncRunner func(context.Context, *ssh.RemoteSync) (ssh.SyncStats, error)
+type remoteSyncRunner func(
+	context.Context,
+	config.Config,
+	*db.DB,
+	config.RemoteHost,
+	bool,
+) (remotesync.SyncStats, error)
 
 func remoteHostSyncFunc(
 	ctx context.Context,
@@ -1044,18 +1180,10 @@ func remoteHostSyncFunc(
 		if runner == nil {
 			return 0, fmt.Errorf("scheduled remote sync missing exclusive runner")
 		}
-		var stats ssh.SyncStats
+		var stats remotesync.SyncStats
 		err := runner.RunExclusive(func() error {
-			rs := &ssh.RemoteSync{
-				Host:                    rh.Host,
-				User:                    rh.User,
-				Port:                    rh.Port,
-				Full:                    database.NeedsResync(),
-				DB:                      database,
-				BlockedResultCategories: cfg.ResultContentBlockedCategories,
-			}
 			var err error
-			stats, err = runRemote(ctx, rs)
+			stats, err = runRemote(ctx, cfg, database, rh, database.NeedsResync())
 			return err
 		})
 		return stats.SessionsSynced, err

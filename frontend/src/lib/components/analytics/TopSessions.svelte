@@ -35,6 +35,15 @@
     return m > 0 ? `${h}h ${m}m` : `${h}h`;
   }
 
+  function formatDurationWithTotal(
+    activeMin: number,
+    totalMin: number,
+  ): string {
+    return `${formatDuration(activeMin)} (${m.analytics_top_sessions_total_duration({
+      duration: formatDuration(totalMin),
+    })})`;
+  }
+
   function handleSessionClick(id: string) {
     let needInvalidate = false;
     const params: Record<string, string> = {};
@@ -154,7 +163,15 @@
           </div>
           <span class="session-metric">
             {#if analytics.topMetric === "duration"}
-              {formatDuration(session.duration_min)}
+              <span
+                class="session-metric-primary"
+                title={m.analytics_top_sessions_active_duration()}
+              >
+                {formatDurationWithTotal(
+                  session.active_duration_min,
+                  session.duration_min,
+                )}
+              </span>
             {:else if analytics.topMetric === "output_tokens"}
               {formatTokenCount(session.output_tokens)}
             {:else}
@@ -322,8 +339,12 @@
     font-weight: 500;
     font-family: var(--font-mono);
     color: var(--accent-blue);
-    min-width: 36px;
+    min-width: 86px;
     text-align: right;
+  }
+
+  .session-metric-primary {
+    display: inline-block;
   }
 
   .empty {

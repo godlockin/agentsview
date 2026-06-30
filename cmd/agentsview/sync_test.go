@@ -22,6 +22,7 @@ import (
 	"github.com/stretchr/testify/require"
 	"go.kenn.io/agentsview/internal/config"
 	"go.kenn.io/agentsview/internal/db"
+	"go.kenn.io/agentsview/internal/remotesync"
 	agentsync "go.kenn.io/agentsview/internal/sync"
 	"go.kenn.io/kit/daemon"
 )
@@ -58,6 +59,70 @@ func TestRunRemoteHosts_AllSucceedReturnsEmpty(t *testing.T) {
 		return nil
 	})
 	assert.Empty(t, failures)
+}
+
+func TestRunRemoteSyncOnceDispatchesHTTP(t *testing.T) {
+	var called config.RemoteHost
+	restore := stubHTTPRemoteSyncForTest(t, func(
+		_ context.Context,
+		rh config.RemoteHost,
+		full bool,
+	) (remotesync.SyncStats, error) {
+		called = rh
+		assert.True(t, full)
+		return remotesync.SyncStats{SessionsSynced: 2}, nil
+	})
+	defer restore()
+
+	err := runRemoteSyncOnce(config.Config{}, nil, config.RemoteHost{
+		Host: "devbox", Transport: config.RemoteTransportHTTP,
+		URL: "http://devbox:8080", Token: "remote-token",
+	}, true)
+
+	require.NoError(t, err)
+	assert.Equal(t, "http://devbox:8080", called.URL)
+}
+
+func TestRunHTTPRemoteSyncRequiresExplicitHTTPToken(t *testing.T) {
+	called := false
+	ts := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+		called = true
+	}))
+	t.Cleanup(ts.Close)
+
+	_, err := runHTTPRemoteSync(
+		context.Background(),
+		config.Config{AuthToken: "collector-token"},
+		nil,
+		config.RemoteHost{
+			Host:      "devbox",
+			Transport: config.RemoteTransportHTTP,
+			URL:       ts.URL,
+		},
+		false,
+	)
+
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "token is required")
+	assert.False(t, called, "collector auth_token must not be sent to remote")
+}
+
+func stubHTTPRemoteSyncForTest(
+	t *testing.T,
+	fn func(context.Context, config.RemoteHost, bool) (remotesync.SyncStats, error),
+) func() {
+	t.Helper()
+	orig := runHTTPRemoteSync
+	runHTTPRemoteSync = func(
+		ctx context.Context,
+		_ config.Config,
+		_ *db.DB,
+		rh config.RemoteHost,
+		full bool,
+	) (remotesync.SyncStats, error) {
+		return fn(ctx, rh, full)
+	}
+	return func() { runHTTPRemoteSync = orig }
 }
 
 func TestSyncLocalAndRemotes_ResyncForcesRemoteFull(t *testing.T) {
@@ -276,6 +341,144 @@ func TestResyncProgressPrinterRendersDoneProgressBeforeCompletion(t *testing.T) 
 		"\r  Syncing sessions into rebuilt database: 1/1 sessions (100%) · 42 messages\x1b[K")
 	assert.Contains(t, got,
 		"\n  Syncing sessions into rebuilt database completed in 1s\n")
+}
+
+func TestRemoteProgressPrinterWritesTimedStepLines(t *testing.T) {
+	now := time.Date(2026, 6, 24, 12, 0, 0, 0, time.UTC)
+	clock := func() time.Time { return now }
+	var out bytes.Buffer
+	printer := newRemoteProgressPrinter(&out, clock)
+
+	printer.Print(agentsync.Progress{
+		Detail: "Resolving agent directories on devbox",
+	})
+	now = now.Add(150 * time.Millisecond)
+	printer.Print(agentsync.Progress{
+		Detail: "Downloading session data from devbox (3 agents)",
+	})
+	now = now.Add(2 * time.Second)
+	printer.Print(agentsync.Progress{
+		Phase:           agentsync.PhaseSyncing,
+		Detail:          "Processing sessions from devbox",
+		SessionsTotal:   10,
+		SessionsDone:    4,
+		MessagesIndexed: 40,
+	})
+	now = now.Add(350 * time.Millisecond)
+	printer.Print(agentsync.Progress{
+		Phase:           agentsync.PhaseSyncing,
+		Detail:          "Processing sessions from devbox",
+		SessionsTotal:   10,
+		SessionsDone:    10,
+		MessagesIndexed: 100,
+	})
+	now = now.Add(3 * time.Second)
+	printer.Print(agentsync.Progress{
+		Detail: "Synced 10 sessions from devbox (1 unchanged)",
+	})
+	printer.Finish()
+
+	got := out.String()
+	assert.Contains(t, got, "  Resolving agent directories on devbox...\n")
+	assert.Contains(t, got, "  Resolving agent directories on devbox completed in 150ms\n")
+	assert.Contains(t, got, "  Downloading session data from devbox (3 agents)...\n")
+	assert.Contains(t, got, "  Downloading session data from devbox (3 agents) completed in 2s\n")
+	assert.Contains(t, got, "\r  Processing sessions from devbox: 10/10 sessions (100%) · 100 messages\x1b[K")
+	assert.Contains(t, got, "\n  Processing sessions from devbox completed in 3.35s\n")
+	assert.Contains(t, got, "  Synced 10 sessions from devbox (1 unchanged)\n")
+	assert.True(t, strings.HasSuffix(got, "\n"), "remote progress should finish on a newline")
+}
+
+func TestRemoteProgressPrinterRendersByteProgressInPlace(t *testing.T) {
+	now := time.Date(2026, 6, 24, 12, 0, 0, 0, time.UTC)
+	clock := func() time.Time { return now }
+	var out bytes.Buffer
+	printer := newRemoteProgressPrinter(&out, clock)
+
+	printer.Print(agentsync.Progress{
+		Detail:     "Downloading session archive from devbox",
+		BytesDone:  1 << 20,
+		BytesTotal: 4 << 20,
+	})
+	now = now.Add(150 * time.Millisecond)
+	printer.Print(agentsync.Progress{
+		Detail:     "Downloading session archive from devbox",
+		BytesDone:  4 << 20,
+		BytesTotal: 4 << 20,
+	})
+	now = now.Add(850 * time.Millisecond)
+	printer.Print(agentsync.Progress{
+		Detail: "Extracting session archive from devbox",
+	})
+	printer.Finish()
+
+	got := out.String()
+	assert.Contains(t, got,
+		"\r  Downloading session archive from devbox: 1.0 MB/4.0 MB (25%)\x1b[K")
+	assert.Contains(t, got,
+		"\r  Downloading session archive from devbox: 4.0 MB/4.0 MB (100%)\x1b[K")
+	assert.Contains(t, got,
+		"\n  Downloading session archive from devbox completed in 1s\n")
+	assert.Contains(t, got, "  Extracting session archive from devbox...\n")
+}
+
+func TestRemoteProgressPrinterRendersLocalSyncProgressWithoutDetail(t *testing.T) {
+	now := time.Date(2026, 6, 24, 12, 0, 0, 0, time.UTC)
+	clock := func() time.Time { return now }
+	var out bytes.Buffer
+	printer := newRemoteProgressPrinter(&out, clock)
+
+	printer.Print(agentsync.Progress{
+		Phase:           agentsync.PhaseSyncing,
+		SessionsTotal:   10,
+		SessionsDone:    4,
+		MessagesIndexed: 40,
+	})
+	now = now.Add(250 * time.Millisecond)
+	printer.Print(agentsync.Progress{
+		Phase:           agentsync.PhaseDone,
+		SessionsTotal:   10,
+		SessionsDone:    10,
+		MessagesIndexed: 100,
+	})
+	printer.Print(agentsync.Progress{
+		Detail: "Resolving agent directories on devbox",
+	})
+
+	got := out.String()
+	assert.Contains(t, got, "\r  Syncing local sessions: 4/10 sessions (40%) · 40 messages\x1b[K")
+	assert.Contains(t, got, "\r  Syncing local sessions: 10/10 sessions (100%) · 100 messages\x1b[K")
+	assert.Contains(t, got, "\n  Syncing local sessions completed in 250ms\n")
+	assert.Contains(t, got, "  Resolving agent directories on devbox...\n")
+}
+
+func TestRemoteProgressPrinterKeepsResyncLabelOnDoneProgress(t *testing.T) {
+	now := time.Date(2026, 6, 24, 12, 0, 0, 0, time.UTC)
+	clock := func() time.Time { return now }
+	var out bytes.Buffer
+	printer := newRemoteProgressPrinter(&out, clock)
+
+	printer.Print(agentsync.Progress{
+		Phase:           agentsync.PhaseSyncing,
+		Detail:          "Syncing sessions into rebuilt database",
+		SessionsTotal:   10,
+		SessionsDone:    4,
+		MessagesIndexed: 40,
+		Resync:          true,
+	})
+	now = now.Add(250 * time.Millisecond)
+	printer.Print(agentsync.Progress{
+		Phase:           agentsync.PhaseDone,
+		SessionsTotal:   10,
+		SessionsDone:    10,
+		MessagesIndexed: 100,
+		Resync:          true,
+	})
+
+	got := out.String()
+	assert.Contains(t, got, "\r  Syncing sessions into rebuilt database: 10/10 sessions (100%) · 100 messages\x1b[K")
+	assert.NotContains(t, got, "\r  Syncing local sessions: 10/10 sessions (100%) · 100 messages\x1b[K")
+	assert.Contains(t, got, "\n  Syncing sessions into rebuilt database completed in 250ms\n")
 }
 
 func TestRunLocalSyncUsesCallerContextForResync(t *testing.T) {

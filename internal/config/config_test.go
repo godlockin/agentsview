@@ -272,9 +272,13 @@ func TestDefault_IncludesCodexArchivedSessionsDir(t *testing.T) {
 }
 
 func TestDefault_SkipsAiderUntilConfigured(t *testing.T) {
+	t.Setenv("AIDER_DIR", "")
 	cfg, err := Default()
 	require.NoError(t, err)
 
+	// Aider has no safe default root: a passive viewer must not enumerate
+	// $HOME (macOS privacy prompts), so it stays unresolved until the user
+	// opts in via AIDER_DIR or aider_dirs.
 	assert.Empty(t, cfg.ResolveDirs(parser.AgentAider))
 	assert.False(t, cfg.IsUserConfigured(parser.AgentAider))
 }
@@ -665,6 +669,7 @@ func TestResolveDirs(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			dir := setupTestEnv(t)
 			writeConfig(t, dir, tt.config)
+			t.Setenv("CLAUDE_CONFIG_DIR", "")
 			if tt.envValue != "" {
 				t.Setenv("CLAUDE_PROJECTS_DIR", tt.envValue)
 			}
@@ -684,6 +689,53 @@ func TestResolveDirs(t *testing.T) {
 			assert.Equal(t, tt.wantUserConfig, cfg.IsUserConfigured(parser.AgentClaude))
 		})
 	}
+}
+
+func TestResolveDirs_ClaudeConfigDirRootEnvVar(t *testing.T) {
+	t.Run("root env re-roots implicit default", func(t *testing.T) {
+		dir := setupTestEnv(t)
+		root := t.TempDir()
+		t.Setenv("CLAUDE_CONFIG_DIR", root)
+		writeConfig(t, dir, map[string]any{})
+
+		cfg, err := LoadMinimal()
+		require.NoError(t, err)
+
+		assert.Equal(t, []string{filepath.Join(root, "projects")},
+			cfg.ResolveDirs(parser.AgentClaude))
+		assert.False(t, cfg.IsUserConfigured(parser.AgentClaude))
+	})
+
+	t.Run("projects env beats root env", func(t *testing.T) {
+		dir := setupTestEnv(t)
+		root := t.TempDir()
+		t.Setenv("CLAUDE_CONFIG_DIR", root)
+		t.Setenv("CLAUDE_PROJECTS_DIR", "/env/override")
+		writeConfig(t, dir, map[string]any{})
+
+		cfg, err := LoadMinimal()
+		require.NoError(t, err)
+
+		assert.Equal(t, []string{"/env/override"},
+			cfg.ResolveDirs(parser.AgentClaude))
+		assert.True(t, cfg.IsUserConfigured(parser.AgentClaude))
+	})
+
+	t.Run("config file beats root env", func(t *testing.T) {
+		dir := setupTestEnv(t)
+		root := t.TempDir()
+		t.Setenv("CLAUDE_CONFIG_DIR", root)
+		writeConfig(t, dir, map[string]any{
+			"claude_project_dirs": []string{"/from/config"},
+		})
+
+		cfg, err := LoadMinimal()
+		require.NoError(t, err)
+
+		assert.Equal(t, []string{"/from/config"},
+			cfg.ResolveDirs(parser.AgentClaude))
+		assert.True(t, cfg.IsUserConfigured(parser.AgentClaude))
+	})
 }
 
 func TestResolveDataDir_DefaultAndEnvOverride(t *testing.T) {
@@ -738,6 +790,7 @@ func TestEnvOverridesConfigFile(t *testing.T) {
 
 func TestLoadFile_MalformedDirValueLogsWarning(t *testing.T) {
 	f := newConfigFixture(t)
+	t.Setenv("CLAUDE_CONFIG_DIR", "")
 
 	// Write a config where claude_project_dirs is a string
 	// instead of a string array.
@@ -842,6 +895,24 @@ func TestLoadFile_EventsCoalesceInterval(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			cfg := loadMinimalWithConfig(t, tt.config)
 			assert.Equal(t, tt.want, cfg.EventsCoalesceInterval)
+		})
+	}
+}
+
+func TestLoadFile_DaemonIdleTimeout(t *testing.T) {
+	tests := []struct {
+		name string
+		data map[string]any
+		want time.Duration
+	}{
+		{name: "absent uses default", data: map[string]any{}, want: 20 * time.Minute},
+		{name: "configured", data: map[string]any{"daemon_idle_timeout": "6h"}, want: 6 * time.Hour},
+		{name: "explicit zero disables", data: map[string]any{"daemon_idle_timeout": "0s"}, want: 0},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := loadMinimalWithConfig(t, tt.data)
+			assert.Equal(t, tt.want, cfg.DaemonIdleTimeout)
 		})
 	}
 }
@@ -1334,7 +1405,7 @@ func TestResolveDuckDB_ErrorsOnMissingEnvVar(t *testing.T) {
 	requireErrorContains(t, err, "MISSING_DUCKDB_URL")
 }
 
-func TestAutomatedPrefixesRoundTrip(t *testing.T) {
+func TestAutomatedConfigRoundTrip(t *testing.T) {
 	cfg := loadPFlagsWithConfig(t, map[string]any{
 		"automated": map[string]any{
 			"prefixes": []string{
@@ -1343,22 +1414,46 @@ func TestAutomatedPrefixesRoundTrip(t *testing.T) {
 				"  ",                         // whitespace preserved here; normalization is db-side
 				"You are analyzing an essay", // duplicate preserved here too
 			},
+			"substrings": []string{
+				"invoked by roborev to perform this review",
+				"  embedded marker  ",
+				"invoked by roborev to perform this review",
+			},
+			"exact_matches": []string{
+				"Warmup",
+				"  Reply with exactly OK.  ",
+				"Warmup",
+			},
 		},
 	})
-	want := []string{
+	wantPrefixes := []string{
 		"You are analyzing an essay",
 		"You are grading quotes",
 		"  ",
 		"You are analyzing an essay",
 	}
-	assert.Equal(t, want, cfg.Automated.Prefixes)
+	wantSubstrings := []string{
+		"invoked by roborev to perform this review",
+		"  embedded marker  ",
+		"invoked by roborev to perform this review",
+	}
+	wantExactMatches := []string{
+		"Warmup",
+		"  Reply with exactly OK.  ",
+		"Warmup",
+	}
+	assert.Equal(t, wantPrefixes, cfg.Automated.Prefixes)
+	assert.Equal(t, wantSubstrings, cfg.Automated.Substrings)
+	assert.Equal(t, wantExactMatches, cfg.Automated.ExactMatches)
 }
 
-func TestAutomatedPrefixesAbsentIsNil(t *testing.T) {
+func TestAutomatedConfigAbsentIsNil(t *testing.T) {
 	cfg := loadPFlagsWithConfig(t, map[string]any{
 		"public_url": "http://example.com",
 	})
 	assert.Nil(t, cfg.Automated.Prefixes)
+	assert.Nil(t, cfg.Automated.Substrings)
+	assert.Nil(t, cfg.Automated.ExactMatches)
 }
 
 func TestLoadFile_CustomModelPricing(t *testing.T) {
@@ -1442,6 +1537,42 @@ host = "  laptop2  "
 	assert.Equal(t, RemoteHost{Host: "laptop2"}, cfg.RemoteHosts[1])
 }
 
+func TestLoadFile_RemoteHostsHTTP(t *testing.T) {
+	f := newConfigFixture(t)
+	f.WriteConfigText(t, `[[remote_hosts]]
+host = "devbox1"
+transport = "http"
+url = "http://devbox1.tailnet.ts.net:8080"
+token = "remote-token"
+interval = "5m"
+`)
+
+	cfg := f.LoadMinimal(t)
+
+	require.Len(t, cfg.RemoteHosts, 1)
+	assert.Equal(t, RemoteHost{
+		Host:      "devbox1",
+		Transport: RemoteTransportHTTP,
+		URL:       "http://devbox1.tailnet.ts.net:8080",
+		Token:     "remote-token",
+		Interval:  5 * time.Minute,
+	}, cfg.RemoteHosts[0])
+}
+
+func TestLoadFile_InvalidRemoteHostsDoNotBlockConfigLoad(t *testing.T) {
+	f := newConfigFixture(t)
+	f.WriteConfigText(t, `[[remote_hosts]]
+host = "devbox1"
+transport = "http"
+`)
+
+	cfg := f.LoadMinimal(t)
+
+	require.Len(t, cfg.RemoteHosts, 1)
+	assert.Equal(t, RemoteTransportHTTP, cfg.RemoteHosts[0].Transport)
+	assert.Equal(t, "devbox1", cfg.RemoteHosts[0].Host)
+}
+
 func TestLoadFile_RemoteHostsAbsentIsNil(t *testing.T) {
 	cfg := loadMinimalWithConfig(t,
 		map[string]any{"public_url": "http://example.com"})
@@ -1467,6 +1598,21 @@ func TestValidateRemoteHosts(t *testing.T) {
 		{"none configured", nil, nil},
 		{"negative interval", []RemoteHost{{Host: "a", Interval: -1}}, []string{"invalid interval"}},
 		{"zero interval ok", []RemoteHost{{Host: "a", Interval: 0}}, nil},
+		{"http valid", []RemoteHost{{Host: "a", Transport: RemoteTransportHTTP, URL: "https://a.example.test", Token: "token"}}, nil},
+		{"http requires url", []RemoteHost{{Host: "a", Transport: RemoteTransportHTTP}}, []string{"url is required"}},
+		{"http requires token", []RemoteHost{{Host: "a", Transport: RemoteTransportHTTP, URL: "https://a.example.test"}}, []string{"token is required"}},
+		{"http rejects user", []RemoteHost{{Host: "a", Transport: RemoteTransportHTTP, URL: "https://a.example.test", User: "alice"}}, []string{"user is only valid for ssh"}},
+		{"http rejects port", []RemoteHost{{Host: "a", Transport: RemoteTransportHTTP, URL: "https://a.example.test", Port: 443}}, []string{"port is only valid for ssh"}},
+		{"http rejects bad scheme", []RemoteHost{{Host: "a", Transport: RemoteTransportHTTP, URL: "ftp://a.example.test"}}, []string{"url must use http or https"}},
+		{"http rejects empty hostname with port", []RemoteHost{{Host: "a", Transport: RemoteTransportHTTP, URL: "http://:8080"}}, []string{"url must include a host"}},
+		{"http rejects query", []RemoteHost{{Host: "a", Transport: RemoteTransportHTTP, URL: "https://a.example.test?token=x"}}, []string{"url must not include query"}},
+		{"http rejects empty query delimiter", []RemoteHost{{Host: "a", Transport: RemoteTransportHTTP, URL: "https://a.example.test?", Token: "token"}}, []string{"url must not include query"}},
+		{"http rejects fragment", []RemoteHost{{Host: "a", Transport: RemoteTransportHTTP, URL: "https://a.example.test/#remote"}}, []string{"url must not include fragment"}},
+		{"http rejects empty fragment delimiter", []RemoteHost{{Host: "a", Transport: RemoteTransportHTTP, URL: "https://a.example.test#", Token: "token"}}, []string{"url must not include fragment"}},
+		{"http rejects userinfo", []RemoteHost{{Host: "a", Transport: RemoteTransportHTTP, URL: "https://alice@a.example.test"}}, []string{"url must not include userinfo"}},
+		{"ssh rejects url", []RemoteHost{{Host: "a", Transport: RemoteTransportSSH, URL: "https://a.example.test"}}, []string{"url is only valid for http"}},
+		{"ssh rejects token", []RemoteHost{{Host: "a", Transport: RemoteTransportSSH, Token: "token"}}, []string{"token is only valid for http"}},
+		{"unknown transport", []RemoteHost{{Host: "a", Transport: RemoteTransport("sftp")}}, []string{"invalid transport"}},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

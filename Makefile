@@ -20,7 +20,7 @@ AIR_BIN := $(shell if command -v air >/dev/null 2>&1; then command -v air; \
 	elif [ -x "$(GOPATH_FIRST)/bin/air" ]; then printf "%s" "$(GOPATH_FIRST)/bin/air"; \
 	fi)
 
-.PHONY: build build-release install frontend frontend-dev dev check-air air-install desktop-dev desktop-build desktop-macos-app desktop-macos-dmg desktop-windows-installer desktop-linux-appimage desktop-app docs-install docs-build docs-serve docs-check docs-screenshots docs-assets-branch docs-generated-assets-branch docs-deploy-staging docs-deploy test test-short bench-backends test-postgres test-postgres-ci postgres-up postgres-down test-ssh test-ssh-ci ssh-up ssh-down e2e e2e-duckdb vet lint lint-ci lint-golangci lint-golangci-ci nilaway nilaway-golangci-build lint-tools tidy clean release release-darwin-arm64 release-darwin-amd64 release-universal-apple build-local-apple-silicon run-offline run-offline-universal release-linux-amd64 install-hooks ensure-embed-dir pricing-snapshot dev-snapshot help
+.PHONY: build build-release install frontend frontend-dev dev check-air air-install desktop-dev desktop-build desktop-macos-app desktop-macos-dmg desktop-windows-installer desktop-linux-appimage desktop-app docs-install docs-build docs-serve docs-check docs-screenshots docs-assets-branch docs-generated-assets-branch docs-deploy-staging docs-deploy test test-short bench-backends test-postgres test-postgres-ci test-s3 postgres-up postgres-down test-ssh test-ssh-ci ssh-up ssh-down e2e e2e-duckdb vet lint lint-ci lint-golangci lint-golangci-ci nilaway nilaway-golangci-build lint-tools tidy clean release release-darwin-arm64 release-darwin-amd64 release-universal-apple build-local-apple-silicon run-offline run-offline-universal release-linux-amd64 install-hooks ensure-embed-dir pricing-snapshot dev-snapshot help
 
 # Ensure go:embed has at least one file (no-op if frontend is built)
 ensure-embed-dir:
@@ -45,11 +45,14 @@ build-release: pricing-snapshot frontend
 	CGO_ENABLED=1 go build -tags fts5 -ldflags="$(LDFLAGS_RELEASE)" -trimpath -o agentsview ./cmd/agentsview
 	@chmod +x agentsview
 
-# Install to ~/.local/bin, $GOBIN, or $GOPATH/bin
+# Install to ~/.local/bin, $GOBIN, or $GOPATH/bin.
+# Copy to a temp file in the destination directory, then rename into place.
+# Rename is atomic and produces a fresh inode, so overwriting the binary while
+# an old agentsview is still running does not leave the kernel validating exec
+# against stale code-signature pages (which SIGKILLs the new process on macOS).
 install: build-release
 	@if [ -d "$(HOME)/.local/bin" ]; then \
-		echo "Installing to ~/.local/bin/agentsview"; \
-		cp agentsview "$(HOME)/.local/bin/agentsview"; \
+		INSTALL_DIR="$(HOME)/.local/bin"; \
 	else \
 		INSTALL_DIR="$${GOBIN:-$$(go env GOBIN)}"; \
 		if [ -z "$$INSTALL_DIR" ]; then \
@@ -57,9 +60,16 @@ install: build-release
 			INSTALL_DIR="$$GOPATH_FIRST/bin"; \
 		fi; \
 		mkdir -p "$$INSTALL_DIR"; \
-		echo "Installing to $$INSTALL_DIR/agentsview"; \
-		cp agentsview "$$INSTALL_DIR/agentsview"; \
-	fi
+	fi; \
+	echo "Installing to $$INSTALL_DIR/agentsview"; \
+	tmp="$$(mktemp "$$INSTALL_DIR/agentsview.tmp.XXXXXX")" || exit $$?; \
+	cleanup() { rm -f "$$tmp"; }; \
+	trap cleanup EXIT HUP INT TERM; \
+	cp agentsview "$$tmp" && chmod 755 "$$tmp" && mv -f "$$tmp" "$$INSTALL_DIR/agentsview"; \
+	status=$$?; \
+	trap - EXIT HUP INT TERM; \
+	cleanup; \
+	exit $$status
 
 # Build frontend SPA and copy into embed directory
 frontend:
@@ -259,6 +269,12 @@ test-postgres: pricing-snapshot ensure-embed-dir postgres-up
 test-postgres-ci: pricing-snapshot ensure-embed-dir
 	CGO_ENABLED=1 go test -tags "fts5,pgtest" -v ./internal/postgres/... ./internal/activity/... -count=1
 
+# S3 discovery integration tests. testcontainers starts and tears down a
+# rustfs (S3-compatible) container automatically, so only a working Docker
+# daemon is required.
+test-s3: pricing-snapshot ensure-embed-dir
+	CGO_ENABLED=1 go test -tags "fts5,s3test" -v ./internal/sync/... -run TestS3 -count=1
+
 # Start test SSH container
 ssh-up:
 	docker compose -f docker-compose.test.yml up -d --build --wait sshd
@@ -334,7 +350,19 @@ nilaway-golangci-build:
 
 # Run NilAway through the custom golangci-lint module plugin.
 nilaway: pricing-snapshot ensure-embed-dir nilaway-golangci-build
-	$(CUSTOM_GCL) run --config .golangci.nilaway.yml ./...
+	@set -e; \
+	root=$$(pwd); \
+	dirs=$$(go list -f '{{.Dir}}' ./...); \
+	for dir in $$dirs; do \
+		if [ "$$dir" = "$$root" ]; then \
+			pkg="."; \
+		else \
+			pkg="./$${dir#$$root/}"; \
+		fi; \
+		echo "$(CUSTOM_GCL) run --config .golangci.nilaway.yml $$pkg"; \
+		GOMAXPROCS=$${GOMAXPROCS:-1} GOGC=$${GOGC:-10} GOMEMLIMIT=$${GOMEMLIMIT:-512MiB} \
+			$(CUSTOM_GCL) run --config .golangci.nilaway.yml "$$pkg"; \
+	done
 
 # Install pinned local lint tools.
 lint-tools:
@@ -516,6 +544,7 @@ help:
 	@echo "  test-short     - Run fast tests only"
 	@echo "  bench-backends - Benchmark SQLite, DuckDB, and PostgreSQL stores"
 	@echo "  test-postgres  - Run PostgreSQL integration tests"
+	@echo "  test-s3        - Run S3 discovery integration tests (Docker)"
 	@echo "  postgres-up    - Start test PostgreSQL container"
 	@echo "  postgres-down  - Stop test PostgreSQL container"
 	@echo "  test-ssh       - Run SSH integration tests"

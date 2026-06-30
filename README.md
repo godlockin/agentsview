@@ -359,19 +359,43 @@ Because the format is Markdown-derived, roles are reconstructed from line
 prefixes and there are no per-message timestamps; a run's start time comes from
 its `# aider chat started at ...` header (written in local time, assumed UTC).
 
+### JetBrains Copilot via exporter
+
+JetBrains IDEs store Copilot chat in a Nitrite database that agentsview does not read directly. The supported path today is to export those sessions to Copilot JSONL with [copilot-jetbrains-exporter](https://github.com/MCBoarder289/copilot-jetbrains-exporter), then point agentsview at that output directory.
+
+```bash
+# Export JetBrains Copilot sessions to JSONL
+copilot-jetbrains-exporter --output ~/.copilot/jetbrains-sessions
+
+# Tell agentsview to index the exported sessions
+export COPILOT_DIR=~/.copilot/jetbrains-sessions
+```
+
+Or in `~/.agentsview/config.toml`:
+
+```toml
+copilot_dirs = ["~/.copilot/jetbrains-sessions"]
+```
+
+Re-run the exporter after new JetBrains Copilot sessions if you want agentsview to pick up fresh conversations from that source.
+
 ### Antigravity CLI: high-resolution transcripts
 
-Antigravity CLI sessions now appear in two on-disk formats. Newer releases store
-conversation trajectories as SQLite `.db` files, which agentsview indexes
-directly. Older releases stored assistant turns and tool calls in
-AES-GCM-encrypted `.pb` files; for those sessions, agentsview falls back to
-**summary mode** using your prompts from `history.jsonl` plus any plain-text
-artifacts under `brain/` (plans, walkthroughs, checkpoints).
+Antigravity CLI sessions appear in two on-disk formats: newer releases store
+conversation trajectories as SQLite `.db` files, older releases used
+AES-GCM-encrypted `.pb` files. For either format, the full transcript --
+structured tool calls, results, reasoning, and diffs -- comes from a
+`<uuid>.trajectory.json` sidecar. Without a covering sidecar, agentsview falls
+back to **summary mode**: a heuristic decode of the raw `.db` steps (prompts and
+tool-call names only), or for `.pb` sessions your prompts from `history.jsonl`
+plus any plain-text artifacts under `brain/` (plans, walkthroughs, checkpoints).
+Summary-mode sessions show a "Summary mode" badge in the detail header that links
+here.
 
-To unlock full transcripts for older `.pb` sessions, run
+To unlock full transcripts for `.db` and `.pb` sessions alike, run
 [agy-reader](https://github.com/mjacobs/agy-reader) alongside agentsview.
 agy-reader talks to the local Antigravity daemon, decrypts each conversation,
-and writes a `<uuid>.trajectory.json` sidecar next to the encrypted `.pb` file.
+and writes a `<uuid>.trajectory.json` sidecar next to the source file.
 agentsview's file watcher detects the sidecar automatically and parses it in
 place of summary mode -- no agentsview restart needed.
 
