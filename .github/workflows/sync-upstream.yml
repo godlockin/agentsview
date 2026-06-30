@@ -1,0 +1,165 @@
+name: sync-upstream
+
+# Daily check for upstream commits on kenn-io/agentsview:main.
+# When the fork is behind, the workflow opens (or updates) a PR
+# titled "sync: upstream main" against fork:main so a human can
+# review and merge. The PR body lists every new upstream commit
+# in reverse-chronological order so reviewers can scan the
+# change set quickly.
+#
+# Manual dispatch is supported so you can re-run the check
+# without waiting for the cron schedule.
+
+on:
+  schedule:
+    # 06:00 UTC every day. Staggered from CI to avoid the
+    # runner pool being saturated by long-running jobs.
+    - cron: "0 6 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  sync:
+    name: Detect upstream drift and open sync PR
+    runs-on: ubuntu-latest
+    # Skip when there is no write target (e.g. PR from a fork
+    # without secrets). Always allow manual dispatch.
+    if: ${{ github.event_name == 'workflow_dispatch' || github.repository == 'godlockin/agentsview' }}
+    steps:
+      - name: Checkout fork
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+        with:
+          fetch-depth: 0
+          persist-credentials: true
+
+      - name: Configure git identity
+        run: |
+          git config user.name "kallax-sync-bot"
+          git config user.email "kallax-sync-bot@users.noreply.github.com"
+
+      - name: Add upstream remote
+        run: git remote add upstream https://github.com/kenn-io/agentsview.git
+
+      - name: Fetch upstream main
+        run: git fetch upstream main
+
+      - name: Detect drift
+        id: drift
+        run: |
+          ahead=$(git rev-list --count upstream/main..HEAD)
+          behind=$(git rev-list --count HEAD..upstream/main)
+          echo "ahead=$ahead" >> "$GITHUB_OUTPUT"
+          echo "behind=$behind" >> "$GITHUB_OUTPUT"
+          if [ "$behind" -eq 0 ]; then
+            echo "drift=clean" >> "$GITHUB_OUTPUT"
+            echo "Fork is up to date with upstream/main ($ahead local commits)."
+          else
+            echo "drift=behind" >> "$GITHUB_OUTPUT"
+            echo "Fork is $behind commits behind upstream/main."
+          fi
+
+      - name: Open or update sync PR
+        if: steps.drift.outputs.drift == 'behind'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          BEHIND: ${{ steps.drift.outputs.behind }}
+        run: |
+          set -euo pipefail
+          branch="sync/upstream-$(date -u +%Y%m%d-%H%M%S)"
+          git checkout -B "$branch" upstream/main
+          # Keep fork-specific paths intact across the sync so
+          # the PR shows a clean conflict if any of them
+          # collide with upstream changes.
+          declare -a keep=(
+            "Makefile"
+            "frontend/index.html"
+            "frontend/public/fonts"
+            "internal/config/config.go"
+            "internal/config/config_test.go"
+            "internal/server/middleware_test.go"
+            "internal/server/server.go"
+            "internal/pricing/litellm.go"
+            "internal/pricing/catalog/openrouter.go"
+            "internal/pricing/openrouter_test.go"
+            "internal/db/usage_test.go"
+            "cmd/agentsview/usage.go"
+            "cmd/agentsview/main_test.go"
+            "cmd/agentsview/pg_test.go"
+            ".github/workflows/sync-upstream.yml"
+            "docs/investigations"
+          )
+          for path in "${keep[@]}"; do
+            if git show "HEAD:$path" >/dev/null 2>&1; then
+              git checkout "HEAD" -- "$path"
+            fi
+          done
+          # List every commit being brought in.
+          {
+            echo "## Upstream sync"
+            echo
+            echo "This PR brings \`$BEHIND\` new commits from \`kenn-io/agentsview:main\` into this fork."
+            echo
+            echo "### Commits"
+            echo
+            # Use --no-color and pipe through a sed pass that strips
+            # any control characters from the subject. %s is the
+            # commit subject and could in principle carry shell
+            # metacharacters if an upstream maintainer crafts a
+            # malicious subject; the body file is the only place
+            # this text lands, so a stripping pass is sufficient
+            # defense.
+            git log --reverse --no-color \
+              --pretty=format:'- %h %s' \
+              upstream/main~"$BEHIND"..upstream/main \
+              | sed -e 's/[[:cntrl:]]//g' \
+              > commits.md
+            cat commits.md
+            echo
+            echo
+            echo "### Review checklist"
+            echo
+            echo "- [ ] Local tests pass (\`make test-short\`)"
+            echo "- [ ] Build succeeds on Apple Silicon (\`make build-local-apple-silicon\`)"
+            echo "- [ ] UI smoke check after merge"
+          } > body.md
+          git add -A
+          if git diff --cached --quiet; then
+            echo "No merge needed (already up to date or no local changes to keep)."
+            exit 0
+          fi
+          # BEHIND is validated to be a decimal integer by the
+          # drift step's rev-list --count output, so printf %d is
+          # safe to use without quoting surprises.
+          git commit -m "$(printf 'sync: bring fork up to date with upstream/main (%d commits)' "$BEHIND")"
+          git push origin "$branch" --force-with-lease
+          # Reuse an existing sync PR if one is already open, so
+          # we don't spam the PR list with one per day.
+          existing=$(gh pr list \
+            --base main \
+            --head "sync/upstream-" \
+            --state open \
+            --json number --jq '.[0].number' || true)
+          if [ -n "$existing" ]; then
+            gh pr edit "$existing" --body-file body.md
+            echo "Updated existing PR #$existing"
+          else
+            gh pr create \
+              --base main \
+              --head "$branch" \
+              --title "sync: upstream main" \
+              --body-file body.md
+            echo "Opened new sync PR"
+          fi
+
+      - name: Summary
+        if: always()
+        run: |
+          echo "### sync-upstream summary"
+          echo
+          echo "- fork HEAD: \`$(git rev-parse --short HEAD)\`"
+          echo "- upstream/main: \`$(git rev-parse --short upstream/main)\`"
+          echo "- behind by: \`${{ steps.drift.outputs.behind }}\`"
+          echo "- ahead by:  \`${{ steps.drift.outputs.ahead }}\`"

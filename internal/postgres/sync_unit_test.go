@@ -141,3 +141,112 @@ func TestScopedSyncStateStoreLegacyModeUsesUnscopedKeys(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, "2026-03-11T12:34:56.123Z", got)
 }
+
+func TestPushSyncStateScopeIncludesProjectFilters(t *testing.T) {
+	assert.Equal(t, "", pushSyncStateScope("", nil, nil))
+	assert.Equal(t, "work", pushSyncStateScope("work", nil, nil))
+
+	includeAB := pushSyncStateScope(
+		"work",
+		[]string{"beta", "alpha"},
+		nil,
+	)
+	includeBA := pushSyncStateScope(
+		"work",
+		[]string{"alpha", "beta"},
+		nil,
+	)
+	excludeAB := pushSyncStateScope(
+		"work",
+		nil,
+		[]string{"alpha", "beta"},
+	)
+	includeAExcludeB := pushSyncStateScope(
+		"work",
+		[]string{"alpha"},
+		[]string{"beta"},
+	)
+	defaultIncludeAB := pushSyncStateScope(
+		"",
+		[]string{"alpha", "beta"},
+		nil,
+	)
+
+	assert.Equal(t, includeAB, includeBA)
+	assert.NotEmpty(t, includeAB)
+	assert.NotEqual(t, "work", includeAB)
+	assert.NotEqual(t, includeAB, excludeAB)
+	assert.NotEqual(t, pushSyncStateScope("work", []string{"alpha"}, nil),
+		includeAExcludeB)
+	assert.NotEqual(t, includeAB, defaultIncludeAB)
+}
+
+func TestNewRejectsIncludeAndExcludeProjects(t *testing.T) {
+	local := testDB(t)
+
+	_, err := New(
+		"postgres://user:pass@127.0.0.1:1/db?sslmode=disable",
+		"agentsview",
+		local,
+		"test-machine",
+		true,
+		SyncOptions{
+			Projects:        []string{"alpha"},
+			ExcludeProjects: []string{"beta"},
+		},
+	)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(),
+		"projects and exclude_projects are mutually exclusive")
+}
+
+func TestReadLastPushAtUsesProjectFilterScope(t *testing.T) {
+	local := testDB(t)
+
+	require.NoError(t, local.SetSyncState(
+		"last_push_at:work",
+		"2026-03-11T12:00:00.000Z",
+	))
+	filterScope := pushSyncStateScope(
+		"work",
+		[]string{"alpha", "beta"},
+		nil,
+	)
+	require.NoError(t, local.SetSyncState(
+		"last_push_at:"+filterScope,
+		"2026-03-11T13:00:00.000Z",
+	))
+
+	got, err := ReadLastPushAt(
+		local,
+		"work",
+		[]string{"beta", "alpha"},
+		nil,
+		true,
+	)
+	require.NoError(t, err)
+	assert.Equal(t, "2026-03-11T13:00:00.000Z", got)
+}
+
+func TestReadLastPushAtDoesNotMigrateLegacyStateForProjectFilter(t *testing.T) {
+	local := testDB(t)
+
+	require.NoError(t, local.SetSyncState(
+		"last_push_at",
+		"2026-03-11T12:00:00.000Z",
+	))
+
+	got, err := ReadLastPushAt(
+		local,
+		"",
+		[]string{"alpha"},
+		nil,
+		true,
+	)
+	require.NoError(t, err)
+	assert.Empty(t, got)
+
+	legacyValue, err := local.GetSyncState("last_push_at")
+	require.NoError(t, err)
+	assert.Equal(t, "2026-03-11T12:00:00.000Z", legacyValue)
+}

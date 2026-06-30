@@ -6,13 +6,13 @@ import (
 	"database/sql"
 	"fmt"
 	"log"
-	"os"
 	"sort"
 	"strconv"
 	"strings"
 	"time"
 
 	"go.kenn.io/agentsview/internal/db/git"
+	"go.kenn.io/agentsview/internal/timeutil"
 )
 
 // StatsFilter mirrors the service-layer StatsFilter but lives in db
@@ -288,7 +288,7 @@ func windowBounds(
 ) (from, to time.Time, days int, err error) {
 	to = now
 	if f.Until != "" {
-		to, err = parseWindowPoint(f.Until, now)
+		to, err = ParseWindowPoint(f.Until, now)
 		if err != nil {
 			return time.Time{}, time.Time{}, 0,
 				fmt.Errorf("parsing until %q: %w", f.Until, err)
@@ -301,7 +301,7 @@ func windowBounds(
 		if d, ok := parseDurationShort(f.Since); ok {
 			from = to.Add(-d)
 		} else {
-			from, err = parseWindowPoint(f.Since, now)
+			from, err = ParseWindowPoint(f.Since, now)
 			if err != nil {
 				return time.Time{}, time.Time{}, 0,
 					fmt.Errorf(
@@ -328,10 +328,13 @@ func windowBounds(
 	return from, to, days, nil
 }
 
-// parseWindowPoint accepts either a duration-relative-to-now form
-// ("28d", "12h") or an absolute YYYY-MM-DD date (interpreted as
-// the start of that UTC day). Used by Since and Until.
-func parseWindowPoint(s string, now time.Time) (time.Time, error) {
+// ParseWindowPoint resolves a single window bound — a compact
+// duration-relative-to-now form ("28d", "12h") or an absolute YYYY-MM-DD
+// date (the start of that UTC day) — to an instant. A duration anchors at
+// now; passing a resolved bound as now lets a caller anchor a duration
+// against it (as usage daily anchors --since to --until). Shared by stats'
+// windowBounds and the usage CLI.
+func ParseWindowPoint(s string, now time.Time) (time.Time, error) {
 	if d, ok := parseDurationShort(s); ok {
 		return now.Add(-d), nil
 	}
@@ -1139,9 +1142,9 @@ func addMessageToCacheTotals(
 // the JSON output emits "hourly_utc": [] rather than null.
 //
 // ReporterTimezone reflects f.Timezone when set (honouring the CLI
-// --timezone flag), the TZ env var when present, or time.Local's name
-// otherwise. This is a best-effort IANA name; tooling that needs a
-// strict tzdata lookup should pass --timezone explicitly.
+// --timezone flag), otherwise the best-effort local IANA name. When
+// the env/local fallback cannot be resolved safely, the field stays
+// empty so downstream fallback logic can take over.
 func (db *DB) computeTemporal(
 	ctx context.Context, stats *SessionStats, f StatsFilter,
 	from, to time.Time, sessionIDs []string,
@@ -1255,20 +1258,14 @@ func (db *DB) accumulateHourlyUTC(
 // SessionStats.Temporal.ReporterTimezone. Precedence:
 //
 //  1. f.Timezone when non-empty — echoes the --timezone flag.
-//  2. TZ environment variable — what most Unix tools respect.
-//  3. time.Local.String() — may be "Local" on systems without /etc/localtime.
-//
-// This function is intentionally simple: it does not attempt tzdata
-// lookups or validate the result. Consumers that need a strict zone
-// pass --timezone explicitly and get the validated name back.
+//  2. Valid IANA names from TZ or the current local location.
+//  3. Empty string when the fallback name is only a sentinel or
+//     otherwise cannot be resolved safely.
 func reporterTimezone(f StatsFilter) string {
 	if f.Timezone != "" {
 		return f.Timezone
 	}
-	if tz := os.Getenv("TZ"); tz != "" {
-		return tz
-	}
-	return time.Local.String()
+	return timeutil.BestEffortLocalTimezone()
 }
 
 // computeOutcomes populates stats.Outcomes from the Claude-agent subset

@@ -30,6 +30,8 @@ type Progress struct {
 	SessionsTotal   int    `json:"sessions_total"`
 	SessionsDone    int    `json:"sessions_done"`
 	MessagesIndexed int    `json:"messages_indexed"`
+	BytesDone       int64  `json:"bytes_done,omitempty"`
+	BytesTotal      int64  `json:"bytes_total,omitempty"`
 }
 
 // SyncResult describes the outcome of syncing a single session.
@@ -63,11 +65,17 @@ type SyncStats struct {
 	// run and is omitted from the summary.
 	Anomalies AnomalyStats `json:"anomalies,omitzero"`
 
-	filesOK             int // unexported: file-level success counter
-	filesDiscovered     int // file-based total, excludes DB-backed agents
-	messagesIndexed     int // unexported: progress message counter
-	parserExcludedFiles int // file-level intentional parser exclusions
-	parserExcludedIDs   []string
+	filesOK         int // unexported: file-level success counter
+	filesDiscovered int // file-based total, excludes DB-backed agents
+	// nonContainerDiscovered counts discovered files that are not part of
+	// a self-preserving container store (OpenCode-format storage and its
+	// SQLite virtual paths). The resync empty-discovery guard uses it so a
+	// container store's discovery does not mask the disappearance of plain
+	// file-backed sessions whose directories went empty.
+	nonContainerDiscovered int
+	messagesIndexed        int // unexported: progress message counter
+	parserExcludedFiles    int // file-level intentional parser exclusions
+	parserExcludedIDs      []string
 }
 
 // AnomalyStats aggregates parser-output anomaly signals observed during a

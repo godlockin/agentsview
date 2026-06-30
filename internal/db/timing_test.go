@@ -116,6 +116,16 @@ func TestGetSessionTiming_NoToolUseHasNoTurnDuration(t *testing.T) {
 	assert.Equal(t, 0, got.TurnCount, "TurnCount")
 }
 
+// TestActiveGapCapConstantsAgree guards the two spellings of the active
+// gap cap against drifting apart: the velocity metric uses the seconds
+// form and the active-duration SQL uses the milliseconds form.
+func TestActiveGapCapConstantsAgree(t *testing.T) {
+	assert.Equal(
+		t, ActiveGapCapMs, int(ActiveGapCapSec*1000),
+		"ActiveGapCapMs must equal ActiveGapCapSec in milliseconds",
+	)
+}
+
 func TestGetSessionTiming_MarshalsEmptyCollectionsAsArrays(t *testing.T) {
 	d := testDB(t)
 	ctx := context.Background()

@@ -2,9 +2,12 @@ package postgres
 
 import (
 	"context"
+	"crypto/sha256"
 	"database/sql"
+	"encoding/hex"
 	"fmt"
 	"log"
+	"sort"
 	"strings"
 	"sync"
 
@@ -213,6 +216,12 @@ func New(
 	if local == nil {
 		return nil, fmt.Errorf("local db is required")
 	}
+	if err := ValidateProjectFilters(
+		opts.Projects,
+		opts.ExcludeProjects,
+	); err != nil {
+		return nil, err
+	}
 
 	pg, err := Open(pgURL, schema, allowInsecure)
 	if err != nil {
@@ -225,29 +234,107 @@ func New(
 			"computing pg target fingerprint: %w", err,
 		)
 	}
+	syncStateScope := pushSyncStateScope(
+		opts.SyncStateTarget,
+		opts.Projects,
+		opts.ExcludeProjects,
+	)
+	migrateLegacySyncState := opts.MigrateLegacySyncState &&
+		!hasProjectFilter(opts.Projects, opts.ExcludeProjects)
 
 	return &Sync{
 		pg:    pg,
 		local: local,
 		syncState: newScopedSyncStateStore(
 			local,
-			opts.SyncStateTarget,
-			opts.MigrateLegacySyncState,
+			syncStateScope,
+			migrateLegacySyncState,
 		),
 		machine:                machine,
 		schema:                 schema,
 		targetFingerprint:      targetFingerprint,
-		syncStateTarget:        opts.SyncStateTarget,
-		migrateLegacySyncState: opts.MigrateLegacySyncState,
+		syncStateTarget:        syncStateScope,
+		migrateLegacySyncState: migrateLegacySyncState,
 		projects:               opts.Projects,
 		excludeProjects:        opts.ExcludeProjects,
 	}, nil
 }
 
+func hasProjectFilter(projects, excludeProjects []string) bool {
+	return len(projects) > 0 || len(excludeProjects) > 0
+}
+
+// ValidateProjectFilters rejects ambiguous include/exclude project filters.
+func ValidateProjectFilters(projects, excludeProjects []string) error {
+	if len(projects) > 0 && len(excludeProjects) > 0 {
+		return fmt.Errorf(
+			"projects and exclude_projects are mutually exclusive",
+		)
+	}
+	return nil
+}
+
+func pushSyncStateScope(
+	target string,
+	projects, excludeProjects []string,
+) string {
+	if !hasProjectFilter(projects, excludeProjects) {
+		return target
+	}
+
+	includeValues := normalizeProjectFilterValues(projects)
+	excludeValues := normalizeProjectFilterValues(excludeProjects)
+
+	sum := sha256.New()
+	writeSyncScopeField(sum, "target")
+	writeSyncScopeField(sum, target)
+	writeSyncScopeField(sum, "include")
+	writeSyncScopeField(sum, fmt.Sprintf("%d", len(includeValues)))
+	for _, value := range includeValues {
+		writeSyncScopeField(sum, value)
+	}
+	writeSyncScopeField(sum, "exclude")
+	writeSyncScopeField(sum, fmt.Sprintf("%d", len(excludeValues)))
+	for _, value := range excludeValues {
+		writeSyncScopeField(sum, value)
+	}
+	fingerprint := hex.EncodeToString(sum.Sum(nil)[:8])
+	if target == "" {
+		return "project-filter:" + fingerprint
+	}
+	return target + ":project-filter:" + fingerprint
+}
+
+func normalizeProjectFilterValues(values []string) []string {
+	out := append([]string{}, values...)
+	sort.Strings(out)
+	return slicesCompact(out)
+}
+
+func slicesCompact(values []string) []string {
+	if len(values) == 0 {
+		return values
+	}
+	write := 1
+	for _, value := range values[1:] {
+		if value == values[write-1] {
+			continue
+		}
+		values[write] = value
+		write++
+	}
+	return values[:write]
+}
+
+func writeSyncScopeField(sum interface{ Write([]byte) (int, error) }, value string) {
+	_, _ = fmt.Fprintf(sum, "%d:", len(value))
+	_, _ = sum.Write([]byte(value))
+}
+
 // isFiltered reports whether push scope is restricted by
 // project include/exclude filters.
 func (s *Sync) isFiltered() bool {
-	return len(s.projects) > 0 || len(s.excludeProjects) > 0
+	return hasProjectFilter(s.projects, s.excludeProjects)
 }
 
 // DB returns the underlying PostgreSQL connection pool.
@@ -308,7 +395,8 @@ func (s *Sync) Status(
 	ctx context.Context,
 ) (SyncStatus, error) {
 	lastPush, err := ReadLastPushAt(
-		s.local, s.syncStateTarget, s.migrateLegacySyncState,
+		s.local, s.syncStateTarget, nil, nil,
+		s.migrateLegacySyncState,
 	)
 	if err != nil {
 		log.Printf(
@@ -398,24 +486,28 @@ func readStatus(
 func ReadLastPushAt(
 	local SyncStateStore,
 	target string,
+	projects, excludeProjects []string,
 	migrateLegacy bool,
 ) (string, error) {
 	if local == nil {
 		return "", fmt.Errorf("local sync state is required")
 	}
-	if target == "" {
+	scope := pushSyncStateScope(target, projects, excludeProjects)
+	if scope == "" {
 		return local.GetSyncState("last_push_at")
 	}
 	store := newScopedSyncStateStore(
 		local,
-		target,
+		scope,
 		false,
 	)
 	lastPush, err := store.GetSyncState("last_push_at")
 	if err != nil {
 		return "", err
 	}
-	if lastPush != "" || !migrateLegacy {
+	if lastPush != "" ||
+		!migrateLegacy ||
+		hasProjectFilter(projects, excludeProjects) {
 		return lastPush, nil
 	}
 	return local.GetSyncState("last_push_at")

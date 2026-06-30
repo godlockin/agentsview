@@ -29,15 +29,21 @@ import (
 
 // VersionInfo holds build-time version metadata.
 type VersionInfo struct {
-	Version     string `json:"version"`
-	Commit      string `json:"commit"`
-	BuildDate   string `json:"build_date"`
-	ReadOnly    bool   `json:"read_only,omitempty"`
-	APIVersion  int    `json:"api_version"`
-	DataVersion int    `json:"data_version"`
+	Version                    string `json:"version"`
+	Commit                     string `json:"commit"`
+	BuildDate                  string `json:"build_date"`
+	ReadOnly                   bool   `json:"read_only,omitempty"`
+	InsightGenerationAvailable bool   `json:"insight_generation_available,omitempty"`
+	APIVersion                 int    `json:"api_version"`
+	DataVersion                int    `json:"data_version"`
 }
 
 const daemonService = "agentsview"
+
+const (
+	defaultInsightLogDrainTimeout    = 2 * time.Second
+	defaultInsightLogStopWaitTimeout = 500 * time.Millisecond
+)
 
 // Server is the HTTP server that serves the SPA and REST API.
 type Server struct {
@@ -62,6 +68,9 @@ type Server struct {
 	generateStreamFunc insight.GenerateStreamFunc
 	spaFS              fs.FS
 	spaHandler         http.Handler
+
+	insightLogDrainTimeout    time.Duration
+	insightLogStopWaitTimeout time.Duration
 
 	// handlerDelay is injected before each timeout-wrapped
 	// handler, used only by tests to guarantee handlers
@@ -104,11 +113,13 @@ func New(
 	}
 
 	s := &Server{
-		cfg:      cfg,
-		db:       database,
-		engine:   engine,
-		sessions: sessions,
-		mux:      http.NewServeMux(),
+		cfg:                       cfg,
+		db:                        database,
+		engine:                    engine,
+		sessions:                  sessions,
+		mux:                       http.NewServeMux(),
+		insightLogDrainTimeout:    defaultInsightLogDrainTimeout,
+		insightLogStopWaitTimeout: defaultInsightLogStopWaitTimeout,
 		generateStreamFunc: func(
 			ctx context.Context, agent, prompt string,
 			onLog insight.LogFunc,
@@ -221,6 +232,19 @@ func WithGenerateStreamFunc(f insight.GenerateStreamFunc) Option {
 	return func(s *Server) {
 		if f != nil {
 			s.generateStreamFunc = f
+		}
+	}
+}
+
+// WithInsightLogDrainTimeouts overrides SSE insight log stream drain timeouts.
+// Zero or negative values keep the production defaults.
+func WithInsightLogDrainTimeouts(drain, stopWait time.Duration) Option {
+	return func(s *Server) {
+		if drain > 0 {
+			s.insightLogDrainTimeout = drain
+		}
+		if stopWait > 0 {
+			s.insightLogStopWaitTimeout = stopWait
 		}
 	}
 }
@@ -473,8 +497,8 @@ func buildCSPPolicy(
 			"script-src %[1]s; "+
 			"connect-src 'self' http: https: ws: wss:; "+
 			"img-src %[1]s data:; "+
-			"style-src %[1]s 'unsafe-inline' https://fonts.googleapis.com; "+
-			"font-src %[1]s data: https://fonts.gstatic.com; "+
+			"style-src %[1]s 'unsafe-inline'; "+
+			"font-src %[1]s data:; "+
 			"object-src 'none'; "+
 			"base-uri %[2]s; "+
 			"frame-ancestors 'none'",

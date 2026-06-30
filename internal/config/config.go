@@ -104,9 +104,11 @@ type DuckDBConfig struct {
 // AutomatedConfig holds user-supplied additions to the
 // automated-session classifier. Parse-only; all semantic
 // normalization (trim, dedupe, length cap, built-in overlap
-// drop) happens inside db.SetUserAutomationPrefixes.
+// drop) happens inside the db setters.
 type AutomatedConfig struct {
-	Prefixes []string `toml:"prefixes" json:"prefixes,omitempty"`
+	Prefixes     []string `toml:"prefixes" json:"prefixes,omitempty"`
+	Substrings   []string `toml:"substrings" json:"substrings,omitempty"`
+	ExactMatches []string `toml:"exact_matches" json:"exact_matches,omitempty"`
 }
 
 // AgentConfig holds per-agent runtime overrides.
@@ -123,15 +125,26 @@ type CustomModelRate struct {
 	CacheRead     float64 `json:"cache_read,omitempty" toml:"cache_read"`
 }
 
-// RemoteHost describes one SSH target for config-driven
-// `agentsview sync` fan-out. Host is required; User, Port, and
-// Interval are optional (Port 0 means the ssh default of 22;
-// zero/empty Interval disables periodic remote sync for this host).
+type RemoteTransport string
+
+const (
+	RemoteTransportSSH  RemoteTransport = "ssh"
+	RemoteTransportHTTP RemoteTransport = "http"
+)
+
+// RemoteHost describes one target for config-driven `agentsview sync`
+// fan-out. Host is required. SSH remotes may set User and Port
+// (Port 0 means the ssh default of 22). HTTP remotes must set URL
+// and Token. A zero/empty Interval disables periodic remote
+// sync for this host.
 type RemoteHost struct {
-	Host     string        `toml:"host" json:"host"`
-	User     string        `toml:"user,omitempty" json:"user,omitempty"`
-	Port     int           `toml:"port,omitempty" json:"port,omitempty"`
-	Interval time.Duration `toml:"interval,omitempty" json:"interval,omitempty"`
+	Host      string          `toml:"host" json:"host"`
+	Transport RemoteTransport `toml:"transport,omitempty" json:"transport,omitempty"`
+	User      string          `toml:"user,omitempty" json:"user,omitempty"`
+	Port      int             `toml:"port,omitempty" json:"port,omitempty"`
+	URL       string          `toml:"url,omitempty" json:"url,omitempty"`
+	Token     string          `toml:"token,omitempty" json:"-"`
+	Interval  time.Duration   `toml:"interval,omitempty" json:"interval,omitempty"`
 }
 
 // Config holds all application configuration.
@@ -181,9 +194,11 @@ type Config struct {
 	// work during bursts of sync activity. Zero disables coalescing.
 	EventsCoalesceInterval time.Duration `json:"events_coalesce_interval,omitempty" toml:"events_coalesce_interval"`
 
+	DaemonIdleTimeout time.Duration `json:"daemon_idle_timeout,omitempty" toml:"daemon_idle_timeout"`
+
 	CustomModelPricing map[string]CustomModelRate `json:"custom_model_pricing,omitempty" toml:"custom_model_pricing"`
 
-	// RemoteHosts is the config-file list of SSH targets that
+	// RemoteHosts is the config-file list of remote targets that
 	// `agentsview sync` (with no --host) syncs after the local
 	// pass. CLI/config-file only; never serialized to the
 	// settings API, so there is no web-UI editing of this list.
@@ -222,15 +237,18 @@ func (c *Config) IsUserConfigured(
 }
 
 // ValidateRemoteHosts checks the configured remote_hosts entries
-// for semantic errors: a non-empty host and a port within 0..65535
-// (0 means the ssh default). It checks the trimmed values that
-// loadFile already normalized, so what is validated here is exactly
-// what is passed to ssh. Returns an aggregated error naming every
+// for semantic errors. It checks the trimmed values that loadFile
+// already normalized, so what is validated here is exactly what is
+// passed to remote sync. Returns an aggregated error naming every
 // offending entry, or nil when all entries are valid.
 func (c Config) ValidateRemoteHosts() error {
 	var problems []string
 	seen := make(map[string]int, len(c.RemoteHosts))
 	for i, h := range c.RemoteHosts {
+		transport := h.Transport
+		if transport == "" {
+			transport = RemoteTransportSSH
+		}
 		if h.Host == "" {
 			problems = append(problems,
 				fmt.Sprintf("entry %d: host is required", i+1))
@@ -255,6 +273,44 @@ func (c Config) ValidateRemoteHosts() error {
 				fmt.Sprintf("entry %d (%q): invalid interval %s",
 					i+1, h.Host, h.Interval))
 		}
+		switch transport {
+		case RemoteTransportSSH:
+			if h.URL != "" {
+				problems = append(problems,
+					fmt.Sprintf("entry %d (%q): url is only valid for http",
+						i+1, h.Host))
+			}
+			if h.Token != "" {
+				problems = append(problems,
+					fmt.Sprintf("entry %d (%q): token is only valid for http",
+						i+1, h.Host))
+			}
+		case RemoteTransportHTTP:
+			if h.User != "" {
+				problems = append(problems,
+					fmt.Sprintf("entry %d (%q): user is only valid for ssh",
+						i+1, h.Host))
+			}
+			if h.Port != 0 {
+				problems = append(problems,
+					fmt.Sprintf("entry %d (%q): port is only valid for ssh",
+						i+1, h.Host))
+			}
+			if err := validateRemoteHTTPURL(h.URL); err != nil {
+				problems = append(problems,
+					fmt.Sprintf("entry %d (%q): %v",
+						i+1, h.Host, err))
+			}
+			if h.Token == "" {
+				problems = append(problems,
+					fmt.Sprintf("entry %d (%q): token is required for http",
+						i+1, h.Host))
+			}
+		default:
+			problems = append(problems,
+				fmt.Sprintf("entry %d (%q): invalid transport %q",
+					i+1, h.Host, h.Transport))
+		}
 		// Remote sync namespaces sessions and the skip cache by
 		// host alone (see ssh.RemoteSync), so two entries sharing a
 		// host collide regardless of user/port. Reject duplicates
@@ -272,6 +328,34 @@ func (c Config) ValidateRemoteHosts() error {
 	if len(problems) > 0 {
 		return fmt.Errorf("remote_hosts: %s",
 			strings.Join(problems, "; "))
+	}
+	return nil
+}
+
+func validateRemoteHTTPURL(raw string) error {
+	value := strings.TrimSpace(raw)
+	if value == "" {
+		return fmt.Errorf("url is required")
+	}
+	u, err := url.Parse(value)
+	if err != nil {
+		return fmt.Errorf("invalid url: %w", err)
+	}
+	scheme := strings.ToLower(u.Scheme)
+	if scheme != "http" && scheme != "https" {
+		return fmt.Errorf("url must use http or https")
+	}
+	if u.Hostname() == "" {
+		return fmt.Errorf("url must include a host")
+	}
+	if u.User != nil {
+		return fmt.Errorf("url must not include userinfo")
+	}
+	if u.RawQuery != "" || u.ForceQuery {
+		return fmt.Errorf("url must not include query")
+	}
+	if u.Fragment != "" || u.RawFragment != "" || strings.Contains(value, "#") {
+		return fmt.Errorf("url must not include fragment")
 	}
 	return nil
 }
@@ -294,7 +378,15 @@ func Default() (Config, error) {
 	agentDirSource := make(map[parser.AgentType]dirSource)
 	for _, def := range parser.Registry {
 		dirs := make([]string, len(def.DefaultDirs))
+		root := ""
+		if def.DefaultRootEnvVar != "" {
+			root = os.Getenv(def.DefaultRootEnvVar)
+		}
 		for i, rel := range def.DefaultDirs {
+			if root != "" {
+				dirs[i] = reRootDefaultDir(root, rel)
+				continue
+			}
 			dirs[i] = filepath.Join(home, rel)
 		}
 		agentDirs[def.Type] = dirs
@@ -303,7 +395,7 @@ func Default() (Config, error) {
 
 	return Config{
 		Host:                           "127.0.0.1",
-		Port:                           8080,
+		Port:                           9765,
 		DataDir:                        dataDir,
 		DBPath:                         filepath.Join(dataDir, "sessions.db"),
 		WriteTimeout:                   30 * time.Second,
@@ -312,8 +404,17 @@ func Default() (Config, error) {
 		WatchExcludePatterns:           []string{".git", "node_modules", "__pycache__", ".venv", "venv", "vendor", ".next"},
 		ResultContentBlockedCategories: []string{"Read", "Glob"},
 		EventsCoalesceInterval:         10 * time.Second,
+		DaemonIdleTimeout:              20 * time.Minute,
 		Agent:                          map[string]AgentConfig{},
 	}, nil
+}
+
+func reRootDefaultDir(root, rel string) string {
+	rel = filepath.Clean(rel)
+	if _, tail, ok := strings.Cut(rel, string(filepath.Separator)); ok && tail != "" {
+		return filepath.Join(root, tail)
+	}
+	return root
 }
 
 // Load builds a Config by layering: defaults < config file < env < flags.
@@ -407,7 +508,7 @@ func loadPGServeBase() (Config, error) {
 	// namespace exists, only explicit pg-serve flags should shape its
 	// network/proxy behavior.
 	cfg.Host = "127.0.0.1"
-	cfg.Port = 8080
+	cfg.Port = 9765
 	cfg.PublicURL = ""
 	cfg.PublicOrigins = nil
 	cfg.Proxy = ProxyConfig{}
@@ -581,6 +682,7 @@ func (c *Config) applyConfigTOML(data string) error {
 		Automated                      AutomatedConfig            `toml:"automated"`
 		Agent                          map[string]AgentConfig     `toml:"agent"`
 		EventsCoalesceInterval         time.Duration              `toml:"events_coalesce_interval"`
+		DaemonIdleTimeout              time.Duration              `toml:"daemon_idle_timeout"`
 		CustomModelPricing             map[string]CustomModelRate `toml:"custom_model_pricing"`
 		RemoteHosts                    []RemoteHost               `toml:"remote_hosts"`
 	}
@@ -693,8 +795,17 @@ func (c *Config) applyConfigTOML(data string) error {
 	if meta.IsDefined("events_coalesce_interval") {
 		c.EventsCoalesceInterval = file.EventsCoalesceInterval
 	}
+	if meta.IsDefined("daemon_idle_timeout") {
+		c.DaemonIdleTimeout = file.DaemonIdleTimeout
+	}
 	if file.Automated.Prefixes != nil {
 		c.Automated.Prefixes = file.Automated.Prefixes
+	}
+	if file.Automated.Substrings != nil {
+		c.Automated.Substrings = file.Automated.Substrings
+	}
+	if file.Automated.ExactMatches != nil {
+		c.Automated.ExactMatches = file.Automated.ExactMatches
 	}
 	if len(file.Agent) > 0 {
 		if c.Agent == nil {
@@ -716,10 +827,13 @@ func (c *Config) applyConfigTOML(data string) error {
 		hosts := make([]RemoteHost, len(file.RemoteHosts))
 		for i, h := range file.RemoteHosts {
 			hosts[i] = RemoteHost{
-				Host:     strings.TrimSpace(h.Host),
-				User:     strings.TrimSpace(h.User),
-				Port:     h.Port,
-				Interval: h.Interval,
+				Host:      strings.TrimSpace(h.Host),
+				Transport: RemoteTransport(strings.TrimSpace(string(h.Transport))),
+				User:      strings.TrimSpace(h.User),
+				Port:      h.Port,
+				URL:       strings.TrimSpace(h.URL),
+				Token:     strings.TrimSpace(h.Token),
+				Interval:  h.Interval,
 			}
 		}
 		c.RemoteHosts = hosts
@@ -937,7 +1051,7 @@ func (f *stringListFlag) Type() string {
 // The caller must call fs.Parse before passing fs to Load.
 func RegisterServeFlags(fs *flag.FlagSet) {
 	fs.String("host", "127.0.0.1", "Host to bind to")
-	fs.Int("port", 8080, "Port to listen on")
+	fs.Int("port", 9765, "Port to listen on")
 	fs.String(
 		"public-url", "",
 		"Public URL to trust and open for hostname or proxy access",
@@ -1001,7 +1115,7 @@ func RegisterServeFlags(fs *flag.FlagSet) {
 // RegisterServePFlags registers serve-command flags on fs.
 func RegisterServePFlags(fs *pflag.FlagSet) {
 	fs.String("host", "127.0.0.1", "Host to bind to")
-	fs.Int("port", 8080, "Port to listen on")
+	fs.Int("port", 9765, "Port to listen on")
 	fs.String(
 		"public-url", "",
 		"Public URL to trust and open for hostname or proxy access",
@@ -1161,6 +1275,9 @@ func finalize(cfg *Config) error {
 		if err != nil {
 			return fmt.Errorf("invalid public url: %w", err)
 		}
+	}
+	if cfg.DaemonIdleTimeout < 0 {
+		return fmt.Errorf("invalid daemon_idle_timeout: %s", cfg.DaemonIdleTimeout)
 	}
 	return nil
 }

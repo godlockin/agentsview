@@ -189,12 +189,17 @@ CLI flags override config values. Use
 [`agentsview projects`](/commands/#agentsview-projects) to list
 available project names.
 
-!!! warning
-    Filtered pushes do not advance the global push watermark
-    because it covers all projects. This means the query window
-    for subsequent filtered pushes grows over time. Run an
-    unfiltered `pg push` (or `pg push --all-projects`)
-    periodically to reset the watermark.
+Filtered pushes keep their own local push watermark for each
+target/filter set. For example, repeated
+`agentsview pg push --projects alpha,beta` runs use a different
+watermark from unfiltered pushes and from
+`agentsview pg push --projects gamma`. This keeps allow-list pushes
+incremental without advancing the unfiltered/global cursor.
+
+After upgrading from an older version, the first filtered push for a
+given project set may still scan the matching local sessions once to
+seed that scoped watermark. Later pushes with the same filter set use
+the scoped watermark.
 
 #### Curation Metadata
 
@@ -227,13 +232,18 @@ filter).
 Show the current sync state.
 
 ```bash
-agentsview pg status [target]
+agentsview pg status [target] [flags]
 agentsview pg status --all
+agentsview pg status --projects alpha,beta
 ```
 
 Without a target name, `pg status` uses the effective default target.
 Pass one named target explicitly to inspect that destination, or use
 `--all` to print every configured target sequentially.
+
+Use the same `--projects`, `--exclude-projects`, or `--all-projects`
+filter flags as `pg push` to inspect the matching filtered or
+unfiltered watermark.
 
 Output:
 

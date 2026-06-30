@@ -66,15 +66,85 @@ type UsageDailyConfig struct {
 	Timezone  string
 }
 
+// resolveUsageWindow resolves the raw --since/--until flags into concrete
+// inclusive YYYY-MM-DD bounds. Both accept a duration like 28d or a date,
+// the same syntax as `stats`. --until resolves first; a duration --since is
+// then measured back from the resolved --until (or from now when --until is
+// open), matching how stats anchors a duration window. An inverted explicit
+// window is rejected so a reversed range fails loudly instead of returning
+// an empty result.
+func resolveUsageWindow(
+	since, until string, now time.Time, loc *time.Location,
+) (string, string, error) {
+	if loc == nil {
+		loc = time.UTC
+	}
+	now = now.In(loc)
+	// Resolve --until first and keep it as the anchor for --since:
+	// ParseWindowPoint measures a duration back from its time argument, so
+	// a duration --since is measured from the resolved --until while a date
+	// stands alone. --until open leaves the anchor at now.
+	anchor := now
+	to := ""
+	if until != "" {
+		t, date, err := resolveUsageWindowPoint(until, now, loc)
+		if err != nil {
+			return "", "", fmt.Errorf("invalid --until: %w", err)
+		}
+		anchor, to = t, date
+	}
+	from := ""
+	if since != "" {
+		_, date, err := resolveUsageWindowPoint(since, anchor, loc)
+		if err != nil {
+			return "", "", fmt.Errorf("invalid --since: %w", err)
+		}
+		from = date
+	}
+	// Bounds are inclusive, so from == to is a valid single day (hence >
+	// not >=). String comparison is valid because YYYY-MM-DD sorts
+	// lexically.
+	if from != "" && to != "" && from > to {
+		return "", "", fmt.Errorf(
+			"--since (%s) must not be after --until (%s)", from, to)
+	}
+	return from, to, nil
+}
+
+func resolveUsageWindowPoint(
+	raw string, anchor time.Time, loc *time.Location,
+) (time.Time, string, error) {
+	if t, err := time.ParseInLocation("2006-01-02", raw, loc); err == nil {
+		return t, raw, nil
+	}
+	t, err := db.ParseWindowPoint(raw, anchor)
+	if err != nil {
+		return time.Time{}, "", err
+	}
+	return t, t.In(loc).Format("2006-01-02"), nil
+}
+
 func runUsageDaily(cfg UsageDailyConfig) {
 	tz := cfg.Timezone
 	if tz == "" {
 		tz = localTimezone()
 	}
 
+	loc, err := time.LoadLocation(tz)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error: invalid --timezone: %v\n", err)
+		os.Exit(1)
+	}
+
+	since, until, err := resolveUsageWindow(cfg.Since, cfg.Until, time.Now(), loc)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error: %v\n", err)
+		os.Exit(1)
+	}
+
 	filter := db.UsageFilter{
-		From:     cfg.Since,
-		To:       cfg.Until,
+		From:     since,
+		To:       until,
 		Agent:    cfg.Agent,
 		Timezone: tz,
 	}
@@ -272,18 +342,19 @@ func printSyncSummaryStderr(stats sync.SyncStats, t time.Time) {
 }
 
 // seedPricing ensures fallback rates are present in
-// model_pricing, then kicks off a background LiteLLM refresh.
+// model_pricing, then kicks off a background multi-source
+// pricing refresh.
 //
 // Fallback rates are only upserted when the stored seed
 // version differs from pricing.FallbackVersion (or is
-// absent). This avoids overwriting live LiteLLM rates on
+// absent). This avoids overwriting live upstream rates on
 // every restart while still propagating corrected fallback
 // rates when the binary is upgraded.
 func seedPricing(database *db.DB) {
 	if err := seedFallbackPricing(database); err != nil {
 		log.Printf("pricing seed: %v", err)
 	}
-	go refreshPricingFromLiteLLM(database)
+	go refreshPricingFromSources(database)
 }
 
 func seedFallbackPricing(database *db.DB) error {
@@ -303,10 +374,57 @@ func seedFallbackPricing(database *db.DB) error {
 	return database.SetPricingMeta(metaKey, pricing.FallbackVersion)
 }
 
-// refreshPricingFromLiteLLM fetches the upstream LiteLLM
-// catalog and upserts it over whatever is in the table. Called
-// from a goroutine after the synchronous fallback seed so a
-// slow or failing fetch never blocks server startup.
+// refreshPricingFromSources walks the default pricing source
+// list and upserts whichever catalogs respond. LiteLLM is
+// tried first because it is the most complete for the public
+// models agentsview normally parses; OpenRouter is tried next
+// because its public /models endpoint frequently lists
+// fork-tuned and private model prices LiteLLM has not yet
+// picked up. Each fetch failure is logged but never aborts
+// the loop, so a partial outage of one upstream does not
+// prevent the other from seeding. All successful results are
+// merged (first non-zero field wins per model_pattern) and
+// upserted as a single batch.
+func refreshPricingFromSources(database *db.DB) {
+	fetched := make(map[string][]pricing.ModelPricing)
+	for _, src := range pricing.DefaultPricingSources() {
+		prices, err := src.Fetch()
+		if err != nil {
+			log.Printf(
+				"pricing refresh: %s fetch failed: %v",
+				src.Name, err,
+			)
+			continue
+		}
+		fetched[src.Name] = prices
+		log.Printf(
+			"pricing refresh: %s returned %d model rows",
+			src.Name, len(prices),
+		)
+	}
+	if len(fetched) == 0 {
+		log.Printf(
+			"pricing refresh: every source failed; " +
+				"keeping embedded fallback pricing",
+		)
+		return
+	}
+	merged := pricing.MergePricing(fetched)
+	flat := make([]pricing.ModelPricing, 0, len(merged))
+	for _, p := range merged {
+		flat = append(flat, p)
+	}
+	if err := upsertPricing(database, flat); err != nil {
+		log.Printf("pricing refresh: upsert failed: %v", err)
+	}
+}
+
+// refreshPricingFromLiteLLM is the single-source refresh
+// helper used by the CLI's statusline path. It does not
+// fan out to OpenRouter so the CLI stays cheap. Kept as a
+// thin wrapper around refreshPricingFromSources with only
+// the LiteLLM entry for callers that want the old
+// single-source behaviour.
 func refreshPricingFromLiteLLM(database *db.DB) {
 	prices, err := pricing.FetchLiteLLMPricing()
 	if err != nil {

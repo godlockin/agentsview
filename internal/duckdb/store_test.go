@@ -8,7 +8,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -216,9 +215,7 @@ func TestSearchContentFTSMatchesNonContiguousTerms(t *testing.T) {
 	})
 	require.NoError(t, err)
 
-	syncer := newTestSync(t,
-		filepath.Join(t.TempDir(), "fts-content.duckdb"),
-		local, SyncOptions{})
+	syncer := newInMemoryTestSync(t, local, SyncOptions{})
 	_, err = syncer.Push(ctx, true, nil)
 	require.NoError(t, err)
 	store := NewStoreFromDB(syncer.DB())
@@ -267,7 +264,7 @@ func TestSearchContentRedactsSecretsUnlessRevealed(t *testing.T) {
 	}})
 	require.NoError(t, err)
 
-	syncer := newTestSync(t, filepath.Join(t.TempDir(), "secret.duckdb"), local, SyncOptions{})
+	syncer := newInMemoryTestSync(t, local, SyncOptions{})
 	_, err = syncer.Push(ctx, true, nil)
 	require.NoError(t, err)
 	store := NewStoreFromDB(syncer.DB())
@@ -320,7 +317,7 @@ func TestSearchGroupsMessagesAndIncludesNameMatches(t *testing.T) {
 	})
 	require.NoError(t, err)
 
-	syncer := newTestSync(t, filepath.Join(t.TempDir(), "search.duckdb"), local, SyncOptions{})
+	syncer := newInMemoryTestSync(t, local, SyncOptions{})
 	_, err = syncer.Push(ctx, true, nil)
 	require.NoError(t, err)
 	store := NewStoreFromDB(syncer.DB())
@@ -377,7 +374,7 @@ func TestSearchOperatorTokenNoError(t *testing.T) {
 	}})
 	require.NoError(t, err)
 
-	syncer := newTestSync(t, filepath.Join(t.TempDir(), "optok.duckdb"), local, SyncOptions{})
+	syncer := newInMemoryTestSync(t, local, SyncOptions{})
 	_, err = syncer.Push(ctx, true, nil)
 	require.NoError(t, err)
 	store := NewStoreFromDB(syncer.DB())
@@ -417,7 +414,7 @@ func TestSearchMultiTermAND(t *testing.T) {
 	})
 	require.NoError(t, err)
 
-	syncer := newTestSync(t, filepath.Join(t.TempDir(), "andterm.duckdb"), local, SyncOptions{})
+	syncer := newInMemoryTestSync(t, local, SyncOptions{})
 	_, err = syncer.Push(ctx, true, nil)
 	require.NoError(t, err)
 	store := NewStoreFromDB(syncer.DB())
@@ -650,7 +647,7 @@ func TestAnalyticsTopSessionsFiltersMetricEligibility(t *testing.T) {
 	}
 	_, err := local.WriteSessionBatchAtomic(writes)
 	require.NoError(t, err)
-	syncer := newTestSync(t, filepath.Join(t.TempDir(), "top-sessions.duckdb"), local, SyncOptions{})
+	syncer := newInMemoryTestSync(t, local, SyncOptions{})
 	_, err = syncer.Push(ctx, true, nil)
 	require.NoError(t, err)
 
@@ -706,6 +703,97 @@ func TestAnalyticsTopSessionsFiltersMetricEligibility(t *testing.T) {
 	assert.Equal(t, "messages", unknown.Metric)
 }
 
+func TestAnalyticsTopSessionsDurationUsesActiveDuration(t *testing.T) {
+	ctx := context.Background()
+	local := newLocalDB(t)
+	wallSession := syncSession(
+		"duck-wall-dominant", "alpha", "wall session",
+		"2026-01-20T09:00:00.000Z", 3,
+	)
+	wallEndedAt := "2026-01-20T11:00:00.000Z"
+	wallSession.EndedAt = &wallEndedAt
+	activeSession := syncSession(
+		"duck-actively-working", "alpha", "active session",
+		"2026-01-20T09:30:00.000Z", 3,
+	)
+	activeEndedAt := "2026-01-20T09:50:00.000Z"
+	activeSession.EndedAt = &activeEndedAt
+	writes := []db.SessionBatchWrite{
+		{
+			Session: wallSession,
+			Messages: []db.Message{
+				syncMessage(
+					"duck-wall-dominant", 0, "user", "wall start",
+					"2026-01-20T09:00:00.000Z",
+				),
+				syncMessage(
+					"duck-wall-dominant", 1, "assistant", "wall tool",
+					"2026-01-20T10:59:00.000Z",
+					db.ToolCall{
+						ToolName:  "Read",
+						Category:  "Read",
+						ToolUseID: "duck-wall-tool",
+						InputJSON: `{"file_path":"README.md"}`,
+					},
+				),
+				syncMessage(
+					"duck-wall-dominant", 2, "user", "wall finish",
+					"2026-01-20T11:00:00.000Z",
+				),
+			},
+			DataVersion:     1,
+			ReplaceMessages: true,
+		},
+		{
+			Session: activeSession,
+			Messages: []db.Message{
+				syncMessage(
+					"duck-actively-working", 0, "user", "active start",
+					"2026-01-20T09:30:00.000Z",
+				),
+				syncMessage(
+					"duck-actively-working", 1, "assistant", "active tool",
+					"2026-01-20T09:35:00.000Z",
+					db.ToolCall{
+						ToolName:  "Edit",
+						Category:  "Write",
+						ToolUseID: "duck-active-tool",
+						InputJSON: `{"file_path":"main.go"}`,
+					},
+				),
+				syncMessage(
+					"duck-actively-working", 2, "user", "active finish",
+					"2026-01-20T09:50:00.000Z",
+				),
+			},
+			DataVersion:     1,
+			ReplaceMessages: true,
+		},
+	}
+	_, err := local.WriteSessionBatchAtomic(writes)
+	require.NoError(t, err)
+
+	syncer := newInMemoryTestSync(t, local, SyncOptions{})
+	_, err = syncer.Push(ctx, true, nil)
+	require.NoError(t, err)
+
+	store := NewStoreFromDB(syncer.DB())
+	filter := db.AnalyticsFilter{From: "2026-01-20", To: "2026-01-20"}
+	resp, err := store.GetAnalyticsTopSessions(ctx, filter, "duration")
+	require.NoError(t, err)
+	require.Len(t, resp.Sessions, 2)
+
+	assert.Equal(t, "duck-actively-working", resp.Sessions[0].ID)
+	assert.Equal(t, 20.0, resp.Sessions[0].DurationMin)
+	// 5 min user->asst gap + a 15 min gap capped at the 5 min idle
+	// cap = 10.
+	assert.Equal(t, 10.0, resp.Sessions[0].ActiveDurationMin)
+	assert.Equal(t, "duck-wall-dominant", resp.Sessions[1].ID)
+	assert.Equal(t, 120.0, resp.Sessions[1].DurationMin)
+	// 119 min idle gap capped to 5 + a 1 min gap = 6.
+	assert.Equal(t, 6.0, resp.Sessions[1].ActiveDurationMin)
+}
+
 func TestAnalyticsProjectsPopulateDailyTrendAndSortByMessages(t *testing.T) {
 	ctx := context.Background()
 	local := newLocalDB(t)
@@ -738,7 +826,7 @@ func TestAnalyticsProjectsPopulateDailyTrendAndSortByMessages(t *testing.T) {
 	_, err := local.WriteSessionBatchAtomic(writes)
 	require.NoError(t, err)
 
-	syncer := newTestSync(t, filepath.Join(t.TempDir(), "project-analytics.duckdb"), local, SyncOptions{})
+	syncer := newInMemoryTestSync(t, local, SyncOptions{})
 	_, err = syncer.Push(ctx, true, nil)
 	require.NoError(t, err)
 	store := NewStoreFromDB(syncer.DB())
@@ -779,7 +867,7 @@ func TestAnalyticsVelocityUsesMessageCyclesAndBreakdowns(t *testing.T) {
 	}})
 	require.NoError(t, err)
 
-	syncer := newTestSync(t, filepath.Join(t.TempDir(), "velocity.duckdb"), local, SyncOptions{})
+	syncer := newInMemoryTestSync(t, local, SyncOptions{})
 	_, err = syncer.Push(ctx, true, nil)
 	require.NoError(t, err)
 	store := NewStoreFromDB(syncer.DB())
@@ -813,7 +901,7 @@ func TestAnalyticsVelocitySingleMessageSessionsReturnArrays(t *testing.T) {
 	}})
 	require.NoError(t, err)
 
-	syncer := newTestSync(t, filepath.Join(t.TempDir(), "velocity-single.duckdb"), local, SyncOptions{})
+	syncer := newInMemoryTestSync(t, local, SyncOptions{})
 	_, err = syncer.Push(ctx, true, nil)
 	require.NoError(t, err)
 	store := NewStoreFromDB(syncer.DB())
@@ -854,7 +942,7 @@ func TestGetSessionTimingPopulatesSharedTimingPayload(t *testing.T) {
 	}})
 	require.NoError(t, err)
 
-	syncer := newTestSync(t, filepath.Join(t.TempDir(), "timing.duckdb"), local, SyncOptions{})
+	syncer := newInMemoryTestSync(t, local, SyncOptions{})
 	_, err = syncer.Push(ctx, true, nil)
 	require.NoError(t, err)
 	store := NewStoreFromDB(syncer.DB())
@@ -898,7 +986,7 @@ func TestGetAllMessagesDoesNotTruncateAtDefaultLimit(t *testing.T) {
 	}})
 	require.NoError(t, err)
 
-	syncer := newTestSync(t, filepath.Join(t.TempDir(), "large.duckdb"), local, SyncOptions{})
+	syncer := newInMemoryTestSync(t, local, SyncOptions{})
 	_, err = syncer.Push(ctx, true, nil)
 	require.NoError(t, err)
 	store := NewStoreFromDB(syncer.DB())
@@ -974,7 +1062,7 @@ func TestSearchContentRegexOrdersBySessionRecency(t *testing.T) {
 		},
 	})
 	require.NoError(t, err)
-	syncer := newTestSync(t, filepath.Join(t.TempDir(), "regex-order.duckdb"), local, SyncOptions{})
+	syncer := newInMemoryTestSync(t, local, SyncOptions{})
 	_, err = syncer.Push(ctx, true, nil)
 	require.NoError(t, err)
 	store := NewStoreFromDB(syncer.DB())
@@ -1048,7 +1136,7 @@ func TestSearchContentToolResultEmptyToolUseIDNotSuppressedByEvents(t *testing.T
 		ReplaceMessages: true,
 	}})
 	require.NoError(t, err)
-	syncer := newTestSync(t, filepath.Join(t.TempDir(), "empty-tool-use.duckdb"), local, SyncOptions{})
+	syncer := newInMemoryTestSync(t, local, SyncOptions{})
 	_, err = syncer.Push(ctx, true, nil)
 	require.NoError(t, err)
 	store := NewStoreFromDB(syncer.DB())
@@ -1107,7 +1195,7 @@ func TestSearchContentLegacyToolResultsUseCallIndexTieBreaker(t *testing.T) {
 		ReplaceMessages: true,
 	}})
 	require.NoError(t, err)
-	syncer := newTestSync(t, filepath.Join(t.TempDir(), "tool-order.duckdb"), local, SyncOptions{})
+	syncer := newInMemoryTestSync(t, local, SyncOptions{})
 	_, err = syncer.Push(ctx, true, nil)
 	require.NoError(t, err)
 	store := NewStoreFromDB(syncer.DB())
@@ -1182,7 +1270,7 @@ func TestSearchContentToolResultEventsUseCallIndexTieBreaker(t *testing.T) {
 		ReplaceMessages: true,
 	}})
 	require.NoError(t, err)
-	syncer := newTestSync(t, filepath.Join(t.TempDir(), "tool-event-order.duckdb"), local, SyncOptions{})
+	syncer := newInMemoryTestSync(t, local, SyncOptions{})
 	_, err = syncer.Push(ctx, true, nil)
 	require.NoError(t, err)
 	store := NewStoreFromDB(syncer.DB())
@@ -1262,7 +1350,7 @@ func TestAnalyticsActivityCountsToolCallRows(t *testing.T) {
 		ReplaceMessages: true,
 	}})
 	require.NoError(t, err)
-	syncer := newTestSync(t, filepath.Join(t.TempDir(), "activity-tools.duckdb"), local, SyncOptions{})
+	syncer := newInMemoryTestSync(t, local, SyncOptions{})
 	_, err = syncer.Push(ctx, true, nil)
 	require.NoError(t, err)
 	_, err = syncer.DB().ExecContext(ctx,
@@ -1297,7 +1385,7 @@ func TestAnalyticsActivitySkipsSystemUserMessages(t *testing.T) {
 		ReplaceMessages: true,
 	}})
 	require.NoError(t, err)
-	syncer := newTestSync(t, filepath.Join(t.TempDir(), "activity-system.duckdb"), local, SyncOptions{})
+	syncer := newInMemoryTestSync(t, local, SyncOptions{})
 	_, err = syncer.Push(ctx, true, nil)
 	require.NoError(t, err)
 	store := NewStoreFromDB(syncer.DB())
@@ -1335,7 +1423,7 @@ func TestAnalyticsSessionFiltersUseMessageTimeForHourAndDay(t *testing.T) {
 		},
 	})
 	require.NoError(t, err)
-	syncer := newTestSync(t, filepath.Join(t.TempDir(), "time-filter.duckdb"), local, SyncOptions{})
+	syncer := newInMemoryTestSync(t, local, SyncOptions{})
 	_, err = syncer.Push(ctx, true, nil)
 	require.NoError(t, err)
 	store := NewStoreFromDB(syncer.DB())
@@ -1388,7 +1476,7 @@ func TestAnalyticsTerminationFilterUsesSharedStateSemantics(t *testing.T) {
 		},
 	})
 	require.NoError(t, err)
-	syncer := newTestSync(t, filepath.Join(t.TempDir(), "termination.duckdb"), local, SyncOptions{})
+	syncer := newInMemoryTestSync(t, local, SyncOptions{})
 	_, err = syncer.Push(ctx, true, nil)
 	require.NoError(t, err)
 	store := NewStoreFromDB(syncer.DB())
@@ -1420,7 +1508,7 @@ func TestAnalyticsActiveSinceParsesEquivalentOffsets(t *testing.T) {
 	}})
 	require.NoError(t, err)
 
-	syncer := newTestSync(t, filepath.Join(t.TempDir(), "active-since.duckdb"), local, SyncOptions{})
+	syncer := newInMemoryTestSync(t, local, SyncOptions{})
 	_, err = syncer.Push(ctx, true, nil)
 	require.NoError(t, err)
 	store := NewStoreFromDB(syncer.DB())
@@ -1451,7 +1539,7 @@ func TestAnalyticsHourOfWeekRespectsSessionFilters(t *testing.T) {
 		},
 	})
 	require.NoError(t, err)
-	syncer := newTestSync(t, filepath.Join(t.TempDir(), "hour-of-week.duckdb"), local, SyncOptions{})
+	syncer := newInMemoryTestSync(t, local, SyncOptions{})
 	_, err = syncer.Push(ctx, true, nil)
 	require.NoError(t, err)
 	store := NewStoreFromDB(syncer.DB())
@@ -1484,7 +1572,7 @@ func TestAnalyticsHourOfWeekIncludesOvernightMessages(t *testing.T) {
 		},
 	})
 	require.NoError(t, err)
-	syncer := newTestSync(t, filepath.Join(t.TempDir(), "hour-of-week-overnight.duckdb"), local, SyncOptions{})
+	syncer := newInMemoryTestSync(t, local, SyncOptions{})
 	_, err = syncer.Push(ctx, true, nil)
 	require.NoError(t, err)
 	store := NewStoreFromDB(syncer.DB())
@@ -1526,7 +1614,7 @@ func TestTrendsTermsApplySessionFiltersAndSystemPrefixExclusion(t *testing.T) {
 		},
 	})
 	require.NoError(t, err)
-	syncer := newTestSync(t, filepath.Join(t.TempDir(), "trends.duckdb"), local, SyncOptions{})
+	syncer := newInMemoryTestSync(t, local, SyncOptions{})
 	_, err = syncer.Push(ctx, true, nil)
 	require.NoError(t, err)
 	store := NewStoreFromDB(syncer.DB())
@@ -1566,7 +1654,7 @@ func TestDailyUsageDefaultsToLocalTimezone(t *testing.T) {
 		ReplaceMessages: true,
 	}})
 	require.NoError(t, err)
-	syncer := newTestSync(t, filepath.Join(t.TempDir(), "usage-local.duckdb"), local, SyncOptions{})
+	syncer := newInMemoryTestSync(t, local, SyncOptions{})
 	_, err = syncer.Push(ctx, true, nil)
 	require.NoError(t, err)
 	store := NewStoreFromDB(syncer.DB())
@@ -1601,7 +1689,7 @@ func TestDailyUsageActiveSinceUsesSessionActivity(t *testing.T) {
 	}})
 	require.NoError(t, err)
 
-	syncer := newTestSync(t, filepath.Join(t.TempDir(), "usage-active-since.duckdb"), local, SyncOptions{})
+	syncer := newInMemoryTestSync(t, local, SyncOptions{})
 	_, err = syncer.Push(ctx, true, nil)
 	require.NoError(t, err)
 	store := NewStoreFromDB(syncer.DB())
@@ -1649,7 +1737,7 @@ func TestDailyUsageHandlesBlankMessageTimestampWithoutSessionStart(t *testing.T)
 	}})
 	require.NoError(t, err)
 
-	syncer := newTestSync(t, filepath.Join(t.TempDir(), "usage-blank-ts.duckdb"), local, SyncOptions{})
+	syncer := newInMemoryTestSync(t, local, SyncOptions{})
 	_, err = syncer.Push(ctx, true, nil)
 	require.NoError(t, err)
 	store := NewStoreFromDB(syncer.DB())
@@ -1710,7 +1798,7 @@ func TestUsageDedupesClaudeMessageIDs(t *testing.T) {
 	})
 	require.NoError(t, err)
 
-	syncer := newTestSync(t, filepath.Join(t.TempDir(), "usage.duckdb"), local, SyncOptions{})
+	syncer := newInMemoryTestSync(t, local, SyncOptions{})
 	_, err = syncer.Push(ctx, true, nil)
 	require.NoError(t, err)
 	store := NewStoreFromDB(syncer.DB())
@@ -1772,7 +1860,7 @@ func TestUsageDedupesSourceUUIDWhenClaudePairIncomplete(t *testing.T) {
 	})
 	require.NoError(t, err)
 
-	syncer := newTestSync(t, filepath.Join(t.TempDir(), "usage-source.duckdb"), local, SyncOptions{})
+	syncer := newInMemoryTestSync(t, local, SyncOptions{})
 	_, err = syncer.Push(ctx, true, nil)
 	require.NoError(t, err)
 	store := NewStoreFromDB(syncer.DB())
@@ -1836,7 +1924,7 @@ func TestUsagePreservesSessionSummaryUsageEventTokens(t *testing.T) {
 	}})
 	require.NoError(t, err)
 
-	syncer := newTestSync(t, filepath.Join(t.TempDir(), "summary-usage.duckdb"), local, SyncOptions{})
+	syncer := newInMemoryTestSync(t, local, SyncOptions{})
 	_, err = syncer.Push(ctx, true, nil)
 	require.NoError(t, err)
 	store := NewStoreFromDB(syncer.DB())
@@ -1897,7 +1985,7 @@ func TestUsageDedupPrefersInRangeDuplicate(t *testing.T) {
 	})
 	require.NoError(t, err)
 
-	syncer := newTestSync(t, filepath.Join(t.TempDir(), "usage-edge.duckdb"), local, SyncOptions{})
+	syncer := newInMemoryTestSync(t, local, SyncOptions{})
 	_, err = syncer.Push(ctx, true, nil)
 	require.NoError(t, err)
 	store := NewStoreFromDB(syncer.DB())
@@ -1931,7 +2019,7 @@ func TestPushSyncsCursorUsageEventsIntoDuckDBDailyUsage(t *testing.T) {
 		IsHeadless:       false,
 	}}), "InsertCursorUsageEvents")
 
-	syncer := newTestSync(t, filepath.Join(t.TempDir(), "cursor-usage.duckdb"), local, SyncOptions{})
+	syncer := newInMemoryTestSync(t, local, SyncOptions{})
 	_, err := syncer.Push(ctx, false, nil)
 	require.NoError(t, err)
 	assertDuckDBCount(t, syncer.DB(), "cursor_usage_events", 1)
@@ -1971,7 +2059,7 @@ func TestTrendsTermsWordBoundaryAndOverlapParity(t *testing.T) {
 		ReplaceMessages: true,
 	}})
 	require.NoError(t, err)
-	syncer := newTestSync(t, filepath.Join(t.TempDir(), "trends-parity.duckdb"), local, SyncOptions{})
+	syncer := newInMemoryTestSync(t, local, SyncOptions{})
 	_, err = syncer.Push(ctx, true, nil)
 	require.NoError(t, err)
 	store := NewStoreFromDB(syncer.DB())
@@ -2025,7 +2113,7 @@ func TestDailyUsageBreakdownsAndCacheSavings(t *testing.T) {
 	}})
 	require.NoError(t, err)
 
-	syncer := newTestSync(t, filepath.Join(t.TempDir(), "usage-breakdowns.duckdb"), local, SyncOptions{})
+	syncer := newInMemoryTestSync(t, local, SyncOptions{})
 	_, err = syncer.Push(ctx, true, nil)
 	require.NoError(t, err)
 	store := NewStoreFromDB(syncer.DB())
@@ -2084,9 +2172,7 @@ func TestGetChildSessionsOrderedByStartedAt(t *testing.T) {
 	require.NoError(t, err)
 	require.NoError(t, local.SoftDeleteSession("duck-child-deleted"))
 
-	syncer := newTestSync(t,
-		filepath.Join(t.TempDir(), "mirror.duckdb"),
-		local, SyncOptions{})
+	syncer := newInMemoryTestSync(t, local, SyncOptions{})
 	_, err = syncer.Push(ctx, true, nil)
 	require.NoError(t, err)
 	store := NewStoreFromDB(syncer.DB())
@@ -2130,8 +2216,7 @@ func TestDuckGetAnalyticsSkillsAggregatesAcrossWeeks(t *testing.T) {
 	_, err := local.WriteSessionBatchAtomic(writes)
 	require.NoError(t, err)
 
-	syncer := newTestSync(t,
-		filepath.Join(t.TempDir(), "mirror.duckdb"), local, SyncOptions{})
+	syncer := newInMemoryTestSync(t, local, SyncOptions{})
 	_, err = syncer.Push(ctx, true, nil)
 	require.NoError(t, err)
 	store := NewStoreFromDB(syncer.DB())
@@ -2189,8 +2274,7 @@ func TestDuckGetAnalyticsSkillsFiltersByMessageDate(t *testing.T) {
 	_, err := local.WriteSessionBatchAtomic(writes)
 	require.NoError(t, err)
 
-	syncer := newTestSync(t,
-		filepath.Join(t.TempDir(), "mirror.duckdb"), local, SyncOptions{})
+	syncer := newInMemoryTestSync(t, local, SyncOptions{})
 	_, err = syncer.Push(ctx, true, nil)
 	require.NoError(t, err)
 	store := NewStoreFromDB(syncer.DB())
@@ -2220,9 +2304,7 @@ func newSyncedStore(t *testing.T) (*Store, syncFixture) {
 	ctx := context.Background()
 	local := newLocalDB(t)
 	fixture := seedDuckDBSyncFixture(t, local)
-	syncer := newTestSync(t,
-		filepath.Join(t.TempDir(), "mirror.duckdb"),
-		local, SyncOptions{})
+	syncer := newInMemoryTestSync(t, local, SyncOptions{})
 	_, err := syncer.Push(ctx, true, nil)
 	require.NoError(t, err)
 	return NewStoreFromDB(syncer.DB()), fixture

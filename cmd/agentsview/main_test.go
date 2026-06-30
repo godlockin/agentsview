@@ -18,8 +18,8 @@ import (
 	"go.kenn.io/agentsview/internal/config"
 	"go.kenn.io/agentsview/internal/db"
 	"go.kenn.io/agentsview/internal/parser"
+	"go.kenn.io/agentsview/internal/remotesync"
 	"go.kenn.io/agentsview/internal/server"
-	"go.kenn.io/agentsview/internal/ssh"
 	agentsync "go.kenn.io/agentsview/internal/sync"
 )
 
@@ -36,7 +36,7 @@ func TestMustLoadConfig(t *testing.T) {
 			name:          "DefaultArgs",
 			args:          []string{},
 			wantHost:      "127.0.0.1",
-			wantPort:      8080,
+			wantPort:      9765,
 			wantPublicURL: "",
 			wantProxyMode: "",
 		},
@@ -189,6 +189,33 @@ func TestTruncateLogFileSymlink(t *testing.T) {
 	assert.Len(t, data, 1024, "symlink target was truncated")
 }
 
+func TestNewDaemonIdleTrackerUsesConfigTimeout(t *testing.T) {
+	t.Setenv(backgroundChildEnvVar, "1")
+	fired := make(chan struct{})
+	tracker := newDaemonIdleTracker(config.Config{DaemonIdleTimeout: 20 * time.Millisecond}, func() { close(fired) })
+	require.NotNil(t, tracker)
+	ctx := t.Context()
+	go tracker.Run(ctx)
+	select {
+	case <-fired:
+	case <-time.After(time.Second):
+		require.FailNow(t, "idle tracker did not fire")
+	}
+}
+
+func TestNewDaemonIdleTrackerConfigZeroDisables(t *testing.T) {
+	t.Setenv(backgroundChildEnvVar, "1")
+	tracker := newDaemonIdleTracker(config.Config{DaemonIdleTimeout: 0}, func() { require.FailNow(t, "idle tracker fired") })
+	assert.Nil(t, tracker)
+}
+
+func TestNewDaemonIdleTrackerEnvOverridesConfig(t *testing.T) {
+	t.Setenv(backgroundChildEnvVar, "1")
+	t.Setenv("AGENTSVIEW_DAEMON_IDLE_TIMEOUT", "0")
+	tracker := newDaemonIdleTracker(config.Config{DaemonIdleTimeout: 20 * time.Minute}, func() { require.FailNow(t, "idle tracker fired") })
+	assert.Nil(t, tracker)
+}
+
 type fakeUnwatchedPollSyncer struct {
 	roots     []string
 	since     time.Time
@@ -286,10 +313,12 @@ func TestRemoteHostSyncFuncSerializesWithEngineExclusiveLock(t *testing.T) {
 		database,
 		engine,
 		config.RemoteHost{Host: "test-host"},
-		func(context.Context, *ssh.RemoteSync) (ssh.SyncStats, error) {
+		func(
+			context.Context, config.Config, *db.DB, config.RemoteHost, bool,
+		) (remotesync.SyncStats, error) {
 			close(remoteEntered)
 			<-releaseRemote
-			return ssh.SyncStats{}, nil
+			return remotesync.SyncStats{}, nil
 		},
 	)
 
@@ -352,14 +381,56 @@ func TestRemoteHostSyncFuncUsesCallerContext(t *testing.T) {
 		database,
 		engine,
 		config.RemoteHost{Host: "test-host"},
-		func(runCtx context.Context, _ *ssh.RemoteSync) (ssh.SyncStats, error) {
-			return ssh.SyncStats{}, runCtx.Err()
+		func(
+			runCtx context.Context, _ config.Config, _ *db.DB,
+			_ config.RemoteHost, _ bool,
+		) (remotesync.SyncStats, error) {
+			return remotesync.SyncStats{}, runCtx.Err()
 		},
 	)
 
 	_, err = syncFn()
 
 	require.ErrorIs(t, err, context.Canceled)
+}
+
+func TestRemoteHostSyncFuncDispatchesHTTPTransport(t *testing.T) {
+	database, err := db.Open(filepath.Join(t.TempDir(), "test.db"))
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, database.Close()) })
+	engine := agentsync.NewEngine(database, agentsync.EngineConfig{
+		AgentDirs: map[parser.AgentType][]string{},
+		Machine:   "local",
+	})
+	var called config.RemoteHost
+	restore := stubHTTPRemoteSyncForTest(t, func(
+		_ context.Context,
+		rh config.RemoteHost,
+		full bool,
+	) (remotesync.SyncStats, error) {
+		called = rh
+		assert.False(t, full)
+		return remotesync.SyncStats{SessionsSynced: 1}, nil
+	})
+	defer restore()
+	syncFn := remoteHostSyncFunc(
+		context.Background(),
+		config.Config{},
+		database,
+		engine,
+		config.RemoteHost{
+			Host:      "test-host",
+			Transport: config.RemoteTransportHTTP,
+			URL:       "https://test-host.example.test",
+		},
+		runRemoteSyncTransport,
+	)
+
+	synced, err := syncFn()
+
+	require.NoError(t, err)
+	assert.Equal(t, 1, synced)
+	assert.Equal(t, "https://test-host.example.test", called.URL)
 }
 
 func TestRemoteHostSyncFuncForcesFullWhenDatabaseNeedsResync(t *testing.T) {
@@ -390,9 +461,12 @@ func TestRemoteHostSyncFuncForcesFullWhenDatabaseNeedsResync(t *testing.T) {
 		database,
 		engine,
 		config.RemoteHost{Host: "test-host"},
-		func(_ context.Context, rs *ssh.RemoteSync) (ssh.SyncStats, error) {
-			gotFull = rs.Full
-			return ssh.SyncStats{}, nil
+		func(
+			_ context.Context, _ config.Config, _ *db.DB,
+			_ config.RemoteHost, full bool,
+		) (remotesync.SyncStats, error) {
+			gotFull = full
+			return remotesync.SyncStats{}, nil
 		},
 	)
 
@@ -568,6 +642,121 @@ func TestStartRemoteHostSync_NilEmitterSafe(t *testing.T) {
 	time.Sleep(2 * interval)
 	close(done)
 	<-exited
+}
+
+func TestCollectWatchRootsHermesSessionsWatchesStateDBParent(t *testing.T) {
+	root := t.TempDir()
+	sessionsDir := filepath.Join(root, "sessions")
+	require.NoError(t, os.Mkdir(sessionsDir, 0o755), "mkdir sessions")
+
+	cfg := config.Config{
+		AgentDirs: map[parser.AgentType][]string{
+			parser.AgentHermes: {sessionsDir},
+		},
+	}
+
+	roots, unwatchedDirs := collectWatchRoots(cfg)
+
+	require.Empty(t, unwatchedDirs, "unwatched dirs before watcher setup")
+	require.Len(t, roots, 2)
+	assert.Equal(t, root, roots[0].root)
+	assert.True(t, roots[0].shallow)
+	assert.Equal(t, []string{sessionsDir}, roots[0].dirs)
+	assert.Equal(t, sessionsDir, roots[1].root)
+	assert.False(t, roots[1].shallow)
+	assert.Equal(t, []string{sessionsDir}, roots[1].dirs)
+}
+
+func TestCollectWatchRootsUsesCoworkProviderRecursiveRoot(t *testing.T) {
+	root := t.TempDir()
+	cfg := config.Config{
+		AgentDirs: map[parser.AgentType][]string{
+			parser.AgentCowork: {root},
+		},
+	}
+
+	roots, unwatchedDirs := collectWatchRoots(cfg)
+
+	require.Empty(t, unwatchedDirs, "cowork root should be watched directly")
+	got, ok := findCollectedWatchRoot(roots, root)
+	require.True(t, ok, "cowork provider WatchPlan root not collected")
+	assert.False(t, got.shallow,
+		"cowork provider recursive WatchPlan must override legacy ShallowWatch")
+	assert.Equal(t, []string{root}, got.dirs)
+}
+
+func TestCollectWatchRootsUsesGeminiProviderMetadataRoot(t *testing.T) {
+	root := t.TempDir()
+	tmpRoot := filepath.Join(root, "tmp")
+	require.NoError(t, os.Mkdir(tmpRoot, 0o755), "mkdir tmp")
+	cfg := config.Config{
+		AgentDirs: map[parser.AgentType][]string{
+			parser.AgentGemini: {root},
+		},
+	}
+
+	roots, unwatchedDirs := collectWatchRoots(cfg)
+
+	require.Empty(t, unwatchedDirs, "all gemini provider roots exist")
+	metadataRoot, ok := findCollectedWatchRoot(roots, root)
+	require.True(t, ok, "gemini provider metadata root not collected")
+	assert.True(t, metadataRoot.shallow)
+	tmp, ok := findCollectedWatchRoot(roots, tmpRoot)
+	require.True(t, ok, "gemini provider recursive tmp root not collected")
+	assert.False(t, tmp.shallow)
+}
+
+func TestCollectWatchRootsUsesAntigravityCLIHistoryRoot(t *testing.T) {
+	root := t.TempDir()
+	for _, subdir := range []string{"brain", "conversations", "implicit"} {
+		require.NoError(t, os.Mkdir(filepath.Join(root, subdir), 0o755))
+	}
+	cfg := config.Config{
+		AgentDirs: map[parser.AgentType][]string{
+			parser.AgentAntigravityCLI: {root},
+		},
+	}
+
+	roots, unwatchedDirs := collectWatchRoots(cfg)
+
+	require.Empty(t, unwatchedDirs, "all antigravity cli provider roots exist")
+	historyRoot, ok := findCollectedWatchRoot(roots, root)
+	require.True(t, ok, "antigravity cli history.jsonl root not collected")
+	assert.True(t, historyRoot.shallow)
+	conversations, ok := findCollectedWatchRoot(
+		roots, filepath.Join(root, "conversations"),
+	)
+	require.True(t, ok, "antigravity cli conversations root not collected")
+	assert.True(t, conversations.shallow)
+	brain, ok := findCollectedWatchRoot(roots, filepath.Join(root, "brain"))
+	require.True(t, ok, "antigravity cli brain root not collected")
+	assert.False(t, brain.shallow)
+}
+
+func TestMissingWatchRootCoverageDoesNotTreatShallowAncestorAsRecursive(t *testing.T) {
+	root := filepath.Clean(filepath.Join(t.TempDir(), "state"))
+	shallowRoots := []watchRoot{{root: root, shallow: true}}
+	recursiveRoots := []watchRoot{{root: root, shallow: false}}
+
+	assert.True(t,
+		pathCoveredByAnyWatchRootCreation(filepath.Join(root, "sessions"), shallowRoots),
+		"shallow roots can observe immediate child creation")
+	assert.False(t,
+		pathCoveredByAnyWatchRootCreation(filepath.Join(root, "nested", "sessions"), shallowRoots),
+		"shallow ancestors must not be treated like recursive watches")
+	assert.True(t,
+		pathCoveredByAnyWatchRootCreation(filepath.Join(root, "nested", "sessions"), recursiveRoots),
+		"recursive roots cover nested missing roots")
+}
+
+func findCollectedWatchRoot(roots []watchRoot, path string) (watchRoot, bool) {
+	path = filepath.Clean(path)
+	for _, root := range roots {
+		if filepath.Clean(root.root) == path {
+			return root, true
+		}
+	}
+	return watchRoot{}, false
 }
 
 func TestResyncCoversSignals(t *testing.T) {

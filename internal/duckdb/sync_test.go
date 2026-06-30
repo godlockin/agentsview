@@ -21,8 +21,7 @@ func TestSyncFullPushCreatesExpectedRows(t *testing.T) {
 	ctx := context.Background()
 	local := newLocalDB(t)
 	fixture := seedDuckDBSyncFixture(t, local)
-	target := filepath.Join(t.TempDir(), "mirror.duckdb")
-	syncer := newTestSync(t, target, local, SyncOptions{})
+	syncer := newInMemoryTestSync(t, local, SyncOptions{})
 
 	result, err := syncer.Push(ctx, true, nil)
 	require.NoError(t, err)
@@ -52,7 +51,7 @@ func TestSessionFingerprintsStoreDigestOnly(t *testing.T) {
 	ctx := context.Background()
 	local := newLocalDB(t)
 	fixture := seedDuckDBSyncFixture(t, local)
-	syncer := newTestSync(t, filepath.Join(t.TempDir(), "mirror.duckdb"), local, SyncOptions{})
+	syncer := newInMemoryTestSync(t, local, SyncOptions{})
 	session, err := local.GetSession(ctx, fixture.alphaID)
 	require.NoError(t, err)
 	require.NotNil(t, session)
@@ -147,7 +146,7 @@ func TestSyncUsesFallbackPricingWhenLocalPricingIsEmpty(t *testing.T) {
 		ReplaceMessages: true,
 	}})
 	require.NoError(t, err)
-	syncer := newTestSync(t, filepath.Join(t.TempDir(), "mirror.duckdb"), local, SyncOptions{})
+	syncer := newInMemoryTestSync(t, local, SyncOptions{})
 
 	_, err = syncer.Push(ctx, true, nil)
 	require.NoError(t, err)
@@ -171,7 +170,7 @@ func TestSyncModelPricingPreservesExistingMirrorRows(t *testing.T) {
 		ReplaceMessages: true,
 	}})
 	require.NoError(t, err)
-	syncer := newTestSync(t, filepath.Join(t.TempDir(), "mirror.duckdb"), local, SyncOptions{})
+	syncer := newInMemoryTestSync(t, local, SyncOptions{})
 	require.NoError(t, syncer.EnsureSchema(ctx))
 	_, err = syncer.DB().ExecContext(ctx, `
 		INSERT INTO model_pricing (
@@ -193,13 +192,40 @@ func TestSyncModelPricingPreservesExistingMirrorRows(t *testing.T) {
 	assert.Equal(t, 2.0, output)
 }
 
+func TestSyncModelPricingSkipsUnchangedMirrorRows(t *testing.T) {
+	ctx := context.Background()
+	local := newLocalDB(t)
+	require.NoError(t, local.UpsertModelPricing([]db.ModelPricing{{
+		ModelPattern:         "claude-test",
+		InputPerMTok:         3,
+		OutputPerMTok:        15,
+		CacheCreationPerMTok: 1,
+		CacheReadPerMTok:     0.5,
+	}}))
+	syncer := newInMemoryTestSync(t, local, SyncOptions{})
+	require.NoError(t, syncer.EnsureSchema(ctx))
+	require.NoError(t, syncer.syncModelPricing(ctx))
+	_, err := syncer.DB().ExecContext(ctx,
+		`UPDATE model_pricing SET updated_at = ? WHERE model_pattern = ?`,
+		"kept", "claude-test",
+	)
+	require.NoError(t, err)
+
+	require.NoError(t, syncer.syncModelPricing(ctx))
+
+	var updatedAt string
+	require.NoError(t, syncer.DB().QueryRowContext(ctx,
+		`SELECT updated_at FROM model_pricing WHERE model_pattern = ?`,
+		"claude-test",
+	).Scan(&updatedAt))
+	assert.Equal(t, "kept", updatedAt)
+}
+
 func TestSyncIncrementalSkipsUnchangedAndPushesChangedSessions(t *testing.T) {
 	ctx := context.Background()
 	local := newLocalDB(t)
 	fixture := seedDuckDBSyncFixture(t, local)
-	syncer := newTestSync(t,
-		filepath.Join(t.TempDir(), "mirror.duckdb"),
-		local, SyncOptions{})
+	syncer := newInMemoryTestSync(t, local, SyncOptions{})
 
 	first, err := syncer.Push(ctx, true, nil)
 	require.NoError(t, err)
@@ -237,9 +263,7 @@ func TestSyncIncrementalPushesSameLengthContentChange(t *testing.T) {
 		ReplaceMessages: true,
 	}})
 	require.NoError(t, err)
-	syncer := newTestSync(t,
-		filepath.Join(t.TempDir(), "mirror.duckdb"),
-		local, SyncOptions{})
+	syncer := newInMemoryTestSync(t, local, SyncOptions{})
 
 	first, err := syncer.Push(ctx, true, nil)
 	require.NoError(t, err)
@@ -264,9 +288,7 @@ func TestSyncIncrementalRechecksLastPushBoundary(t *testing.T) {
 	ctx := context.Background()
 	local := newLocalDB(t)
 	fixture := seedDuckDBSyncFixture(t, local)
-	syncer := newTestSync(t,
-		filepath.Join(t.TempDir(), "mirror.duckdb"),
-		local, SyncOptions{})
+	syncer := newInMemoryTestSync(t, local, SyncOptions{})
 
 	first, err := syncer.Push(ctx, true, nil)
 	require.NoError(t, err)
@@ -294,9 +316,7 @@ func TestSyncResetTargetForcesFullPushWhenWatermarkExists(t *testing.T) {
 	ctx := context.Background()
 	local := newLocalDB(t)
 	seedDuckDBSyncFixture(t, local)
-	syncer := newTestSync(t,
-		filepath.Join(t.TempDir(), "mirror.duckdb"),
-		local, SyncOptions{})
+	syncer := newInMemoryTestSync(t, local, SyncOptions{})
 
 	first, err := syncer.Push(ctx, true, nil)
 	require.NoError(t, err)
@@ -315,9 +335,7 @@ func TestSyncResetTargetIgnoresOtherMachineRows(t *testing.T) {
 	ctx := context.Background()
 	local := newLocalDB(t)
 	seedDuckDBSyncFixture(t, local)
-	syncer := newTestSync(t,
-		filepath.Join(t.TempDir(), "mirror.duckdb"),
-		local, SyncOptions{})
+	syncer := newInMemoryTestSync(t, local, SyncOptions{})
 	require.NoError(t, syncer.EnsureSchema(ctx))
 	insertOtherMachineDuckSession(t, syncer.DB())
 	require.NoError(t, local.SetSyncState(
@@ -337,9 +355,7 @@ func TestSyncFullPushRemovesHardDeletedSessions(t *testing.T) {
 	ctx := context.Background()
 	local := newLocalDB(t)
 	fixture := seedDuckDBSyncFixture(t, local)
-	syncer := newTestSync(t,
-		filepath.Join(t.TempDir(), "mirror.duckdb"),
-		local, SyncOptions{})
+	syncer := newInMemoryTestSync(t, local, SyncOptions{})
 
 	first, err := syncer.Push(ctx, true, nil)
 	require.NoError(t, err)
@@ -362,9 +378,7 @@ func TestSyncFullPushPreservesOtherMachineRows(t *testing.T) {
 	ctx := context.Background()
 	local := newLocalDB(t)
 	seedDuckDBSyncFixture(t, local)
-	syncer := newTestSync(t,
-		filepath.Join(t.TempDir(), "mirror.duckdb"),
-		local, SyncOptions{})
+	syncer := newInMemoryTestSync(t, local, SyncOptions{})
 
 	first, err := syncer.Push(ctx, true, nil)
 	require.NoError(t, err)
@@ -385,9 +399,7 @@ func TestSyncIncrementalPushRemovesHardDeletedSessions(t *testing.T) {
 	ctx := context.Background()
 	local := newLocalDB(t)
 	fixture := seedDuckDBSyncFixture(t, local)
-	syncer := newTestSync(t,
-		filepath.Join(t.TempDir(), "mirror.duckdb"),
-		local, SyncOptions{})
+	syncer := newInMemoryTestSync(t, local, SyncOptions{})
 
 	first, err := syncer.Push(ctx, true, nil)
 	require.NoError(t, err)
@@ -410,9 +422,7 @@ func TestSyncIncrementalUpdatesPinsWithoutSessionChange(t *testing.T) {
 	ctx := context.Background()
 	local := newLocalDB(t)
 	fixture := seedDuckDBSyncFixture(t, local)
-	syncer := newTestSync(t,
-		filepath.Join(t.TempDir(), "mirror.duckdb"),
-		local, SyncOptions{})
+	syncer := newInMemoryTestSync(t, local, SyncOptions{})
 
 	first, err := syncer.Push(ctx, true, nil)
 	require.NoError(t, err)
@@ -441,9 +451,7 @@ func TestClearSessionTablesRollsBackWithTransaction(t *testing.T) {
 	ctx := context.Background()
 	local := newLocalDB(t)
 	seedDuckDBSyncFixture(t, local)
-	syncer := newTestSync(t,
-		filepath.Join(t.TempDir(), "mirror.duckdb"),
-		local, SyncOptions{})
+	syncer := newInMemoryTestSync(t, local, SyncOptions{})
 
 	_, err := syncer.Push(ctx, true, nil)
 	require.NoError(t, err)
@@ -463,18 +471,14 @@ func TestSyncProjectFiltersMatchPushScope(t *testing.T) {
 	local := newLocalDB(t)
 	seedDuckDBSyncFixture(t, local)
 
-	include := newTestSync(t,
-		filepath.Join(t.TempDir(), "include.duckdb"),
-		local, SyncOptions{Projects: []string{"alpha"}})
+	include := newInMemoryTestSync(t, local, SyncOptions{Projects: []string{"alpha"}})
 	result, err := include.Push(ctx, true, nil)
 	require.NoError(t, err)
 	assert.Equal(t, 1, result.SessionsPushed)
 	assertDuckDBCount(t, include.DB(), "sessions", 1)
 	assertDuckDBCountWhere(t, include.DB(), "sessions", "project = ?", "alpha", 1)
 
-	exclude := newTestSync(t,
-		filepath.Join(t.TempDir(), "exclude.duckdb"),
-		local, SyncOptions{ExcludeProjects: []string{"alpha"}})
+	exclude := newInMemoryTestSync(t, local, SyncOptions{ExcludeProjects: []string{"alpha"}})
 	result, err = exclude.Push(ctx, true, nil)
 	require.NoError(t, err)
 	assert.Equal(t, 1, result.SessionsPushed)
@@ -522,9 +526,7 @@ func TestSyncFilteredFullPushKeepsNextFilteredPushIncremental(t *testing.T) {
 	ctx := context.Background()
 	local := newLocalDB(t)
 	seedDuckDBSyncFixture(t, local)
-	syncer := newTestSync(t,
-		filepath.Join(t.TempDir(), "filtered-incremental.duckdb"),
-		local, SyncOptions{Projects: []string{"alpha"}})
+	syncer := newInMemoryTestSync(t, local, SyncOptions{Projects: []string{"alpha"}})
 
 	first, err := syncer.Push(ctx, true, nil)
 	require.NoError(t, err)
@@ -578,9 +580,7 @@ func TestSyncFilteredIncrementalUpdatesPinsWithoutSessionChange(t *testing.T) {
 	ctx := context.Background()
 	local := newLocalDB(t)
 	fixture := seedDuckDBSyncFixture(t, local)
-	syncer := newTestSync(t,
-		filepath.Join(t.TempDir(), "filtered-pins.duckdb"),
-		local, SyncOptions{Projects: []string{"alpha"}})
+	syncer := newInMemoryTestSync(t, local, SyncOptions{Projects: []string{"alpha"}})
 
 	first, err := syncer.Push(ctx, true, nil)
 	require.NoError(t, err)
@@ -609,9 +609,7 @@ func TestSyncFilteredIncrementalRemovesHardDeletedSessions(t *testing.T) {
 	ctx := context.Background()
 	local := newLocalDB(t)
 	fixture := seedDuckDBSyncFixture(t, local)
-	syncer := newTestSync(t,
-		filepath.Join(t.TempDir(), "filtered-delete.duckdb"),
-		local, SyncOptions{Projects: []string{"alpha"}})
+	syncer := newInMemoryTestSync(t, local, SyncOptions{Projects: []string{"alpha"}})
 
 	first, err := syncer.Push(ctx, true, nil)
 	require.NoError(t, err)
@@ -660,9 +658,7 @@ func TestSyncStatusCountsDuckDBRows(t *testing.T) {
 	ctx := context.Background()
 	local := newLocalDB(t)
 	seedDuckDBSyncFixture(t, local)
-	syncer := newTestSync(t,
-		filepath.Join(t.TempDir(), "mirror.duckdb"),
-		local, SyncOptions{})
+	syncer := newInMemoryTestSync(t, local, SyncOptions{})
 
 	_, err := syncer.Push(ctx, true, nil)
 	require.NoError(t, err)
@@ -703,6 +699,11 @@ func newTestSync(
 	return syncer
 }
 
+func newInMemoryTestSync(t *testing.T, local *db.DB, opts SyncOptions) *Sync {
+	t.Helper()
+	return newTestSync(t, ":memory:", local, opts)
+}
+
 // TestDuckGetAnalyticsSkillsIgnoresCrossSessionDuplicateIDs guards the
 // skill join: DuckDB mirrors SQLite row IDs from many machines, so
 // messages.id is not globally unique. A tool call must join only to a
@@ -710,8 +711,7 @@ func newTestSync(
 func TestDuckGetAnalyticsSkillsIgnoresCrossSessionDuplicateIDs(t *testing.T) {
 	ctx := context.Background()
 	local := newLocalDB(t)
-	syncer := newTestSync(t,
-		filepath.Join(t.TempDir(), "mirror.duckdb"), local, SyncOptions{})
+	syncer := newInMemoryTestSync(t, local, SyncOptions{})
 	_, err := syncer.Push(ctx, true, nil)
 	require.NoError(t, err)
 	duck := syncer.DB()
@@ -986,9 +986,7 @@ func TestSyncResultDurationIsSet(t *testing.T) {
 	ctx := context.Background()
 	local := newLocalDB(t)
 	seedDuckDBSyncFixture(t, local)
-	syncer := newTestSync(t,
-		filepath.Join(t.TempDir(), "mirror.duckdb"),
-		local, SyncOptions{})
+	syncer := newInMemoryTestSync(t, local, SyncOptions{})
 
 	result, err := syncer.Push(ctx, true, nil)
 	require.NoError(t, err)

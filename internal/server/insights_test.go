@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -18,6 +19,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"go.kenn.io/agentsview/internal/config"
 	"go.kenn.io/agentsview/internal/db"
 	"go.kenn.io/agentsview/internal/insight"
 	"go.kenn.io/agentsview/internal/server"
@@ -40,6 +42,31 @@ func (f roundTripFunc) RoundTrip(
 	req *http.Request,
 ) (*http.Response, error) {
 	return f(req)
+}
+
+type readOnlyInsightPersistStore struct {
+	db.Store
+	insertCalls int
+}
+
+func fastInsightLogDrainTimeouts() server.Option {
+	return server.WithInsightLogDrainTimeouts(
+		50*time.Millisecond,
+		150*time.Millisecond,
+	)
+}
+
+func (s *readOnlyInsightPersistStore) ReadOnly() bool { return true }
+
+func (s *readOnlyInsightPersistStore) InsightGenerationAvailable() bool {
+	return true
+}
+
+func (s *readOnlyInsightPersistStore) InsertInsight(
+	insight db.Insight,
+) (int64, error) {
+	s.insertCalls++
+	return s.Store.InsertInsight(insight)
 }
 
 func newFailFirstWriteRecorder() *failFirstWriteRecorder {
@@ -70,95 +97,76 @@ func (f *failFirstWriteRecorder) Flush() {
 }
 
 func TestListInsights(t *testing.T) {
-	tests := []struct {
-		name       string
-		seed       func(t *testing.T, te *testEnv)
-		path       string
-		wantStatus int
-		wantCount  int
-		wantBody   string
-	}{
-		{
-			name:       "Empty",
-			seed:       func(t *testing.T, te *testEnv) {},
-			path:       "/api/v1/insights",
-			wantStatus: http.StatusOK,
-			wantCount:  0,
-		},
-		{
-			name: "WithData",
-			seed: func(t *testing.T, te *testEnv) {
-				te.seedInsight(t, "daily_activity", "2025-01-15", new("my-app"))
-				te.seedInsight(t, "daily_activity", "2025-01-15", new("other-app"))
-				te.seedInsight(t, "agent_analysis", "2025-01-15", nil)
-			},
-			path:       "/api/v1/insights",
-			wantStatus: http.StatusOK,
-			wantCount:  3,
-		},
-		{
-			name: "TypeFilter",
-			seed: func(t *testing.T, te *testEnv) {
-				te.seedInsight(t, "daily_activity", "2025-01-15", new("my-app"))
-				te.seedInsight(t, "agent_analysis", "2025-01-15", nil)
-			},
-			path:       "/api/v1/insights?type=daily_activity",
-			wantStatus: http.StatusOK,
-			wantCount:  1,
-		},
-		{
-			name: "ReturnsAll",
-			seed: func(t *testing.T, te *testEnv) {
-				te.seedInsight(t, "daily_activity", "2025-01-15", new("my-app"))
-				te.seedInsight(t, "daily_activity", "2025-01-16", new("my-app"))
-			},
-			path:       "/api/v1/insights",
-			wantStatus: http.StatusOK,
-			wantCount:  2,
-		},
-		{
-			name:       "InvalidType",
-			seed:       func(t *testing.T, te *testEnv) {},
-			path:       "/api/v1/insights?type=invalid",
-			wantStatus: http.StatusBadRequest,
-			wantBody:   "invalid type",
-		},
-		{
-			name:       "ReversedDateRange",
-			seed:       func(t *testing.T, te *testEnv) {},
-			path:       "/api/v1/insights?date_from=2026-06-17&date_to=2026-06-16",
-			wantStatus: http.StatusBadRequest,
-			wantBody:   "date_from must not be after date_to",
-		},
-		{
-			// A non-date value is rejected with 400 before the handler runs
-			// (huma's format:"date" query validation), so only the status is
-			// asserted; the body message is owned by the framework.
-			name:       "InvalidDateFrom",
-			seed:       func(t *testing.T, te *testEnv) {},
-			path:       "/api/v1/insights?date_from=not-a-date",
-			wantStatus: http.StatusBadRequest,
-		},
+	assertList := func(
+		t *testing.T,
+		te *testEnv,
+		path string,
+		wantStatus int,
+		wantCount int,
+		wantBody string,
+	) {
+		t.Helper()
+		w := te.get(t, path)
+		assertStatus(t, w, wantStatus)
+
+		if wantBody != "" {
+			assertBodyContains(t, w, wantBody)
+		}
+
+		if wantStatus == http.StatusOK {
+			r := decode[listInsightsResponse](t, w)
+			require.Len(t, r.Insights, wantCount)
+		}
 	}
 
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			te := setup(t)
-			tt.seed(t, te)
+	t.Run("Empty", func(t *testing.T) {
+		te := setup(t)
+		assertList(t, te, "/api/v1/insights", http.StatusOK, 0, "")
+	})
 
-			w := te.get(t, tt.path)
-			assertStatus(t, w, tt.wantStatus)
+	t.Run("FiltersAndInvalidRequests", func(t *testing.T) {
+		te := setup(t)
+		te.seedInsight(t, "daily_activity", "2025-01-15", new("my-app"))
+		te.seedInsight(t, "agent_analysis", "2025-01-15", nil)
 
-			if tt.wantBody != "" {
-				assertBodyContains(t, w, tt.wantBody)
-			}
-
-			if tt.wantStatus == http.StatusOK {
-				r := decode[listInsightsResponse](t, w)
-				require.Len(t, r.Insights, tt.wantCount)
-			}
+		t.Run("TypeFilter", func(t *testing.T) {
+			assertList(t, te, "/api/v1/insights?type=daily_activity",
+				http.StatusOK, 1, "")
 		})
-	}
+
+		te.seedInsight(t, "daily_activity", "2025-01-15", new("other-app"))
+		t.Run("WithData", func(t *testing.T) {
+			assertList(t, te, "/api/v1/insights", http.StatusOK, 3, "")
+		})
+
+		t.Run("InvalidType", func(t *testing.T) {
+			assertList(t, te, "/api/v1/insights?type=invalid",
+				http.StatusBadRequest, 0, "invalid type")
+		})
+
+		t.Run("ReversedDateRange", func(t *testing.T) {
+			assertList(t, te,
+				"/api/v1/insights?date_from=2026-06-17&date_to=2026-06-16",
+				http.StatusBadRequest, 0,
+				"date_from must not be after date_to")
+		})
+
+		t.Run("InvalidDateFrom", func(t *testing.T) {
+			// A non-date value is rejected with 400 before the handler
+			// runs (huma's format:"date" query validation), so only the
+			// status is asserted; the body message is owned by the
+			// framework.
+			assertList(t, te, "/api/v1/insights?date_from=not-a-date",
+				http.StatusBadRequest, 0, "")
+		})
+	})
+
+	t.Run("ReturnsAll", func(t *testing.T) {
+		te := setup(t)
+		te.seedInsight(t, "daily_activity", "2025-01-15", new("my-app"))
+		te.seedInsight(t, "daily_activity", "2025-01-16", new("my-app"))
+		assertList(t, te, "/api/v1/insights", http.StatusOK, 2, "")
+	})
 }
 
 func TestGetInsight_Found(t *testing.T) {
@@ -313,6 +321,8 @@ func TestInsightPublish(t *testing.T) {
 }
 
 func TestGenerateInsight_Validation(t *testing.T) {
+	te := setup(t)
+
 	tests := []struct {
 		name     string
 		payload  string
@@ -329,7 +339,6 @@ func TestGenerateInsight_Validation(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			te := setup(t)
 			w := te.post(t, "/api/v1/insights/generate", tt.payload)
 
 			assertStatus(t, w, http.StatusBadRequest)
@@ -356,6 +365,99 @@ func TestGenerateInsight_DefaultAgent(t *testing.T) {
 	assertStatus(t, w, http.StatusOK)
 	assertBodyContains(t, w, "event: error")
 	assertBodyContains(t, w, "stub: no CLI")
+}
+
+func TestGenerateInsight_PersistsWithReadOnlyStore(t *testing.T) {
+	dir := tempDirWithRetryCleanup(t)
+	dbPath := filepath.Join(dir, "test.db")
+	database, err := db.Open(dbPath)
+	require.NoError(t, err, "opening db")
+	t.Cleanup(func() { database.Close() })
+
+	store := &readOnlyInsightPersistStore{Store: database}
+	cfg := config.Config{
+		Host:         "127.0.0.1",
+		Port:         0,
+		DataDir:      dir,
+		DBPath:       dbPath,
+		WriteTimeout: 30 * time.Second,
+	}
+	srv := server.New(cfg, store, nil, server.WithGenerateFunc(func(
+		_ context.Context, agent, _ string,
+	) (insight.Result, error) {
+		assert.Equal(t, "claude", agent)
+		return insight.Result{
+			Agent:   "claude",
+			Content: "persisted from read-only wrapper",
+		}, nil
+	}))
+	te := &testEnv{
+		srv:         srv,
+		handler:     wrapTestHandler(cfg, srv.Handler()),
+		db:          database,
+		engine:      nil,
+		broadcaster: nil,
+		dataDir:     dir,
+	}
+
+	assert.True(t, store.ReadOnly())
+
+	w := te.post(t, "/api/v1/insights/generate",
+		`{"type":"daily_activity","date_from":"2025-01-15","date_to":"2025-01-15"}`)
+	assertStatus(t, w, http.StatusOK)
+
+	events := parseSSE(w.Body.String())
+	require.NotEmpty(t, events)
+	require.Equal(t, "done", events[len(events)-1].Event)
+	assert.Equal(t, 1, store.insertCalls)
+
+	var saved db.Insight
+	require.NoError(t, json.Unmarshal([]byte(events[len(events)-1].Data), &saved))
+	assert.Equal(t, "persisted from read-only wrapper", saved.Content)
+	assert.Equal(t, "claude", saved.Agent)
+
+	stored, err := database.GetInsight(context.Background(), saved.ID)
+	require.NoError(t, err, "GetInsight after generate")
+	require.NotNil(t, stored)
+	assert.Equal(t, saved.ID, stored.ID)
+	assert.Equal(t, saved.Content, stored.Content)
+}
+
+func TestGenerateInsight_StaysBlockedForReadOnlyStoreWithoutInsightWrites(t *testing.T) {
+	dir := tempDirWithRetryCleanup(t)
+	dbPath := filepath.Join(dir, "test.db")
+	database, err := db.Open(dbPath)
+	require.NoError(t, err, "opening db")
+	t.Cleanup(func() { database.Close() })
+
+	var called bool
+	cfg := config.Config{
+		Host:         "127.0.0.1",
+		Port:         0,
+		DataDir:      dir,
+		DBPath:       dbPath,
+		WriteTimeout: 30 * time.Second,
+	}
+	srv := server.New(cfg, readOnlyTestStore{Store: database}, nil, server.WithGenerateFunc(func(
+		_ context.Context, _ string, _ string,
+	) (insight.Result, error) {
+		called = true
+		return insight.Result{Agent: "claude", Content: "should not run"}, nil
+	}))
+	te := &testEnv{
+		srv:         srv,
+		handler:     wrapTestHandler(cfg, srv.Handler()),
+		db:          database,
+		engine:      nil,
+		broadcaster: nil,
+		dataDir:     dir,
+	}
+
+	w := te.post(t, "/api/v1/insights/generate",
+		`{"type":"daily_activity","date_from":"2025-01-15","date_to":"2025-01-15"}`)
+	assertStatus(t, w, http.StatusNotImplemented)
+	assertBodyContains(t, w, "read-only mode")
+	assert.False(t, called)
 }
 
 func TestGenerateCannedInsight_RequiresExplicitOptIn(t *testing.T) {
@@ -1447,6 +1549,7 @@ func TestGenerateInsight_LogDrainTimeoutReturnsWithoutHang(t *testing.T) {
 	}
 	te := setupWithServerOpts(t, []server.Option{
 		server.WithGenerateStreamFunc(stubGen),
+		fastInsightLogDrainTimeouts(),
 	})
 
 	req := httptest.NewRequest(
@@ -1458,7 +1561,7 @@ func TestGenerateInsight_LogDrainTimeoutReturnsWithoutHang(t *testing.T) {
 	req.Header.Set("Content-Type", "application/json")
 	w := &slowLogRecorder{
 		ResponseRecorder: httptest.NewRecorder(),
-		delay:            5 * time.Second,
+		delay:            75 * time.Millisecond,
 	}
 
 	started := time.Now()
@@ -1501,6 +1604,7 @@ func TestGenerateInsight_LogDrainTimeoutReportsBufferedDrops(t *testing.T) {
 	}
 	te := setupWithServerOpts(t, []server.Option{
 		server.WithGenerateStreamFunc(stubGen),
+		fastInsightLogDrainTimeouts(),
 	})
 
 	req := httptest.NewRequest(
@@ -1512,7 +1616,7 @@ func TestGenerateInsight_LogDrainTimeoutReportsBufferedDrops(t *testing.T) {
 	req.Header.Set("Content-Type", "application/json")
 	w := &firstLogDelayRecorder{
 		ResponseRecorder: httptest.NewRecorder(),
-		delay:            2200 * time.Millisecond,
+		delay:            75 * time.Millisecond,
 	}
 
 	done := make(chan struct{})
@@ -1579,6 +1683,7 @@ func TestGenerateInsight_LogDrainTimeoutBoundedWhenWriterStuck(t *testing.T) {
 	}
 	te := setupWithServerOpts(t, []server.Option{
 		server.WithGenerateStreamFunc(stubGen),
+		fastInsightLogDrainTimeouts(),
 	})
 
 	req := httptest.NewRequest(
@@ -1628,6 +1733,7 @@ func TestGenerateInsight_LogDrainTimeoutForceUnblocksAndNoPostReturnWrites(t *te
 	}
 	te := setupWithServerOpts(t, []server.Option{
 		server.WithGenerateStreamFunc(stubGen),
+		fastInsightLogDrainTimeouts(),
 	})
 
 	req := httptest.NewRequest(
