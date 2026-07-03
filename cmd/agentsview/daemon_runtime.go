@@ -13,6 +13,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/gofrs/flock"
@@ -23,7 +24,7 @@ import (
 
 const (
 	daemonService          = "agentsview"
-	daemonAPIVersion       = 1
+	daemonAPIVersion       = 2
 	runtimeReadOnly        = "read_only"
 	runtimeHost            = "host"
 	runtimePort            = "port"
@@ -34,8 +35,14 @@ const (
 	runtimeCreateTime      = "create_time"
 	runtimeCaddyPID        = "caddy_pid"
 	runtimeCaddyCreateTime = "caddy_create_time"
-	startProbeTick         = 250 * time.Millisecond
+	defaultStartProbeTick  = 250 * time.Millisecond
 )
+
+var startProbeTickNanos int64 = int64(defaultStartProbeTick)
+
+func startProbeTick() time.Duration {
+	return time.Duration(atomic.LoadInt64(&startProbeTickNanos))
+}
 
 // DaemonRuntime is the agentsview-specific view of a kit daemon runtime record.
 type DaemonRuntime struct {
@@ -550,6 +557,13 @@ type heldStartLock struct {
 
 var startLocks sync.Map
 
+// startLockMu makes "this process holds the start flock" and "the lock is
+// registered in startLocks" a single atomic state for same-process observers.
+// Without it, a probe running between markDaemonStarting's flock acquire and
+// its startLocks registration sees the lock held with no registration and
+// misreports a same-process startup as an external daemon.
+var startLockMu sync.Mutex
+
 // markDaemonStarting acquires the kit daemon start lock for this data dir while
 // the server is starting. owned reports whether this process now owns the
 // marker; acquired reports whether this call acquired it.
@@ -558,6 +572,8 @@ func markDaemonStarting(dataDir string) (owned bool, acquired bool) {
 	if err != nil {
 		return false, false
 	}
+	startLockMu.Lock()
+	defer startLockMu.Unlock()
 	if _, ok := startLocks.Load(path); ok {
 		return true, false
 	}
@@ -566,11 +582,7 @@ func markDaemonStarting(dataDir string) (owned bool, acquired bool) {
 	if err != nil || !locked {
 		return false, false
 	}
-	held := heldStartLock{path: path, lock: lock}
-	if _, loaded := startLocks.LoadOrStore(path, held); loaded {
-		_ = lock.Unlock()
-		return true, false
-	}
+	startLocks.Store(path, heldStartLock{path: path, lock: lock})
 	return true, true
 }
 
@@ -587,6 +599,8 @@ func UnmarkDaemonStarting(dataDir string) {
 	if err != nil {
 		return
 	}
+	startLockMu.Lock()
+	defer startLockMu.Unlock()
 	value, ok := startLocks.LoadAndDelete(path)
 	if !ok {
 		return
@@ -600,6 +614,8 @@ func isDaemonStarting(dataDir string) bool {
 	if err != nil {
 		return false
 	}
+	startLockMu.Lock()
+	defer startLockMu.Unlock()
 	if _, ok := startLocks.Load(path); ok {
 		return true
 	}
@@ -620,13 +636,18 @@ func isExternalDaemonStarting(dataDir string) bool {
 	if err != nil {
 		return false
 	}
+	startLockMu.Lock()
+	defer startLockMu.Unlock()
 	if _, ok := startLocks.Load(path); ok {
 		return false
 	}
 	lock := flock.New(path)
 	locked, err := lock.TryLock()
 	if err != nil {
-		return false
+		// On Windows, probing a lock held by a helper process can report an
+		// error instead of a clean locked=false result. Treat uncertainty as
+		// active startup so replacement does not stop the incumbent daemon.
+		return true
 	}
 	if locked {
 		_ = lock.Unlock()
@@ -706,7 +727,8 @@ func WaitForDaemonStartupContext(
 		if !IsDaemonStarting(dataDir) {
 			return false
 		}
-		timer := time.NewTimer(startProbeTick)
+		wait := min(time.Until(deadline), startProbeTick())
+		timer := time.NewTimer(wait)
 		select {
 		case <-ctx.Done():
 			timer.Stop()

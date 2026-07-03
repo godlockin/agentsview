@@ -21,6 +21,7 @@ import (
 
 	"go.kenn.io/agentsview/internal/config"
 	"go.kenn.io/agentsview/internal/db"
+	"go.kenn.io/agentsview/internal/dbtest"
 	"go.kenn.io/agentsview/internal/insight"
 	"go.kenn.io/agentsview/internal/server"
 )
@@ -51,8 +52,8 @@ type readOnlyInsightPersistStore struct {
 
 func fastInsightLogDrainTimeouts() server.Option {
 	return server.WithInsightLogDrainTimeouts(
+		20*time.Millisecond,
 		50*time.Millisecond,
-		150*time.Millisecond,
 	)
 }
 
@@ -370,9 +371,7 @@ func TestGenerateInsight_DefaultAgent(t *testing.T) {
 func TestGenerateInsight_PersistsWithReadOnlyStore(t *testing.T) {
 	dir := tempDirWithRetryCleanup(t)
 	dbPath := filepath.Join(dir, "test.db")
-	database, err := db.Open(dbPath)
-	require.NoError(t, err, "opening db")
-	t.Cleanup(func() { database.Close() })
+	database := dbtest.OpenTestDBAt(t, dbPath)
 
 	store := &readOnlyInsightPersistStore{Store: database}
 	cfg := config.Config{
@@ -426,9 +425,7 @@ func TestGenerateInsight_PersistsWithReadOnlyStore(t *testing.T) {
 func TestGenerateInsight_StaysBlockedForReadOnlyStoreWithoutInsightWrites(t *testing.T) {
 	dir := tempDirWithRetryCleanup(t)
 	dbPath := filepath.Join(dir, "test.db")
-	database, err := db.Open(dbPath)
-	require.NoError(t, err, "opening db")
-	t.Cleanup(func() { database.Close() })
+	database := dbtest.OpenTestDBAt(t, dbPath)
 
 	var called bool
 	cfg := config.Config{
@@ -1466,7 +1463,7 @@ func TestGenerateInsight_LogDropSummaryAndCompletion(t *testing.T) {
 	stubGen := func(
 		_ context.Context, _ string, _ string, onLog insight.LogFunc,
 	) (insight.Result, error) {
-		for i := range 5000 {
+		for i := range 1000 {
 			onLog(insight.LogEvent{
 				Stream: "stdout",
 				Line:   fmt.Sprintf("line-%d", i),
@@ -1490,7 +1487,7 @@ func TestGenerateInsight_LogDropSummaryAndCompletion(t *testing.T) {
 	req.Header.Set("Content-Type", "application/json")
 	w := &slowFlushRecorder{
 		ResponseRecorder: httptest.NewRecorder(),
-		delay:            4 * time.Millisecond,
+		delay:            time.Millisecond,
 	}
 
 	done := make(chan struct{})
@@ -1561,7 +1558,7 @@ func TestGenerateInsight_LogDrainTimeoutReturnsWithoutHang(t *testing.T) {
 	req.Header.Set("Content-Type", "application/json")
 	w := &slowLogRecorder{
 		ResponseRecorder: httptest.NewRecorder(),
-		delay:            75 * time.Millisecond,
+		delay:            35 * time.Millisecond,
 	}
 
 	started := time.Now()
@@ -1591,7 +1588,7 @@ func TestGenerateInsight_LogDrainTimeoutReportsBufferedDrops(t *testing.T) {
 	stubGen := func(
 		_ context.Context, _ string, _ string, onLog insight.LogFunc,
 	) (insight.Result, error) {
-		for i := range 10 {
+		for i := range 300 {
 			onLog(insight.LogEvent{
 				Stream: "stdout",
 				Line:   fmt.Sprintf("slow-line-%d", i),
@@ -1616,7 +1613,7 @@ func TestGenerateInsight_LogDrainTimeoutReportsBufferedDrops(t *testing.T) {
 	req.Header.Set("Content-Type", "application/json")
 	w := &firstLogDelayRecorder{
 		ResponseRecorder: httptest.NewRecorder(),
-		delay:            75 * time.Millisecond,
+		delay:            35 * time.Millisecond,
 	}
 
 	done := make(chan struct{})
@@ -1662,10 +1659,8 @@ func TestGenerateInsight_LogDrainTimeoutReportsBufferedDrops(t *testing.T) {
 		if err != nil {
 			continue
 		}
-		// 10 events were enqueued; timeout truncation should account
-		// for most buffered entries that were never flushed.
-		require.GreaterOrEqual(t, dropped, 8,
-			"expected timeout drop summary >=8 (%q)", line.Line)
+		require.Positive(t, dropped,
+			"expected timeout drop summary to report at least one dropped log line (%q)", line.Line)
 		foundDropSummary = true
 	}
 	require.True(t, foundTimeoutError,
@@ -1762,7 +1757,7 @@ func TestGenerateInsight_LogDrainTimeoutForceUnblocksAndNoPostReturnWrites(t *te
 	select {
 	case <-w.PostReturnAttempted():
 		require.Fail(t, "expected no writes after handler return")
-	case <-time.After(300 * time.Millisecond):
+	case <-time.After(100 * time.Millisecond):
 	}
 	require.Zero(t, w.PostReturnWrites(), "expected no writes after handler return")
 

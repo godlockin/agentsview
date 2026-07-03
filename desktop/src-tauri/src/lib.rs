@@ -27,16 +27,19 @@ use tauri_plugin_updater::UpdaterExt;
 
 const HOST: &str = "127.0.0.1";
 const READY_TIMEOUT: Duration = Duration::from_secs(30);
-const DAEMON_STARTUP_TIMEOUT: Duration = Duration::from_secs(300);
+const DAEMON_STARTUP_LONG_NOTICE_AFTER: Duration = Duration::from_secs(300);
+const DAEMON_UNHEALTHY_GRACE: Duration = Duration::from_secs(15);
 const READY_POLL_INTERVAL: Duration = Duration::from_millis(125);
 const STATUS_POLL_MAX_INTERVAL: Duration = Duration::from_secs(1);
 const STATUS_PROBE_TIMEOUT: Duration = Duration::from_millis(1250);
 const STATUS_PROBE_FAILURE_NOTICE_AFTER: u32 = 10;
+const STATUS_PROBE_FAILURE_FAIL_AFTER: u32 = 30;
 const LOGIN_SHELL_ENV_TIMEOUT: Duration = Duration::from_secs(3);
 const UPDATE_SIDECAR_STOP_TIMEOUT: Duration = Duration::from_secs(10);
 const DATA_VERSION_TOO_NEW_EXIT_CODE: i32 = 3;
 const DESKTOP_LOG_FILE_NAME: &str = "agentsview-desktop.log";
 const DESKTOP_LOG_QUEUE_CAPACITY: usize = 64;
+const STARTUP_OUTPUT_MAX_CHARS: usize = 12_000;
 const OPEN_LOGS_FOLDER_MENU_ID: &str = "open_logs_folder";
 // Delay after navigating to the backend before probing whether the
 // Linux WebKitGTK web content process is actually alive. Gives the
@@ -89,6 +92,18 @@ struct SidecarStdoutUpdate {
     port: Option<u16>,
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum BackendStatusProbe {
+    Ready(u16),
+    Starting(String),
+    Unhealthy(String),
+    NotRunning(String),
+    Incompatible(String),
+    ReadOnly(String),
+    Unusable(String),
+    Unavailable,
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     // WebKitGTK 2.40+ DMABUF renderer aborts on some Linux EGL
@@ -117,11 +132,23 @@ pub fn run() {
         .plugin(init_navigation_guard_plugin())
         .manage(SidecarState::default())
         .setup(|app| {
-            setup_menu(app)?;
+            if let Err(err) = setup_menu(app) {
+                eprintln!("[agentsview] failed to set up desktop menu: {err}");
+            }
             match tauri::async_runtime::block_on(run_data_version_preflight(app.handle())) {
                 Ok(()) => {
-                    launch_backend(app)?;
-                    schedule_auto_update_check(app.handle().clone());
+                    if let Err(err) = launch_backend(app) {
+                        eprintln!("[agentsview] backend launch failed: {err}");
+                        let window = main_window(app)?;
+                        spawn_startup_error_render(
+                            window,
+                            "AgentsView could not start",
+                            "The local backend failed to launch.",
+                            err.to_string().as_str(),
+                        );
+                    } else {
+                        schedule_auto_update_check(app.handle().clone());
+                    }
                 }
                 Err(DataVersionPreflightError::TooNew(message)) => {
                     eprintln!("[agentsview] data version preflight rejected archive: {message}");
@@ -139,14 +166,11 @@ pub fn run() {
                 }
                 Err(DataVersionPreflightError::Failed(message)) => {
                     let window = main_window(app)?;
-                    spawn_preflight_error_render(
+                    spawn_startup_error_render(
                         window,
                         "AgentsView could not verify the archive",
-                        format!(
-                            "Database compatibility check failed: {message}. The backend was not started."
-                        )
-                        .as_str(),
-                        "Close and reopen AgentsView after fixing the issue.",
+                        "The database compatibility check failed, so the backend was not started.",
+                        message.as_str(),
                     );
                 }
             }
@@ -963,14 +987,17 @@ fn wait_for_sidecar_termination(state: &SidecarState, generation: u64, timeout: 
 fn forward_sidecar_logs(mut rx: CommandRx, window: WebviewWindow, generation: u64) {
     let startup_handled = Arc::new(AtomicBool::new(false));
     let first_output = Arc::new(AtomicBool::new(false));
+    let startup_output = Arc::new(Mutex::new(String::new()));
     let log_sender = spawn_sidecar_log_writer(window.app_handle().clone());
     let timeout_window = window.clone();
     let timeout_state = startup_handled.clone();
     thread::spawn(move || {
         thread::sleep(READY_TIMEOUT);
         if !timeout_state.load(Ordering::SeqCst) {
-            let _ = timeout_window
-                .eval("window.__setStatus('AgentsView backend did not become ready in time.');");
+            let _ = timeout_window.eval(
+                "window.__setStatus(\
+                 'AgentsView backend is still starting. Large migrations or initial syncs can take several minutes.');",
+            );
         }
     });
 
@@ -988,6 +1015,11 @@ fn forward_sidecar_logs(mut rx: CommandRx, window: WebviewWindow, generation: u6
                         &chunk_bytes,
                     );
                     emit_redacted_sidecar_stdout_chunk(stdout_update.redacted_chunk.as_str());
+                    push_startup_output(
+                        &startup_output,
+                        "stdout",
+                        stdout_update.redacted_chunk.as_str(),
+                    );
                     if !startup_handled.load(Ordering::SeqCst) {
                         if !first_output.swap(true, Ordering::SeqCst) {
                             let _ = window.eval(
@@ -1012,36 +1044,42 @@ fn forward_sidecar_logs(mut rx: CommandRx, window: WebviewWindow, generation: u6
                     }
                 }
                 CommandEvent::Stderr(line_bytes) => {
-                    emit_redacted_sidecar_stderr_chunk(
-                        queue_redacted_sidecar_chunk(
-                            &log_sender,
-                            "stderr",
-                            &mut stderr_log_buffer,
-                            String::from_utf8_lossy(&line_bytes).as_ref(),
-                        )
-                        .as_str(),
+                    let redacted_stderr = queue_redacted_sidecar_chunk(
+                        &log_sender,
+                        "stderr",
+                        &mut stderr_log_buffer,
+                        String::from_utf8_lossy(&line_bytes).as_ref(),
                     );
+                    emit_redacted_sidecar_stderr_chunk(redacted_stderr.as_str());
+                    push_startup_output(&startup_output, "stderr", redacted_stderr.as_str());
                 }
                 CommandEvent::Terminated(payload) => {
-                    emit_redacted_sidecar_stdout_chunk(
-                        flush_pending_sidecar_log_record(
-                            &log_sender,
-                            "stdout",
-                            &mut stdout_log_buffer,
-                        )
-                        .as_str(),
+                    let flushed_stdout = flush_pending_sidecar_log_record(
+                        &log_sender,
+                        "stdout",
+                        &mut stdout_log_buffer,
                     );
-                    emit_redacted_sidecar_stderr_chunk(
-                        flush_pending_sidecar_log_record(
-                            &log_sender,
-                            "stderr",
-                            &mut stderr_log_buffer,
-                        )
-                        .as_str(),
+                    emit_redacted_sidecar_stdout_chunk(flushed_stdout.as_str());
+                    push_startup_output(&startup_output, "stdout", flushed_stdout.as_str());
+                    let flushed_stderr = flush_pending_sidecar_log_record(
+                        &log_sender,
+                        "stderr",
+                        &mut stderr_log_buffer,
                     );
+                    emit_redacted_sidecar_stderr_chunk(flushed_stderr.as_str());
+                    push_startup_output(&startup_output, "stderr", flushed_stderr.as_str());
                     queue_sidecar_event_log_record(
                         &log_sender,
                         &CommandEvent::Terminated(payload.clone()),
+                    );
+                    push_startup_output(
+                        &startup_output,
+                        "terminated",
+                        format!(
+                            "sidecar terminated (code: {:?}, signal: {:?})",
+                            payload.code, payload.signal
+                        )
+                        .as_str(),
                     );
                     eprintln!(
                         "[agentsview] sidecar terminated (code: {:?}, signal: {:?})",
@@ -1064,9 +1102,15 @@ fn forward_sidecar_logs(mut rx: CommandRx, window: WebviewWindow, generation: u6
                         break;
                     }
                     if handle_sidecar_terminated(&state, startup_handled.as_ref(), generation) {
-                        let _ = window.eval(
-                            "window.__setStatus(\
-                             'AgentsView backend exited before startup completed.');",
+                        spawn_startup_error_render(
+                            window.clone(),
+                            "AgentsView backend failed",
+                            "The local backend exited before startup completed.",
+                            startup_failure_detail(
+                                "The sidecar process ended before it reported a ready backend.",
+                                recent_startup_output(&startup_output).as_str(),
+                            )
+                            .as_str(),
                         );
                     }
                     let restart_after_stop_timeout =
@@ -1078,19 +1122,37 @@ fn forward_sidecar_logs(mut rx: CommandRx, window: WebviewWindow, generation: u6
                 }
                 CommandEvent::Error(err) => {
                     queue_sidecar_event_log_record(&log_sender, &CommandEvent::Error(err.clone()));
+                    let redacted = redact_sidecar_log_line(err.as_str());
+                    push_startup_output(
+                        &startup_output,
+                        "error",
+                        format!("sidecar command error: {redacted}").as_str(),
+                    );
                     eprintln!("[agentsview:error] {err}");
+                    if !startup_handled.swap(true, Ordering::SeqCst) {
+                        spawn_startup_error_render(
+                            window.clone(),
+                            "AgentsView backend failed",
+                            "The desktop wrapper received an error from the backend process.",
+                            startup_failure_detail(
+                                redacted.as_str(),
+                                recent_startup_output(&startup_output).as_str(),
+                            )
+                            .as_str(),
+                        );
+                    }
                 }
                 _ => {}
             }
         }
-        emit_redacted_sidecar_stdout_chunk(
-            flush_pending_sidecar_log_record(&log_sender, "stdout", &mut stdout_log_buffer)
-                .as_str(),
-        );
-        emit_redacted_sidecar_stderr_chunk(
-            flush_pending_sidecar_log_record(&log_sender, "stderr", &mut stderr_log_buffer)
-                .as_str(),
-        );
+        let flushed_stdout =
+            flush_pending_sidecar_log_record(&log_sender, "stdout", &mut stdout_log_buffer);
+        emit_redacted_sidecar_stdout_chunk(flushed_stdout.as_str());
+        push_startup_output(&startup_output, "stdout", flushed_stdout.as_str());
+        let flushed_stderr =
+            flush_pending_sidecar_log_record(&log_sender, "stderr", &mut stderr_log_buffer);
+        emit_redacted_sidecar_stderr_chunk(flushed_stderr.as_str());
+        push_startup_output(&startup_output, "stderr", flushed_stderr.as_str());
     });
 }
 
@@ -1103,6 +1165,65 @@ fn main_window_from_handle(handle: &AppHandle) -> Result<WebviewWindow, DynError
     handle
         .get_webview_window("main")
         .ok_or_else(|| io::Error::other("missing main window").into())
+}
+
+fn spawn_startup_error_render(window: WebviewWindow, title: &str, message: &str, detail: &str) {
+    let title = title.to_string();
+    let message = message.to_string();
+    let detail = detail.to_string();
+    let footer = startup_failure_footer(window.app_handle());
+    thread::spawn(move || {
+        let script = startup_error_script(
+            title.as_str(),
+            message.as_str(),
+            detail.as_str(),
+            footer.as_str(),
+        );
+        let deadline = Instant::now() + READY_TIMEOUT;
+        while Instant::now() < deadline {
+            if window.eval(script.as_str()).is_ok() {
+                return;
+            }
+            thread::sleep(READY_POLL_INTERVAL);
+        }
+        eprintln!("[agentsview] timed out waiting to render startup error");
+    });
+}
+
+fn startup_error_script(title: &str, message: &str, detail: &str, footer: &str) -> String {
+    let title = js_string_literal(title);
+    let message = js_string_literal(message);
+    let detail = js_string_literal(detail);
+    let footer = js_string_literal(footer);
+    let retry_ms = READY_POLL_INTERVAL.as_millis();
+    format!(
+        "(function renderStartupError() {{\
+            var h = document.querySelector('h1');\
+            var status = document.getElementById('status');\
+            if (!h || !status) {{\
+                window.setTimeout(renderStartupError, {retry_ms});\
+                return;\
+            }}\
+            var shell = document.querySelector('.shell');\
+            if (shell) shell.setAttribute('role', 'alert');\
+            if (h) h.textContent = {title};\
+            if (status) status.textContent = {message};\
+            var detail = document.getElementById('startup-error-detail');\
+            if (!detail) {{\
+                detail = document.createElement('pre');\
+                detail.id = 'startup-error-detail';\
+                status.insertAdjacentElement('afterend', detail);\
+            }}\
+            detail.textContent = {detail};\
+            detail.style.cssText = 'margin:14px 0 0;padding:12px;border:1px solid #f0b8b8;border-radius:8px;background:#fff7f7;color:#5f1f1f;font:12px/1.45 Consolas,Menlo,monospace;white-space:pre-wrap;max-height:280px;overflow:auto;';\
+            var meter = document.querySelector('.meter');\
+            if (meter) meter.style.display = 'none';\
+            var stages = document.querySelector('.stage-list');\
+            if (stages) stages.style.display = 'none';\
+            var foot = document.querySelector('.foot');\
+            if (foot) foot.textContent = {footer};\
+        }})()"
+    )
 }
 
 fn spawn_preflight_error_render(window: WebviewWindow, title: &str, message: &str, footer: &str) {
@@ -1159,6 +1280,75 @@ fn too_new_archive_footer_message() -> &'static str {
 
 fn js_string_literal(value: &str) -> String {
     serde_json::to_string(value).unwrap_or_else(|_| "\"\"".to_string())
+}
+
+fn startup_failure_footer(handle: &AppHandle) -> String {
+    match desktop_log_file_path(handle) {
+        Ok(path) => format!(
+            "Attach this desktop log when reporting the failure: {}. If the details mention serve.log, attach that file too.",
+            path.display()
+        ),
+        Err(_) => {
+            "Use File > Open Logs Folder and attach agentsview-desktop.log when reporting this. If the details mention serve.log, attach that file too."
+                .to_string()
+        }
+    }
+}
+
+fn startup_failure_detail(summary: &str, recent_output: &str) -> String {
+    let recent_output = recent_output.trim();
+    if recent_output.is_empty() {
+        return format!("{summary}\n\nNo backend output was captured before startup stopped.");
+    }
+    format!("{summary}\n\nRecent backend output:\n{recent_output}")
+}
+
+fn push_startup_output(buffer: &Arc<Mutex<String>>, label: &str, chunk: &str) {
+    let chunk = chunk.trim();
+    if chunk.is_empty() {
+        return;
+    }
+    let Ok(mut guard) = buffer.lock() else {
+        return;
+    };
+    if !guard.is_empty() {
+        guard.push('\n');
+    }
+    guard.push('[');
+    guard.push_str(label);
+    guard.push_str("] ");
+    guard.push_str(chunk);
+    trim_startup_output(&mut guard);
+}
+
+fn recent_startup_output(buffer: &Arc<Mutex<String>>) -> String {
+    buffer
+        .lock()
+        .map(|guard| guard.trim().to_string())
+        .unwrap_or_default()
+}
+
+fn trim_startup_output(output: &mut String) {
+    if output.len() <= STARTUP_OUTPUT_MAX_CHARS {
+        return;
+    }
+    let target = output.len() - STARTUP_OUTPUT_MAX_CHARS;
+    let mut drain_to = output.len();
+    for (idx, ch) in output.char_indices() {
+        if ch == '\n' && idx + ch.len_utf8() >= target {
+            drain_to = idx + ch.len_utf8();
+            break;
+        }
+        if idx >= target {
+            drain_to = idx;
+            break;
+        }
+    }
+    output.drain(..drain_to);
+    let prefix = "[earlier startup output truncated]\n";
+    if !output.starts_with(prefix) {
+        output.insert_str(0, prefix);
+    }
 }
 
 fn desktop_redirect_url(port: u16) -> String {
@@ -1231,9 +1421,11 @@ fn redirect_when_ready(window: WebviewWindow, port: u16) {
             return;
         }
 
-        let _ = window.eval(
-            "document.getElementById('status').textContent = \
-             'AgentsView backend did not start within 30 seconds.';",
+        spawn_startup_error_render(
+            window,
+            "AgentsView interface did not respond",
+            "The backend reported a port, but the desktop window could not connect to it.",
+            format!("Backend URL: {target_url}").as_str(),
         );
     });
 }
@@ -1245,39 +1437,146 @@ fn poll_background_status_after_launcher_exit(window: WebviewWindow, generation:
         .background_status_poll_generation
         .store(generation, Ordering::SeqCst);
     tauri::async_runtime::spawn(async move {
-        let deadline = Instant::now() + DAEMON_STARTUP_TIMEOUT;
+        let started = Instant::now();
         let mut failed_status_probes = 0;
-        while Instant::now() < deadline {
+        let mut status_poll_backoff_attempts = 0;
+        let mut long_startup_notice_shown = false;
+        let mut unhealthy_since: Option<Instant> = None;
+        loop {
             if !background_status_poll_is_current(&handle, generation) {
                 return;
             }
-            if let Some(port) = probe_backend_status(&handle).await {
-                if !background_status_poll_is_current(&handle, generation) {
+            let status = probe_backend_status(&handle).await;
+            status_poll_backoff_attempts =
+                next_background_status_poll_attempts(&status, status_poll_backoff_attempts);
+            match status {
+                BackendStatusProbe::Ready(port) => {
+                    if !background_status_poll_is_current(&handle, generation) {
+                        return;
+                    }
+                    save_sidecar_port(&handle, port);
+                    let _ = window.eval(
+                        "window.__setStage(2); \
+                         window.__setStatus('Connecting to interface...');",
+                    );
+                    redirect_when_ready(window.clone(), port);
                     return;
                 }
-                save_sidecar_port(&handle, port);
-                let _ = window.eval(
-                    "window.__setStage(2); \
-                     window.__setStatus('Connecting to interface...');",
-                );
-                redirect_when_ready(window.clone(), port);
-                return;
+                BackendStatusProbe::Starting(status) => {
+                    failed_status_probes = 0;
+                    unhealthy_since = None;
+                    if !long_startup_notice_shown && !status.trim().is_empty() {
+                        let escaped = status.replace('\\', "\\\\").replace('\'', "\\'");
+                        let _ = window.eval(format!("window.__setStatus('{escaped}');").as_str());
+                    }
+                }
+                BackendStatusProbe::Unhealthy(status) => {
+                    failed_status_probes = 0;
+                    let first_seen = unhealthy_since.get_or_insert_with(Instant::now);
+                    if first_seen.elapsed() >= DAEMON_UNHEALTHY_GRACE {
+                        spawn_startup_error_render(
+                            window,
+                            "AgentsView backend is not responding",
+                            "A backend process is running, but it is not answering health checks.",
+                            startup_failure_detail(
+                                "The daemon runtime record points to a live process, but repeated health checks did not get a usable response.",
+                                status.as_str(),
+                            )
+                            .as_str(),
+                        );
+                        return;
+                    }
+                    let _ = window.eval(
+                        "window.__setStatus(\
+                         'AgentsView found a backend process, but health checks are not responding yet.');",
+                    );
+                }
+                BackendStatusProbe::NotRunning(status) => {
+                    spawn_startup_error_render(
+                        window,
+                        "AgentsView backend stopped",
+                        "The background launcher exited, and no AgentsView server is running.",
+                        startup_failure_detail(
+                            "The background backend disappeared before it became ready.",
+                            status.as_str(),
+                        )
+                        .as_str(),
+                    );
+                    return;
+                }
+                BackendStatusProbe::Incompatible(status) => {
+                    spawn_startup_error_render(
+                        window,
+                        "AgentsView backend is incompatible",
+                        "AgentsView found a running backend that this desktop app cannot use.",
+                        status.as_str(),
+                    );
+                    return;
+                }
+                BackendStatusProbe::ReadOnly(status) => {
+                    spawn_startup_error_render(
+                        window,
+                        "AgentsView backend is read-only",
+                        "AgentsView Desktop needs a writable local backend to sync and migrate the archive.",
+                        startup_failure_detail(
+                            "A read-only backend is running for this archive, but desktop startup requires a writable daemon.",
+                            status.as_str(),
+                        )
+                        .as_str(),
+                    );
+                    return;
+                }
+                BackendStatusProbe::Unusable(status) => {
+                    spawn_startup_error_render(
+                        window,
+                        "AgentsView backend status is unusable",
+                        "The background launcher exited, but the backend did not report a usable writable server.",
+                        startup_failure_detail(
+                            "The status command returned output that is not a ready writable daemon or an active startup lock.",
+                            status.as_str(),
+                        )
+                        .as_str(),
+                    );
+                    return;
+                }
+                BackendStatusProbe::Unavailable => {
+                    failed_status_probes += 1;
+                    if status_probe_failures_should_stop(failed_status_probes) {
+                        spawn_startup_error_render(
+                            window,
+                            "AgentsView backend status is unavailable",
+                            "The background launcher exited, but the desktop app could not confirm backend status.",
+                            startup_failure_detail(
+                                format!(
+                                    "`agentsview serve status` failed, timed out, or returned no usable output after {failed_status_probes} attempts."
+                                )
+                                .as_str(),
+                                "",
+                            )
+                            .as_str(),
+                        );
+                        return;
+                    }
+                    if failed_status_probes == STATUS_PROBE_FAILURE_NOTICE_AFTER {
+                        let _ = window.eval(
+                            "window.__setStatus(\
+                             'Waiting for background daemon status. Check serve.log if this persists.');",
+                        );
+                    }
+                }
             }
-            failed_status_probes += 1;
-            if failed_status_probes == STATUS_PROBE_FAILURE_NOTICE_AFTER {
+            if !long_startup_notice_shown && started.elapsed() >= DAEMON_STARTUP_LONG_NOTICE_AFTER {
+                long_startup_notice_shown = true;
                 let _ = window.eval(
                     "window.__setStatus(\
-                     'Waiting for background daemon status. Check serve.log if this persists.');",
+                     'AgentsView is still preparing the local archive. Large migrations or full resyncs can take many minutes.');",
                 );
             }
-            tokio::time::sleep(background_status_poll_interval(failed_status_probes)).await;
+            tokio::time::sleep(background_status_poll_interval(
+                status_poll_backoff_attempts,
+            ))
+            .await;
         }
-        if !background_status_poll_is_current(&handle, generation) {
-            return;
-        }
-        let _ = window.eval(
-            "window.__setStatus('AgentsView backend did not become ready after several minutes.');",
-        );
     });
 }
 
@@ -1289,8 +1588,8 @@ fn background_status_poll_is_current(handle: &AppHandle, generation: u64) -> boo
         == generation
 }
 
-fn background_status_poll_interval(failed_status_probes: u32) -> Duration {
-    let multiplier = match failed_status_probes {
+fn background_status_poll_interval(backoff_attempts: u32) -> Duration {
+    let multiplier = match backoff_attempts {
         0..=8 => 1,
         9..=16 => 2,
         17..=24 => 4,
@@ -1301,21 +1600,49 @@ fn background_status_poll_interval(failed_status_probes: u32) -> Duration {
         .min(STATUS_POLL_MAX_INTERVAL)
 }
 
-async fn probe_backend_status(handle: &AppHandle) -> Option<u16> {
-    let mut command = handle.shell().sidecar("agentsview").ok()?;
+fn next_background_status_poll_attempts(status: &BackendStatusProbe, current: u32) -> u32 {
+    match status {
+        BackendStatusProbe::Starting(_)
+        | BackendStatusProbe::Unhealthy(_)
+        | BackendStatusProbe::Unavailable => current.saturating_add(1),
+        BackendStatusProbe::Ready(_)
+        | BackendStatusProbe::NotRunning(_)
+        | BackendStatusProbe::Incompatible(_)
+        | BackendStatusProbe::ReadOnly(_)
+        | BackendStatusProbe::Unusable(_) => current,
+    }
+}
+
+fn status_probe_failures_should_stop(failed_status_probes: u32) -> bool {
+    failed_status_probes >= STATUS_PROBE_FAILURE_FAIL_AFTER
+}
+
+async fn probe_backend_status(handle: &AppHandle) -> BackendStatusProbe {
+    let Ok(mut command) = handle.shell().sidecar("agentsview") else {
+        return BackendStatusProbe::Unavailable;
+    };
     for (key, value) in sidecar_env() {
         command = command.env(key, value);
     }
-    let (mut rx, child) = command.args(sidecar_status_args()).spawn().ok()?;
+    let Ok((mut rx, child)) = command.args(sidecar_status_args()).spawn() else {
+        return BackendStatusProbe::Unavailable;
+    };
     let mut stdout_buffer = String::new();
+    let mut stderr_buffer = String::new();
     let status = tokio::time::timeout(STATUS_PROBE_TIMEOUT, async {
         while let Some(event) = rx.recv().await {
             match event {
                 CommandEvent::Stdout(bytes) => {
                     stdout_buffer.push_str(String::from_utf8_lossy(&bytes).as_ref());
                 }
+                CommandEvent::Stderr(bytes) => {
+                    stderr_buffer.push_str(String::from_utf8_lossy(&bytes).as_ref());
+                }
                 CommandEvent::Terminated(_) => {
-                    return Ok(parse_writable_listening_port_from_status(&stdout_buffer));
+                    return Ok(classify_backend_status_output(
+                        stdout_buffer.as_str(),
+                        stderr_buffer.as_str(),
+                    ));
                 }
                 CommandEvent::Error(err) => {
                     eprintln!("[agentsview:error] {err}");
@@ -1324,15 +1651,64 @@ async fn probe_backend_status(handle: &AppHandle) -> Option<u16> {
                 _ => {}
             }
         }
-        Ok(None)
+        Ok(BackendStatusProbe::Unavailable)
     })
     .await;
     match status {
-        Ok(Ok(port)) => port,
+        Ok(Ok(status)) => status,
         Ok(Err(())) | Err(_) => {
             let _ = child.kill();
-            None
+            BackendStatusProbe::Unavailable
         }
+    }
+}
+
+fn classify_backend_status_output(stdout: &str, stderr: &str) -> BackendStatusProbe {
+    if let Some(port) = parse_writable_listening_port_from_status(stdout) {
+        return BackendStatusProbe::Ready(port);
+    }
+
+    let detail = combined_probe_output(stdout, stderr);
+    if detail.contains("No agentsview server is running.") {
+        return BackendStatusProbe::NotRunning(detail);
+    }
+    if detail.contains("incompatible running writable daemon") {
+        return BackendStatusProbe::Incompatible(detail);
+    }
+    if status_output_is_unhealthy(detail.as_str()) {
+        return BackendStatusProbe::Unhealthy(detail);
+    }
+    if detail.trim().is_empty() {
+        return BackendStatusProbe::Unavailable;
+    }
+    if status_output_is_read_only(detail.as_str()) {
+        return BackendStatusProbe::ReadOnly(detail);
+    }
+    if status_output_is_starting(detail.as_str()) {
+        return BackendStatusProbe::Starting(detail);
+    }
+    BackendStatusProbe::Unusable(detail)
+}
+
+fn status_output_is_unhealthy(output: &str) -> bool {
+    output.contains("agentsview process running")
+        && output.contains("not responding to health checks")
+}
+
+fn status_output_is_starting(output: &str) -> bool {
+    output
+        .lines()
+        .any(|line| line.trim() == "agentsview is starting up.")
+}
+
+fn combined_probe_output(stdout: &str, stderr: &str) -> String {
+    let stdout = stdout.trim();
+    let stderr = stderr.trim();
+    match (stdout.is_empty(), stderr.is_empty()) {
+        (true, true) => String::new(),
+        (false, true) => stdout.to_string(),
+        (true, false) => stderr.to_string(),
+        (false, false) => format!("{stdout}\n{stderr}"),
     }
 }
 
@@ -2506,6 +2882,45 @@ mod tests {
     }
 
     #[test]
+    fn status_poll_backoff_counts_non_ready_statuses() {
+        let mut attempts = 0;
+
+        attempts = next_background_status_poll_attempts(
+            &BackendStatusProbe::Starting("agentsview is starting up.".to_string()),
+            attempts,
+        );
+        assert_eq!(attempts, 1);
+
+        attempts = next_background_status_poll_attempts(
+            &BackendStatusProbe::Unhealthy("health checks are not responding".to_string()),
+            attempts,
+        );
+        assert_eq!(attempts, 2);
+
+        attempts = next_background_status_poll_attempts(&BackendStatusProbe::Unavailable, attempts);
+        assert_eq!(attempts, 3);
+
+        attempts = next_background_status_poll_attempts(&BackendStatusProbe::Ready(8080), attempts);
+        assert_eq!(attempts, 3);
+
+        assert_eq!(
+            next_background_status_poll_attempts(&BackendStatusProbe::Unavailable, u32::MAX),
+            u32::MAX
+        );
+    }
+
+    #[test]
+    fn status_probe_failures_stop_after_bounded_threshold() {
+        assert!(!status_probe_failures_should_stop(
+            STATUS_PROBE_FAILURE_FAIL_AFTER - 1
+        ));
+        assert!(status_probe_failures_should_stop(
+            STATUS_PROBE_FAILURE_FAIL_AFTER
+        ));
+        assert!(status_probe_failures_should_stop(u32::MAX));
+    }
+
+    #[test]
     fn data_version_preflight_args_use_serve_check() {
         assert_eq!(
             data_version_preflight_args(),
@@ -2597,6 +3012,46 @@ mod tests {
         assert!(script.contains("function renderPreflightError"));
         assert!(script.contains("setTimeout(renderPreflightError"));
         assert!(script.contains("if (!h || !status)"));
+    }
+
+    #[test]
+    fn startup_error_script_renders_reportable_details() {
+        let script = startup_error_script(
+            "Backend failed",
+            "The local backend exited.",
+            "fatal: opening database",
+            "Attach logs",
+        );
+
+        assert!(script.contains("function renderStartupError"));
+        assert!(script.contains("startup-error-detail"));
+        assert!(script.contains("fatal: opening database"));
+        assert!(script.contains("role', 'alert'"));
+        assert!(script.contains("Attach logs"));
+    }
+
+    #[test]
+    fn startup_failure_detail_includes_recent_output() {
+        let detail = startup_failure_detail(
+            "The sidecar process ended before it was ready.",
+            "[stderr] fatal: opening database",
+        );
+
+        assert!(detail.contains("The sidecar process ended"));
+        assert!(detail.contains("Recent backend output"));
+        assert!(detail.contains("[stderr] fatal: opening database"));
+    }
+
+    #[test]
+    fn startup_output_buffer_labels_recent_chunks() {
+        let buffer = Arc::new(Mutex::new(String::new()));
+
+        push_startup_output(&buffer, "stdout", "Auth enabled. Token: secret-token");
+        push_startup_output(&buffer, "stderr", "fatal: bad config");
+
+        let output = recent_startup_output(&buffer);
+        assert!(output.contains("[stdout] Auth enabled. Token: secret-token"));
+        assert!(output.contains("[stderr] fatal: bad config"));
     }
 
     #[test]
@@ -2973,7 +3428,7 @@ mod tests {
         assert!(stdout_arm.contains("stdout_update.port"));
         assert!(stdout_arm.contains("window.__setStage(2)"));
         assert!(source.contains(
-            "flush_pending_sidecar_stdout_log_record(&log_sender, &mut stdout_log_buffer);"
+            "flush_pending_sidecar_log_record(&log_sender, \"stdout\", &mut stdout_log_buffer)"
         ));
     }
 
@@ -3016,11 +3471,99 @@ mode:    read-only
     fn parse_writable_listening_port_from_status_accepts_writable_daemon() {
         let output = "\
 agentsview running at http://127.0.0.1:18082 (pid 123)
-mode:    writable
+  mode:    writable
 ";
         assert_eq!(
             parse_writable_listening_port_from_status(output),
             Some(18082)
+        );
+    }
+
+    #[test]
+    fn classify_backend_status_output_detects_ready_daemon() {
+        let output = "\
+agentsview running at http://127.0.0.1:18082 (pid 123)
+  mode:    writable
+";
+
+        assert_eq!(
+            classify_backend_status_output(output, ""),
+            BackendStatusProbe::Ready(18082)
+        );
+    }
+
+    #[test]
+    fn classify_backend_status_output_keeps_starting_state_open_ended() {
+        assert_eq!(
+            classify_backend_status_output("agentsview is starting up.", ""),
+            BackendStatusProbe::Starting("agentsview is starting up.".to_string())
+        );
+    }
+
+    #[test]
+    fn classify_backend_status_output_keeps_starting_with_stderr_diagnostics() {
+        assert_eq!(
+            classify_backend_status_output(
+                "agentsview is starting up.\n",
+                "warning: using default config"
+            ),
+            BackendStatusProbe::Starting(
+                "agentsview is starting up.\nwarning: using default config".to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn classify_backend_status_output_detects_unhealthy_daemon() {
+        assert_eq!(
+            classify_backend_status_output(
+                "agentsview process running (pid 123) but not responding to health checks.",
+                "",
+            ),
+            BackendStatusProbe::Unhealthy(
+                "agentsview process running (pid 123) but not responding to health checks."
+                    .to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn classify_backend_status_output_rejects_read_only_daemon() {
+        let output = "\
+agentsview running at http://127.0.0.1:18082
+  pid:     123
+  version: v0.35.0
+  mode:    read-only
+";
+
+        assert_eq!(
+            classify_backend_status_output(output, ""),
+            BackendStatusProbe::ReadOnly(output.trim().to_string())
+        );
+    }
+
+    #[test]
+    fn classify_backend_status_output_rejects_unknown_non_startup_status() {
+        assert_eq!(
+            classify_backend_status_output("agentsview status is unexpected.", ""),
+            BackendStatusProbe::Unusable("agentsview status is unexpected.".to_string())
+        );
+    }
+
+    #[test]
+    fn classify_backend_status_output_reports_absent_or_incompatible_daemon() {
+        assert_eq!(
+            classify_backend_status_output("No agentsview server is running.", ""),
+            BackendStatusProbe::NotRunning("No agentsview server is running.".to_string())
+        );
+        assert_eq!(
+            classify_backend_status_output(
+                "agentsview found an incompatible running writable daemon.",
+                "",
+            ),
+            BackendStatusProbe::Incompatible(
+                "agentsview found an incompatible running writable daemon.".to_string()
+            )
         );
     }
 

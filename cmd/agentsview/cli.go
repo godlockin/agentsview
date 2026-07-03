@@ -124,6 +124,7 @@ func newServeCommand() *cobra.Command {
 	var background bool
 	var checkDataVersion bool
 	var replace bool
+	var pprofEnabled bool
 	cmd := &cobra.Command{
 		Use:          "serve",
 		Short:        "Start server",
@@ -150,6 +151,7 @@ func newServeCommand() *cobra.Command {
 			runServe(mustLoadConfig(cmd), serveOptions{
 				ReplaceDaemon:  replace,
 				NoSyncExplicit: cmd.Flags().Changed("no-sync"),
+				Pprof:          pprofEnabled,
 			})
 			return nil
 		},
@@ -173,6 +175,13 @@ func newServeCommand() *cobra.Command {
 		"Check whether the configured database is compatible with this binary",
 	)
 	_ = cmd.Flags().MarkHidden("check-data-version")
+	cmd.Flags().BoolVar(
+		&pprofEnabled,
+		"pprof",
+		false,
+		"Serve net/http/pprof under /debug/pprof (developer use)",
+	)
+	_ = cmd.Flags().MarkHidden("pprof")
 	config.RegisterServePFlags(cmd.Flags())
 	cmd.AddCommand(newServeStatusCommand())
 	cmd.AddCommand(newServeStopCommand())
@@ -416,7 +425,7 @@ func newHealthCommand() *cobra.Command {
 		Args:         cobra.MaximumNArgs(1),
 		Run: func(cmd *cobra.Command, args []string) {
 			cfg.JSON = outputFormat(cmd) == "json"
-			runHealth(args, cfg)
+			runHealth(cmd, args, cfg)
 		},
 	}
 	registerFormatFlags(cmd.Flags())
@@ -672,6 +681,9 @@ func newDuckDBPushCommand() *cobra.Command {
 	cmd.Flags().StringVar(&cfg.ProjectsFlag, "projects", "", "Comma-separated list of projects to push (inclusive)")
 	cmd.Flags().StringVar(&cfg.ExcludeProjects, "exclude-projects", "", "Comma-separated list of projects to exclude from push")
 	cmd.Flags().BoolVar(&cfg.AllProjects, "all-projects", false, "Ignore configured project filters for this run")
+	cmd.Flags().BoolVar(&cfg.Watch, "watch", false, "Continue watching local files and pushing changes")
+	cmd.Flags().DurationVar(&cfg.Debounce, "debounce", defaultWatchDebounce, "Coalesce window after a change before pushing (--watch only)")
+	cmd.Flags().DurationVar(&cfg.Interval, "interval", defaultWatchInterval, "Periodic floor push interval (--watch only)")
 	return cmd
 }
 
@@ -741,7 +753,7 @@ func newDuckDBQuackCommand() *cobra.Command {
 	)
 	serveCmd.Flags().StringVar(
 		&serveCfg.Token, "token", "",
-		"Quack authentication token (generated if omitted)",
+		"Quack authentication token (required unless configured)",
 	)
 	serveCmd.Flags().BoolVar(
 		&serveCfg.AllowInsecure, "allow-insecure", false,

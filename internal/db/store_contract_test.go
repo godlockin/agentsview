@@ -4,8 +4,12 @@ import (
 	"context"
 	"errors"
 	"math"
+	"os"
+	"path/filepath"
 	"slices"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -37,18 +41,84 @@ func storeContractBackends() []storeContractBackend {
 			name: "sqlite",
 			open: func(t *testing.T) Store {
 				t.Helper()
-				return testDB(t)
+				return openStoreContractSQLiteFixtureDB(t)
 			},
 			seed: func(t *testing.T, store Store) storeContractFixture {
 				t.Helper()
-				return seedStoreContractSQLite(t, store)
+				return storeContractSQLiteFixtureForTest(t)
 			},
 			supportsLocalWrites: true,
 		},
 	}
 }
 
+var (
+	storeContractSQLiteTemplateOnce    sync.Once
+	storeContractSQLiteTemplateDir     string
+	storeContractSQLiteTemplatePath    string
+	storeContractSQLiteTemplateFixture storeContractFixture
+	storeContractSQLiteTemplateErr     error
+)
+
+func openStoreContractSQLiteFixtureDB(t *testing.T) Store {
+	t.Helper()
+	src, _ := storeContractSQLiteTemplate(t)
+
+	dst := filepath.Join(t.TempDir(), "test.db")
+	for _, suffix := range []string{"", "-wal", "-shm"} {
+		require.NoError(t,
+			copyTemplateDBFile(src+suffix, dst+suffix, suffix == ""),
+			"copy store-contract fixture %q", suffix)
+	}
+	d, err := OpenPreparedTestDB(dst)
+	require.NoError(t, err, "open store-contract fixture")
+	t.Cleanup(func() { require.NoError(t, d.Close()) })
+	return d
+}
+
+func storeContractSQLiteFixtureForTest(t *testing.T) storeContractFixture {
+	t.Helper()
+	_, fixture := storeContractSQLiteTemplate(t)
+	return fixture
+}
+
+func storeContractSQLiteTemplate(t *testing.T) (string, storeContractFixture) {
+	t.Helper()
+	storeContractSQLiteTemplateOnce.Do(func() {
+		storeContractSQLiteTemplateDir, storeContractSQLiteTemplateErr =
+			os.MkdirTemp("", "agentsview-store-contract-*")
+		if storeContractSQLiteTemplateErr != nil {
+			return
+		}
+		storeContractSQLiteTemplatePath = filepath.Join(
+			storeContractSQLiteTemplateDir, "test.db")
+		storeContractSQLiteTemplateErr = copyTestDBTemplate(
+			storeContractSQLiteTemplatePath)
+		if storeContractSQLiteTemplateErr != nil {
+			return
+		}
+
+		var d *DB
+		d, storeContractSQLiteTemplateErr = OpenPreparedTestDB(
+			storeContractSQLiteTemplatePath)
+		if storeContractSQLiteTemplateErr != nil {
+			return
+		}
+		storeContractSQLiteTemplateFixture = seedStoreContractSQLite(t, d)
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		storeContractSQLiteTemplateErr = d.CheckpointWALTruncate(ctx)
+		if closeErr := d.Close(); storeContractSQLiteTemplateErr == nil {
+			storeContractSQLiteTemplateErr = closeErr
+		}
+	})
+	require.NoError(t, storeContractSQLiteTemplateErr,
+		"build store-contract fixture")
+	return storeContractSQLiteTemplatePath, storeContractSQLiteTemplateFixture
+}
+
 func TestStoreContract(t *testing.T) {
+
 	tests := []struct {
 		name string
 		run  func(t *testing.T, store Store, fixture storeContractFixture, backend storeContractBackend)
@@ -572,6 +642,85 @@ func contractLocalOnlyMethods(
 	require.NoError(t, err)
 	require.Len(t, list, 1)
 	require.NoError(t, store.DeleteInsight(insightID))
+}
+
+func TestStoreContractGetUsageMatchingSessionCountCountsCopilotSessionsWithoutUsageRows(
+	t *testing.T,
+) {
+	store, ok := openStoreContractSQLiteFixtureDB(t).(*DB)
+	require.True(t, ok, "sqlite fixture should expose *DB")
+	ctx := context.Background()
+
+	insertSession(t, store, "contract-copilot-empty", "alpha", func(s *Session) {
+		ts := "2026-01-12T16:00:00Z"
+		s.Agent = "copilot"
+		s.StartedAt = &ts
+		s.EndedAt = &ts
+	})
+	insertMessages(t, store, Message{
+		SessionID:  "contract-copilot-empty",
+		Ordinal:    0,
+		Role:       "assistant",
+		Timestamp:  "2026-01-12T16:00:00Z",
+		Model:      "gpt-5.3-codex",
+		TokenUsage: nil,
+	})
+
+	count, err := store.GetUsageMatchingSessionCount(ctx, UsageFilter{
+		From:     "2026-01-12",
+		To:       "2026-01-12",
+		Timezone: "UTC",
+		Agent:    "copilot",
+	})
+	require.NoError(t, err)
+	require.Equal(t, 1, count)
+}
+
+func TestStoreContractGetUsageMatchingSessionCountCountsCopilotSessionByMessageTimestampOutsideSessionWindow(
+	t *testing.T,
+) {
+	store, ok := openStoreContractSQLiteFixtureDB(t).(*DB)
+	require.True(t, ok, "sqlite fixture should expose *DB")
+	ctx := context.Background()
+
+	insertSession(t, store, "contract-copilot-late-message", "alpha", func(s *Session) {
+		ts := "2026-02-08T10:00:00Z"
+		s.Agent = "copilot"
+		s.StartedAt = &ts
+		s.EndedAt = &ts
+	})
+	insertMessages(t, store, Message{
+		SessionID:  "contract-copilot-late-message",
+		Ordinal:    0,
+		Role:       "assistant",
+		Timestamp:  "2026-02-10T12:00:00Z",
+		Model:      "gpt-5.3-codex",
+		TokenUsage: nil,
+	})
+
+	insertSession(t, store, "contract-copilot-out-of-range", "alpha", func(s *Session) {
+		ts := "2026-02-08T10:00:00Z"
+		s.Agent = "copilot"
+		s.StartedAt = &ts
+		s.EndedAt = &ts
+	})
+	insertMessages(t, store, Message{
+		SessionID:  "contract-copilot-out-of-range",
+		Ordinal:    0,
+		Role:       "assistant",
+		Timestamp:  "2026-02-08T10:00:00Z",
+		Model:      "gpt-5.3-codex",
+		TokenUsage: nil,
+	})
+
+	count, err := store.GetUsageMatchingSessionCount(ctx, UsageFilter{
+		From:     "2026-02-10",
+		To:       "2026-02-10",
+		Timezone: "UTC",
+		Agent:    "copilot",
+	})
+	require.NoError(t, err)
+	require.Equal(t, 1, count)
 }
 
 func seedStoreContractSQLite(

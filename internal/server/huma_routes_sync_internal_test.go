@@ -18,6 +18,7 @@ import (
 	"github.com/stretchr/testify/require"
 	"go.kenn.io/agentsview/internal/config"
 	"go.kenn.io/agentsview/internal/db"
+	"go.kenn.io/agentsview/internal/dbtest"
 	"go.kenn.io/agentsview/internal/parser"
 	"go.kenn.io/agentsview/internal/remotesync"
 	"go.kenn.io/agentsview/internal/service"
@@ -71,15 +72,19 @@ func newSyncRouteFixture(
 	}
 
 	if cfg.stale {
-		database, err := db.Open(dbPath)
-		require.NoError(t, err)
-		require.NoError(t, database.Close())
+		dbtest.EnsureTestDBAt(t, dbPath)
 		markDBStale(t, dbPath)
 	}
 
-	database, err := db.Open(dbPath)
-	require.NoError(t, err)
-	t.Cleanup(func() { database.Close() })
+	var database *db.DB
+	var err error
+	if cfg.stale {
+		database, err = db.Open(dbPath)
+		require.NoError(t, err)
+		t.Cleanup(func() { database.Close() })
+	} else {
+		database = dbtest.OpenTestDBAt(t, dbPath)
+	}
 
 	serverConfig := config.Config{
 		Host:         "127.0.0.1",
@@ -259,9 +264,7 @@ func stubRunHTTPRemoteSync(
 func TestSyncEngineForLocalReusesNoSyncEngineConcurrently(t *testing.T) {
 	dir := t.TempDir()
 	dbPath := filepath.Join(dir, "test.db")
-	database, err := db.Open(dbPath)
-	require.NoError(t, err)
-	t.Cleanup(func() { database.Close() })
+	database := dbtest.OpenTestDBAt(t, dbPath)
 
 	srv := New(config.Config{
 		Host:         "127.0.0.1",
@@ -292,9 +295,7 @@ func TestSyncEngineForLocalReusesNoSyncEngineConcurrently(t *testing.T) {
 func TestHumaSyncStatusUsesExistingOnDemandEngine(t *testing.T) {
 	dir := t.TempDir()
 	dbPath := filepath.Join(dir, "test.db")
-	database, err := db.Open(dbPath)
-	require.NoError(t, err)
-	t.Cleanup(func() { database.Close() })
+	database := dbtest.OpenTestDBAt(t, dbPath)
 
 	srv := New(config.Config{
 		Host:         "127.0.0.1",

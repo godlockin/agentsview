@@ -4,6 +4,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 
@@ -15,40 +16,41 @@ func TestHydrateAssetsForceFetchesRemoteAssetBranches(t *testing.T) {
 	tempDir := t.TempDir()
 	remoteRepo := filepath.Join(tempDir, "remote")
 	localRepo := filepath.Join(tempDir, "local")
-	require.NoError(t, os.MkdirAll(remoteRepo, 0o755))
 	require.NoError(t, os.MkdirAll(localRepo, 0o755))
 
-	git(t, remoteRepo, "init")
-	git(t, remoteRepo, "config", "user.name", "Test User")
-	git(t, remoteRepo, "config", "user.email", "test@example.invalid")
-	writeStaticAssets(t, remoteRepo, "old static")
-	git(t, remoteRepo, "add", ".")
-	git(t, remoteRepo, "commit", "-m", "old static assets")
-	git(t, remoteRepo, "branch", "docs-assets")
+	git(t, tempDir, "init", "--bare", remoteRepo)
+	oldStaticDir := filepath.Join(tempDir, "old-static")
+	writeStaticAssets(t, oldStaticDir, "old static")
+	oldStaticCommit := commitBareAssetTree(
+		t, remoteRepo, oldStaticDir, "old static assets",
+	)
+	updateBareBranch(t, remoteRepo, "docs-assets", oldStaticCommit)
 
 	git(t, localRepo, "init")
 	git(t, localRepo, "remote", "add", "origin", remoteRepo)
 	git(t, localRepo, "fetch", "origin", "docs-assets:refs/remotes/origin/docs-assets")
 
-	git(t, remoteRepo, "rm", "-r", ".")
-	writeStaticAssets(t, remoteRepo, "new static")
-	git(t, remoteRepo, "add", ".")
-	git(t, remoteRepo, "commit", "-m", "new static assets")
-	newStaticCommit := gitOutput(t, remoteRepo, "rev-parse", "HEAD")
-	git(t, remoteRepo, "update-ref", "refs/heads/docs-assets", newStaticCommit)
+	newStaticDir := filepath.Join(tempDir, "new-static")
+	writeStaticAssets(t, newStaticDir, "new static")
+	newStaticCommit := commitBareAssetTree(
+		t, remoteRepo, newStaticDir, "new static assets",
+	)
+	updateBareBranch(t, remoteRepo, "docs-assets", newStaticCommit)
 
-	git(t, remoteRepo, "rm", "-r", ".")
-	writeGeneratedAssets(t, remoteRepo, "generated")
-	git(t, remoteRepo, "add", ".")
-	git(t, remoteRepo, "commit", "-m", "generated assets")
-	git(t, remoteRepo, "branch", "docs-generated-assets")
-
-	git(t, localRepo, "fetch", "origin", "docs-generated-assets:refs/remotes/origin/docs-generated-assets")
+	generatedDir := filepath.Join(tempDir, "generated")
+	writeGeneratedAssets(t, generatedDir, "generated")
+	generatedCommit := commitBareAssetTree(
+		t, remoteRepo, generatedDir, "generated assets",
+	)
+	updateBareBranch(t, remoteRepo, "docs-generated-assets", generatedCommit)
 
 	docsAssetsDir := filepath.Join(localRepo, "docs", "assets")
 	require.NoError(t, os.MkdirAll(docsAssetsDir, 0o755))
 	writeStaticAssets(t, filepath.Join(docsAssetsDir, "static"), "stale local static")
-	writeGeneratedAssets(t, filepath.Join(docsAssetsDir, "generated"), "stale local generated")
+	writeAssetFiles(
+		t, filepath.Join(docsAssetsDir, "generated"),
+		[]string{"screenshots/dashboard.png"}, "stale local generated",
+	)
 
 	script, err := os.ReadFile(filepath.Join("..", "docs", "assets", "hydrate-assets.sh"))
 	require.NoError(t, err)
@@ -89,6 +91,7 @@ func TestAssetPublishersRejectUnexpectedFiles(t *testing.T) {
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
+
 			tempDir := t.TempDir()
 			repo := filepath.Join(tempDir, "repo")
 			sourceDir := filepath.Join(tempDir, "source")
@@ -137,8 +140,7 @@ func TestCheckDocsRejectsCorruptedMarkdownSyntax(t *testing.T) {
 
 	cmd := exec.Command("bash", checkScript)
 	cmd.Dir = repo
-	pythonPath, err := exec.LookPath("python3")
-	require.NoError(t, err)
+	pythonPath := requireRunnablePython3(t)
 	cmd.Env = append(envWithout("PATH", "PYTHON"), "PYTHON="+pythonPath, "PATH=/usr/bin:/bin")
 	output, err := cmd.CombinedOutput()
 
@@ -178,8 +180,7 @@ func TestCheckDocsRequiresRipgrepForMediaReferenceChecks(t *testing.T) {
 	require.NoError(t, err)
 	cmd := exec.Command(bashPath, checkScript)
 	cmd.Dir = repo
-	pythonPath, err := exec.LookPath("python3")
-	require.NoError(t, err)
+	pythonPath := requireRunnablePython3(t)
 	emptyBin := filepath.Join(tempDir, "empty-bin")
 	require.NoError(t, os.MkdirAll(emptyBin, 0o755))
 	cmd.Env = append(envWithout("PATH", "PYTHON"), "PYTHON="+pythonPath, "PATH="+emptyBin)
@@ -197,8 +198,7 @@ func TestBuiltSiteCheckRequiresMarkdownCompanions(t *testing.T) {
 	checkScript := installScript(t, repo, filepath.Join("docs", "scripts", "check_built_site.py"))
 	writeMinimalBuiltDocsSite(t, filepath.Join(repo, "docs", "site"))
 
-	pythonPath, err := exec.LookPath("python3")
-	require.NoError(t, err)
+	pythonPath := requireRunnablePython3(t)
 	cmd := exec.Command(pythonPath, checkScript)
 	cmd.Dir = filepath.Join(repo, "docs")
 	output, err := cmd.CombinedOutput()
@@ -215,6 +215,22 @@ func installScript(t *testing.T, repo, scriptRel string) string {
 	require.NoError(t, os.MkdirAll(filepath.Dir(scriptPath), 0o755))
 	require.NoError(t, os.WriteFile(scriptPath, script, 0o755))
 	return scriptPath
+}
+
+func requireRunnablePython3(t *testing.T) string {
+	t.Helper()
+	pythonPath, err := exec.LookPath("python3")
+	if err != nil {
+		t.Skipf("python3 not available on PATH: %v", err)
+	}
+	cmd := exec.Command(pythonPath, "--version")
+	if out, err := cmd.CombinedOutput(); err != nil {
+		if runtime.GOOS == "windows" {
+			t.Skipf("python3 is not runnable: %v\n%s", err, out)
+		}
+		require.NoError(t, err, "python3 --version\n%s", out)
+	}
+	return pythonPath
 }
 
 func writeMinimalBuiltDocsSite(t *testing.T, siteDir string) {
@@ -323,6 +339,7 @@ func writeGeneratedAssets(t *testing.T, dir, content string) {
 		"screenshots/activity-timeline.png",
 		"screenshots/activity-week.png",
 		"screenshots/agent-comparison.png",
+		"screenshots/analytics-model-filter.png",
 		"screenshots/block-filter.png",
 		"screenshots/code-block-copy-btn.png",
 		"screenshots/command-palette.png",
@@ -347,6 +364,7 @@ func writeGeneratedAssets(t *testing.T, dir, content string) {
 		"screenshots/message-viewer.png",
 		"screenshots/project-breakdown.png",
 		"screenshots/publish-modal.png",
+		"screenshots/recent-edits.png",
 		"screenshots/resync-modal.png",
 		"screenshots/search-grouped.png",
 		"screenshots/search-results.png",
@@ -398,6 +416,22 @@ func writeAssetFiles(t *testing.T, dir string, files []string, content string) {
 	}
 }
 
+func commitBareAssetTree(
+	t *testing.T, bareRepo, workTree, message string,
+) string {
+	t.Helper()
+	indexPath := filepath.Join(t.TempDir(), "index")
+	env := gitCommitEnv("GIT_INDEX_FILE=" + indexPath)
+	gitBareWorkTree(t, bareRepo, workTree, env, "add", "-A", ".")
+	tree := gitBareWorkTreeOutput(t, bareRepo, workTree, env, "write-tree")
+	return gitBareOutput(t, bareRepo, env, "commit-tree", tree, "-m", message)
+}
+
+func updateBareBranch(t *testing.T, bareRepo, branch, commit string) {
+	t.Helper()
+	gitBare(t, bareRepo, nil, "update-ref", "refs/heads/"+branch, commit)
+}
+
 func git(t *testing.T, dir string, args ...string) {
 	t.Helper()
 	cmd := exec.Command("git", args...)
@@ -406,11 +440,58 @@ func git(t *testing.T, dir string, args ...string) {
 	require.NoError(t, err, string(output))
 }
 
-func gitOutput(t *testing.T, dir string, args ...string) string {
+func gitBareWorkTree(
+	t *testing.T, bareRepo, workTree string, env []string, args ...string,
+) {
 	t.Helper()
-	cmd := exec.Command("git", args...)
-	cmd.Dir = dir
-	output, err := cmd.Output()
+	output, err := gitBareCmd(bareRepo, workTree, env, args...).CombinedOutput()
+	require.NoError(t, err, string(output))
+}
+
+func gitBareWorkTreeOutput(
+	t *testing.T, bareRepo, workTree string, env []string, args ...string,
+) string {
+	t.Helper()
+	output, err := gitBareCmd(bareRepo, workTree, env, args...).Output()
 	require.NoError(t, err)
 	return strings.TrimSpace(string(output))
+}
+
+func gitBare(t *testing.T, bareRepo string, env []string, args ...string) {
+	t.Helper()
+	output, err := gitBareCmd(bareRepo, "", env, args...).CombinedOutput()
+	require.NoError(t, err, string(output))
+}
+
+func gitBareOutput(t *testing.T, bareRepo string, env []string, args ...string) string {
+	t.Helper()
+	output, err := gitBareCmd(bareRepo, "", env, args...).Output()
+	require.NoError(t, err)
+	return strings.TrimSpace(string(output))
+}
+
+func gitBareCmd(
+	bareRepo, workTree string, env []string, args ...string,
+) *exec.Cmd {
+	fullArgs := []string{"--git-dir", bareRepo}
+	if workTree != "" {
+		fullArgs = append(fullArgs, "--work-tree", workTree)
+	}
+	fullArgs = append(fullArgs, args...)
+	cmd := exec.Command("git", fullArgs...)
+	if workTree != "" {
+		cmd.Dir = workTree
+	}
+	cmd.Env = append(os.Environ(), env...)
+	return cmd
+}
+
+func gitCommitEnv(extra ...string) []string {
+	env := []string{
+		"GIT_AUTHOR_NAME=Test User",
+		"GIT_AUTHOR_EMAIL=test@example.invalid",
+		"GIT_COMMITTER_NAME=Test User",
+		"GIT_COMMITTER_EMAIL=test@example.invalid",
+	}
+	return append(env, extra...)
 }

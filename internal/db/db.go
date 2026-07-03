@@ -241,6 +241,11 @@ import (
 // classification, so historical skill usage is backfilled on
 // re-parse.)
 //
+// (58: Persisted message/result content sanitization now covers
+// tool_calls.result_content and tool_result_events.content. Existing rows
+// need re-parsing so NUL/control bytes accepted by SQLite are stripped before
+// they can poison DuckDB mirrors.)
+//
 // (57: Antigravity-CLI transcript fidelity classification. Re-parsing
 // populates transcript_fidelity ("full"/"summary") on existing
 // Antigravity CLI rows so sessions built from summary transcripts are
@@ -265,7 +270,7 @@ import (
 // (51: Gemini cumulative-to-delta token reparse.)
 // (17: Codex <skill> template filtering.)
 // (16: <turn_aborted> system messages.)
-const dataVersion = 57
+const dataVersion = 58
 
 const tokenCoverageRepairStatsKey = "token_coverage_repair_v1"
 
@@ -834,6 +839,34 @@ func tableColumns(
 	return out, nil
 }
 
+// SchemaUpgradeRequiredError reports that a read-only open failed because the
+// on-disk archive is missing a column the current binary's schema defines. The
+// file is not corrupt: it was written by an older agentsview version and has
+// not been migrated yet. Read-only opens never run migrations, so the archive
+// can only be upgraded by a writable process (the daemon). Callers can detect
+// this with IsSchemaUpgradeRequired and point the user at restarting the daemon
+// so the migration runs. The Error text preserves the historical
+// "schema missing <table>.<column>" wording so existing diagnostics still match.
+type SchemaUpgradeRequiredError struct {
+	Table  string
+	Column string
+}
+
+func (e *SchemaUpgradeRequiredError) Error() string {
+	return fmt.Sprintf(
+		"opening read-only database: schema missing %s.%s",
+		e.Table, e.Column,
+	)
+}
+
+// IsSchemaUpgradeRequired reports whether err indicates a read-only open failed
+// because the archive predates this binary's schema and needs a writable
+// migration to run.
+func IsSchemaUpgradeRequired(err error) bool {
+	var target *SchemaUpgradeRequiredError
+	return errors.As(err, &target)
+}
+
 func checkReadOnlySchemaCompatibility(conn *sql.DB) error {
 	required, err := readOnlyRequiredSchema()
 	if err != nil {
@@ -850,10 +883,10 @@ func checkReadOnlySchemaCompatibility(conn *sql.DB) error {
 		}
 		for _, column := range columns {
 			if !have[column] {
-				return fmt.Errorf(
-					"opening read-only database: schema missing %s.%s",
-					table, column,
-				)
+				return &SchemaUpgradeRequiredError{
+					Table:  table,
+					Column: column,
+				}
 			}
 		}
 	}
@@ -1419,6 +1452,8 @@ func (db *DB) createPartialIndexesLocked(w *writerHandle) error {
 	indexes := []string{
 		`CREATE INDEX IF NOT EXISTS idx_sessions_cwd
 		 ON sessions(cwd) WHERE cwd != ''`,
+		`CREATE INDEX IF NOT EXISTS idx_sessions_project_git_branch
+		 ON sessions(project, git_branch) WHERE git_branch != ''`,
 		`CREATE INDEX IF NOT EXISTS idx_messages_compact_boundary
 		 ON messages(session_id, ordinal) WHERE is_compact_boundary = 1`,
 		`CREATE INDEX IF NOT EXISTS idx_messages_sidechain

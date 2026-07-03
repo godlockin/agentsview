@@ -87,6 +87,7 @@ func warnMissingDirs(dirs []string, label string) {
 type serveOptions struct {
 	ReplaceDaemon  bool
 	NoSyncExplicit bool
+	Pprof          bool
 }
 
 func runServe(cfg config.Config, opts serveOptions) {
@@ -104,16 +105,14 @@ func runServe(cfg config.Config, opts serveOptions) {
 		log.Fatalf("Failed to generate auth token: %v", err)
 	}
 	if cfg.RequireAuth {
-		// A background child redirects stdout to serve.log; printing the
-		// token there would persist it to a file. The parent already
-		// printed the token to the invoking terminal, so the child stays
-		// quiet about it.
+		// Startup output may be captured by service managers or log files,
+		// so never write the bearer token itself.
 		if cfg.AuthToken != "" && !runningAsBackgroundChild() {
-			fmt.Printf("Auth enabled. Token: %s\n", cfg.AuthToken)
+			fmt.Println("Auth enabled. Token is configured.")
 		}
 	}
 
-	cont, releaseForegroundReplacement, err := prepareForegroundServeDaemon(
+	cont, releaseForegroundServeLaunch, err := prepareForegroundServeDaemon(
 		&cfg,
 		serveReplacementOptions{
 			Replace:        opts.ReplaceDaemon,
@@ -126,7 +125,7 @@ func runServe(cfg config.Config, opts serveOptions) {
 	if !cont {
 		return
 	}
-	defer releaseForegroundReplacement()
+	defer releaseForegroundServeLaunch()
 
 	// Acquire the daemon start lock immediately after config setup,
 	// before opening the DB, so token-use never sees a window
@@ -234,6 +233,16 @@ func runServe(cfg config.Config, opts serveOptions) {
 	// background LiteLLM refresh follows immediately.
 	seedPricing(database)
 
+	// Apply the config-driven custom pricing map on top of the
+	// pricing that seedPricing just wrote into model_pricing so
+	// fork-private models (e.g. MiniMax-M3, internal/private
+	// endpoints) carry their owner's authoritative rates into
+	// every GetDailyUsage call. Without this, custom_model_pricing
+	// would only influence the CLI statusline / pg serve paths
+	// where applyCustomPricing runs explicitly, leaving the
+	// embedded server reading rates from model_pricing only.
+	applyCustomPricing(database, cfg)
+
 	rtOpts := serveRuntimeOptions{
 		Mode:          "serve",
 		RequestedPort: cfg.Port,
@@ -254,6 +263,7 @@ func runServe(cfg config.Config, opts serveOptions) {
 		server.WithBaseContext(ctx),
 		server.WithBroadcaster(broadcaster),
 		server.WithIdleTracker(idleTracker),
+		server.WithPprof(opts.Pprof),
 	)
 
 	rt, err := startServerWithOptionalCaddy(ctx, cfg, srv, rtOpts)
@@ -283,7 +293,7 @@ func runServe(cfg config.Config, opts serveOptions) {
 		runtimeRecordDataDir = rt.Cfg.DataDir
 		UnmarkDaemonStarting(rt.Cfg.DataDir)
 	}
-	releaseForegroundReplacement()
+	releaseForegroundServeLaunch()
 	if idleTracker != nil {
 		idleTracker.Touch()
 		go idleTracker.Run(ctx)
@@ -307,6 +317,10 @@ func runServe(cfg config.Config, opts serveOptions) {
 	startTelemetryPings(ctx, telemetryReporter)
 
 	if engine != nil {
+		// Registered before stopWatcher so LIFO defer order stops
+		// the watcher first, then Close flushes any pending
+		// debounced signal recomputes.
+		defer engine.Close()
 		stopWatcher, unwatchedDirs := startFileWatcher(
 			cfg, engine, func(paths []string) {
 				idleTracker.Do(func() {
@@ -445,7 +459,7 @@ func openReadOnlyDB(cfg config.Config) (*db.DB, error) {
 	applyClassifierConfig(cfg)
 	database, err := db.OpenReadOnly(cfg.DBPath)
 	if err != nil {
-		return nil, err
+		return nil, schemaUpgradeHint(err)
 	}
 	applyCustomPricing(database, cfg)
 	if err := applyCursorSecret(database, cfg); err != nil {
@@ -453,6 +467,32 @@ func openReadOnlyDB(cfg config.Config) (*db.DB, error) {
 		return nil, err
 	}
 	return database, nil
+}
+
+// schemaUpgradeHint augments a read-only open failure with actionable guidance
+// when the archive is simply older than this binary. The pending migration only
+// runs on a writable open, which read-only commands never perform, so the user
+// must let the daemon (re)start to upgrade the archive. Without this, the raw
+// "schema missing tool_calls.file_path" error leaves upgraders with no path
+// forward; it is the failure reported in issue #929 after a version bump while
+// an older daemon still owned the archive.
+func schemaUpgradeHint(err error) error {
+	if !db.IsSchemaUpgradeRequired(err) {
+		return err
+	}
+	return appendDaemonRestartUpgradeHint(err)
+}
+
+func appendDaemonRestartUpgradeHint(err error) error {
+	return fmt.Errorf("%w\n\n%s", err, daemonRestartUpgradeHint())
+}
+
+func daemonRestartUpgradeHint() string {
+	return "This database was written by an older agentsview version and " +
+		"must be upgraded before it can be read. The upgrade runs when a " +
+		"writable daemon starts, so restart the daemon to let it run:\n" +
+		"  - desktop app: quit and relaunch it\n" +
+		"  - CLI: run `agentsview serve --replace`"
 }
 
 func openWriteDB(
@@ -489,7 +529,7 @@ func rejectLiveWritableDaemonBeforeDirectWrite(cfg config.Config) error {
 		)
 	}
 	if isBackgroundLaunchActive(dataDir) &&
-		!ownsForegroundReplacementLaunchLock(dataDir) &&
+		!ownsForegroundServeLaunchLock(dataDir) &&
 		!runningAsBackgroundChild() {
 		return fmt.Errorf(
 			"local daemon launch is in progress and owns the SQLite archive; " +
@@ -806,6 +846,19 @@ func formatAnomalySummary(a sync.AnomalyStats) string {
 			)
 		}
 	}
+	if a.UnknownSchemaSessionsTotal > 0 {
+		fmt.Fprintf(&b,
+			"  unrecognized schema sessions: %d total\n",
+			a.UnknownSchemaSessionsTotal,
+		)
+		for _, agent := range slices.Sorted(
+			maps.Keys(a.UnknownSchemaSessionsByAgent),
+		) {
+			fmt.Fprintf(&b,
+				"    %s: %d\n", agent, a.UnknownSchemaSessionsByAgent[agent],
+			)
+		}
+	}
 	if !a.Sanitize.IsZero() {
 		fmt.Fprintf(&b,
 			"  sanitized fields: %d total\n", a.Sanitize.Total(),
@@ -1011,9 +1064,14 @@ func collectProviderWatchRoots(
 	added := false
 	var addedRoots []watchRoot
 	var missingRoots []string
+	var unwatchedDirs []string
 	for _, providerRoot := range plan.Roots {
 		root := filepath.Clean(providerRoot.Path)
 		if root == "" || root == "." {
+			continue
+		}
+		if providerRoot.Recursive && isSymlinkPath(root) {
+			unwatchedDirs = appendUniqueString(unwatchedDirs, dir)
 			continue
 		}
 		if _, err := os.Stat(root); err == nil {
@@ -1028,6 +1086,9 @@ func collectProviderWatchRoots(
 		missingRoots = append(missingRoots, root)
 	}
 	if !added {
+		if len(unwatchedDirs) > 0 {
+			return true, unwatchedDirs
+		}
 		return false, nil
 	}
 	// A watch target that does not exist yet but lives under an already-watched
@@ -1037,10 +1098,25 @@ func collectProviderWatchRoots(
 	// missing nested provider root.
 	for _, missing := range missingRoots {
 		if !pathCoveredByAnyWatchRootCreation(missing, addedRoots) {
-			return true, []string{dir}
+			unwatchedDirs = appendUniqueString(unwatchedDirs, dir)
 		}
 	}
-	return true, nil
+	return true, unwatchedDirs
+}
+
+func isSymlinkPath(path string) bool {
+	info, err := os.Lstat(path)
+	if err != nil || info == nil {
+		return false
+	}
+	return info.Mode()&os.ModeSymlink != 0
+}
+
+func appendUniqueString(values []string, value string) []string {
+	if slices.Contains(values, value) {
+		return values
+	}
+	return append(values, value)
 }
 
 // pathCoveredByAnyWatchRootCreation reports whether path is covered by an

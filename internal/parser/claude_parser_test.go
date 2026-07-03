@@ -217,6 +217,7 @@ func TestParseClaudeSession_EdgeCases(t *testing.T) {
 }
 
 func TestParseClaudeSession_SkippedMessages(t *testing.T) {
+
 	t.Run("skips isMeta user messages", func(t *testing.T) {
 		content := testjsonl.JoinJSONL(
 			testjsonl.ClaudeMetaUserJSON("meta context", tsZero, true, false),

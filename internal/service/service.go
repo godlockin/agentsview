@@ -23,6 +23,10 @@ var ErrSearchUnavailable = errors.New("search not available")
 // (proxies to a running daemon).
 type SessionService interface {
 	Get(ctx context.Context, id string) (*SessionDetail, error)
+	// FindSessionIDsByPartial returns IDs containing partial as a literal,
+	// case-sensitive substring, ordered by most recent activity and capped by
+	// limit.
+	FindSessionIDsByPartial(ctx context.Context, partial string, limit int) ([]string, error)
 	List(ctx context.Context, f ListFilter) (*SessionList, error)
 	Messages(ctx context.Context, id string, f MessageFilter) (*MessageList, error)
 	ToolCalls(ctx context.Context, id string) (*ToolCallList, error)
@@ -32,6 +36,9 @@ type SessionService interface {
 	Search(ctx context.Context, req SearchRequest) (*SessionSearchResult, error)
 	SearchContent(ctx context.Context, req ContentSearchRequest) (*ContentSearchResult, error)
 	UsageSummary(ctx context.Context, req UsageRequest) (*UsageSummaryResult, error)
+	UsagePairwiseComparison(
+		ctx context.Context, req UsagePairwiseComparisonRequest,
+	) (*UsagePairwiseComparisonResponse, error)
 	ListSecrets(ctx context.Context, f SecretListFilter) (*SecretFindingList, error)
 	ScanSecrets(ctx context.Context, in SecretScanInput,
 		progress func(SecretScanProgress)) (*SecretScanSummary, error)
@@ -111,6 +118,8 @@ type ContentSearchRequest struct {
 	Project, ExcludeProject, Machine, Agent           string
 	Date, DateFrom, DateTo, ActiveSince               string
 	IncludeChildren, IncludeAutomated, IncludeOneShot bool
+	// GitBranch is a branchListSep-joined list of opaque (project, branch) tokens (EncodeBranchFilterToken).
+	GitBranch string
 
 	Limit  int `json:"limit,omitempty"`
 	Cursor int `json:"cursor,omitempty"`
@@ -130,10 +139,22 @@ type SessionDetail struct {
 	db.Session
 	HealthScoreBasis []string       `json:"health_score_basis,omitempty"`
 	HealthPenalties  map[string]int `json:"health_penalties,omitempty"`
+	// DecodeConfidence is a derive-on-read Antigravity marker: it has no
+	// persisted column. The serving side (buildSessionDetail) computes it
+	// once from the session's agent and source_version via
+	// parser.DecodeConfidence, so the "agy-schema:" prefix knowledge stays
+	// Go-only. It is a real reflected field so Huma/OpenAPI and the generated
+	// TypeScript client document and type the response property; MarshalJSON
+	// passes the field through and UnmarshalJSON restores it so the HTTP
+	// backend round-trips it rather than dropping it.
+	DecodeConfidence string `json:"decode_confidence,omitempty"`
 }
 
 // MarshalJSON preserves the grouped db.Session quality_signals field
-// while also exposing detail-only health explanation fields.
+// while also exposing the detail-only health explanation fields and the
+// derived Antigravity decode-confidence marker. DecodeConfidence is passed
+// through from the field populated at construction (see buildSessionDetail),
+// not recomputed here.
 func (d SessionDetail) MarshalJSON() ([]byte, error) {
 	type sessionAlias db.Session
 	return json.Marshal(struct {
@@ -141,16 +162,19 @@ func (d SessionDetail) MarshalJSON() ([]byte, error) {
 		QualitySignals   *db.QualitySignals `json:"quality_signals,omitempty"`
 		HealthScoreBasis []string           `json:"health_score_basis,omitempty"`
 		HealthPenalties  map[string]int     `json:"health_penalties,omitempty"`
+		DecodeConfidence string             `json:"decode_confidence,omitempty"`
 	}{
 		sessionAlias:     sessionAlias(d.Session),
 		QualitySignals:   d.StoredQualitySignals(),
 		HealthScoreBasis: d.HealthScoreBasis,
 		HealthPenalties:  d.HealthPenalties,
+		DecodeConfidence: d.DecodeConfidence,
 	})
 }
 
-// UnmarshalJSON preserves the grouped quality_signals object when
-// SessionDetail is decoded by the HTTP-backed service.
+// UnmarshalJSON preserves the grouped quality_signals object and the
+// derived decode_confidence marker when SessionDetail is decoded by the
+// HTTP-backed service.
 func (d *SessionDetail) UnmarshalJSON(data []byte) error {
 	type sessionAlias db.Session
 	var v struct {
@@ -158,6 +182,7 @@ func (d *SessionDetail) UnmarshalJSON(data []byte) error {
 		QualitySignals   *db.QualitySignals `json:"quality_signals"`
 		HealthScoreBasis []string           `json:"health_score_basis"`
 		HealthPenalties  map[string]int     `json:"health_penalties"`
+		DecodeConfidence string             `json:"decode_confidence"`
 	}
 	if err := json.Unmarshal(data, &v); err != nil {
 		return err
@@ -166,6 +191,7 @@ func (d *SessionDetail) UnmarshalJSON(data []byte) error {
 	d.ApplyQualitySignals(v.QualitySignals)
 	d.HealthScoreBasis = v.HealthScoreBasis
 	d.HealthPenalties = v.HealthPenalties
+	d.DecodeConfidence = v.DecodeConfidence
 	return nil
 }
 
@@ -182,6 +208,7 @@ type ListFilter struct {
 	Project          string `json:"project,omitempty"`
 	ExcludeProject   string `json:"exclude_project,omitempty"`
 	Machine          string `json:"machine,omitempty"`
+	GitBranch        string `json:"git_branch,omitempty"`
 	Agent            string `json:"agent,omitempty"`
 	Date             string `json:"date,omitempty"`
 	DateFrom         string `json:"date_from,omitempty"`

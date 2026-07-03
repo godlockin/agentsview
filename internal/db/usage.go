@@ -11,11 +11,37 @@ import (
 	"strings"
 	"time"
 
+	"go.kenn.io/agentsview/internal/parser"
 	pricingpkg "go.kenn.io/agentsview/internal/pricing"
 )
 
-func IsCopilotAgent(agent string) bool {
-	return agent == "copilot" || agent == "vscode-copilot" || agent == "visualstudio-copilot"
+// aiCreditUSD is the USD value of one AI credit for agents whose cost
+// is denominated in AI credits (the AICreditsDenominated capability).
+const aiCreditUSD = 0.01
+
+// AICreditsFromCost converts a USD cost into AI credits when the
+// agent's cost is denominated in AI credits, and returns 0 otherwise.
+// It is the single home of the credit conversion shared by the SQLite,
+// PostgreSQL, and DuckDB usage paths; a per-agent credit rate would
+// slot in here rather than at each accumulation site.
+func AICreditsFromCost(agent string, costUSD float64) float64 {
+	if costUSD == 0 || !parser.AgentNameUsesAICredits(agent) {
+		return 0
+	}
+	return costUSD / aiCreditUSD
+}
+
+// NoTokenData reports whether a daily-usage total carries neither token
+// data nor cost: every token counter, the cost total, and any Copilot AI
+// credits are zero. It distinguishes a window whose sessions simply do not
+// record token usage from one that genuinely has no sessions.
+func NoTokenData(t UsageTotals) bool {
+	return t.InputTokens == 0 &&
+		t.OutputTokens == 0 &&
+		t.CacheCreationTokens == 0 &&
+		t.CacheReadTokens == 0 &&
+		t.TotalCost == 0 &&
+		t.CopilotAICredits == 0
 }
 
 func lookupModelRates(
@@ -58,11 +84,13 @@ func (r *modelRateResolver) lookup(model string) (modelRates, bool) {
 // UsageFilter controls the date range, agent, and timezone
 // for daily usage aggregation queries.
 type UsageFilter struct {
-	From              string // YYYY-MM-DD, inclusive
-	To                string // YYYY-MM-DD, inclusive
-	Agent             string // "" for all; supports comma-separated
-	Project           string // "" for all; supports comma-separated
-	Machine           string // "" for all; supports comma-separated
+	From    string // YYYY-MM-DD, inclusive
+	To      string // YYYY-MM-DD, inclusive
+	Agent   string // "" for all; supports comma-separated
+	Project string // "" for all; supports comma-separated
+	Machine string // "" for all; supports comma-separated
+	// GitBranch is a branchListSep-joined list of opaque (project, branch) tokens (EncodeBranchFilterToken).
+	GitBranch         string
 	Model             string // "" for all; supports comma-separated
 	ExcludeProject    string // comma-separated projects to exclude
 	ExcludeAgent      string // comma-separated agents to exclude
@@ -160,6 +188,11 @@ func (f UsageFilter) appendUsageSessionFilterClauses(
 	where, args = appendCSV(where, args, "s.agent", f.Agent, true)
 	where, args = appendCSV(where, args, "s.project", f.Project, true)
 	where, args = appendCSV(where, args, "s.machine", f.Machine, true)
+	if f.GitBranch != "" {
+		var clause string
+		clause, args = BranchPairClauseArgs("s.project", "s.git_branch", f.GitBranch, args)
+		where += "\n\tAND " + clause
+	}
 	where, args = appendCSV(where, args, "s.project", f.ExcludeProject, false)
 	where, args = appendCSV(where, args, "s.agent", f.ExcludeAgent, false)
 
@@ -187,6 +220,47 @@ func (f UsageFilter) appendUsageSessionFilterClauses(
 		args = append(args, pargs...)
 	}
 
+	return where, args
+}
+
+// appendUsageMatchingActivityClauses requires the session to have at
+// least one row that GetUsageMatchingSessionCount's bounded branch would
+// count: an assistant, non-synthetic message (model optional — some
+// Copilot assistant messages parse before a model name is known) or a
+// usage_events row with a model. Model/ExcludeModel narrow those same
+// rows. Seeding the EXISTS subqueries with the matching eligibility
+// predicates keeps the unbounded branch's semantics aligned with the
+// bounded branch's per-row predicates, so the same filter matches the
+// same sessions whether or not a date range is set.
+func (f UsageFilter) appendUsageMatchingActivityClauses(
+	where string, args []any,
+) (string, []any) {
+	var messageArgs []any
+	messageWhere, messageArgs := f.appendUsageSourceFilterClauses(
+		usageMatchingMessageSourceEligibility, messageArgs, "m.model",
+	)
+	var eventArgs []any
+	eventWhere, eventArgs := f.appendUsageSourceFilterClauses(
+		usageEventSourceEligibility, eventArgs, "ue.model",
+	)
+
+	where += `
+	AND (
+		EXISTS (
+			SELECT 1
+			FROM messages m
+			WHERE m.session_id = s.id
+				AND ` + messageWhere + `
+		)
+		OR EXISTS (
+			SELECT 1
+			FROM usage_events ue
+			WHERE ue.session_id = s.id
+				AND ` + eventWhere + `
+		)
+	)`
+	args = append(args, messageArgs...)
+	args = append(args, eventArgs...)
 	return where, args
 }
 
@@ -266,6 +340,25 @@ const usageMessageEligibility = `
 const usageMessageSourceEligibility = `
     m.token_usage != ''
     AND m.model != ''
+    AND m.model != '<synthetic>'`
+
+// usageMatchingMessageEligibility is usageMessageEligibility with the
+// token-presence requirement removed and the model-presence requirement
+// relaxed to a role check. GetUsageMatchingSessionCount counts sessions
+// that have usage-shaped activity even when the agent (e.g. Copilot)
+// never records per-message tokens or, for some assistant messages, a
+// model name, so it must not gate on m.token_usage or m.model != ” the
+// way every token/cost query does; Model/ExcludeModel filters are applied
+// separately and still narrow the match when set. Do not reuse this for
+// usageRowQuery or its callers — see the usageMessageEligibility doc
+// comment above.
+const usageMatchingMessageEligibility = `
+    m.role = 'assistant'
+    AND m.model != '<synthetic>'
+    AND s.deleted_at IS NULL`
+
+const usageMatchingMessageSourceEligibility = `
+    m.role = 'assistant'
     AND m.model != '<synthetic>'`
 
 const usageEventEligibility = `
@@ -707,7 +800,19 @@ func usageRowsSQLForBounds(
 		return rowsSQL, args
 	}
 
-	messageTimestampSourceWhere := usageMessageSourceEligibility +
+	return usageBoundedRowsSQL(
+		f, b, usageMessageSourceEligibility, usageMessageEligibility)
+}
+
+// usageBoundedRowsSQL builds the bounded-branch CTE row source shared by
+// usageRowsSQLForBounds (token-eligible rows) and
+// usageMatchingSessionRowsSQLForBounds (relaxed matching rows). The two
+// callers differ only in the message eligibility predicates.
+func usageBoundedRowsSQL(
+	f UsageFilter, b usageBounds,
+	messageSourceEligibility, messageEligibility string,
+) (string, []any) {
+	messageTimestampSourceWhere := messageSourceEligibility +
 		"\n\tAND m.timestamp IS NOT NULL" +
 		"\n\tAND m.timestamp != ''"
 	var messageTimestampArgs []any
@@ -734,7 +839,7 @@ func usageRowsSQLForBounds(
 		f.appendUsageSessionFilterClauses(
 			usageSessionEligibility, eventTimestampJoinArgs)
 
-	messageFallbackWhere := usageMessageEligibility +
+	messageFallbackWhere := messageEligibility +
 		"\n\tAND NULLIF(m.timestamp, '') IS NULL"
 	var messageFallbackArgs []any
 	messageFallbackWhere, messageFallbackArgs =
@@ -775,6 +880,19 @@ func usageRowsSQLForBounds(
 	return rowsSQL, args
 }
 
+// usageMatchingSessionRowsSQLForBounds is usageRowsSQLForBounds's bounded
+// branch built from the relaxed usageMatchingMessageEligibility predicates,
+// so GetUsageMatchingSessionCount only relaxes the token-usage and
+// model-presence requirements and keeps the same per-row
+// Model/ExcludeModel filtering as the normal bounded path.
+func usageMatchingSessionRowsSQLForBounds(
+	f UsageFilter, b usageBounds,
+) (string, []any) {
+	return usageBoundedRowsSQL(
+		f, b,
+		usageMatchingMessageSourceEligibility, usageMatchingMessageEligibility)
+}
+
 func usageRowQuery(f UsageFilter) (string, []any) {
 	rowsSQL, args := usageRowsSQLForBounds(f, usageBoundsForFilter(f))
 	query := dailyUsageRowSelectFromRows(rowsSQL)
@@ -811,8 +929,11 @@ func cursorUsageRowsSQLForBounds(
 	f UsageFilter, b usageBounds,
 ) (string, []any, bool) {
 	termPred, _ := buildUsageTerminationPredSQLite(f.Termination)
+	// Cursor usage rows carry no project or git branch and bypass the session
+	// filter, so any filter they cannot satisfy (project, machine, branch)
+	// must exclude them entirely rather than let them leak into totals.
 	if f.Project != "" || f.ExcludeProject != "" ||
-		f.Machine != "" || f.MinUserMessages > 0 ||
+		f.Machine != "" || f.GitBranch != "" || f.MinUserMessages > 0 ||
 		f.ExcludeOneShot || termPred != "" ||
 		f.ActiveSince != "" {
 		return "", nil, false
@@ -1724,14 +1845,12 @@ func (db *DB) GetDailyUsage(
 		}
 		totals.CacheSavings = totalSavings
 
-		var copilotCost float64
+		var aiCredits float64
 		for key, b := range accum {
-			if IsCopilotAgent(key.agent) {
-				copilotCost += b.cost
-			}
+			aiCredits += AICreditsFromCost(key.agent, b.cost)
 		}
-		if copilotCost > 0 {
-			totals.CopilotAICredits = copilotCost / 0.01
+		if aiCredits > 0 {
+			totals.CopilotAICredits = aiCredits
 		}
 		var sessionCounts UsageSessionCounts
 		if seenSessions != nil {
@@ -1899,16 +2018,14 @@ func (db *DB) GetDailyUsage(
 
 	totals.CacheSavings = totalSavings
 
-	var copilotCost float64
+	var aiCredits float64
 	for _, d := range daily {
 		for _, ab := range d.AgentBreakdowns {
-			if IsCopilotAgent(ab.Agent) {
-				copilotCost += ab.Cost
-			}
+			aiCredits += AICreditsFromCost(ab.Agent, ab.Cost)
 		}
 	}
-	if copilotCost > 0 {
-		totals.CopilotAICredits = copilotCost / 0.01
+	if aiCredits > 0 {
+		totals.CopilotAICredits = aiCredits
 	}
 
 	var sessionCounts UsageSessionCounts
@@ -2215,9 +2332,7 @@ func (db *DB) GetSessionUsage(
 	}
 	if out.HasCost {
 		out.CostUSD = cost
-	}
-	if IsCopilotAgent(sess.Agent) && out.HasCost {
-		out.AICredits = cost / 0.01
+		out.AICredits = AICreditsFromCost(sess.Agent, cost)
 	}
 	if len(unpricedSet) > 0 {
 		out.UnpricedModels = sortedSetKeys(unpricedSet)
@@ -2359,4 +2474,63 @@ func (db *DB) GetUsageSessionCounts(
 	}
 
 	return out, nil
+}
+
+// GetUsageMatchingSessionCount counts sessions that match the usage filter
+// even when they have no token-bearing usage rows. Bounded ranges are
+// resolved against the timestamps of the sessions' messages/usage_events
+// rows (falling back to s.started_at for rows with no timestamp of their
+// own), the same shape usageRowsSQLForBounds uses, so a session whose
+// started_at/ended_at fall outside the window but whose message activity
+// falls inside it is still counted.
+func (db *DB) GetUsageMatchingSessionCount(
+	ctx context.Context, f UsageFilter,
+) (int, error) {
+	bounds := usageBoundsForFilter(f)
+
+	if !bounds.bounded() {
+		where, args := f.appendUsageSessionFilterClauses(usageSessionEligibility, nil)
+		where, args = f.appendUsageMatchingActivityClauses(where, args)
+
+		var count int
+		err := db.getReader().QueryRowContext(ctx, `
+			SELECT COUNT(*)
+			FROM sessions s WHERE `+where, args...).Scan(&count)
+		if err != nil {
+			return 0, fmt.Errorf("querying matching usage sessions: %w", err)
+		}
+		return count, nil
+	}
+
+	rowsSQL, args := usageMatchingSessionRowsSQLForBounds(f, bounds)
+	rows, err := db.getReader().QueryContext(
+		ctx, dailyUsageRowSelectFromRows(rowsSQL), args...)
+	if err != nil {
+		return 0, fmt.Errorf("querying matching usage sessions: %w", err)
+	}
+	defer rows.Close()
+
+	loc := f.location()
+	seen := make(map[string]struct{})
+	for rows.Next() {
+		r, err := scanDailyUsageRow(rows)
+		if err != nil {
+			return 0, fmt.Errorf("scanning matching usage session: %w", err)
+		}
+		date := localDate(r.ts, loc)
+		if date == "" {
+			continue
+		}
+		if f.From != "" && date < f.From {
+			continue
+		}
+		if f.To != "" && date > f.To {
+			continue
+		}
+		seen[r.sessionID] = struct{}{}
+	}
+	if err := rows.Err(); err != nil {
+		return 0, fmt.Errorf("iterating matching usage sessions: %w", err)
+	}
+	return len(seen), nil
 }

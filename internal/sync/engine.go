@@ -130,6 +130,12 @@ type Engine struct {
 	// toDBUsageEvents). Reset at the start of each sync run and folded
 	// into the returned SyncStats before the run completes.
 	anomalies anomalyAccumulator
+
+	// signalSched debounces the O(session history) signal/secret
+	// recompute triggered by incremental writes, so streaming
+	// sessions don't rescan their whole history on every appended
+	// line. Close flushes and stops it.
+	signalSched *signalScheduler
 }
 
 // PhaseStats returns the engine's phase counter. The values reflect only
@@ -206,7 +212,7 @@ func NewEngine(
 		maps.Copy(providerModes, cfg.ProviderMigrationModes)
 	}
 
-	return &Engine{
+	e := &Engine{
 		db:                      database,
 		agentDirs:               dirs,
 		machine:                 cfg.Machine,
@@ -221,6 +227,48 @@ func NewEngine(
 		providerFactories:       providerFactoryMap(providerFactories),
 		providerMigrationModes:  providerModes,
 	}
+	// Errors are logged inside recomputeSignalsFromDB and are
+	// non-fatal: the next write or flush retries.
+	recompute := func(sessionID string) {
+		_ = e.recomputeSignalsFromDB(
+			context.Background(), sessionID,
+		)
+	}
+	e.signalSched = newSignalScheduler(
+		signalRecomputeInterval, signalRecomputeQuiet,
+		// Inline runs happen from markDirty inside writeIncremental,
+		// whose callers already hold syncMu.
+		recompute,
+		// Timer and flush passes happen outside any sync operation,
+		// so they take syncMu around the whole claim-and-recompute
+		// pass: otherwise a delayed recompute could read an older
+		// message snapshot and overwrite signals just written by a
+		// concurrent sync, or claim a session and block while a
+		// locked pre-push flush finds nothing left to recompute.
+		func(flush func()) {
+			e.syncMu.Lock()
+			defer e.syncMu.Unlock()
+			flush()
+		},
+	)
+	return e
+}
+
+// Close flushes any pending debounced signal recomputes and stops
+// the scheduler. Call once when the engine's owner shuts down;
+// safe to call repeatedly.
+func (e *Engine) Close() {
+	e.signalSched.stop()
+}
+
+// FlushSignals immediately recomputes signals for sessions with a
+// pending debounced recompute, leaving the scheduler running. Push
+// paths that read SQLite rows outside a sync operation call it
+// first so pushed sessions carry current signal fields. Callers
+// must not hold syncMu; work running inside SyncThenRun is flushed
+// by the engine instead.
+func (e *Engine) FlushSignals() {
+	e.signalSched.flushAll()
 }
 
 func providerFactoryMap(
@@ -605,6 +653,17 @@ func (e *Engine) classifyProviderChangedPath(
 		})
 		def := provider.Definition()
 		watchRoots := providerChangedPathWatchRoots(ctx, provider, roots)
+		// Every SourcesForChangedPath implementation resolves the
+		// changed path within the provider's configured roots or plan
+		// watch roots (stored-path hints are already scoped to the
+		// watch root by the query), so an agent whose roots cannot
+		// contain the path never claims it. Skip it before the
+		// per-root stored-hint DB queries, which otherwise run for
+		// every registered agent on every watcher event.
+		if !changedPathWithinAnyRoot(path, roots) &&
+			!changedPathWithinAnyRoot(path, watchRoots) {
+			continue
+		}
 		for _, watchRoot := range watchRoots {
 			storedSourcePaths, err := e.db.ListStoredSourcePathHints(
 				string(def.Type),
@@ -1564,6 +1623,10 @@ func (e *Engine) SyncThenRun(
 	if ctx.Err() != nil {
 		return stats, ctx.Err()
 	}
+	// work typically scans and pushes SQLite rows, so flush any
+	// deferred signal recomputes first (inline: syncMu is held) or
+	// pushed sessions could carry stale signal/secret fields.
+	e.signalSched.flushAllInline()
 	if err := work(full || didResync); err != nil {
 		return stats, err
 	}
@@ -2034,6 +2097,20 @@ func (e *Engine) discoverProviderSources(
 			failures++
 			continue
 		}
+		currentSources := providerSourcePathSet(sources)
+		forceParseSources := map[string]struct{}{}
+		if agentType == parser.AgentVSCopilot {
+			missingSources, forceSources :=
+				e.visualStudioCopilotMissingVS2026PollSources(
+					ctx, provider, filteredRoots, currentSources,
+				)
+			sources = append(sources, missingSources...)
+			maps.Copy(forceParseSources, forceSources)
+		}
+		forceParseSource := func(sourcePath string) bool {
+			_, ok := forceParseSources[filepath.Clean(sourcePath)]
+			return ok
+		}
 		// Forge, Piebald, and Warp are DB-backed providers: a shared SQLite
 		// DB hosts every session. Full-sync change detection and counting
 		// run through their dedicated provider-driven DB sync phase
@@ -2062,6 +2139,9 @@ func (e *Engine) discoverProviderSources(
 				ProviderSource:  &sourceCopy,
 				ProviderProcess: true,
 			}
+			if forceParseSource(sourcePath) {
+				discovered.ForceParse = true
+			}
 			// S3-aware source sets carry the durable object metadata in the
 			// Opaque payload. Thread it into the DiscoveredFile so the S3 sync
 			// path (object fetch, fingerprinting, machine-ID namespacing) and the
@@ -2084,6 +2164,155 @@ func (e *Engine) discoverProviderSources(
 		}
 	}
 	return files, failures
+}
+
+func providerSourcePathSet(sources []parser.SourceRef) map[string]struct{} {
+	seen := make(map[string]struct{}, len(sources))
+	for _, source := range sources {
+		path := providerDiscoveredPath(source)
+		if path == "" {
+			continue
+		}
+		seen[filepath.Clean(path)] = struct{}{}
+	}
+	return seen
+}
+
+func (e *Engine) visualStudioCopilotMissingVS2026PollSources(
+	ctx context.Context,
+	provider parser.Provider,
+	roots []string,
+	currentSources map[string]struct{},
+) ([]parser.SourceRef, map[string]struct{}) {
+	watchRoots := providerChangedPathWatchRoots(ctx, provider, roots)
+	var out []parser.SourceRef
+	seenHints := make(map[string]struct{})
+	forceParseSources := make(map[string]struct{})
+	for _, watchRoot := range watchRoots {
+		hints, err := e.db.ListStoredSourcePathHints(
+			string(parser.AgentVSCopilot), []string{watchRoot},
+		)
+		if err != nil {
+			log.Printf(
+				"%s provider poll stored hints: %v",
+				parser.AgentVSCopilot, err,
+			)
+			continue
+		}
+		for _, hint := range hints {
+			hint = filepath.Clean(hint)
+			if _, seen := seenHints[hint]; seen {
+				continue
+			}
+			seenHints[hint] = struct{}{}
+			container, conversationID, ok :=
+				parser.SplitVisualStudioCopilotVirtualPath(hint)
+			if !ok ||
+				!parser.IsVisualStudioCopilotVS2026SessionPath(container) {
+				continue
+			}
+			if _, ok := currentSources[hint]; ok {
+				continue
+			}
+			if current, ok := e.visualStudioCopilotCurrentPollSource(
+				ctx, provider, conversationID,
+			); ok {
+				sourcePath := providerDiscoveredPath(current)
+				if sourcePath == "" {
+					continue
+				}
+				path := filepath.Clean(sourcePath)
+				forceParseSources[path] = struct{}{}
+				if _, exists := currentSources[path]; !exists {
+					currentSources[path] = struct{}{}
+					out = append(out, current)
+				}
+				continue
+			}
+			if !visualStudioCopilotVS2026PollCanTombstone(
+				roots, container,
+			) {
+				continue
+			}
+			tombstones, err := provider.SourcesForChangedPath(
+				ctx,
+				parser.ChangedPathRequest{
+					Path:              hint,
+					EventKind:         "remove",
+					WatchRoot:         watchRoot,
+					StoredSourcePaths: []string{hint},
+				},
+			)
+			if err != nil {
+				log.Printf(
+					"%s provider poll tombstone: %v",
+					parser.AgentVSCopilot, err,
+				)
+				continue
+			}
+			for _, tombstone := range tombstones {
+				sourcePath := providerDiscoveredPath(tombstone)
+				if sourcePath == "" {
+					continue
+				}
+				path := filepath.Clean(sourcePath)
+				if _, exists := currentSources[path]; exists {
+					continue
+				}
+				currentSources[path] = struct{}{}
+				forceParseSources[path] = struct{}{}
+				out = append(out, tombstone)
+			}
+		}
+	}
+	return out, forceParseSources
+}
+
+func visualStudioCopilotVS2026PollCanTombstone(
+	roots []string,
+	container string,
+) bool {
+	if container == "" {
+		return false
+	}
+	container = filepath.Clean(container)
+	if parser.IsRegularFile(container) {
+		return false
+	}
+	if !reachableDir(filepath.Dir(container)) {
+		return false
+	}
+	return slices.ContainsFunc(roots, func(root string) bool {
+		root = filepath.Clean(root)
+		return samePathOrDescendant(container, root) && reachableDir(root)
+	})
+}
+
+func reachableDir(path string) bool {
+	info, err := os.Stat(path)
+	return err == nil && info != nil && info.IsDir()
+}
+
+func (e *Engine) visualStudioCopilotCurrentPollSource(
+	ctx context.Context,
+	provider parser.Provider,
+	conversationID string,
+) (parser.SourceRef, bool) {
+	current, ok, err := provider.FindSource(
+		ctx,
+		parser.FindSourceRequest{
+			RawSessionID:       conversationID,
+			RequireFreshSource: true,
+		},
+	)
+	if err != nil {
+		log.Printf(
+			"%s provider poll source lookup: %v",
+			parser.AgentVSCopilot, err,
+		)
+		return parser.SourceRef{}, false
+	}
+	return current, ok
 }
 
 // expandCodexProviderDuplicates re-adds the on-disk duplicate paths of each
@@ -2205,6 +2434,10 @@ func (e *Engine) filterFilesByMtime(
 	out := files[:0]
 	codexIndexRefresh := make(map[string][]parser.DiscoveredFile)
 	for _, f := range files {
+		if f.ForceParse {
+			out = append(out, f)
+			continue
+		}
 		mtime, err := e.discoveredFileEffectiveMtime(ctx, f)
 		if err != nil {
 			out = append(out, f)
@@ -3195,9 +3428,10 @@ type processResult struct {
 	// forceReplace requests full message replacement on write,
 	// even when the existing rows would otherwise be left in
 	// place. Set when a fall-through to full parse is recovering
-	// from a cross-sync streaming split: the new merged messages
-	// reuse the existing ordinals, so the default append-only
-	// writeMessages would silently drop the rewrite.
+	// from stale stored rows, such as an atomic file replacement
+	// or cross-sync streaming split. In those cases the parsed
+	// messages can reuse existing ordinals, so the default
+	// append-only writeMessages would silently drop the rewrite.
 	forceReplace bool
 	cacheKey     string
 	// retrySessionIDs carries provider per-result data-version state.
@@ -3414,11 +3648,16 @@ func (e *Engine) processProviderFile(
 	// parse entirely. This reproduces the legacy process arm's
 	// shouldSkipFile gate so an unchanged session is not re-parsed on
 	// every full sync.
-	if mtime, fresh := e.providerSingleSessionFresh(ctx, provider, source, file); fresh {
+	sourceForceReplace := false
+	if mtime, fresh, forceReplace := e.providerSingleSessionFresh(
+		ctx, provider, source, file,
+	); fresh {
 		return processResult{
 			skip:  true,
 			mtime: mtime,
 		}, true
+	} else if forceReplace {
+		sourceForceReplace = true
 	}
 	if freshMtime, fresh := e.providerSourceFreshBeforeFingerprint(source, file); fresh {
 		return processResult{
@@ -3487,7 +3726,7 @@ func (e *Engine) processProviderFile(
 		incRes.cacheKey = cacheKey
 		return incRes, true
 	}
-	incForceReplace := incRes.forceReplace
+	incForceReplace := sourceForceReplace || incRes.forceReplace
 
 	// DB-stored fingerprint skip. The provider has no database handle, so the
 	// engine reproduces the legacy DB-aware skip that single-session JSONL
@@ -3497,7 +3736,7 @@ func (e *Engine) processProviderFile(
 	// engine). For Codex this also folds in the session_index.jsonl sidecar:
 	// a shared index mtime bump that did not change this session's title must
 	// not trigger a reparse.
-	if !e.forceParse && !file.ForceParse &&
+	if !incForceReplace && !e.forceParse && !file.ForceParse &&
 		e.shouldSkipProviderSourceByDB(file, fingerprint) {
 		return processResult{
 			skip:        true,
@@ -3518,7 +3757,7 @@ func (e *Engine) processProviderFile(
 	// a provider whose fingerprint mtime differs from the stored value simply
 	// reparses, matching the prior behavior. Claude and Cowork have their own
 	// earlier freshness checks; this is the generic fallback for the rest.
-	if !e.forceParse && !file.ForceParse &&
+	if !incForceReplace && !e.forceParse && !file.ForceParse &&
 		e.providerSourceUnchangedInDB(source, fingerprint) {
 		return processResult{
 			skip:      true,
@@ -4213,7 +4452,7 @@ func (e *Engine) providerSingleSessionFresh(
 	provider parser.Provider,
 	source parser.SourceRef,
 	file parser.DiscoveredFile,
-) (int64, bool) {
+) (int64, bool, bool) {
 	// Match the legacy shouldSkipFile gate, which keyed off the
 	// engine-wide forceParse (parse-diff) flag only. A per-file
 	// ForceParse (set by SyncSingleSession to bypass the error skip
@@ -4221,7 +4460,7 @@ func (e *Engine) providerSingleSessionFresh(
 	// is still skipped so a single-session resync does not, for example,
 	// reapply a worktree project mapping to a file that has not changed.
 	if e.forceParse {
-		return 0, false
+		return 0, false, false
 	}
 	// Claude is the single-physical-file provider that takes the
 	// append-only incremental path. Its source stem is the session ID,
@@ -4229,15 +4468,15 @@ func (e *Engine) providerSingleSessionFresh(
 	// can later split the file into several sessions.
 	if provider.Capabilities().Source.IncrementalAppend !=
 		parser.CapabilitySupported {
-		return 0, false
+		return 0, false, false
 	}
 	path := providerDiscoveredPath(source)
 	if path == "" {
-		return 0, false
+		return 0, false, false
 	}
 	sessionID := claudeSessionIDFromPath(path)
 	if sessionID == "" {
-		return 0, false
+		return 0, false, false
 	}
 	lookupPath := path
 	if e.pathRewriter != nil {
@@ -4247,16 +4486,32 @@ func (e *Engine) providerSingleSessionFresh(
 	if err != nil {
 		info, err = os.Stat(path)
 		if err != nil {
-			return 0, false
+			return 0, false, false
 		}
 	}
 	if !e.shouldSkipFile(sessionID, info) {
-		return 0, false
+		return 0, false, false
+	}
+	if e.providerIncrementalIdentityChanged(lookupPath, info) {
+		return 0, false, true
 	}
 	sess, _ := e.db.GetSession(ctx, e.idPrefix+sessionID)
 	return info.ModTime().UnixNano(), sess != nil &&
 		sess.Project != "" &&
-		!parser.NeedsProjectReparse(sess.Project)
+		!parser.NeedsProjectReparse(sess.Project), false
+}
+
+func (e *Engine) providerIncrementalIdentityChanged(
+	lookupPath string,
+	info os.FileInfo,
+) bool {
+	if e.pathRewriter != nil {
+		// Remote imports rewrite per-run temp paths to stable source paths;
+		// the temp inode is expected to change between identical downloads.
+		return false
+	}
+	curInode, curDevice := getFileIdentity(info)
+	return e.db.FileIdentityChanged(lookupPath, curInode, curDevice)
 }
 
 func (e *Engine) providerSourceFreshBeforeFingerprint(
@@ -4489,7 +4744,7 @@ func (e *Engine) tryIncrementalJSONL(
 	// state. Only check when both sides have a known identity
 	// (non-zero); zeros mean the data is missing or the
 	// platform doesn't expose inode/device (Windows).
-	if inc.FileInode != 0 && inc.FileDevice != 0 {
+	if e.pathRewriter == nil && inc.FileInode != 0 && inc.FileDevice != 0 {
 		curInode, curDevice := getFileIdentity(info)
 		if curInode != 0 && curDevice != 0 &&
 			(curInode != inc.FileInode ||
@@ -5410,6 +5665,13 @@ func (e *Engine) prepareSessionWrite(
 	e.anomalies.recordMalformedLines(
 		s.Agent, pw.sess.File.Path, s.ParserMalformedLines,
 	)
+	// An Antigravity session decoded from an unrecognized (newer) schema
+	// carries an "agy-schema:" source_version; count it as an early warning
+	// that a new agy build may have broken the heuristic decode. Reuse the
+	// single-source-of-truth rule so the agent gate stays in one place.
+	if parser.DecodeConfidence(s.Agent, s.SourceVersion) == parser.DecodeConfidenceLow {
+		e.anomalies.recordUnknownSchemaSession(s.Agent)
+	}
 
 	// A per-row token clamp must not leave an inflated value stranded in a
 	// row-derived session total while the row that produced it was clamped.
@@ -6280,12 +6542,14 @@ func (e *Engine) writeIncremental(
 		return err
 	}
 
-	// Errors here are already logged by recomputeSignalsFromDB
-	// and are non-fatal for incremental sync; the next
-	// incremental write will retry.
-	_ = e.recomputeSignalsFromDB(
-		context.Background(), inc.sessionID,
-	)
+	// Signal/secret recompute costs O(session history), so it is
+	// debounced per session instead of running on every appended
+	// line: the first write after a quiet period recomputes
+	// inline, writes during a streaming burst coalesce into one
+	// recompute per interval plus a trailing flush. Recompute
+	// errors are logged inside recomputeSignalsFromDB and are
+	// non-fatal; a later write or flush retries.
+	e.signalSched.markDirty(inc.sessionID)
 
 	return nil
 }

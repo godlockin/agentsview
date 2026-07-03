@@ -56,6 +56,7 @@ const openersService = OpenersService as unknown as {
 const sessionsService = SessionsService as unknown as {
   getApiV1SessionsIdDirectory: ReturnType<typeof vi.fn>;
   getApiV1SessionsIdUsage: ReturnType<typeof vi.fn>;
+  postApiV1SessionsIdResume: ReturnType<typeof vi.fn>;
 };
 
 type SessionWithTokenFlags = Session & {
@@ -163,6 +164,7 @@ beforeEach(() => {
   sessionsService.getApiV1SessionsIdUsage
     .mockReset()
     .mockResolvedValue(makeUsage());
+  sessionsService.postApiV1SessionsIdResume.mockReset();
 });
 
 afterEach(() => {
@@ -244,6 +246,47 @@ describe("SessionBreadcrumb", () => {
 
     expect(document.body.textContent).toContain("重命名");
     expect(document.body.textContent).toContain("删除");
+
+    unmount(component);
+  });
+
+  it("keeps whole-session resume request bodies unchanged", async () => {
+    sessionsService.postApiV1SessionsIdResume.mockResolvedValue({
+      launched: false,
+      command: "claude --resume run:123456789abcdef",
+      cwd: "/tmp/project",
+    });
+
+    const component = mount(SessionBreadcrumb, {
+      target: document.body,
+      props: {
+        session: makeSession("claude", {
+          file_path: "/tmp/project/session.jsonl",
+        }),
+        onBack: () => {},
+      },
+    });
+
+    await vi.waitFor(() => {
+      expect(document.querySelector(".resume-btn")).toBeTruthy();
+    });
+    await tick();
+
+    document.querySelector<HTMLButtonElement>(".resume-btn")?.click();
+    await tick();
+
+    const resumeItem = document.querySelector<HTMLButtonElement>(
+      ".open-menu-item",
+    );
+    expect(resumeItem).toBeTruthy();
+    resumeItem!.click();
+    await Promise.resolve();
+    await tick();
+
+    expect(sessionsService.postApiV1SessionsIdResume).toHaveBeenCalledWith({
+      id: "run:123456789abcdef",
+      requestBody: {},
+    });
 
     unmount(component);
   });
@@ -469,6 +512,154 @@ describe("SessionBreadcrumb", () => {
       });
       await tick();
       expect(document.querySelector(".summary-badge")).toBeNull();
+      unmount(component);
+    });
+  });
+
+  describe("malformed-lines badge", () => {
+    it("shows the badge with the line count when parser_malformed_lines is positive", async () => {
+      const component = mount(SessionBreadcrumb, {
+        target: document.body,
+        props: {
+          session: makeSession("claude", {
+            parser_malformed_lines: 3,
+          }),
+          onBack: () => {},
+        },
+      });
+      await tick();
+      const badge = document.querySelector(".malformed-badge");
+      expect(badge).toBeTruthy();
+      expect(badge?.textContent?.trim()).toBe("3 malformed lines");
+      expect(badge?.getAttribute("title")).toBe(
+        "3 lines in the source file could not be parsed",
+      );
+      unmount(component);
+    });
+
+    it("uses singular wording for exactly one malformed line", async () => {
+      const component = mount(SessionBreadcrumb, {
+        target: document.body,
+        props: {
+          session: makeSession("claude", {
+            parser_malformed_lines: 1,
+          }),
+          onBack: () => {},
+        },
+      });
+      await tick();
+      const badge = document.querySelector(".malformed-badge");
+      expect(badge?.textContent?.trim()).toBe("1 malformed line");
+      expect(badge?.getAttribute("title")).toBe(
+        "1 line in the source file could not be parsed",
+      );
+      unmount(component);
+    });
+
+    it("hides the badge when parser_malformed_lines is zero", async () => {
+      const component = mount(SessionBreadcrumb, {
+        target: document.body,
+        props: {
+          session: makeSession("claude", {
+            parser_malformed_lines: 0,
+          }),
+          onBack: () => {},
+        },
+      });
+      await tick();
+      expect(document.querySelector(".malformed-badge")).toBeNull();
+      unmount(component);
+    });
+
+    it("hides the badge when parser_malformed_lines is absent", async () => {
+      const component = mount(SessionBreadcrumb, {
+        target: document.body,
+        props: {
+          session: makeSession("claude"),
+          onBack: () => {},
+        },
+      });
+      await tick();
+      expect(document.querySelector(".malformed-badge")).toBeNull();
+      unmount(component);
+    });
+  });
+
+  describe("decode-confidence badge", () => {
+    it("shows the badge for low-confidence antigravity", async () => {
+      const component = mount(SessionBreadcrumb, {
+        target: document.body,
+        props: {
+          session: makeSession("antigravity", {
+            decode_confidence: "low",
+          }),
+          onBack: () => {},
+        },
+      });
+      await tick();
+      const badge = document.querySelector(".decode-badge");
+      expect(badge).toBeTruthy();
+      expect(badge?.textContent?.trim().toLowerCase()).toContain(
+        "unverified schema",
+      );
+      unmount(component);
+    });
+
+    it("shows the badge for low-confidence antigravity-cli", async () => {
+      const component = mount(SessionBreadcrumb, {
+        target: document.body,
+        props: {
+          session: makeSession("antigravity-cli", {
+            decode_confidence: "low",
+          }),
+          onBack: () => {},
+        },
+      });
+      await tick();
+      expect(document.querySelector(".decode-badge")).toBeTruthy();
+      unmount(component);
+    });
+
+    it("hides the badge for high confidence", async () => {
+      const component = mount(SessionBreadcrumb, {
+        target: document.body,
+        props: {
+          session: makeSession("antigravity", {
+            decode_confidence: "high",
+          }),
+          onBack: () => {},
+        },
+      });
+      await tick();
+      expect(document.querySelector(".decode-badge")).toBeNull();
+      unmount(component);
+    });
+
+    it("hides the badge when confidence is absent", async () => {
+      const component = mount(SessionBreadcrumb, {
+        target: document.body,
+        props: {
+          session: makeSession("antigravity"),
+          onBack: () => {},
+        },
+      });
+      await tick();
+      expect(document.querySelector(".decode-badge")).toBeNull();
+      unmount(component);
+    });
+
+    it("hides the badge for non-antigravity agents", async () => {
+      const component = mount(SessionBreadcrumb, {
+        target: document.body,
+        props: {
+          session: makeSession("claude", {
+            decode_confidence: "low",
+          }),
+          onBack: () => {},
+        },
+      });
+      await tick();
+      expect(document.querySelector(".decode-badge")).toBeNull();
       unmount(component);
     });
   });

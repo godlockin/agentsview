@@ -11,7 +11,8 @@ import (
 	"time"
 )
 
-const piebaldDBFilename = "app.db"
+// PiebaldDBFilename is the Piebald session store filename inside its data dir.
+const PiebaldDBFilename = "app.db"
 
 // PiebaldSessionMeta is lightweight metadata for a Piebald chat.
 type PiebaldSessionMeta struct {
@@ -25,7 +26,7 @@ func piebaldDBPath(dir string) string {
 	if dir == "" {
 		return ""
 	}
-	path := filepath.Join(dir, piebaldDBFilename)
+	path := filepath.Join(dir, PiebaldDBFilename)
 	info, err := os.Stat(path)
 	if err != nil || info.IsDir() {
 		return ""
@@ -94,7 +95,7 @@ func parsePiebaldSessionResults(dbPath, chatID, machine string) ([]ParseResult, 
 }
 
 func openPiebaldDB(dbPath string) (*sql.DB, error) {
-	dsn := "file:" + dbPath + "?mode=ro&_busy_timeout=3000"
+	dsn := "file:" + sqliteURIPath(dbPath) + "?mode=ro&_busy_timeout=3000"
 	db, err := sql.Open("sqlite3", dsn)
 	if err != nil {
 		return nil, fmt.Errorf("opening piebald db %s: %w", dbPath, err)
