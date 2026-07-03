@@ -125,12 +125,13 @@ func runServeBackgroundCommand(
 func runServeBackground(
 	cfg config.Config, args []string, opts serveReplacementOptions,
 ) {
+	replacementCheckStarted := time.Now()
 	if err := ensureServeAuthToken(&cfg); err != nil {
 		fatal("serve background: generating auth token: %v", err)
 	}
 	if cfg.RequireAuth {
 		if cfg.AuthToken != "" {
-			fmt.Printf("Auth enabled. Token: %s\n", cfg.AuthToken)
+			fmt.Println("Auth enabled. Token is configured.")
 		}
 	}
 
@@ -147,12 +148,14 @@ func runServeBackground(
 		}
 		return
 	case serveReplacementAuto, serveReplacementExplicit:
+		waitedForExternalStartup := false
 		if waited, err := waitForExternalServeStartupBeforeReplacement(
 			context.Background(),
 			cfg.DataDir,
 			cfg.AuthToken,
 			backgroundServeReadyTimeout,
 		); waited {
+			waitedForExternalStartup = true
 			if err != nil {
 				if errors.Is(err, errServeStartupInProgress) {
 					fmt.Println(errServeStartupInProgress.Error() + ".")
@@ -160,10 +163,11 @@ func runServeBackground(
 				}
 				fatal("serve background: %v", err)
 			}
-			decision = decideServeDaemonReplacementAfterExternalStartup(
-				cfg, opts, decision,
-			)
 		}
+		decision = refreshServeDaemonReplacementDecision(
+			cfg, opts, decision, waitedForExternalStartup,
+			replacementCheckStarted,
+		)
 		switch decision.Action {
 		case serveReplacementNone:
 		case serveReplacementUseExisting:
@@ -356,6 +360,9 @@ probeDaemon:
 				}
 				goto probeDaemon
 			}
+			if serveReplacementTargetChanged(*cfg, rt) {
+				goto probeDaemon
+			}
 			adoptDaemonRuntimeLaunchOptions(cfg, rt)
 			if err := stopDaemonRuntimeForUpgrade(*cfg, rt); err != nil {
 				return nil, fmt.Errorf(
@@ -384,6 +391,9 @@ probeDaemon:
 				if err != nil {
 					return nil, err
 				}
+				goto probeDaemon
+			}
+			if serveReplacementTargetChanged(*cfg, rt) {
 				goto probeDaemon
 			}
 			adoptDaemonRuntimeLaunchOptions(cfg, rt)
@@ -426,6 +436,9 @@ probeDaemon:
 					if err != nil {
 						return nil, err
 					}
+					goto probeDaemon
+				}
+				if serveReplacementTargetChanged(*cfg, rt) {
 					goto probeDaemon
 				}
 				adoptDaemonRuntimeLaunchOptions(cfg, rt)
@@ -498,7 +511,7 @@ func waitForExternalServeStartup(
 		if remaining <= 0 {
 			return nil, true, errServeStartupInProgress
 		}
-		wait := min(remaining, startProbeTick)
+		wait := min(remaining, startProbeTick())
 		timer := time.NewTimer(wait)
 		select {
 		case <-ctx.Done():
@@ -551,13 +564,20 @@ func waitForExternalServeStartupBeforeReplacement(
 	return true, nil
 }
 
-func decideServeDaemonReplacementAfterExternalStartup(
+func refreshServeDaemonReplacementDecision(
 	cfg config.Config,
 	opts serveReplacementOptions,
 	original serveReplacementDecision,
+	waitedForExternalStartup bool,
+	replacementCheckStarted time.Time,
 ) serveReplacementDecision {
 	if !opts.Replace {
-		return decideServeDaemonReplacement(cfg, opts)
+		decision := decideServeDaemonReplacement(cfg, opts)
+		if decision.Runtime == nil &&
+			replacementTargetStillStopConfirmed(cfg, original.Runtime) {
+			return original
+		}
+		return decision
 	}
 	decision := decideServeDaemonReplacement(
 		cfg, serveReplacementOptions{},
@@ -566,7 +586,41 @@ func decideServeDaemonReplacementAfterExternalStartup(
 		!sameDaemonReplacementTarget(original.Runtime, decision.Runtime) {
 		return decision
 	}
+	// A foreground startup may publish its runtime while still holding the
+	// start lock. If that startup wins, reuse the daemon it just published
+	// instead of treating --replace as permission to stop it.
+	if waitedForExternalStartup &&
+		decision.Action == serveReplacementUseExisting &&
+		daemonRuntimeStartedAfter(decision.Runtime, replacementCheckStarted) {
+		return decision
+	}
+	if decision.Runtime == nil &&
+		replacementTargetStillStopConfirmed(cfg, original.Runtime) {
+		return original
+	}
 	return decideServeDaemonReplacement(cfg, opts)
+}
+
+func daemonRuntimeStartedAfter(rt *DaemonRuntime, started time.Time) bool {
+	return rt != nil &&
+		!rt.Record.StartedAt.IsZero() &&
+		rt.Record.StartedAt.After(started)
+}
+
+func serveReplacementTargetChanged(
+	cfg config.Config, original *DaemonRuntime,
+) bool {
+	decision := decideServeDaemonReplacement(cfg, serveReplacementOptions{})
+	if decision.Runtime == nil {
+		return !replacementTargetStillStopConfirmed(cfg, original)
+	}
+	return !sameDaemonReplacementTarget(original, decision.Runtime)
+}
+
+func replacementTargetStillStopConfirmed(
+	cfg config.Config, original *DaemonRuntime,
+) bool {
+	return original != nil && stopTargetConfirmed(original.Record, cfg.AuthToken)
 }
 
 func sameDaemonReplacementTarget(a, b *DaemonRuntime) bool {
@@ -631,7 +685,8 @@ func waitForBackgroundLaunchOwner(
 				return
 			}
 		}
-		timer := time.NewTimer(startProbeTick)
+		wait := min(time.Until(deadline), startProbeTick())
+		timer := time.NewTimer(wait)
 		select {
 		case <-ctx.Done():
 			timer.Stop()
@@ -767,7 +822,7 @@ func waitForBackgroundServeReady(
 ) (*DaemonRuntime, error) {
 	timer := time.NewTimer(timeout)
 	defer timer.Stop()
-	ticker := time.NewTicker(startProbeTick)
+	ticker := time.NewTicker(startProbeTick())
 	defer ticker.Stop()
 
 	for {

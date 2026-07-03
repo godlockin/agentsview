@@ -206,6 +206,16 @@ func (s *mcpDaemonService) Get(
 	return svc.Get(ctx, id)
 }
 
+func (s *mcpDaemonService) FindSessionIDsByPartial(
+	ctx context.Context, partial string, limit int,
+) ([]string, error) {
+	svc, err := s.daemonService(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return svc.FindSessionIDsByPartial(ctx, partial, limit)
+}
+
 func (s *mcpDaemonService) List(
 	ctx context.Context, f service.ListFilter,
 ) (*service.SessionList, error) {
@@ -294,6 +304,16 @@ func (s *mcpDaemonService) UsageSummary(
 		return nil, err
 	}
 	return svc.UsageSummary(ctx, req)
+}
+
+func (s *mcpDaemonService) UsagePairwiseComparison(
+	ctx context.Context, req service.UsagePairwiseComparisonRequest,
+) (*service.UsagePairwiseComparisonResponse, error) {
+	svc, err := s.daemonService(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return svc.UsagePairwiseComparison(ctx, req)
 }
 
 func (s *mcpDaemonService) ListSecrets(

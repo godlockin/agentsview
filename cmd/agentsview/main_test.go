@@ -17,6 +17,7 @@ import (
 	"github.com/stretchr/testify/require"
 	"go.kenn.io/agentsview/internal/config"
 	"go.kenn.io/agentsview/internal/db"
+	"go.kenn.io/agentsview/internal/dbtest"
 	"go.kenn.io/agentsview/internal/parser"
 	"go.kenn.io/agentsview/internal/remotesync"
 	"go.kenn.io/agentsview/internal/server"
@@ -270,6 +271,36 @@ func TestCollectWatchRootsPreservesDirsSharingWatchRoot(t *testing.T) {
 	assert.ElementsMatch(t, []string{sessionsDir, archivedDir}, roots[0].dirs)
 }
 
+func TestCollectWatchRootsPollsRecursiveSymlinkProviderRoot(t *testing.T) {
+	root := t.TempDir()
+	targetVSRoot := filepath.Join(t.TempDir(), "vs-target")
+	sessionsRoot := filepath.Join(
+		targetVSRoot, "SampleApp", "copilot-chat", "thread", "sessions",
+	)
+	require.NoError(t, os.MkdirAll(sessionsRoot, 0o755))
+	requireSymlinkOrSkip(t, targetVSRoot, filepath.Join(root, ".VS"))
+	cfg := config.Config{
+		AgentDirs: map[parser.AgentType][]string{
+			parser.AgentVSCopilot: {root},
+		},
+	}
+
+	roots, unwatchedDirs := collectWatchRoots(cfg)
+
+	require.Len(t, roots, 2)
+	assert.Equal(t, root, roots[0].root)
+	assert.True(t, roots[0].shallow)
+	assert.Equal(t, []string{root}, roots[0].dirs)
+	assert.Equal(
+		t,
+		filepath.Join(root, ".VS", "SampleApp", "copilot-chat", "thread", "sessions"),
+		roots[1].root,
+	)
+	assert.True(t, roots[1].shallow)
+	assert.Equal(t, []string{root}, roots[1].dirs)
+	assert.ElementsMatch(t, []string{root}, unwatchedDirs)
+}
+
 // fakeEmitter records Emit calls; safe for concurrent use.
 type fakeEmitter struct {
 	count atomic.Int64
@@ -297,9 +328,7 @@ func TestStartRemoteHostSync_EmitsAfterSuccess(t *testing.T) {
 }
 
 func TestRemoteHostSyncFuncSerializesWithEngineExclusiveLock(t *testing.T) {
-	database, err := db.Open(filepath.Join(t.TempDir(), "test.db"))
-	require.NoError(t, err)
-	t.Cleanup(func() { require.NoError(t, database.Close()) })
+	database := dbtest.OpenTestDB(t)
 	engine := agentsync.NewEngine(database, agentsync.EngineConfig{
 		AgentDirs: map[parser.AgentType][]string{},
 		Machine:   "local",
@@ -366,9 +395,7 @@ func TestRemoteHostSyncFuncSerializesWithEngineExclusiveLock(t *testing.T) {
 }
 
 func TestRemoteHostSyncFuncUsesCallerContext(t *testing.T) {
-	database, err := db.Open(filepath.Join(t.TempDir(), "test.db"))
-	require.NoError(t, err)
-	t.Cleanup(func() { require.NoError(t, database.Close()) })
+	database := dbtest.OpenTestDB(t)
 	engine := agentsync.NewEngine(database, agentsync.EngineConfig{
 		AgentDirs: map[parser.AgentType][]string{},
 		Machine:   "local",
@@ -389,15 +416,13 @@ func TestRemoteHostSyncFuncUsesCallerContext(t *testing.T) {
 		},
 	)
 
-	_, err = syncFn()
+	_, err := syncFn()
 
 	require.ErrorIs(t, err, context.Canceled)
 }
 
 func TestRemoteHostSyncFuncDispatchesHTTPTransport(t *testing.T) {
-	database, err := db.Open(filepath.Join(t.TempDir(), "test.db"))
-	require.NoError(t, err)
-	t.Cleanup(func() { require.NoError(t, database.Close()) })
+	database := dbtest.OpenTestDB(t)
 	engine := agentsync.NewEngine(database, agentsync.EngineConfig{
 		AgentDirs: map[parser.AgentType][]string{},
 		Machine:   "local",
@@ -895,6 +920,22 @@ func TestFormatAnomalySummary(t *testing.T) {
 				"timestamps blanked: 1",
 			},
 		},
+		{
+			name: "unknown schema sessions only",
+			anomalies: agentsync.AnomalyStats{
+				UnknownSchemaSessionsByAgent: map[string]int{
+					"antigravity": 2, "antigravity-cli": 1,
+				},
+				UnknownSchemaSessionsTotal: 3,
+			},
+			wantContain: []string{
+				"Parser anomalies (this run):",
+				"unrecognized schema sessions: 3 total",
+				"antigravity: 2",
+				"antigravity-cli: 1",
+			},
+			wantOmit: []string{"malformed lines", "sanitized fields"},
+		},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -944,5 +985,24 @@ func TestPrintSyncSummaryAnomalySection(t *testing.T) {
 		idx := strings.Index(out, "Sync complete")
 		anomalyIdx := strings.Index(out, "Parser anomalies")
 		assert.Less(t, idx, anomalyIdx)
+	})
+}
+
+func TestSchemaUpgradeHint(t *testing.T) {
+	t.Run("guides outdated-schema errors to a daemon restart", func(t *testing.T) {
+		base := &db.SchemaUpgradeRequiredError{
+			Table:  "tool_calls",
+			Column: "file_path",
+		}
+		got := schemaUpgradeHint(base)
+		// The original error stays wrappable so logs keep the detail, and the
+		// hint names the command that actually runs the pending migration.
+		assert.ErrorIs(t, got, base)
+		assert.Contains(t, got.Error(), "agentsview serve --replace")
+	})
+
+	t.Run("passes unrelated errors through unchanged", func(t *testing.T) {
+		base := errors.New("disk is on fire")
+		assert.Equal(t, base, schemaUpgradeHint(base))
 	})
 }

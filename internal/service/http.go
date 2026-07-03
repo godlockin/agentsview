@@ -72,6 +72,23 @@ func (b *httpBackend) Get(
 	return &out, nil
 }
 
+func (b *httpBackend) FindSessionIDsByPartial(
+	ctx context.Context, partial string, limit int,
+) ([]string, error) {
+	q := url.Values{}
+	q.Set("partial", partial)
+	if limit > 0 {
+		q.Set("limit", strconv.Itoa(limit))
+	}
+	var out struct {
+		IDs []string `json:"ids"`
+	}
+	if err := b.getJSON(ctx, "/api/v1/session-ids/resolve?"+q.Encode(), &out); err != nil {
+		return nil, err
+	}
+	return out.IDs, nil
+}
+
 func (b *httpBackend) List(
 	ctx context.Context, f ListFilter,
 ) (*SessionList, error) {
@@ -96,6 +113,7 @@ func filterToQuery(f ListFilter) url.Values {
 	setIfNotEmpty("project", f.Project)
 	setIfNotEmpty("exclude_project", f.ExcludeProject)
 	setIfNotEmpty("machine", f.Machine)
+	setIfNotEmpty("git_branch", f.GitBranch)
 	setIfNotEmpty("agent", f.Agent)
 	setIfNotEmpty("date", f.Date)
 	setIfNotEmpty("date_from", f.DateFrom)
@@ -278,12 +296,39 @@ func (b *httpBackend) Watch(
 	return out, nil
 }
 
-// Stats is not yet implemented over HTTP; the daemon currently has
-// no /stats endpoint. Subsequent tasks may add one.
 func (b *httpBackend) Stats(
-	_ context.Context, _ StatsFilter,
+	ctx context.Context, f StatsFilter,
 ) (*SessionStats, error) {
-	return nil, errors.New("stats over HTTP backend: not yet implemented")
+	q := url.Values{}
+	setIfNotEmpty := func(k, v string) {
+		if v != "" {
+			q.Set(k, v)
+		}
+	}
+	setIfNotEmpty("since", f.Since)
+	setIfNotEmpty("until", f.Until)
+	setIfNotEmpty("agent", f.Agent)
+	setIfNotEmpty("timezone", f.Timezone)
+	for _, p := range f.IncludeProjects {
+		q.Add("include_project", p)
+	}
+	for _, p := range f.ExcludeProjects {
+		q.Add("exclude_project", p)
+	}
+	q.Set("include_git_outcomes", strconv.FormatBool(f.IncludeGitOutcomes))
+	q.Set("include_github_outcomes", strconv.FormatBool(f.IncludeGitHubOutcomes))
+
+	var out SessionStats
+	err := b.getJSON(ctx, "/api/v1/session-stats?"+q.Encode(), &out)
+	if errors.Is(err, errHTTPNotImplemented) {
+		return nil, fmt.Errorf(
+			"stats: daemon at %s: %w", b.baseURL, db.ErrReadOnly,
+		)
+	}
+	if err != nil {
+		return nil, err
+	}
+	return &out, nil
 }
 
 func (b *httpBackend) Search(
@@ -344,6 +389,7 @@ func (b *httpBackend) SearchContent(
 		"project":         req.Project,
 		"exclude_project": req.ExcludeProject,
 		"machine":         req.Machine,
+		"git_branch":      req.GitBranch,
 		"agent":           req.Agent,
 		"date":            req.Date,
 		"date_from":       req.DateFrom,
@@ -387,6 +433,7 @@ func (b *httpBackend) UsageSummary(
 		"agent":           req.Agent,
 		"project":         req.Project,
 		"machine":         req.Machine,
+		"git_branch":      req.GitBranch,
 		"exclude_project": req.ExcludeProject,
 		"exclude_agent":   req.ExcludeAgent,
 		"exclude_model":   req.ExcludeModel,
@@ -424,6 +471,70 @@ func (b *httpBackend) UsageSummary(
 		// the shared sentinel so callers can errors.Is it.
 		return nil, fmt.Errorf(
 			"usage summary: daemon at %s: %w", b.baseURL, db.ErrReadOnly,
+		)
+	}
+	if err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+
+func (b *httpBackend) UsagePairwiseComparison(
+	ctx context.Context, req UsagePairwiseComparisonRequest,
+) (*UsagePairwiseComparisonResponse, error) {
+	q := url.Values{}
+	for k, v := range map[string]string{
+		"from":            req.From,
+		"to":              req.To,
+		"timezone":        req.Timezone,
+		"agent":           req.Agent,
+		"project":         req.Project,
+		"machine":         req.Machine,
+		"git_branch":      req.GitBranch,
+		"exclude_project": req.ExcludeProject,
+		"exclude_agent":   req.ExcludeAgent,
+		"exclude_model":   req.ExcludeModel,
+		"active_since":    req.ActiveSince,
+		"termination":     req.Termination,
+	} {
+		if v != "" {
+			q.Set(k, v)
+		}
+	}
+	if req.LeftDimension != "" {
+		q.Set("left_dimension", req.LeftDimension)
+	}
+	if req.LeftValue != "" {
+		q.Set("left_value", req.LeftValue)
+	}
+	if req.RightDimension != "" {
+		q.Set("right_dimension", req.RightDimension)
+	}
+	if req.RightValue != "" {
+		q.Set("right_value", req.RightValue)
+	}
+	if req.MinUserMessages > 0 {
+		q.Set("min_user_messages", strconv.Itoa(req.MinUserMessages))
+	}
+	if req.NoDefaultRange {
+		q.Set("no_default_range", "true")
+	}
+	// Include explicit booleans to preserve source defaults.
+	q.Set("include_one_shot", strconv.FormatBool(req.IncludeOneShot))
+	q.Set("include_automated", strconv.FormatBool(req.IncludeAutomated))
+	if req.Model != "" {
+		q.Set("model", req.Model)
+	}
+
+	var out UsagePairwiseComparisonResponse
+	err := b.getJSON(
+		ctx,
+		"/api/v1/usage/pairwise-comparison?"+q.Encode(),
+		&out,
+	)
+	if errors.Is(err, errHTTPNotImplemented) {
+		return nil, fmt.Errorf(
+			"usage pairwise comparison: daemon at %s: %w", b.baseURL, db.ErrReadOnly,
 		)
 	}
 	if err != nil {

@@ -53,6 +53,7 @@ func TestDiscoverAndFindOpenHandsSessions(t *testing.T) {
 }
 
 func TestParseOpenHandsSession(t *testing.T) {
+
 	root := t.TempDir()
 	projectDir := filepath.Join(root, "demo-repo")
 	require.NoError(t, os.MkdirAll(projectDir, 0o755))

@@ -31,6 +31,13 @@ self-exits after an idle period. Read-only CLI commands can still open
 `AGENTSVIEW_NO_DAEMON=1` for scripts or CI jobs that must never auto-start a
 daemon.
 
+The Cursor source in code attribution stats is a live, machine-local read
+from `~/.cursor/ai-tracking/ai-code-tracking.db` by default. Set
+`AGENTSVIEW_CURSOR_ATTRIBUTION_DB` when Cursor stores that database
+somewhere else on the host answering the stats request. The attribution
+database is not synced into AgentsView's archive and is not pushed to
+PostgreSQL.
+
 ## Config File
 
 The config file at `~/.agentsview/config.toml` is auto-created on first run. It
@@ -58,7 +65,7 @@ daemon_idle_timeout = "20m"
 | `github_token`                      | Optional saved GitHub token for Gist publishing                                                              |
 | `result_content_blocked_categories` | Tool categories whose result content is not stored (default: `["Read", "Glob"]`)                             |
 | `require_auth`                      | Require bearer-token authentication for API access                                                           |
-| `auth_token`                        | Auto-generated 256-bit bearer token for remote access                                                        |
+| `auth_token`                        | Auto-generated 256-bit bearer token for remote access; can be overridden with `AGENTSVIEW_AUTH_TOKEN`        |
 | `public_url`                        | Public URL for hostname/proxy access and origin validation                                                   |
 | `public_origins`                    | Array of additional trusted CORS origins                                                                     |
 | `daemon_idle_timeout`               | Idle timeout for detached `serve --background` daemons; set to `"0s"` to keep them alive                     |
@@ -78,6 +85,11 @@ requests, if no token is saved, it then tries `AGENTSVIEW_GITHUB_TOKEN` and then
 UI Settings page or the API endpoint `POST /api/v1/config/github` when you want
 AgentsView to publish gists. Remote access fields can be configured via the
 Settings page or CLI flags — see [Remote Access](/remote-access/) for details.
+
+When `require_auth` is enabled, the browser login prompt accepts the configured
+`auth_token`. The value can come from `~/.agentsview/config.toml` or from the
+`AGENTSVIEW_AUTH_TOKEN` environment variable; the environment variable wins when
+both are set.
 
 !!! note
 
@@ -169,6 +181,7 @@ can still be parsed.
 | Antigravity (IDE)     | `~/.gemini/antigravity/`                                                         | SQLite database per session                                                                                                     |
 | Antigravity CLI       | `~/.gemini/antigravity-cli/`                                                     | SQLite `conversations/<uuid>.db`, `<uuid>.trajectory.json` sidecars, or encrypted `.pb` files plus `brain/` and `history.jsonl` |
 | Claude Code           | `~/.claude/projects/`                                                            | JSONL per session                                                                                                               |
+| OpenClaude            | `~/.openclaude/projects/`                                                        | JSONL per session                                                                                                               |
 | Claude Cowork         | (platform-specific, see below)                                                   | Claude Desktop cowork sessions                                                                                                  |
 | Codex                 | `~/.codex/sessions/` and `~/.codex/archived_sessions/`                           | JSONL per session                                                                                                               |
 | Command Code          | `~/.commandcode/projects/`                                                       | JSONL per session, optional `.meta.json` sidecar                                                                                |
@@ -364,6 +377,8 @@ export AMP_DIR=~/custom/amp # historical local Amp threads only
 export ANTIGRAVITY_DIR=~/custom/antigravity
 export ANTIGRAVITY_CLI_DIR=~/custom/antigravity-cli
 export CLAUDE_PROJECTS_DIR=~/custom/claude
+export OPENCLAUDE_PROJECTS_DIR=~/custom/openclaude/projects
+export OPENCLAUDE_CONFIG_DIR=~/custom/openclaude
 export COWORK_DIR=~/custom/cowork
 export CODEX_SESSIONS_DIR=~/custom/codex
 export COMMANDCODE_PROJECTS_DIR=~/custom/commandcode
@@ -419,7 +434,8 @@ codex_sessions_dirs = [
 ```
 
 The corresponding fields are `aider_dirs`, `amp_dirs`, `antigravity_dirs`,
-`antigravity_cli_dirs`, `claude_project_dirs`, `cowork_dirs`,
+`antigravity_cli_dirs`, `claude_project_dirs`, `openclaude_project_dirs`,
+`cowork_dirs`,
 `codex_sessions_dirs`, `commandcode_project_dirs`, `copilot_dirs`,
 `cortex_dirs`, `cursor_project_dirs`, `deepseek_tui_sessions_dirs`,
 `forge_dirs`, `gemini_dirs`, `gptme_dirs`, `hermes_sessions_dirs`, `iflow_dirs`,

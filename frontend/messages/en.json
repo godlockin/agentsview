@@ -1,6 +1,6 @@
 {
   "app_auth_title": "Authentication Required",
-  "app_auth_description": "This server requires an auth token to access. Enter the token shown on the server's console or settings page.",
+  "app_auth_description": "This server requires an auth token to access. Enter the auth_token from ~/.agentsview/config.toml or AGENTSVIEW_AUTH_TOKEN.",
   "app_auth_placeholder": "Paste auth token",
   "app_auth_authenticate": "Authenticate",
   "app_auth_disconnect_reset": "Disconnect and reset",
@@ -172,6 +172,38 @@
   "session_breadcrumb_failed_to_open": "Failed to open",
   "session_breadcrumb_summary_mode": "Summary mode",
   "session_breadcrumb_summary_mode_tooltip": "Tool results, thinking, and diffs are missing from this transcript. Full fidelity needs the agy-reader sidecar — install it, or if installed, let it catch up. Click to learn how.",
+  "session_breadcrumb_malformed_lines": [
+    {
+      "declarations": [
+        "input count",
+        "local countPlural = count: plural"
+      ],
+      "selectors": [
+        "countPlural"
+      ],
+      "match": {
+        "countPlural=one": "{count} malformed line",
+        "countPlural=other": "{count} malformed lines"
+      }
+    }
+  ],
+  "session_breadcrumb_malformed_lines_tooltip": [
+    {
+      "declarations": [
+        "input count",
+        "local countPlural = count: plural"
+      ],
+      "selectors": [
+        "countPlural"
+      ],
+      "match": {
+        "countPlural=one": "{count} line in the source file could not be parsed",
+        "countPlural=other": "{count} lines in the source file could not be parsed"
+      }
+    }
+  ],
+  "session_breadcrumb_antigravity_decode_confidence_low": "Unverified schema",
+  "session_breadcrumb_antigravity_decode_confidence_low_tooltip": "This session came from an unrecognized (newer) Antigravity build. The decode is heuristic and may be incomplete or wrong.",
   "session_find_find_in_session": "Find in session",
   "session_find_placeholder": "Find in session...",
   "session_find_search_query": "Search query",
@@ -460,6 +492,7 @@
   "shared_no_sessions_in_range": "No sessions in range",
   "shared_none": "None",
   "shared_other": "Other",
+  "shared_no_branch": "(no branch)",
   "shared_unknown": "unknown",
   "analytics_refresh": "Refresh analytics",
   "analytics_export_csv": "Export CSV",
@@ -686,6 +719,8 @@
   "usage_refresh": "Refresh usage data",
   "usage_summary_total_cost": "Total Cost",
   "usage_summary_copilot_ai_credits": "Copilot AI Credits",
+  "usage_summary_unsupported_copilot_no_token_data": "Copilot sessions matched this range, but Copilot does not record per-message token usage.",
+  "usage_summary_unsupported_generic": "Matching sessions do not expose token usage data.",
   "usage_summary_input_tokens": "Input Tokens",
   "usage_summary_daily_burn": "Daily Burn",
   "usage_summary_peak_day": "Peak Day",
@@ -742,6 +777,7 @@
   "settings_language_label": "Interface language",
   "settings_language_english": "English",
   "settings_language_simplified_chinese": "Simplified Chinese",
+  "settings_language_traditional_chinese": "Traditional Chinese",
   "settings_language_no_results": "No languages found",
   "nav_recent_edits": "Recent Edits",
   "recent_edits_title": "Recent Edits",
@@ -1582,6 +1618,26 @@
   "usage_refresh_data": "Refresh usage data",
   "usage_vs_prior": "{pct}% vs prior",
   "usage_total_cost": "Total Cost",
+  "usage_pairwise_title": "Comparative Cost Analysis",
+  "usage_pairwise_subtitle": "Compare two model or project slices using backend-computed session and token metrics.",
+  "usage_pairwise_left": "Left side",
+  "usage_pairwise_right": "Right side",
+  "usage_pairwise_dimension": "Dimension",
+  "usage_pairwise_value": "Value",
+  "usage_pairwise_left_dimension": "Left comparison dimension",
+  "usage_pairwise_left_value": "Left comparison value",
+  "usage_pairwise_right_dimension": "Right comparison dimension",
+  "usage_pairwise_right_value": "Right comparison value",
+  "usage_pairwise_select_value": "Select a value",
+  "usage_pairwise_no_matching_dimensions": "No matching dimensions",
+  "usage_pairwise_no_matching_values": "No matching values",
+  "usage_pairwise_not_enough_data": "Need at least two model or project slices in this range to compare them.",
+  "usage_pairwise_metric": "Metric",
+  "usage_pairwise_delta": "Delta",
+  "usage_pairwise_side_heading": "{dimension}: {value}",
+  "usage_pairwise_cost_per_session": "Cost / Session",
+  "usage_pairwise_total_tokens": "Total Tokens",
+  "usage_pairwise_tokens_per_session": "Tokens / Session",
   "usage_copilot_credits": "Copilot AI Credits",
   "usage_input_tokens": "Input Tokens",
   "usage_cached_suffix": "+{tokens} cached",

@@ -30,6 +30,8 @@ type Store interface {
 	GetSidebarSessionIndex(ctx context.Context, f SessionFilter) (SidebarSessionIndex, error)
 	GetSession(ctx context.Context, id string) (*Session, error)
 	GetSessionFull(ctx context.Context, id string) (*Session, error)
+	// FindSessionIDsByPartial uses literal, case-sensitive substring matching.
+	FindSessionIDsByPartial(ctx context.Context, partial string, limit int) ([]string, error)
 	GetChildSessions(ctx context.Context, parentID string) ([]Session, error)
 
 	// Messages.
@@ -56,6 +58,7 @@ type Store interface {
 	GetProjects(ctx context.Context, excludeOneShot, excludeAutomated bool) ([]ProjectInfo, error)
 	GetAgents(ctx context.Context, excludeOneShot, excludeAutomated bool) ([]AgentInfo, error)
 	GetMachines(ctx context.Context, excludeOneShot, excludeAutomated bool) ([]string, error)
+	GetBranches(ctx context.Context, excludeOneShot, excludeAutomated bool) ([]BranchInfo, error)
 
 	// Analytics.
 	GetAnalyticsSummary(ctx context.Context, f AnalyticsFilter) (AnalyticsSummary, error)
@@ -78,6 +81,7 @@ type Store interface {
 	GetDailyUsage(ctx context.Context, f UsageFilter) (DailyUsageResult, error)
 	GetTopSessionsByCost(ctx context.Context, f UsageFilter, limit int) ([]TopSessionEntry, error)
 	GetUsageSessionCounts(ctx context.Context, f UsageFilter) (UsageSessionCounts, error)
+	GetUsageMatchingSessionCount(ctx context.Context, f UsageFilter) (int, error)
 	GetSessionUsage(ctx context.Context, sessionID string) (*SessionUsage, error)
 
 	// Stars.

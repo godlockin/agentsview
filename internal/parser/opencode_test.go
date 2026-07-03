@@ -3,8 +3,10 @@ package parser
 import (
 	"database/sql"
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 
 	_ "github.com/mattn/go-sqlite3"
@@ -124,14 +126,57 @@ func (s *OpenCodeSeeder) AddPart(id, messageID, sessionID string, timeCreated, t
 func newTestDB(t *testing.T) (string, *OpenCodeSeeder, *sql.DB) {
 	t.Helper()
 	dbPath := filepath.Join(t.TempDir(), "opencode.db")
+	copyOpenCodeSchemaTemplate(t, dbPath)
 	db, err := sql.Open("sqlite3", dbPath)
 	require.NoError(t, err, "open test db")
 
-	_, err = db.Exec(openCodeSchema)
-	require.NoError(t, err, "create schema")
-
 	seeder := &OpenCodeSeeder{db: db, t: t}
 	return dbPath, seeder, db
+}
+
+var (
+	openCodeSchemaTemplateOnce  sync.Once
+	openCodeSchemaTemplateBytes []byte
+	openCodeSchemaTemplateErr   error
+)
+
+func copyOpenCodeSchemaTemplate(t *testing.T, dbPath string) {
+	t.Helper()
+	openCodeSchemaTemplateOnce.Do(func() {
+		openCodeSchemaTemplateBytes, openCodeSchemaTemplateErr =
+			buildOpenCodeSchemaTemplate()
+	})
+	require.NoError(t, openCodeSchemaTemplateErr)
+	require.NoError(t, os.MkdirAll(filepath.Dir(dbPath), 0o755),
+		"mkdir opencode test db dir")
+	require.NoError(t, os.WriteFile(dbPath, openCodeSchemaTemplateBytes, 0o644),
+		"copy opencode schema template")
+}
+
+func buildOpenCodeSchemaTemplate() ([]byte, error) {
+	dir, err := os.MkdirTemp("", "agentsview-opencode-schema-*")
+	if err != nil {
+		return nil, fmt.Errorf("create opencode schema template dir: %w", err)
+	}
+	defer os.RemoveAll(dir)
+
+	dbPath := filepath.Join(dir, "opencode.db")
+	db, err := sql.Open("sqlite3", dbPath)
+	if err != nil {
+		return nil, fmt.Errorf("open opencode schema template: %w", err)
+	}
+	if _, err = db.Exec(openCodeSchema); err != nil {
+		_ = db.Close()
+		return nil, fmt.Errorf("create opencode schema template: %w", err)
+	}
+	if err = db.Close(); err != nil {
+		return nil, fmt.Errorf("close opencode schema template: %w", err)
+	}
+	raw, err := os.ReadFile(dbPath)
+	if err != nil {
+		return nil, fmt.Errorf("read opencode schema template: %w", err)
+	}
+	return raw, nil
 }
 
 // seedHybridSQLiteDB creates an OpenCode-shaped SQLite DB at
@@ -141,11 +186,10 @@ func newTestDB(t *testing.T) (string, *OpenCodeSeeder, *sql.DB) {
 // required.
 func seedHybridSQLiteDB(t *testing.T, dbPath, sessionID string) {
 	t.Helper()
+	copyOpenCodeSchemaTemplate(t, dbPath)
 	db, err := sql.Open("sqlite3", dbPath)
 	require.NoError(t, err, "open hybrid db")
 	t.Cleanup(func() { db.Close() })
-	_, err = db.Exec(openCodeSchema)
-	require.NoError(t, err, "create hybrid schema")
 	_, err = db.Exec(
 		`INSERT INTO project (id, worktree)
 		 VALUES (?, ?)`,
@@ -213,6 +257,23 @@ func TestParseOpenCodeDB_StandardSession(t *testing.T) {
 	assertEq(t, "msg[0].Role", s.Messages[0].Role, RoleUser)
 	assertEq(t, "msg[1].Role", s.Messages[1].Role, RoleAssistant)
 	assertEq(t, "msg[1].Content", s.Messages[1].Content, "Sure, I can help with Go.")
+}
+
+func TestOpenOpenCodeDBDoesNotForceWALMode(t *testing.T) {
+	dbPath, _, writer := newTestDB(t)
+	require.NoError(t, writer.Close())
+
+	reader, err := openOpenCodeDB(dbPath)
+	require.NoError(t, err)
+	defer reader.Close()
+	_, err = reader.Exec("CREATE TABLE must_stay_read_only (id INTEGER)")
+	require.Error(t, err, "OpenCode source databases must stay read-only")
+
+	var journalMode string
+	require.NoError(t, reader.QueryRow("PRAGMA journal_mode").Scan(&journalMode))
+	assert.Equal(t, "delete", journalMode)
+	assert.NoFileExists(t, dbPath+"-wal")
+	assert.NoFileExists(t, dbPath+"-shm")
 }
 
 func TestParseOpenCodeFile_StorageSession(t *testing.T) {

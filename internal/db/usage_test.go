@@ -4,8 +4,11 @@ import (
 	"context"
 	"encoding/json"
 	"math"
+	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -13,7 +16,117 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"go.kenn.io/agentsview/internal/config"
+	"go.kenn.io/agentsview/internal/parser"
+	"go.kenn.io/agentsview/internal/parsertest"
 )
+
+var (
+	dailyUsageFixtureOnce sync.Once
+	dailyUsageFixtureDir  string
+	dailyUsageFixturePath string
+)
+
+func openDailyUsageFixtureDB(t *testing.T) *DB {
+	t.Helper()
+
+	dailyUsageFixtureOnce.Do(func() {
+		dailyUsageFixtureDir, dailyUsageFixturePath =
+			buildDailyUsageFixtureTemplate(t)
+	})
+
+	dst := filepath.Join(t.TempDir(), "test.db")
+	for _, suffix := range []string{"", "-wal", "-shm"} {
+		require.NoError(t,
+			copyTemplateDBFile(
+				dailyUsageFixturePath+suffix, dst+suffix, suffix == "",
+			),
+			"copy daily usage fixture %q", suffix)
+	}
+	d, err := OpenPreparedTestDB(dst)
+	require.NoError(t, err, "open daily usage fixture")
+	t.Cleanup(func() { require.NoError(t, d.Close()) })
+	return d
+}
+
+func buildDailyUsageFixtureTemplate(t *testing.T) (string, string) {
+	t.Helper()
+
+	dir, err := os.MkdirTemp("", "agentsview-daily-usage-*")
+	require.NoError(t, err, "create daily usage fixture dir")
+	path := filepath.Join(dir, "test.db")
+	require.NoError(t, copyTestDBTemplate(path),
+		"copy base db template for daily usage fixture")
+
+	d, err := OpenPreparedTestDB(path)
+	require.NoError(t, err, "open daily usage template")
+	seedDailyUsageFixture(t, d)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	require.NoError(t, d.CheckpointWALTruncate(ctx),
+		"checkpoint daily usage template")
+	require.NoError(t, d.Close(), "close daily usage template")
+	return dir, path
+}
+
+func seedDailyUsageFixture(t *testing.T, d *DB) {
+	t.Helper()
+
+	require.NoError(t, d.UpsertModelPricing([]ModelPricing{
+		{ModelPattern: "model-a", InputPerMTok: 2.0,
+			OutputPerMTok: 10.0},
+		{ModelPattern: "gpt-5", InputPerMTok: 2.5,
+			OutputPerMTok: 10.0},
+	}), "UpsertModelPricing")
+
+	type combo struct {
+		project string
+		agent   string
+	}
+	combos := []combo{
+		{"proj-a", "claude"},
+		{"proj-a", "codex"},
+		{"proj-b", "claude"},
+		{"proj-b", "codex"},
+	}
+	for i, c := range combos {
+		sid := "usage-fixture-" + strconv.Itoa(i)
+		insertSession(t, d, sid, c.project, func(s *Session) {
+			s.Agent = c.agent
+			s.StartedAt = Ptr("2024-06-15T10:00:00Z")
+		})
+		insertMessages(t, d,
+			Message{
+				SessionID:  sid,
+				Ordinal:    0,
+				Role:       "assistant",
+				Timestamp:  "2024-06-15T10:30:00Z",
+				Model:      "model-a",
+				TokenUsage: json.RawMessage(`{"input_tokens":1000,"output_tokens":500}`),
+			},
+			Message{
+				SessionID:  sid,
+				Ordinal:    1,
+				Role:       "assistant",
+				Timestamp:  "2024-06-15T10:31:00Z",
+				Model:      "gpt-5",
+				TokenUsage: json.RawMessage(`{"input_tokens":1000,"output_tokens":500}`),
+			},
+		)
+	}
+
+	insertSession(t, d, "usage-fixture-no-price", "proj-unknown", func(s *Session) {
+		s.Agent = "claude"
+		s.StartedAt = Ptr("2024-07-15T10:00:00Z")
+	})
+	insertMessages(t, d, Message{
+		SessionID:  "usage-fixture-no-price",
+		Ordinal:    0,
+		Role:       "assistant",
+		Timestamp:  "2024-07-15T10:30:00Z",
+		Model:      "unknown-model",
+		TokenUsage: json.RawMessage(`{"input_tokens":500,"output_tokens":250}`),
+	})
+}
 
 func TestGetDailyUsageEmpty(t *testing.T) {
 	d := testDB(t)
@@ -964,25 +1077,12 @@ func TestGetDailyUsageMultipleDaysAndModels(t *testing.T) {
 }
 
 func TestGetDailyUsageNoPricing(t *testing.T) {
-	d := testDB(t)
+	d := openDailyUsageFixtureDB(t)
 	ctx := context.Background()
 
-	insertSession(t, d, "sess1", "proj1", func(s *Session) {
-		s.Agent = "claude"
-		s.StartedAt = new("2024-06-15T10:00:00Z")
-	})
-	insertMessages(t, d, Message{
-		SessionID:  "sess1",
-		Ordinal:    0,
-		Role:       "assistant",
-		Timestamp:  "2024-06-15T10:30:00Z",
-		Model:      "unknown-model",
-		TokenUsage: json.RawMessage(`{"input_tokens":500,"output_tokens":250}`),
-	})
-
 	result, err := d.GetDailyUsage(ctx, UsageFilter{
-		From: "2024-06-01",
-		To:   "2024-06-30",
+		From: "2024-07-01",
+		To:   "2024-07-31",
 	})
 	requireNoError(t, err, "GetDailyUsage no pricing")
 
@@ -1213,7 +1313,7 @@ func TestGetDailyUsage_DedupesByClaudeMessageAndRequestID(t *testing.T) {
 	assert.Equal(t, 55000, day.CacheReadTokens, "cache_rd")
 }
 
-func TestGetDailyUsage_DedupesBySourceUUIDWhenClaudePairIncomplete(t *testing.T) {
+func TestGetDailyUsage_DedupKeyVariants(t *testing.T) {
 	d := testDB(t)
 	require.NoError(t, d.UpsertModelPricing([]ModelPricing{{
 		ModelPattern:         "claude-opus-4-6",
@@ -1223,90 +1323,84 @@ func TestGetDailyUsage_DedupesBySourceUUIDWhenClaudePairIncomplete(t *testing.T)
 		CacheReadPerMTok:     1.50,
 	}}), "seed pricing")
 
-	insertSession(t, d, "s-main", "proj", func(s *Session) {
+	insertSession(t, d, "source-main", "proj", func(s *Session) {
 		s.Agent = "claude"
 		s.StartedAt = new("2026-04-10T10:00:00Z")
 		s.EndedAt = new("2026-04-10T10:05:00Z")
 	})
-	insertSession(t, d, "s-fork", "proj", func(s *Session) {
+	insertSession(t, d, "source-fork", "proj", func(s *Session) {
 		s.Agent = "claude"
 		s.StartedAt = new("2026-04-10T10:01:00Z")
 		s.EndedAt = new("2026-04-10T10:06:00Z")
-		s.ParentSessionID = new("s-main")
+		s.ParentSessionID = new("source-main")
 		s.RelationshipType = "fork"
+	})
+	insertSession(t, d, "missing-keys", "proj", func(s *Session) {
+		s.Agent = "claude"
+		s.StartedAt = new("2026-04-11T10:00:00Z")
+		s.EndedAt = new("2026-04-11T10:05:00Z")
 	})
 
 	shared := json.RawMessage(`{"input_tokens":100,"output_tokens":500,"cache_creation_input_tokens":1000,"cache_read_input_tokens":50000}`)
 	unique := json.RawMessage(`{"input_tokens":20,"output_tokens":80,"cache_creation_input_tokens":200,"cache_read_input_tokens":5000}`)
+	missingKeysUsage := json.RawMessage(`{"input_tokens":0,"output_tokens":10,"cache_creation_input_tokens":0,"cache_read_input_tokens":0}`)
 
 	insertMessages(t, d,
 		Message{
-			SessionID: "s-main", Ordinal: 0,
+			SessionID: "source-main", Ordinal: 0,
 			Role: "assistant", Timestamp: "2026-04-10T10:02:00Z",
-			Model: "claude-opus-4-6", TokenUsage: shared,
+			Model: "claude-opus-4-6", TokenUsage: shared, HasOutputTokens: true,
 			ClaudeMessageID: "msg_dup", SourceUUID: "source_dup",
 		},
 		Message{
-			SessionID: "s-fork", Ordinal: 0,
+			SessionID: "source-fork", Ordinal: 0,
 			Role: "assistant", Timestamp: "2026-04-10T10:02:00Z",
-			Model: "claude-opus-4-6", TokenUsage: shared,
+			Model: "claude-opus-4-6", TokenUsage: shared, HasOutputTokens: true,
 			ClaudeMessageID: "msg_dup", SourceUUID: "source_dup",
 		},
 		Message{
-			SessionID: "s-fork", Ordinal: 1,
+			SessionID: "source-fork", Ordinal: 1,
 			Role: "assistant", Timestamp: "2026-04-10T10:03:00Z",
-			Model: "claude-opus-4-6", TokenUsage: unique,
+			Model: "claude-opus-4-6", TokenUsage: unique, HasOutputTokens: true,
 			ClaudeMessageID: "msg_uniq", SourceUUID: "source_uniq",
+		},
+		Message{
+			SessionID: "missing-keys", Ordinal: 0,
+			Role: "assistant", Timestamp: "2026-04-11T10:02:00Z",
+			Model: "claude-opus-4-6", TokenUsage: missingKeysUsage,
+			HasOutputTokens: true,
+		},
+		Message{
+			SessionID: "missing-keys", Ordinal: 1,
+			Role: "assistant", Timestamp: "2026-04-11T10:02:00Z",
+			Model: "claude-opus-4-6", TokenUsage: missingKeysUsage,
+			HasOutputTokens: true,
 		},
 	)
 
-	result, err := d.GetDailyUsage(context.Background(), UsageFilter{
-		From: "2026-04-10", To: "2026-04-10", Timezone: "UTC",
+	t.Run("dedupes by source uuid when claude pair incomplete", func(t *testing.T) {
+		result, err := d.GetDailyUsage(context.Background(), UsageFilter{
+			From: "2026-04-10", To: "2026-04-10", Timezone: "UTC",
+		})
+		require.NoError(t, err, "GetDailyUsage")
+		require.Len(t, result.Daily, 1, "daily entries =")
+		day := result.Daily[0]
+		assert.Equal(t, 120, day.InputTokens, "input")
+		assert.Equal(t, 580, day.OutputTokens, "output")
+		assert.Equal(t, 1200, day.CacheCreationTokens, "cache_cr")
+		assert.Equal(t, 55000, day.CacheReadTokens, "cache_rd")
 	})
-	require.NoError(t, err, "GetDailyUsage")
-	require.Len(t, result.Daily, 1, "daily entries =")
-	day := result.Daily[0]
-	assert.Equal(t, 120, day.InputTokens, "input")
-	assert.Equal(t, 580, day.OutputTokens, "output")
-	assert.Equal(t, 1200, day.CacheCreationTokens, "cache_cr")
-	assert.Equal(t, 55000, day.CacheReadTokens, "cache_rd")
-}
 
-func TestGetDailyUsage_MissingDedupKeysCountedEveryTime(t *testing.T) {
-	d := testDB(t)
-	require.NoError(t, d.UpsertModelPricing([]ModelPricing{{
-		ModelPattern:  "claude-opus-4-6",
-		OutputPerMTok: 75.0,
-	}}), "seed pricing")
-
-	mustExec := func(q string, args ...any) {
-		t.Helper()
-		_, err := d.getWriter().Exec(q, args...)
-		require.NoError(t, err, "exec %q", q)
-	}
-	mustExec(`INSERT INTO sessions (id, project, machine, agent, started_at, ended_at)
-	          VALUES ('s1', 'proj', 'local', 'claude', ?, ?)`,
-		"2026-04-10T10:00:00Z", "2026-04-10T10:05:00Z")
-
-	usage := `{"input_tokens":0,"output_tokens":10,"cache_creation_input_tokens":0,"cache_read_input_tokens":0}`
-	for _, ord := range []int{0, 1} {
-		mustExec(`INSERT INTO messages
-			(session_id, ordinal, role, content, timestamp,
-			 model, token_usage,
-			 claude_message_id, claude_request_id,
-			 has_output_tokens)
-			VALUES ('s1', ?, 'assistant', '', '2026-04-10T10:02:00Z',
-			        'claude-opus-4-6', ?, '', '', 1)`, ord, usage)
-	}
-
-	result, err := d.GetDailyUsage(context.Background(), UsageFilter{
-		From: "2026-04-10", To: "2026-04-10", Timezone: "UTC",
+	t.Run("missing dedup keys counted every time", func(t *testing.T) {
+		result, err := d.GetDailyUsage(context.Background(), UsageFilter{
+			From: "2026-04-11", To: "2026-04-11", Timezone: "UTC",
+		})
+		require.NoError(t, err, "GetDailyUsage")
+		require.Len(t, result.Daily, 1,
+			"output want 20 (both no-key rows counted): %v", result.Daily)
+		assert.Equal(t, 20, result.Daily[0].OutputTokens,
+			"output want 20 (both no-key rows counted): %v", result.Daily)
 	})
-	require.NoError(t, err, "GetDailyUsage")
-	require.Len(t, result.Daily, 1,
-		"output want 20 (both no-key rows counted): %v", result.Daily)
-	assert.Equal(t, 20, result.Daily[0].OutputTokens,
-		"output want 20 (both no-key rows counted): %v", result.Daily)
 }
 
 func TestGetDailyUsageLongLivedSession(t *testing.T) {
@@ -1369,40 +1463,9 @@ func TestGetDailyUsageLongLivedSession(t *testing.T) {
 }
 
 func TestGetDailyUsageProjectFilter(t *testing.T) {
-	d := testDB(t)
+
+	d := openDailyUsageFixtureDB(t)
 	ctx := context.Background()
-
-	requireNoError(t, d.UpsertModelPricing([]ModelPricing{{
-		ModelPattern:  "claude-sonnet",
-		InputPerMTok:  3.0,
-		OutputPerMTok: 15.0,
-	}}), "UpsertModelPricing")
-
-	insertSession(t, d, "sess-a", "proj-a", func(s *Session) {
-		s.Agent = "claude"
-		s.StartedAt = new("2024-06-15T10:00:00Z")
-	})
-	insertMessages(t, d, Message{
-		SessionID:  "sess-a",
-		Ordinal:    0,
-		Role:       "assistant",
-		Timestamp:  "2024-06-15T10:30:00Z",
-		Model:      "claude-sonnet",
-		TokenUsage: json.RawMessage(`{"input_tokens":1000,"output_tokens":500}`),
-	})
-
-	insertSession(t, d, "sess-b", "proj-b", func(s *Session) {
-		s.Agent = "claude"
-		s.StartedAt = new("2024-06-15T10:00:00Z")
-	})
-	insertMessages(t, d, Message{
-		SessionID:  "sess-b",
-		Ordinal:    0,
-		Role:       "assistant",
-		Timestamp:  "2024-06-15T10:30:00Z",
-		Model:      "claude-sonnet",
-		TokenUsage: json.RawMessage(`{"input_tokens":2000,"output_tokens":1000}`),
-	})
 
 	result, err := d.GetDailyUsage(ctx, UsageFilter{
 		From:    "2024-06-01",
@@ -1413,43 +1476,14 @@ func TestGetDailyUsageProjectFilter(t *testing.T) {
 
 	require.Len(t, result.Daily, 1, "got")
 	day := result.Daily[0]
-	assert.Equal(t, 1000, day.InputTokens, "InputTokens")
-	assert.Equal(t, 1000, result.Totals.InputTokens, "Totals.InputTokens")
+	assert.Equal(t, 4000, day.InputTokens, "InputTokens")
+	assert.Equal(t, 4000, result.Totals.InputTokens, "Totals.InputTokens")
 }
 
 func TestGetDailyUsageModelFilter(t *testing.T) {
-	d := testDB(t)
+
+	d := openDailyUsageFixtureDB(t)
 	ctx := context.Background()
-
-	requireNoError(t, d.UpsertModelPricing([]ModelPricing{
-		{ModelPattern: "claude-sonnet", InputPerMTok: 3.0,
-			OutputPerMTok: 15.0},
-		{ModelPattern: "gpt-5", InputPerMTok: 2.5,
-			OutputPerMTok: 10.0},
-	}), "UpsertModelPricing")
-
-	insertSession(t, d, "sess1", "proj1", func(s *Session) {
-		s.Agent = "claude"
-		s.StartedAt = new("2024-06-15T10:00:00Z")
-	})
-	insertMessages(t, d,
-		Message{
-			SessionID:  "sess1",
-			Ordinal:    0,
-			Role:       "assistant",
-			Timestamp:  "2024-06-15T10:30:00Z",
-			Model:      "claude-sonnet",
-			TokenUsage: json.RawMessage(`{"input_tokens":2000,"output_tokens":800}`),
-		},
-		Message{
-			SessionID:  "sess1",
-			Ordinal:    1,
-			Role:       "assistant",
-			Timestamp:  "2024-06-15T10:31:00Z",
-			Model:      "gpt-5",
-			TokenUsage: json.RawMessage(`{"input_tokens":1000,"output_tokens":500}`),
-		},
-	)
 
 	result, err := d.GetDailyUsage(ctx, UsageFilter{
 		From:  "2024-06-01",
@@ -1460,45 +1494,14 @@ func TestGetDailyUsageModelFilter(t *testing.T) {
 
 	require.Len(t, result.Daily, 1, "got")
 	day := result.Daily[0]
-	assert.Equal(t, 1000, day.InputTokens, "InputTokens")
+	assert.Equal(t, 4000, day.InputTokens, "InputTokens")
 	assert.Equal(t, []string{"gpt-5"}, day.ModelsUsed, "ModelsUsed")
 }
 
 func TestGetDailyUsageProjectBreakdowns(t *testing.T) {
-	d := testDB(t)
+
+	d := openDailyUsageFixtureDB(t)
 	ctx := context.Background()
-
-	requireNoError(t, d.UpsertModelPricing([]ModelPricing{{
-		ModelPattern:  "claude-sonnet",
-		InputPerMTok:  3.0,
-		OutputPerMTok: 15.0,
-	}}), "UpsertModelPricing")
-
-	insertSession(t, d, "sess-a", "proj-a", func(s *Session) {
-		s.Agent = "claude"
-		s.StartedAt = new("2024-06-15T10:00:00Z")
-	})
-	insertMessages(t, d, Message{
-		SessionID:  "sess-a",
-		Ordinal:    0,
-		Role:       "assistant",
-		Timestamp:  "2024-06-15T10:30:00Z",
-		Model:      "claude-sonnet",
-		TokenUsage: json.RawMessage(`{"input_tokens":1000,"output_tokens":500}`),
-	})
-
-	insertSession(t, d, "sess-b", "proj-b", func(s *Session) {
-		s.Agent = "claude"
-		s.StartedAt = new("2024-06-15T10:00:00Z")
-	})
-	insertMessages(t, d, Message{
-		SessionID:  "sess-b",
-		Ordinal:    0,
-		Role:       "assistant",
-		Timestamp:  "2024-06-15T10:30:00Z",
-		Model:      "claude-sonnet",
-		TokenUsage: json.RawMessage(`{"input_tokens":1000,"output_tokens":500}`),
-	})
 
 	result, err := d.GetDailyUsage(ctx, UsageFilter{
 		From:       "2024-06-01",
@@ -1523,7 +1526,7 @@ func TestGetDailyUsageProjectBreakdowns(t *testing.T) {
 			"missing ProjectBreakdown for %s", name) {
 			continue
 		}
-		assert.Equal(t, 1000, pb.InputTokens,
+		assert.Equal(t, 4000, pb.InputTokens,
 			"%s InputTokens", name)
 	}
 	assert.InDelta(t, day.TotalCost, projCostSum, 1e-9,
@@ -1531,40 +1534,9 @@ func TestGetDailyUsageProjectBreakdowns(t *testing.T) {
 }
 
 func TestGetDailyUsageAgentBreakdowns(t *testing.T) {
-	d := testDB(t)
+
+	d := openDailyUsageFixtureDB(t)
 	ctx := context.Background()
-
-	requireNoError(t, d.UpsertModelPricing([]ModelPricing{{
-		ModelPattern:  "claude-sonnet",
-		InputPerMTok:  3.0,
-		OutputPerMTok: 15.0,
-	}}), "UpsertModelPricing")
-
-	insertSession(t, d, "sess-claude", "proj1", func(s *Session) {
-		s.Agent = "claude"
-		s.StartedAt = new("2024-06-15T10:00:00Z")
-	})
-	insertMessages(t, d, Message{
-		SessionID:  "sess-claude",
-		Ordinal:    0,
-		Role:       "assistant",
-		Timestamp:  "2024-06-15T10:30:00Z",
-		Model:      "claude-sonnet",
-		TokenUsage: json.RawMessage(`{"input_tokens":1000,"output_tokens":500}`),
-	})
-
-	insertSession(t, d, "sess-codex", "proj1", func(s *Session) {
-		s.Agent = "codex"
-		s.StartedAt = new("2024-06-15T10:00:00Z")
-	})
-	insertMessages(t, d, Message{
-		SessionID:  "sess-codex",
-		Ordinal:    0,
-		Role:       "assistant",
-		Timestamp:  "2024-06-15T10:30:00Z",
-		Model:      "claude-sonnet",
-		TokenUsage: json.RawMessage(`{"input_tokens":1000,"output_tokens":500}`),
-	})
 
 	result, err := d.GetDailyUsage(ctx, UsageFilter{
 		From:       "2024-06-01",
@@ -1589,7 +1561,7 @@ func TestGetDailyUsageAgentBreakdowns(t *testing.T) {
 			"missing AgentBreakdown for %s", name) {
 			continue
 		}
-		assert.Equal(t, 1000, ab.InputTokens,
+		assert.Equal(t, 4000, ab.InputTokens,
 			"%s InputTokens", name)
 	}
 	assert.InDelta(t, day.TotalCost, agentCostSum, 1e-9,
@@ -1597,53 +1569,9 @@ func TestGetDailyUsageAgentBreakdowns(t *testing.T) {
 }
 
 func TestGetDailyUsageBreakdownInvariant(t *testing.T) {
-	d := testDB(t)
+
+	d := openDailyUsageFixtureDB(t)
 	ctx := context.Background()
-
-	requireNoError(t, d.UpsertModelPricing([]ModelPricing{
-		{ModelPattern: "model-a", InputPerMTok: 2.0,
-			OutputPerMTok: 10.0},
-		{ModelPattern: "model-b", InputPerMTok: 4.0,
-			OutputPerMTok: 20.0},
-	}), "UpsertModelPricing")
-
-	// 2 projects x 2 agents = 4 sessions, each with 2 messages
-	// from different models.
-	type combo struct {
-		project string
-		agent   string
-	}
-	combos := []combo{
-		{"proj-a", "claude"},
-		{"proj-a", "codex"},
-		{"proj-b", "claude"},
-		{"proj-b", "codex"},
-	}
-	for i, c := range combos {
-		sid := "sess-" + strconv.Itoa(i)
-		insertSession(t, d, sid, c.project, func(s *Session) {
-			s.Agent = c.agent
-			s.StartedAt = new("2024-06-15T10:00:00Z")
-		})
-		insertMessages(t, d,
-			Message{
-				SessionID:  sid,
-				Ordinal:    0,
-				Role:       "assistant",
-				Timestamp:  "2024-06-15T10:30:00Z",
-				Model:      "model-a",
-				TokenUsage: json.RawMessage(`{"input_tokens":1000,"output_tokens":500}`),
-			},
-			Message{
-				SessionID:  sid,
-				Ordinal:    1,
-				Role:       "assistant",
-				Timestamp:  "2024-06-15T10:31:00Z",
-				Model:      "model-b",
-				TokenUsage: json.RawMessage(`{"input_tokens":1000,"output_tokens":500}`),
-			},
-		)
-	}
 
 	result, err := d.GetDailyUsage(ctx, UsageFilter{
 		From:       "2024-06-01",
@@ -2132,6 +2060,313 @@ func TestGetUsageSessionCounts(t *testing.T) {
 	assert.Zero(t, dailyNoCounts.SessionCounts.Total)
 	assert.Nil(t, dailyNoCounts.SessionCounts.ByProject)
 	assert.Nil(t, dailyNoCounts.SessionCounts.ByAgent)
+}
+
+func TestGetUsageMatchingSessionCount(t *testing.T) {
+	d := testDB(t)
+	ctx := context.Background()
+
+	insertSession(t, d, "copilot-empty", "proj-a", func(s *Session) {
+		s.Agent = "copilot"
+		s.StartedAt = new("2024-06-15T10:00:00Z")
+		s.EndedAt = new("2024-06-15T10:00:00Z")
+	})
+	insertMessages(t, d, Message{
+		SessionID: "copilot-empty", Ordinal: 0,
+		Role: "assistant", Timestamp: "2024-06-15T10:00:00Z",
+		Model: "gpt-5.3-codex",
+	})
+
+	insertSession(t, d, "claude-usage", "proj-a", func(s *Session) {
+		s.Agent = "claude"
+		s.StartedAt = new("2024-06-15T11:00:00Z")
+		s.EndedAt = new("2024-06-15T11:00:00Z")
+	})
+	insertMessages(t, d, Message{
+		SessionID: "claude-usage", Ordinal: 0,
+		Role: "assistant", Timestamp: "2024-06-15T11:00:00Z",
+		Model: "claude-sonnet",
+		TokenUsage: json.RawMessage(
+			`{"input_tokens":100,"output_tokens":50}`),
+	})
+
+	tests := []struct {
+		name   string
+		filter UsageFilter
+		want   int
+	}{
+		{
+			name: "counts copilot sessions without usage rows",
+			filter: UsageFilter{
+				From: "2024-06-15", To: "2024-06-15",
+				Timezone: "UTC", Agent: "copilot",
+			},
+			want: 1,
+		},
+		{
+			name: "respects model filters from session messages",
+			filter: UsageFilter{
+				From: "2024-06-15", To: "2024-06-15",
+				Timezone: "UTC", Agent: "copilot", Model: "gpt-5.3-codex",
+			},
+			want: 1,
+		},
+		{
+			name: "excludes sessions when model is excluded",
+			filter: UsageFilter{
+				From: "2024-06-15", To: "2024-06-15",
+				Timezone: "UTC", Agent: "copilot", ExcludeModel: "gpt-5.3-codex",
+			},
+			want: 0,
+		},
+		{
+			name: "respects date range",
+			filter: UsageFilter{
+				From: "2024-06-16", To: "2024-06-16",
+				Timezone: "UTC", Agent: "copilot",
+			},
+			want: 0,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := d.GetUsageMatchingSessionCount(ctx, tt.filter)
+			requireNoError(t, err, "GetUsageMatchingSessionCount")
+			assert.Equal(t, tt.want, got)
+		})
+	}
+}
+
+// TestGetUsageMatchingSessionCount_UsesMessageTimestampNotSessionActivity
+// guards against regressing to session-activity bounding: a Copilot
+// session whose started_at/ended_at fall outside the requested window but
+// whose message is timestamped inside it must still be counted, because
+// GetDailyUsage and GetUsageSessionCounts already bound on message/event
+// timestamps, not session activity.
+func TestGetUsageMatchingSessionCount_UsesMessageTimestampNotSessionActivity(
+	t *testing.T,
+) {
+	d := testDB(t)
+	ctx := context.Background()
+
+	insertSession(t, d, "copilot-late-message", "proj-a", func(s *Session) {
+		s.Agent = "copilot"
+		s.StartedAt = new("2026-02-08T10:00:00Z")
+		s.EndedAt = new("2026-02-08T10:00:00Z")
+	})
+	insertMessages(t, d, Message{
+		SessionID: "copilot-late-message", Ordinal: 0,
+		Role: "assistant", Timestamp: "2026-02-10T12:00:00Z",
+		Model:      "gpt-5.3-codex",
+		TokenUsage: nil,
+	})
+
+	insertSession(t, d, "copilot-out-of-range", "proj-a", func(s *Session) {
+		s.Agent = "copilot"
+		s.StartedAt = new("2026-02-08T10:00:00Z")
+		s.EndedAt = new("2026-02-08T10:00:00Z")
+	})
+	insertMessages(t, d, Message{
+		SessionID: "copilot-out-of-range", Ordinal: 0,
+		Role: "assistant", Timestamp: "2026-02-08T10:00:00Z",
+		Model:      "gpt-5.3-codex",
+		TokenUsage: nil,
+	})
+
+	filter := UsageFilter{
+		From: "2026-02-10", To: "2026-02-10",
+		Timezone: "UTC", Agent: "copilot",
+	}
+
+	got, err := d.GetUsageMatchingSessionCount(ctx, filter)
+	requireNoError(t, err, "GetUsageMatchingSessionCount")
+	assert.Equal(t, 1, got)
+}
+
+// TestGetUsageMatchingSessionCount_ModelFilterAppliesToBoundedRow guards
+// against the model/exclude-model predicate being applied session-wide
+// instead of to the in-range message/event row: a session with an
+// out-of-range message on the filtered model but an in-range message on a
+// different model must not match a Model filter for the out-of-range
+// model, and must not be excluded by an ExcludeModel filter for the
+// out-of-range model either.
+func TestGetUsageMatchingSessionCount_ModelFilterAppliesToBoundedRow(
+	t *testing.T,
+) {
+	d := testDB(t)
+	ctx := context.Background()
+
+	insertSession(t, d, "copilot-mixed-model", "proj-a", func(s *Session) {
+		s.Agent = "copilot"
+		s.StartedAt = new("2026-02-08T10:00:00Z")
+		s.EndedAt = new("2026-02-10T12:00:00Z")
+	})
+	insertMessages(t, d,
+		Message{
+			SessionID: "copilot-mixed-model", Ordinal: 0,
+			Role: "assistant", Timestamp: "2026-02-08T10:00:00Z",
+			Model:      "gpt-5.3-codex",
+			TokenUsage: nil,
+		},
+		Message{
+			SessionID: "copilot-mixed-model", Ordinal: 1,
+			Role: "assistant", Timestamp: "2026-02-10T12:00:00Z",
+			Model:      "claude-sonnet",
+			TokenUsage: nil,
+		},
+	)
+
+	inRangeFilter := UsageFilter{
+		From: "2026-02-10", To: "2026-02-10",
+		Timezone: "UTC", Agent: "copilot",
+	}
+
+	got, err := d.GetUsageMatchingSessionCount(ctx, UsageFilter{
+		From: inRangeFilter.From, To: inRangeFilter.To,
+		Timezone: inRangeFilter.Timezone, Agent: inRangeFilter.Agent,
+		Model: "gpt-5.3-codex",
+	})
+	requireNoError(t, err, "GetUsageMatchingSessionCount with Model")
+	assert.Equal(t, 0, got,
+		"out-of-range message's model must not match the bounded window")
+
+	got, err = d.GetUsageMatchingSessionCount(ctx, UsageFilter{
+		From: inRangeFilter.From, To: inRangeFilter.To,
+		Timezone: inRangeFilter.Timezone, Agent: inRangeFilter.Agent,
+		ExcludeModel: "gpt-5.3-codex",
+	})
+	requireNoError(t, err, "GetUsageMatchingSessionCount with ExcludeModel")
+	assert.Equal(t, 1, got,
+		"in-range message's model is not excluded, so the session must still count")
+}
+
+// TestGetUsageMatchingSessionCount_CountsAssistantMessageWithNoModel
+// guards against gating matching-session eligibility on m.model != ”:
+// some Copilot assistant messages parse before a model name is known, so
+// an assistant message with an empty Model must still count toward the
+// matching-session total when no Model/ExcludeModel filter narrows it.
+func TestGetUsageMatchingSessionCount_CountsAssistantMessageWithNoModel(
+	t *testing.T,
+) {
+	d := testDB(t)
+	ctx := context.Background()
+
+	insertSession(t, d, "copilot-no-model", "proj-a", func(s *Session) {
+		s.Agent = "copilot"
+		s.StartedAt = new("2026-02-10T10:00:00Z")
+		s.EndedAt = new("2026-02-10T10:00:00Z")
+	})
+	insertMessages(t, d, Message{
+		SessionID: "copilot-no-model", Ordinal: 0,
+		Role: "assistant", Timestamp: "2026-02-10T10:00:00Z",
+		Model:      "",
+		TokenUsage: nil,
+	})
+
+	got, err := d.GetUsageMatchingSessionCount(ctx, UsageFilter{
+		From: "2026-02-10", To: "2026-02-10",
+		Timezone: "UTC", Agent: "copilot",
+	})
+	requireNoError(t, err, "GetUsageMatchingSessionCount")
+	assert.Equal(t, 1, got,
+		"assistant message with no model must still count without a model filter")
+}
+
+// TestGetUsageMatchingSessionCount_UnboundedMatchesBoundedSemantics guards
+// against the unbounded (no From/To) branch drifting from the bounded
+// branch: both must require an assistant, non-synthetic message (or a
+// usage_events row with a model), both must admit empty-model assistant
+// messages, and Model/ExcludeModel must narrow the same rows.
+func TestGetUsageMatchingSessionCount_UnboundedMatchesBoundedSemantics(
+	t *testing.T,
+) {
+	d := testDB(t)
+	ctx := context.Background()
+
+	insertSession(t, d, "copilot-user-only", "proj-a", func(s *Session) {
+		s.Agent = "copilot"
+		s.StartedAt = new("2026-03-01T10:00:00Z")
+		s.EndedAt = new("2026-03-01T10:00:00Z")
+	})
+	insertMessages(t, d, Message{
+		SessionID: "copilot-user-only", Ordinal: 0,
+		Role: "user", Timestamp: "2026-03-01T10:00:00Z",
+	})
+
+	insertSession(t, d, "copilot-synthetic-only", "proj-a", func(s *Session) {
+		s.Agent = "copilot"
+		s.StartedAt = new("2026-03-01T11:00:00Z")
+		s.EndedAt = new("2026-03-01T11:00:00Z")
+	})
+	insertMessages(t, d, Message{
+		SessionID: "copilot-synthetic-only", Ordinal: 0,
+		Role: "assistant", Timestamp: "2026-03-01T11:00:00Z",
+		Model: "<synthetic>",
+	})
+
+	insertSession(t, d, "copilot-no-model-msg", "proj-a", func(s *Session) {
+		s.Agent = "copilot"
+		s.StartedAt = new("2026-03-01T12:00:00Z")
+		s.EndedAt = new("2026-03-01T12:00:00Z")
+	})
+	insertMessages(t, d, Message{
+		SessionID: "copilot-no-model-msg", Ordinal: 0,
+		Role: "assistant", Timestamp: "2026-03-01T12:00:00Z",
+		Model: "",
+	})
+
+	insertSession(t, d, "copilot-no-messages", "proj-a", func(s *Session) {
+		s.Agent = "copilot"
+		s.StartedAt = new("2026-03-01T13:00:00Z")
+		s.EndedAt = new("2026-03-01T13:00:00Z")
+	})
+
+	tests := []struct {
+		name   string
+		filter UsageFilter
+		want   int
+	}{
+		{
+			name:   "unbounded requires assistant or event activity",
+			filter: UsageFilter{Timezone: "UTC", Agent: "copilot"},
+			// Only copilot-no-model-msg has a qualifying assistant
+			// message; user-only, synthetic-only, and message-less
+			// sessions must not count.
+			want: 1,
+		},
+		{
+			name: "unbounded exclude-model keeps empty-model assistant messages",
+			filter: UsageFilter{
+				Timezone: "UTC", Agent: "copilot",
+				ExcludeModel: "gpt-5.3-codex",
+			},
+			want: 1,
+		},
+		{
+			name: "unbounded model filter narrows to matching rows",
+			filter: UsageFilter{
+				Timezone: "UTC", Agent: "copilot", Model: "gpt-5.3-codex",
+			},
+			want: 0,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := d.GetUsageMatchingSessionCount(ctx, tt.filter)
+			requireNoError(t, err, "GetUsageMatchingSessionCount")
+			assert.Equal(t, tt.want, got)
+
+			bounded := tt.filter
+			bounded.From = "2026-03-01"
+			bounded.To = "2026-03-01"
+			boundedGot, err := d.GetUsageMatchingSessionCount(ctx, bounded)
+			requireNoError(t, err, "GetUsageMatchingSessionCount bounded")
+			assert.Equal(t, got, boundedGot,
+				"bounded and unbounded requests must match the same sessions")
+		})
+	}
 }
 
 func TestNewUsageSessionCounts(t *testing.T) {
@@ -2873,10 +3108,31 @@ func BenchmarkGetDailyUsage(b *testing.B) {
 }
 
 func TestGetDailyUsage_PricingPrecedence(t *testing.T) {
+	d := testDB(t)
+	ctx := context.Background()
+
+	requireNoError(t, d.UpsertModelPricing([]ModelPricing{
+		{
+			ModelPattern: "db-only-model",
+			InputPerMTok: 1.0, OutputPerMTok: 4.0,
+		},
+		{
+			ModelPattern: "custom-overrides-model",
+			InputPerMTok: 1.0, OutputPerMTok: 4.0,
+		},
+		{
+			ModelPattern: "db-model",
+			InputPerMTok: 3.0, OutputPerMTok: 10.0,
+		},
+	}), "UpsertModelPricing")
+	d.SetCustomPricing(map[string]config.CustomModelRate{
+		"custom-overrides-model": {Input: 2.0, Output: 8.0},
+		"my-custom-model":        {Input: 1.5, Output: 6.0},
+		"other-model":            {Input: 99.0, Output: 99.0},
+	})
+
 	tests := []struct {
 		name     string
-		dbRates  []ModelPricing
-		custom   map[string]config.CustomModelRate
 		model    string
 		input    int // input tokens
 		output   int // output tokens
@@ -2884,24 +3140,20 @@ func TestGetDailyUsage_PricingPrecedence(t *testing.T) {
 	}{
 		{
 			name:     "db pricing only",
-			dbRates:  []ModelPricing{{ModelPattern: "acme-ultra-2.1", InputPerMTok: 1.0, OutputPerMTok: 4.0}},
-			model:    "acme-ultra-2.1",
+			model:    "db-only-model",
 			input:    1_000_000,
 			output:   100_000,
 			wantCost: 1.4, // 1M*$1/M + 100k*$4/M
 		},
 		{
 			name:     "custom overrides db for same model",
-			dbRates:  []ModelPricing{{ModelPattern: "acme-ultra-2.1", InputPerMTok: 1.0, OutputPerMTok: 4.0}},
-			custom:   map[string]config.CustomModelRate{"acme-ultra-2.1": {Input: 2.0, Output: 8.0}},
-			model:    "acme-ultra-2.1",
+			model:    "custom-overrides-model",
 			input:    1_000_000,
 			output:   100_000,
 			wantCost: 2.8, // 1M*$2/M + 100k*$8/M
 		},
 		{
 			name:     "custom for unknown model, no db entry",
-			custom:   map[string]config.CustomModelRate{"my-custom-model": {Input: 1.5, Output: 6.0}},
 			model:    "my-custom-model",
 			input:    500_000,
 			output:   50_000,
@@ -2916,8 +3168,6 @@ func TestGetDailyUsage_PricingPrecedence(t *testing.T) {
 		},
 		{
 			name:     "custom only affects targeted model",
-			dbRates:  []ModelPricing{{ModelPattern: "db-model", InputPerMTok: 3.0, OutputPerMTok: 10.0}},
-			custom:   map[string]config.CustomModelRate{"other-model": {Input: 99.0, Output: 99.0}},
 			model:    "db-model",
 			input:    1_000_000,
 			output:   100_000,
@@ -2925,33 +3175,37 @@ func TestGetDailyUsage_PricingPrecedence(t *testing.T) {
 		},
 	}
 
+	for i, tt := range tests {
+		sessionID := "pricing-" + strconv.Itoa(i)
+		insertSession(t, d, sessionID, "proj", func(s *Session) {
+			s.StartedAt = new("2024-06-15T10:00:00Z")
+		})
+		insertMessages(t, d, Message{
+			SessionID: sessionID,
+			Ordinal:   0,
+			Role:      "assistant",
+			Timestamp: "2024-06-15T10:30:00Z",
+			Model:     tt.model,
+			TokenUsage: json.RawMessage(
+				`{"input_tokens":` + strconv.Itoa(tt.input) +
+					`,"output_tokens":` + strconv.Itoa(tt.output) + `}`,
+			),
+		})
+	}
+
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			d := testDB(t)
-			if len(tt.dbRates) > 0 {
-				requireNoError(t, d.UpsertModelPricing(tt.dbRates), "UpsertModelPricing")
-			}
-			if tt.custom != nil {
-				d.SetCustomPricing(tt.custom)
-			}
-
-			insertSession(t, d, "s1", "proj", func(s *Session) {
-				s.StartedAt = new("2024-06-15T10:00:00Z")
-			})
-			insertMessages(t, d, Message{
-				SessionID:  "s1",
-				Ordinal:    0,
-				Role:       "assistant",
-				Timestamp:  "2024-06-15T10:30:00Z",
-				Model:      tt.model,
-				TokenUsage: json.RawMessage(`{"input_tokens":` + strconv.Itoa(tt.input) + `,"output_tokens":` + strconv.Itoa(tt.output) + `}`),
-			})
-
-			result, err := d.GetDailyUsage(context.Background(), UsageFilter{
-				From: "2024-06-01", To: "2024-06-30",
+			result, err := d.GetDailyUsage(ctx, UsageFilter{
+				From:  "2024-06-01",
+				To:    "2024-06-30",
+				Model: tt.model,
 			})
 			requireNoError(t, err, "GetDailyUsage")
 
+			assert.Equal(t, tt.input, result.Totals.InputTokens,
+				"InputTokens")
+			assert.Equal(t, tt.output, result.Totals.OutputTokens,
+				"OutputTokens")
 			assert.InDelta(t, tt.wantCost, result.Totals.TotalCost, 0.01,
 				"TotalCost")
 		})
@@ -3167,89 +3421,166 @@ func TestGetSessionUsage_NotFound(t *testing.T) {
 	assert.Nil(t, u, "usage")
 }
 
-// TestGetDailyUsage_CopilotAICreditsComputed verifies AI credits are computed
-// from priced Copilot usage: costUSD / 0.01.
-func TestGetDailyUsage_CopilotAICreditsComputed(t *testing.T) {
+func TestGetSessionUsage_AICreditsCapability(t *testing.T) {
+	parsertest.StubAgentDefs(t, parser.AgentDef{
+		Type:        parser.AgentType("ai-credit-agent"),
+		DisplayName: "AI Credit Agent",
+		Usage: parser.UsageCapabilities{
+			AICreditsDenominated: true,
+		},
+	})
+
 	d := testDB(t)
 	ctx := context.Background()
+	seedOpusPricing(t, d)
 
-	require.NoError(t, d.UpsertModelPricing([]ModelPricing{{
-		ModelPattern:         "gpt-4",
-		InputPerMTok:         15.0,
-		OutputPerMTok:        60.0,
-		CacheCreationPerMTok: 15.0,
-		CacheReadPerMTok:     6.0,
-	}}))
-
-	insertSession(t, d, "copilot:aicredits", "proj", func(s *Session) {
-		s.Agent = "copilot"
-		s.StartedAt = new("2024-06-15T10:00:00Z")
-		s.EndedAt = new("2024-06-15T11:00:00Z")
+	insertSession(t, d, "ai-credit-agent:s1", "proj", func(s *Session) {
+		s.Agent = "ai-credit-agent"
+		s.StartedAt = new("2026-05-20T10:00:00Z")
 	})
-
 	insertMessages(t, d, Message{
-		SessionID: "copilot:aicredits",
+		SessionID: "ai-credit-agent:s1",
 		Ordinal:   0,
 		Role:      "assistant",
-		Timestamp: "2024-06-15T10:30:00Z",
-		Model:     "gpt-4",
-		TokenUsage: json.RawMessage(`{
-			"input_tokens": 1000,
-			"output_tokens": 500
-		}`),
+		Timestamp: "2026-05-20T10:30:00Z",
+		Model:     "claude-opus-4-6",
+		TokenUsage: json.RawMessage(
+			`{"input_tokens":1000,"output_tokens":500}`),
 	})
 
-	result, err := d.GetDailyUsage(ctx, UsageFilter{
-		From: "2024-06-01",
-		To:   "2024-06-30",
-	})
-	requireNoError(t, err, "GetDailyUsage")
-
-	wantCost := (1000*15.0 + 500*60.0) / 1_000_000
-	wantCredits := wantCost / 0.01
-	assert.InDelta(t, wantCost, result.Totals.TotalCost, 1e-9, "TotalCost")
-	assert.InDelta(t, wantCredits, result.Totals.CopilotAICredits, 1e-6, "CopilotAICredits")
+	u, err := d.GetSessionUsage(ctx, "ai-credit-agent:s1")
+	requireNoError(t, err, "GetSessionUsage")
+	require.NotNil(t, u, "usage is nil")
+	assert.True(t, u.HasCost, "HasCost = false, want true")
+	assert.InDelta(t, 0.0175, u.CostUSD, 1e-9, "CostUSD")
+	assert.InDelta(t, 1.75, u.AICredits, 1e-9, "AICredits")
 }
 
-// TestGetDailyUsage_NoAICreditsNonCopilot verifies non-Copilot agents do
-// not emit CopilotAICredits even when priced.
-func TestGetDailyUsage_NoAICreditsNonCopilot(t *testing.T) {
+// TestGetDailyUsage_CopilotAICredits verifies AI credits are computed from
+// agents with the parser AI-credit capability: costUSD / 0.01.
+func TestGetDailyUsage_CopilotAICredits(t *testing.T) {
+	parsertest.StubAgentDefs(t, parser.AgentDef{
+		Type:        parser.AgentType("ai-credit-agent"),
+		DisplayName: "AI Credit Agent",
+		Usage: parser.UsageCapabilities{
+			AICreditsDenominated: true,
+		},
+	})
+
 	d := testDB(t)
 	ctx := context.Background()
 
-	require.NoError(t, d.UpsertModelPricing([]ModelPricing{{
-		ModelPattern:         "claude-opus-4-6",
-		InputPerMTok:         3.0,
-		OutputPerMTok:        15.0,
-		CacheCreationPerMTok: 3.75,
-		CacheReadPerMTok:     0.30,
-	}}))
+	require.NoError(t, d.UpsertModelPricing([]ModelPricing{
+		{
+			ModelPattern:         "gpt-4",
+			InputPerMTok:         15.0,
+			OutputPerMTok:        60.0,
+			CacheCreationPerMTok: 15.0,
+			CacheReadPerMTok:     6.0,
+		},
+		{
+			ModelPattern:         "claude-opus-4-6",
+			InputPerMTok:         3.0,
+			OutputPerMTok:        15.0,
+			CacheCreationPerMTok: 3.75,
+			CacheReadPerMTok:     0.30,
+		},
+	}))
 
-	insertSession(t, d, "claude:nocredits", "proj", func(s *Session) {
-		s.Agent = "claude-code"
-		s.StartedAt = new("2024-06-15T10:00:00Z")
-		s.EndedAt = new("2024-06-15T11:00:00Z")
-	})
+	tests := []struct {
+		name        string
+		sessionID   string
+		agent       string
+		model       string
+		inputRate   float64
+		outputRate  float64
+		wantCredits bool
+	}{
+		{
+			name:        "copilot credits computed",
+			sessionID:   "copilot:aicredits",
+			agent:       "copilot",
+			model:       "gpt-4",
+			inputRate:   15.0,
+			outputRate:  60.0,
+			wantCredits: true,
+		},
+		{
+			name:        "non copilot capability credits computed",
+			sessionID:   "ai-credit-agent:aicredits",
+			agent:       "ai-credit-agent",
+			model:       "gpt-4",
+			inputRate:   15.0,
+			outputRate:  60.0,
+			wantCredits: true,
+		},
+		{
+			name:       "non copilot has no credits",
+			sessionID:  "claude:nocredits",
+			agent:      "claude-code",
+			model:      "claude-opus-4-6",
+			inputRate:  3.0,
+			outputRate: 15.0,
+		},
+	}
 
-	insertMessages(t, d, Message{
-		SessionID: "claude:nocredits",
-		Ordinal:   0,
-		Role:      "assistant",
-		Timestamp: "2024-06-15T10:30:00Z",
-		Model:     "claude-opus-4-6",
-		TokenUsage: json.RawMessage(`{
-			"input_tokens": 1000,
-			"output_tokens": 500
-		}`),
-	})
+	for _, tt := range tests {
+		insertSession(t, d, tt.sessionID, "proj", func(s *Session) {
+			s.Agent = tt.agent
+			s.StartedAt = new("2024-06-15T10:00:00Z")
+			s.EndedAt = new("2024-06-15T11:00:00Z")
+		})
+		insertMessages(t, d, Message{
+			SessionID: tt.sessionID,
+			Ordinal:   0,
+			Role:      "assistant",
+			Timestamp: "2024-06-15T10:30:00Z",
+			Model:     tt.model,
+			TokenUsage: json.RawMessage(`{
+				"input_tokens": 1000,
+				"output_tokens": 500
+			}`),
+		})
+	}
 
-	result, err := d.GetDailyUsage(ctx, UsageFilter{
-		From: "2024-06-01",
-		To:   "2024-06-30",
-	})
-	requireNoError(t, err, "GetDailyUsage")
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result, err := d.GetDailyUsage(ctx, UsageFilter{
+				From:  "2024-06-01",
+				To:    "2024-06-30",
+				Agent: tt.agent,
+			})
+			requireNoError(t, err, "GetDailyUsage")
 
-	wantCost := (1000*3.0 + 500*15.0) / 1_000_000
-	assert.InDelta(t, wantCost, result.Totals.TotalCost, 1e-9, "TotalCost")
-	assert.Equal(t, 0.0, result.Totals.CopilotAICredits, "CopilotAICredits should be 0")
+			wantCost := (1000*tt.inputRate + 500*tt.outputRate) / 1_000_000
+			wantCredits := 0.0
+			if tt.wantCredits {
+				wantCredits = wantCost / 0.01
+			}
+			assert.InDelta(t, wantCost, result.Totals.TotalCost, 1e-9,
+				"TotalCost")
+			assert.InDelta(t, wantCredits, result.Totals.CopilotAICredits,
+				1e-6, "CopilotAICredits")
+		})
+	}
+}
+
+func TestAICreditsFromCost(t *testing.T) {
+	cases := []struct {
+		name  string
+		agent string
+		cost  float64
+		want  float64
+	}{
+		{"copilot converts at a cent per credit", "copilot", 0.42, 42},
+		{"zero cost yields zero credits", "copilot", 0, 0},
+		{"non-credit agent yields zero", "claude", 3.5, 0},
+		{"unknown agent yields zero", "unknown-agent", 3.5, 0},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			assert.InDelta(t, tc.want,
+				AICreditsFromCost(tc.agent, tc.cost), 1e-9)
+		})
+	}
 }

@@ -32,6 +32,7 @@ import (
 	"go.kenn.io/agentsview/internal/parser"
 	"go.kenn.io/agentsview/internal/server"
 	"go.kenn.io/agentsview/internal/service"
+	"go.kenn.io/agentsview/internal/sessionwatch"
 	"go.kenn.io/agentsview/internal/sync"
 	"go.kenn.io/agentsview/internal/testjsonl"
 )
@@ -94,15 +95,31 @@ func setupWithServerOpts(
 	srvOpts []server.Option,
 	opts ...setupOption,
 ) *testEnv {
+	return setupWithServerOptsAndDBTemplate(t, srvOpts, nil, opts...)
+}
+
+func setupWithDBTemplate(
+	t *testing.T,
+	dbFiles map[string][]byte,
+	opts ...setupOption,
+) *testEnv {
+	return setupWithServerOptsAndDBTemplate(t, nil, dbFiles, opts...)
+}
+
+func setupWithServerOptsAndDBTemplate(
+	t *testing.T,
+	srvOpts []server.Option,
+	dbFiles map[string][]byte,
+	opts ...setupOption,
+) *testEnv {
 	t.Helper()
 	dir := tempDirWithRetryCleanup(t)
 	dbPath := filepath.Join(dir, "test.db")
-
-	database, err := db.Open(dbPath)
-	if err != nil {
-		t.Fatalf("opening db: %v", err)
+	if dbFiles != nil {
+		writeDBTemplateFiles(t, dbPath, dbFiles)
 	}
-	t.Cleanup(func() { database.Close() })
+
+	database := dbtest.OpenTestDBAt(t, dbPath)
 
 	claudeDir := filepath.Join(dir, "claude")
 	codexDir := filepath.Join(dir, "codex")
@@ -150,6 +167,23 @@ func setupWithServerOpts(
 	}
 }
 
+func writeDBTemplateFiles(
+	t *testing.T,
+	dbPath string,
+	files map[string][]byte,
+) {
+	t.Helper()
+	require.Contains(t, files, "", "db template is missing main file")
+	require.NoError(t, os.MkdirAll(filepath.Dir(dbPath), 0o755))
+	for _, suffix := range []string{"", "-wal", "-shm"} {
+		data, ok := files[suffix]
+		if !ok {
+			continue
+		}
+		require.NoError(t, os.WriteFile(dbPath+suffix, data, 0o600))
+	}
+}
+
 // wrapTestHandler wraps the server handler so test requests default
 // to the configured Host and a loopback RemoteAddr, matching the test
 // config (e.g. 127.0.0.1:0), and so mutating requests get an Origin
@@ -193,11 +227,7 @@ func setupPGMode(t *testing.T) *testEnv {
 	dir := tempDirWithRetryCleanup(t)
 	dbPath := filepath.Join(dir, "test.db")
 
-	database, err := db.Open(dbPath)
-	if err != nil {
-		t.Fatalf("opening db: %v", err)
-	}
-	t.Cleanup(func() { database.Close() })
+	database := dbtest.OpenTestDBAt(t, dbPath)
 
 	cfg := config.Config{
 		Host:         "127.0.0.1",
@@ -223,11 +253,7 @@ func setupNoSyncMode(t *testing.T) *testEnv {
 	dir := tempDirWithRetryCleanup(t)
 	dbPath := filepath.Join(dir, "test.db")
 
-	database, err := db.Open(dbPath)
-	if err != nil {
-		t.Fatalf("opening db: %v", err)
-	}
-	t.Cleanup(func() { database.Close() })
+	database := dbtest.OpenTestDBAt(t, dbPath)
 
 	cfg := config.Config{
 		Host:         "127.0.0.1",
@@ -249,6 +275,26 @@ func setupNoSyncMode(t *testing.T) *testEnv {
 		engine:      nil,
 		broadcaster: broadcaster,
 		dataDir:     dir,
+	}
+}
+
+const hostMiddlewareProbePath = "/api/openapi"
+
+func setupHostOnly(t *testing.T, opts ...setupOption) *testEnv {
+	t.Helper()
+	cfg := config.Config{
+		Host:         "127.0.0.1",
+		Port:         0,
+		WriteTimeout: 30 * time.Second,
+	}
+	for _, opt := range opts {
+		opt(&cfg)
+	}
+	srv := server.New(cfg, readOnlyTestStore{}, nil)
+
+	return &testEnv{
+		srv:     srv,
+		handler: wrapTestHandler(cfg, srv.Handler()),
 	}
 }
 
@@ -465,6 +511,17 @@ func (te *testEnv) seedMessages(
 	t *testing.T, sessionID string, count int, mods ...func(i int, m *db.Message),
 ) {
 	t.Helper()
+	msgs := buildTestMessages(sessionID, count, mods...)
+	if err := te.db.ReplaceSessionMessages(
+		sessionID, msgs,
+	); err != nil {
+		t.Fatalf("seeding messages: %v", err)
+	}
+}
+
+func buildTestMessages(
+	sessionID string, count int, mods ...func(i int, m *db.Message),
+) []db.Message {
 	msgs := make([]db.Message, count)
 	for i := range count {
 		role := "user"
@@ -483,11 +540,7 @@ func (te *testEnv) seedMessages(
 			mod(i, &msgs[i])
 		}
 	}
-	if err := te.db.ReplaceSessionMessages(
-		sessionID, msgs,
-	); err != nil {
-		t.Fatalf("seeding messages: %v", err)
-	}
+	return msgs
 }
 
 // requireFTS skips the test when the database lacks FTS5 support.
@@ -549,6 +602,8 @@ func TestOpenAPIEndpointDocumentsExistingAPIRoutes(t *testing.T) {
 	assert.Contains(t, spec.Paths["/api/v1/sessions/{id}/messages"], "get")
 	require.Contains(t, spec.Paths, "/api/v1/settings")
 	assert.Contains(t, spec.Paths["/api/v1/settings"], "put")
+	require.Contains(t, spec.Paths, "/api/v1/session-stats")
+	assert.Contains(t, spec.Paths["/api/v1/session-stats"], "get")
 }
 
 func TestOpenAPIEndpointKeepsUsageSummaryContract(t *testing.T) {
@@ -807,6 +862,43 @@ func TestOpenAPIEndpointDocumentsQualitySignalResponses(t *testing.T) {
 		"#/components/schemas/DbSignalSessionExample",
 		sessions.Items.Ref,
 		"sessions item schema")
+}
+
+// TestOpenAPIEndpointDocumentsDecodeConfidence guards that the derived
+// decode_confidence marker is a reflected field on the session-detail response
+// schema, so Huma/OpenAPI and the generated TypeScript client document and type
+// it. It is a detail-only derive-on-read field with no persisted column, so it
+// must appear on ServiceSessionDetail but not on the plain DbSession schema.
+func TestOpenAPIEndpointDocumentsDecodeConfidence(t *testing.T) {
+	te := setup(t)
+
+	w := te.get(t, "/api/openapi.json")
+
+	require.Equal(t, http.StatusOK, w.Code, "body: %s", w.Body.String())
+	type openAPISchema struct {
+		Type       any                      `json:"type"`
+		Properties map[string]openAPISchema `json:"properties"`
+	}
+	var spec struct {
+		Components struct {
+			Schemas map[string]openAPISchema `json:"schemas"`
+		} `json:"components"`
+	}
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &spec))
+
+	detail, ok := spec.Components.Schemas["ServiceSessionDetail"]
+	require.True(t, ok, "schema ServiceSessionDetail missing")
+	prop, ok := detail.Properties["decode_confidence"]
+	require.True(t, ok,
+		"ServiceSessionDetail should document the derived decode_confidence field")
+	assert.Equal(t, "string", prop.Type,
+		"decode_confidence should be typed as a string")
+
+	dbSession, ok := spec.Components.Schemas["DbSession"]
+	require.True(t, ok, "schema DbSession missing")
+	_, present := dbSession.Properties["decode_confidence"]
+	assert.False(t, present,
+		"decode_confidence is detail-only and must not leak into DbSession")
 }
 
 func TestOpenAPIEndpointDocumentsImportResponseContentTypes(t *testing.T) {
@@ -1104,16 +1196,58 @@ func TestHumaScanSecretsEmitsSummaryEvent(t *testing.T) {
 func (te *testEnv) waitForSSEEvent(t *testing.T, w *flushRecorder, expectedEvent string, timeout time.Duration) {
 	t.Helper()
 	deadline := time.Now().Add(timeout)
-	ticker := time.NewTicker(50 * time.Millisecond)
+	ticker := time.NewTicker(10 * time.Millisecond)
 	defer ticker.Stop()
 
-	for time.Now().Before(deadline) {
-		<-ticker.C
-		events := parseSSE(w.BodyString())
-		for _, e := range events {
-			if e.Event == expectedEvent {
-				return
-			}
+	for {
+		if hasSSEEvent(w, expectedEvent) {
+			return
+		}
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			break
+		}
+		select {
+		case <-ticker.C:
+		case <-time.After(remaining):
+		}
+	}
+	t.Fatalf("timed out waiting for event: %s, got: %s", expectedEvent, w.BodyString())
+}
+
+func hasSSEEvent(w *flushRecorder, expectedEvent string) bool {
+	events := parseSSE(w.BodyString())
+	for _, e := range events {
+		if e.Event == expectedEvent {
+			return true
+		}
+	}
+	return false
+}
+
+func (te *testEnv) emitUntilSSEEvent(
+	t *testing.T,
+	w *flushRecorder,
+	scope string,
+	expectedEvent string,
+	timeout time.Duration,
+) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	ticker := time.NewTicker(10 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		te.broadcaster.Emit(scope)
+		if hasSSEEvent(w, expectedEvent) {
+			return
+		}
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			break
+		}
+		select {
+		case <-ticker.C:
+		case <-time.After(remaining):
 		}
 	}
 	t.Fatalf("timed out waiting for event: %s, got: %s", expectedEvent, w.BodyString())
@@ -1466,6 +1600,8 @@ func TestSidebarIndexPaginatesByDescendantFreshness(t *testing.T) {
 }
 
 func TestSidebarIndexValidatesParams(t *testing.T) {
+	te := setup(t)
+
 	tests := []string{
 		"/api/v1/sessions/sidebar-index?min_messages=bad",
 		"/api/v1/sessions/sidebar-index?max_messages=bad",
@@ -1477,7 +1613,6 @@ func TestSidebarIndexValidatesParams(t *testing.T) {
 
 	for _, path := range tests {
 		t.Run(path, func(t *testing.T) {
-			te := setup(t)
 			w := te.get(t, path)
 			assertStatus(t, w, http.StatusBadRequest)
 		})
@@ -2045,6 +2180,10 @@ func TestListMachines_ExcludeOneShotDefault(t *testing.T) {
 		s.Machine = "desktop"
 		s.UserMessageCount = 5
 	})
+	te.seedSession(t, "s3", "other-app", 3, func(s *db.Session) {
+		s.Machine = "desktop"
+		s.UserMessageCount = 5
+	})
 
 	// Default: exclude one-shot sessions.
 	w := te.get(t, "/api/v1/machines")
@@ -2067,21 +2206,14 @@ func TestListMachines_ExcludeOneShotDefault(t *testing.T) {
 		t.Fatalf("include: expected 2 machines, got %d",
 			len(resp.Machines))
 	}
-}
 
-func TestListProjects(t *testing.T) {
-	te := setup(t)
-	te.seedSession(t, "s1", "my-app", 5)
-	te.seedSession(t, "s2", "my-app", 3)
-	te.seedSession(t, "s3", "other-app", 1)
-
-	w := te.get(t, "/api/v1/projects")
+	w = te.get(t, "/api/v1/projects")
 	assertStatus(t, w, http.StatusOK)
 
-	resp := decode[projectListResponse](t, w)
-	if len(resp.Projects) != 2 {
+	projects := decode[projectListResponse](t, w)
+	if len(projects.Projects) != 2 {
 		t.Fatalf("expected 2 projects, got %d",
-			len(resp.Projects))
+			len(projects.Projects))
 	}
 }
 
@@ -2212,8 +2344,33 @@ func TestPGPushLocalNoSyncDaemonReachesConfigValidation(t *testing.T) {
 	assert.Contains(t, w.Body.String(), "pg push: url not configured")
 }
 
+func TestDuckDBPushLocalNoSyncDaemonWritesConfiguredPath(t *testing.T) {
+	if runtime.GOOS == "windows" && runtime.GOARCH == "arm64" {
+		t.Skip("duckdb-go-bindings does not ship a windows/arm64 library")
+	}
+
+	te := setupNoSyncMode(t)
+	target := filepath.Join(t.TempDir(), "agentsview.duckdb")
+	body, err := json.Marshal(struct {
+		Full   bool                `json:"full"`
+		DuckDB config.DuckDBConfig `json:"duckdb"`
+	}{
+		Full: true,
+		DuckDB: config.DuckDBConfig{
+			Path:        target,
+			MachineName: "workstation",
+		},
+	})
+	require.NoError(t, err)
+
+	w := te.post(t, "/api/v1/push/duckdb", string(body))
+
+	assertStatus(t, w, http.StatusOK)
+	assert.FileExists(t, target)
+}
+
 func TestCORSPreflightRejectsBadOrigin(t *testing.T) {
-	te := setup(t)
+	te := setupHostOnly(t)
 
 	// OPTIONS preflight from foreign origin should return 403.
 	w := te.wrappedRequest(http.MethodOptions, "/api/v1/sessions",
@@ -2222,7 +2379,7 @@ func TestCORSPreflightRejectsBadOrigin(t *testing.T) {
 }
 
 func TestCORSBlocksMutatingWithNoOrigin(t *testing.T) {
-	te := setup(t)
+	te := setupHostOnly(t)
 
 	// POST with no Origin header should be blocked (prevents
 	// CSRF where browser omits Origin). Use rawRequest to
@@ -2233,20 +2390,20 @@ func TestCORSBlocksMutatingWithNoOrigin(t *testing.T) {
 }
 
 func TestHostHeaderRejectsDNSRebinding(t *testing.T) {
-	te := setup(t)
+	te := setupHostOnly(t)
 
 	// A DNS rebinding attack uses a custom domain that resolves
 	// to 127.0.0.1. The Host header carries the attacker's domain.
-	w := te.rawRequest(http.MethodGet, "/api/v1/stats",
+	w := te.wrappedRequest(http.MethodGet, hostMiddlewareProbePath,
 		withHost("evil.attacker.com:8080"))
 	assertStatus(t, w, http.StatusForbidden)
 }
 
 func TestHostHeaderRejectionBodyIsDescriptive(t *testing.T) {
-	te := setup(t)
+	te := setupHostOnly(t)
 
 	// A forwarded port produces a Host the server does not trust.
-	w := te.rawRequest(http.MethodGet, "/api/v1/stats",
+	w := te.wrappedRequest(http.MethodGet, hostMiddlewareProbePath,
 		withHost("127.0.0.1:18080"))
 
 	assertStatus(t, w, http.StatusForbidden)
@@ -2258,14 +2415,14 @@ func TestHostHeaderRejectionBodyIsDescriptive(t *testing.T) {
 }
 
 func TestHostHeaderAllowsLegitimate(t *testing.T) {
-	te := setup(t)
+	te := setupHostOnly(t)
 
 	// Requests with legitimate Host should pass.
 	for _, host := range []string{
 		"127.0.0.1:0",
 		"localhost:0",
 	} {
-		w := te.rawRequest(http.MethodGet, "/api/v1/stats",
+		w := te.wrappedRequest(http.MethodGet, hostMiddlewareProbePath,
 			withHost(host), withRemoteAddr("127.0.0.1:1234"))
 		if w.Code == http.StatusForbidden {
 			t.Errorf("host %s should be allowed, got 403", host)
@@ -2274,21 +2431,21 @@ func TestHostHeaderAllowsLegitimate(t *testing.T) {
 }
 
 func TestHostHeaderAllowsConfiguredPublicOriginHost(t *testing.T) {
-	te := setup(t, withPublicURL("http://viewer.example.test:8004"))
+	te := setupHostOnly(t, withPublicURL("http://viewer.example.test:8004"))
 
 	// In the managed Caddy flow, the backend only accepts loopback
 	// connections. Set RemoteAddr to loopback so authMiddleware
 	// passes the request through to the host-check layer.
-	w := te.rawRequest(http.MethodGet, "/api/v1/stats",
+	w := te.wrappedRequest(http.MethodGet, hostMiddlewareProbePath,
 		withHost("viewer.example.test:8004"),
 		withRemoteAddr("127.0.0.1:1234"))
 	assertStatus(t, w, http.StatusOK)
 }
 
 func TestHostHeaderPublicOriginsExpandTrustedHosts(t *testing.T) {
-	te := setup(t, withPublicOrigins("http://viewer.example.test:8004"))
+	te := setupHostOnly(t, withPublicOrigins("http://viewer.example.test:8004"))
 
-	w := te.rawRequest(http.MethodGet, "/api/v1/stats",
+	w := te.wrappedRequest(http.MethodGet, hostMiddlewareProbePath,
 		withHost("viewer.example.test:8004"),
 		withRemoteAddr("127.0.0.1:1234"))
 	// public_origins should expand the host allowlist so
@@ -2299,7 +2456,7 @@ func TestHostHeaderPublicOriginsExpandTrustedHosts(t *testing.T) {
 func TestHostHeaderHTTPSPublicOriginExpandsTrustedHosts(
 	t *testing.T,
 ) {
-	te := setup(t, withPublicOrigins(
+	te := setupHostOnly(t, withPublicOrigins(
 		"https://viewer.example.test",
 	))
 
@@ -2310,7 +2467,7 @@ func TestHostHeaderHTTPSPublicOriginExpandsTrustedHosts(
 		"viewer.example.test:443",
 	} {
 		t.Run(host, func(t *testing.T) {
-			w := te.rawRequest(http.MethodGet, "/api/v1/stats",
+			w := te.wrappedRequest(http.MethodGet, hostMiddlewareProbePath,
 				withHost(host), withRemoteAddr("127.0.0.1:1234"))
 			assertStatus(t, w, http.StatusOK)
 		})
@@ -2318,20 +2475,18 @@ func TestHostHeaderHTTPSPublicOriginExpandsTrustedHosts(
 }
 
 func TestCORSAllowsConfiguredHTTPSPublicOrigin(t *testing.T) {
-	te := setup(t, withPublicOrigins("https://viewer.example.test"))
+	te := setupHostOnly(t, withPublicOrigins("https://viewer.example.test"))
 
-	w := te.wrappedRequest(http.MethodPost, "/api/v1/sync",
+	w := te.wrappedRequest(http.MethodOptions, "/api/v1/sync",
 		withOrigin("https://viewer.example.test"))
-	if w.Code == http.StatusForbidden {
-		t.Fatal("configured public origin should not be blocked")
-	}
+	assertStatus(t, w, http.StatusNoContent)
 }
 
 func TestCORSAllowsLocalhost(t *testing.T) {
-	te := setup(t)
+	te := setupHostOnly(t)
 
 	// localhost variant should also be allowed when bound to 127.0.0.1.
-	w := te.wrappedRequest(http.MethodGet, "/api/v1/stats",
+	w := te.wrappedRequest(http.MethodGet, hostMiddlewareProbePath,
 		withOrigin("http://localhost:0"))
 	assertStatus(t, w, http.StatusOK)
 
@@ -2344,7 +2499,7 @@ func TestCORSAllowsLocalhost(t *testing.T) {
 func TestHostHeaderBindAllPort80AllowsPortlessLoopback(t *testing.T) {
 	for _, bindHost := range []string{"0.0.0.0", "::"} {
 		t.Run(bindHost, func(t *testing.T) {
-			te := setup(t, func(c *config.Config) {
+			te := setupHostOnly(t, func(c *config.Config) {
 				c.Host = bindHost
 				c.Port = 80
 			})
@@ -2357,7 +2512,7 @@ func TestHostHeaderBindAllPort80AllowsPortlessLoopback(t *testing.T) {
 				"[::1]:80",
 				"[::1]",
 			} {
-				w := te.rawRequest(http.MethodGet, "/api/v1/stats",
+				w := te.wrappedRequest(http.MethodGet, hostMiddlewareProbePath,
 					withHost(host), withRemoteAddr("127.0.0.1:1234"))
 				assertStatus(t, w, http.StatusOK)
 			}
@@ -2368,7 +2523,7 @@ func TestHostHeaderBindAllPort80AllowsPortlessLoopback(t *testing.T) {
 func TestCORSBindAllPort80AllowsPortlessLoopbackOrigins(t *testing.T) {
 	for _, bindHost := range []string{"0.0.0.0", "::"} {
 		t.Run(bindHost, func(t *testing.T) {
-			te := setup(t, func(c *config.Config) {
+			te := setupHostOnly(t, func(c *config.Config) {
 				c.Host = bindHost
 				c.Port = 80
 			})
@@ -2381,7 +2536,7 @@ func TestCORSBindAllPort80AllowsPortlessLoopbackOrigins(t *testing.T) {
 				"http://[::1]:80",
 				"http://[::1]",
 			} {
-				w := te.wrappedRequest(http.MethodGet, "/api/v1/stats",
+				w := te.wrappedRequest(http.MethodGet, hostMiddlewareProbePath,
 					withOrigin(origin))
 				assertStatus(t, w, http.StatusOK)
 
@@ -2403,12 +2558,12 @@ func TestCORSBindAllPort80AllowsPortlessLANOrigin(t *testing.T) {
 
 	for _, bindHost := range []string{"0.0.0.0", "::"} {
 		t.Run(bindHost, func(t *testing.T) {
-			te := setup(t, func(c *config.Config) {
+			te := setupHostOnly(t, func(c *config.Config) {
 				c.Host = bindHost
 				c.Port = 80
 			})
 
-			w := te.wrappedRequest(http.MethodGet, "/api/v1/stats",
+			w := te.wrappedRequest(http.MethodGet, hostMiddlewareProbePath,
 				withOrigin(origin))
 			assertStatus(t, w, http.StatusOK)
 
@@ -2426,17 +2581,13 @@ func TestHostHeaderBindAllPort80AllowsPortlessLANIP(t *testing.T) {
 
 	for _, bindHost := range []string{"0.0.0.0", "::"} {
 		t.Run(bindHost, func(t *testing.T) {
-			te := setup(t, func(c *config.Config) {
+			te := setupHostOnly(t, func(c *config.Config) {
 				c.Host = bindHost
 				c.Port = 80
-				// LAN access requires require_auth + auth token.
-				c.RequireAuth = true
-				c.AuthToken = "test-token"
 			})
 
-			w := te.rawRequest(http.MethodGet, "/api/v1/stats",
-				withHost(host), withRemoteAddr(lanIP+":1234"),
-				withBearer("test-token"))
+			w := te.wrappedRequest(http.MethodGet, hostMiddlewareProbePath,
+				withHost(host), withRemoteAddr(lanIP+":1234"))
 			assertStatus(t, w, http.StatusOK)
 		})
 	}
@@ -2447,7 +2598,7 @@ func TestCORSBindAllPort80RejectsNonLocalIPOrigin(t *testing.T) {
 
 	for _, bindHost := range []string{"0.0.0.0", "::"} {
 		t.Run(bindHost, func(t *testing.T) {
-			te := setup(t, func(c *config.Config) {
+			te := setupHostOnly(t, func(c *config.Config) {
 				c.Host = bindHost
 				c.Port = 80
 			})
@@ -2464,12 +2615,12 @@ func TestHostHeaderBindAllPort80RejectsNonLocalIP(t *testing.T) {
 
 	for _, bindHost := range []string{"0.0.0.0", "::"} {
 		t.Run(bindHost, func(t *testing.T) {
-			te := setup(t, func(c *config.Config) {
+			te := setupHostOnly(t, func(c *config.Config) {
 				c.Host = bindHost
 				c.Port = 80
 			})
 
-			w := te.rawRequest(http.MethodGet, "/api/v1/stats",
+			w := te.wrappedRequest(http.MethodGet, hostMiddlewareProbePath,
 				withHost(host))
 			assertStatus(t, w, http.StatusForbidden)
 		})
@@ -2479,7 +2630,7 @@ func TestHostHeaderBindAllPort80RejectsNonLocalIP(t *testing.T) {
 func TestCORSBindAllInterfaces(t *testing.T) {
 	for _, bindHost := range []string{"0.0.0.0", "::"} {
 		t.Run(bindHost, func(t *testing.T) {
-			te := setup(t, func(c *config.Config) {
+			te := setupHostOnly(t, func(c *config.Config) {
 				c.Host = bindHost
 			})
 
@@ -2490,7 +2641,7 @@ func TestCORSBindAllInterfaces(t *testing.T) {
 				"http://localhost:0",
 				"http://[::1]:0",
 			} {
-				w := te.wrappedRequest(http.MethodGet, "/api/v1/stats",
+				w := te.wrappedRequest(http.MethodGet, hostMiddlewareProbePath,
 					withOrigin(origin))
 				assertStatus(t, w, http.StatusOK)
 
@@ -2509,11 +2660,11 @@ func TestCORSBindAllAllowsLANIPOrigin(t *testing.T) {
 
 	for _, bindHost := range []string{"0.0.0.0", "::"} {
 		t.Run(bindHost, func(t *testing.T) {
-			te := setup(t, func(c *config.Config) {
+			te := setupHostOnly(t, func(c *config.Config) {
 				c.Host = bindHost
 			})
 
-			w := te.wrappedRequest(http.MethodGet, "/api/v1/stats",
+			w := te.wrappedRequest(http.MethodGet, hostMiddlewareProbePath,
 				withOrigin(origin))
 			assertStatus(t, w, http.StatusOK)
 
@@ -2531,16 +2682,12 @@ func TestHostHeaderBindAllAllowsLANIP(t *testing.T) {
 
 	for _, bindHost := range []string{"0.0.0.0", "::"} {
 		t.Run(bindHost, func(t *testing.T) {
-			te := setup(t, func(c *config.Config) {
+			te := setupHostOnly(t, func(c *config.Config) {
 				c.Host = bindHost
-				// LAN access requires require_auth + auth token.
-				c.RequireAuth = true
-				c.AuthToken = "test-token"
 			})
 
-			w := te.rawRequest(http.MethodGet, "/api/v1/stats",
-				withHost(host), withRemoteAddr(lanIP+":1234"),
-				withBearer("test-token"))
+			w := te.wrappedRequest(http.MethodGet, hostMiddlewareProbePath,
+				withHost(host), withRemoteAddr(lanIP+":1234"))
 			assertStatus(t, w, http.StatusOK)
 		})
 	}
@@ -2551,7 +2698,7 @@ func TestCORSBindAllRejectsNonLocalIPOrigin(t *testing.T) {
 
 	for _, bindHost := range []string{"0.0.0.0", "::"} {
 		t.Run(bindHost, func(t *testing.T) {
-			te := setup(t, func(c *config.Config) {
+			te := setupHostOnly(t, func(c *config.Config) {
 				c.Host = bindHost
 			})
 
@@ -2567,11 +2714,11 @@ func TestHostHeaderBindAllRejectsNonLocalIP(t *testing.T) {
 
 	for _, bindHost := range []string{"0.0.0.0", "::"} {
 		t.Run(bindHost, func(t *testing.T) {
-			te := setup(t, func(c *config.Config) {
+			te := setupHostOnly(t, func(c *config.Config) {
 				c.Host = bindHost
 			})
 
-			w := te.rawRequest(http.MethodGet, "/api/v1/stats",
+			w := te.wrappedRequest(http.MethodGet, hostMiddlewareProbePath,
 				withHost(host))
 			assertStatus(t, w, http.StatusForbidden)
 		})
@@ -2581,7 +2728,7 @@ func TestHostHeaderBindAllRejectsNonLocalIP(t *testing.T) {
 func TestCORSBindAllRejectsForeignOrigin(t *testing.T) {
 	for _, bindHost := range []string{"0.0.0.0", "::"} {
 		t.Run(bindHost, func(t *testing.T) {
-			te := setup(t, func(c *config.Config) {
+			te := setupHostOnly(t, func(c *config.Config) {
 				c.Host = bindHost
 			})
 
@@ -2595,11 +2742,11 @@ func TestCORSBindAllRejectsForeignOrigin(t *testing.T) {
 func TestHostHeaderBindAllRejectsDNSRebinding(t *testing.T) {
 	for _, bindHost := range []string{"0.0.0.0", "::"} {
 		t.Run(bindHost, func(t *testing.T) {
-			te := setup(t, func(c *config.Config) {
+			te := setupHostOnly(t, func(c *config.Config) {
 				c.Host = bindHost
 			})
 
-			w := te.rawRequest(http.MethodGet, "/api/v1/stats",
+			w := te.wrappedRequest(http.MethodGet, hostMiddlewareProbePath,
 				withHost("evil.attacker.com:8080"))
 			assertStatus(t, w, http.StatusForbidden)
 		})
@@ -2607,10 +2754,10 @@ func TestHostHeaderBindAllRejectsDNSRebinding(t *testing.T) {
 }
 
 func TestCORSVaryAlwaysSet(t *testing.T) {
-	te := setup(t)
+	te := setupHostOnly(t)
 
 	// Vary: Origin should be set even for disallowed origins.
-	w := te.wrappedRequest(http.MethodGet, "/api/v1/stats",
+	w := te.wrappedRequest(http.MethodGet, hostMiddlewareProbePath,
 		withOrigin("http://evil-site.com"))
 	assertStatus(t, w, http.StatusOK)
 
@@ -2621,7 +2768,7 @@ func TestCORSVaryAlwaysSet(t *testing.T) {
 }
 
 func TestCORSPreflight(t *testing.T) {
-	te := setup(t)
+	te := setupHostOnly(t)
 
 	w := te.wrappedRequest(http.MethodOptions, "/api/v1/sessions",
 		withOrigin("http://127.0.0.1:0"))
@@ -2629,9 +2776,9 @@ func TestCORSPreflight(t *testing.T) {
 }
 
 func TestCORSAllowMethods(t *testing.T) {
-	te := setup(t)
+	te := setupHostOnly(t)
 
-	w := te.wrappedRequest(http.MethodGet, "/api/v1/stats",
+	w := te.wrappedRequest(http.MethodGet, hostMiddlewareProbePath,
 		withOrigin("http://127.0.0.1:0"))
 	assertStatus(t, w, http.StatusOK)
 
@@ -3120,184 +3267,185 @@ func TestExportSession_HTMLContent(t *testing.T) {
 	}
 }
 
-func TestUploadSession(t *testing.T) {
+func TestUploadSessionVariants(t *testing.T) {
+
 	te := setup(t)
 
-	assistantWithUsage, err := json.Marshal(map[string]any{
-		"type":      "assistant",
-		"timestamp": tsEarlyS5,
-		"message": map[string]any{
-			"model": "claude-sonnet-4-20250514",
-			"usage": map[string]any{
-				"input_tokens":                100,
-				"cache_creation_input_tokens": 200,
-				"cache_read_input_tokens":     200,
-				"output_tokens":               200,
+	t.Run("stores token metadata", func(t *testing.T) {
+		assistantWithUsage, err := json.Marshal(map[string]any{
+			"type":      "assistant",
+			"timestamp": tsEarlyS5,
+			"message": map[string]any{
+				"model": "claude-sonnet-4-20250514",
+				"usage": map[string]any{
+					"input_tokens":                100,
+					"cache_creation_input_tokens": 200,
+					"cache_read_input_tokens":     200,
+					"output_tokens":               200,
+				},
+				"content": []map[string]any{
+					{"type": "text", "text": "Hi!"},
+				},
 			},
-			"content": []map[string]any{
-				{"type": "text", "text": "Hi!"},
-			},
-		},
+		})
+		if err != nil {
+			t.Fatalf("marshal assistant fixture: %v", err)
+		}
+
+		content := testjsonl.NewSessionBuilder().
+			AddClaudeUser(tsEarly, "Hello upload").
+			AddRaw(string(assistantWithUsage)).
+			String()
+
+		w := te.upload(t, "upload-test.jsonl", content,
+			"project=myproj&machine=remote")
+		assertStatus(t, w, http.StatusOK)
+
+		resp := decode[uploadResponse](t, w)
+		if resp.SessionID != "upload-test" {
+			t.Errorf("session_id = %v", resp.SessionID)
+		}
+		if resp.Project != "myproj" {
+			t.Errorf("project = %v", resp.Project)
+		}
+		if resp.Machine != "remote" {
+			t.Errorf("machine = %v", resp.Machine)
+		}
+		if resp.Messages != 2 {
+			t.Errorf("messages = %v", resp.Messages)
+		}
+
+		sess, err := te.db.GetSession(context.Background(), "upload-test")
+		if err != nil {
+			t.Fatalf("GetSession: %v", err)
+		}
+		if sess == nil {
+			t.Fatal("session not found in DB")
+			return
+		}
+		if sess.Project != "myproj" {
+			t.Errorf("stored project = %q", sess.Project)
+		}
+		if !sess.HasTotalOutputTokens {
+			t.Error("stored HasTotalOutputTokens = false, want true")
+		}
+		if !sess.HasPeakContextTokens {
+			t.Error("stored HasPeakContextTokens = false, want true")
+		}
+		if sess.TotalOutputTokens != 200 {
+			t.Errorf("stored TotalOutputTokens = %d, want 200",
+				sess.TotalOutputTokens)
+		}
+		if sess.PeakContextTokens != 500 {
+			t.Errorf("stored PeakContextTokens = %d, want 500",
+				sess.PeakContextTokens)
+		}
+
+		msgs, err := te.db.GetMessages(context.Background(), "upload-test", 0, 10, true)
+		if err != nil {
+			t.Fatalf("GetMessages: %v", err)
+		}
+		if len(msgs) != 2 {
+			t.Fatalf("message count = %d, want 2", len(msgs))
+		}
+		if !msgs[1].HasContextTokens {
+			t.Error("assistant HasContextTokens = false, want true")
+		}
+		if !msgs[1].HasOutputTokens {
+			t.Error("assistant HasOutputTokens = false, want true")
+		}
+		if msgs[1].OutputTokens != 200 {
+			t.Errorf("assistant OutputTokens = %d, want 200", msgs[1].OutputTokens)
+		}
+		if msgs[1].ContextTokens != 500 {
+			t.Errorf("assistant ContextTokens = %d, want 500", msgs[1].ContextTokens)
+		}
 	})
-	if err != nil {
-		t.Fatalf("marshal assistant fixture: %v", err)
-	}
 
-	content := testjsonl.NewSessionBuilder().
-		AddClaudeUser(tsEarly, "Hello upload").
-		AddRaw(string(assistantWithUsage)).
-		String()
-
-	w := te.upload(t, "upload-test.jsonl", content,
-		"project=myproj&machine=remote")
-	assertStatus(t, w, http.StatusOK)
-
-	resp := decode[uploadResponse](t, w)
-	if resp.SessionID != "upload-test" {
-		t.Errorf("session_id = %v", resp.SessionID)
-	}
-	if resp.Project != "myproj" {
-		t.Errorf("project = %v", resp.Project)
-	}
-	if resp.Machine != "remote" {
-		t.Errorf("machine = %v", resp.Machine)
-	}
-	if resp.Messages != 2 {
-		t.Errorf("messages = %v", resp.Messages)
-	}
-
-	sess, err := te.db.GetSession(context.Background(), "upload-test")
-	if err != nil {
-		t.Fatalf("GetSession: %v", err)
-	}
-	if sess == nil {
-		t.Fatal("session not found in DB")
-		return
-	}
-	if sess.Project != "myproj" {
-		t.Errorf("stored project = %q", sess.Project)
-	}
-	if !sess.HasTotalOutputTokens {
-		t.Error("stored HasTotalOutputTokens = false, want true")
-	}
-	if !sess.HasPeakContextTokens {
-		t.Error("stored HasPeakContextTokens = false, want true")
-	}
-	if sess.TotalOutputTokens != 200 {
-		t.Errorf("stored TotalOutputTokens = %d, want 200",
-			sess.TotalOutputTokens)
-	}
-	if sess.PeakContextTokens != 500 {
-		t.Errorf("stored PeakContextTokens = %d, want 500",
-			sess.PeakContextTokens)
-	}
-
-	msgs, err := te.db.GetMessages(context.Background(), "upload-test", 0, 10, true)
-	if err != nil {
-		t.Fatalf("GetMessages: %v", err)
-	}
-	if len(msgs) != 2 {
-		t.Fatalf("message count = %d, want 2", len(msgs))
-	}
-	if !msgs[1].HasContextTokens {
-		t.Error("assistant HasContextTokens = false, want true")
-	}
-	if !msgs[1].HasOutputTokens {
-		t.Error("assistant HasOutputTokens = false, want true")
-	}
-	if msgs[1].OutputTokens != 200 {
-		t.Errorf("assistant OutputTokens = %d, want 200", msgs[1].OutputTokens)
-	}
-	if msgs[1].ContextTokens != 500 {
-		t.Errorf("assistant ContextTokens = %d, want 500", msgs[1].ContextTokens)
-	}
-}
-
-func TestUploadSessionSanitizesParsedRows(t *testing.T) {
-	te := setup(t)
-
-	rawInput := db.MaxPlausibleTokens + 200
-	rawOutput := db.MaxPlausibleTokens + 100
-	longModel := strings.Repeat("m", 160)
-	assistantWithBadUsage, err := json.Marshal(map[string]any{
-		"type":      "assistant",
-		"timestamp": tsEarlyS5,
-		"message": map[string]any{
-			"model": longModel,
-			"usage": map[string]any{
-				"input_tokens":  rawInput,
-				"output_tokens": rawOutput,
+	t.Run("sanitizes parsed rows", func(t *testing.T) {
+		rawInput := db.MaxPlausibleTokens + 200
+		rawOutput := db.MaxPlausibleTokens + 100
+		longModel := strings.Repeat("m", 160)
+		assistantWithBadUsage, err := json.Marshal(map[string]any{
+			"type":      "assistant",
+			"timestamp": tsEarlyS5,
+			"message": map[string]any{
+				"model": longModel,
+				"usage": map[string]any{
+					"input_tokens":  rawInput,
+					"output_tokens": rawOutput,
+				},
+				"content": []map[string]any{
+					{"type": "text", "text": "Hi!"},
+				},
 			},
-			"content": []map[string]any{
-				{"type": "text", "text": "Hi!"},
-			},
-		},
-	})
-	require.NoError(t, err)
+		})
+		require.NoError(t, err)
 
-	content := testjsonl.NewSessionBuilder().
-		AddClaudeUser(tsEarly, "Hello \x1b[31mupload\x07").
-		AddRaw(string(assistantWithBadUsage)).
-		String()
+		content := testjsonl.NewSessionBuilder().
+			AddClaudeUser(tsEarly, "Hello \x1b[31mupload\x07").
+			AddRaw(string(assistantWithBadUsage)).
+			String()
 
-	w := te.upload(t, "upload-sanitize.jsonl", content,
-		"project=myproj&machine=remote")
-	assertStatus(t, w, http.StatusOK)
+		w := te.upload(t, "upload-sanitize.jsonl", content,
+			"project=myproj&machine=remote")
+		assertStatus(t, w, http.StatusOK)
 
-	msgs, err := te.db.GetMessages(
-		context.Background(), "upload-sanitize", 0, 10, true,
-	)
-	require.NoError(t, err)
-	require.Len(t, msgs, 2)
-	assert.Equal(t, "Hello [31mupload", msgs[0].Content)
-	assert.Equal(t, len("Hello [31mupload"), msgs[0].ContentLength)
-	assert.Len(t, msgs[1].Model, 128)
-	assert.Equal(t, db.MaxPlausibleTokens, msgs[1].ContextTokens)
-	assert.Equal(t, db.MaxPlausibleTokens, msgs[1].OutputTokens)
-
-	sess, err := te.db.GetSession(context.Background(), "upload-sanitize")
-	require.NoError(t, err)
-	require.NotNil(t, sess)
-	assert.Equal(t, db.MaxPlausibleTokens, sess.TotalOutputTokens)
-	assert.Equal(t, db.MaxPlausibleTokens, sess.PeakContextTokens)
-}
-
-func TestUploadSession_InfersRelationshipType(t *testing.T) {
-	te := setup(t)
-
-	// Build a session whose first entry has a different sessionId,
-	// making it a child session. The filename starts with "agent-"
-	// so it should be inferred as a subagent.
-	content := testjsonl.NewSessionBuilder().
-		AddClaudeUserWithSessionID(
-			tsEarly, "Run task", "parent-session",
-		).
-		AddClaudeAssistant(tsEarlyS5, "Done.").
-		String()
-
-	w := te.upload(t, "agent-task42.jsonl", content,
-		"project=myproj&machine=remote")
-	assertStatus(t, w, http.StatusOK)
-
-	sess, err := te.db.GetSession(
-		context.Background(), "agent-task42",
-	)
-	if err != nil {
-		t.Fatalf("GetSession: %v", err)
-	}
-	if sess == nil {
-		t.Fatal("session not found in DB")
-		return
-	}
-	if sess.RelationshipType != "subagent" {
-		t.Errorf(
-			"RelationshipType = %q, want %q",
-			sess.RelationshipType, "subagent",
+		msgs, err := te.db.GetMessages(
+			context.Background(), "upload-sanitize", 0, 10, true,
 		)
-	}
+		require.NoError(t, err)
+		require.Len(t, msgs, 2)
+		assert.Equal(t, "Hello [31mupload", msgs[0].Content)
+		assert.Equal(t, len("Hello [31mupload"), msgs[0].ContentLength)
+		assert.Len(t, msgs[1].Model, 128)
+		assert.Equal(t, db.MaxPlausibleTokens, msgs[1].ContextTokens)
+		assert.Equal(t, db.MaxPlausibleTokens, msgs[1].OutputTokens)
+
+		sess, err := te.db.GetSession(context.Background(), "upload-sanitize")
+		require.NoError(t, err)
+		require.NotNil(t, sess)
+		assert.Equal(t, db.MaxPlausibleTokens, sess.TotalOutputTokens)
+		assert.Equal(t, db.MaxPlausibleTokens, sess.PeakContextTokens)
+	})
+
+	t.Run("infers relationship type", func(t *testing.T) {
+		// Build a session whose first entry has a different sessionId,
+		// making it a child session. The filename starts with "agent-"
+		// so it should be inferred as a subagent.
+		content := testjsonl.NewSessionBuilder().
+			AddClaudeUserWithSessionID(
+				tsEarly, "Run task", "parent-session",
+			).
+			AddClaudeAssistant(tsEarlyS5, "Done.").
+			String()
+
+		w := te.upload(t, "agent-task42.jsonl", content,
+			"project=myproj&machine=remote")
+		assertStatus(t, w, http.StatusOK)
+
+		sess, err := te.db.GetSession(
+			context.Background(), "agent-task42",
+		)
+		if err != nil {
+			t.Fatalf("GetSession: %v", err)
+		}
+		if sess == nil {
+			t.Fatal("session not found in DB")
+			return
+		}
+		if sess.RelationshipType != "subagent" {
+			t.Errorf(
+				"RelationshipType = %q, want %q",
+				sess.RelationshipType, "subagent",
+			)
+		}
+	})
 }
 
 func TestUploadSession_Errors(t *testing.T) {
+	te := setup(t)
+
 	tests := []struct {
 		name     string
 		filename string
@@ -3335,7 +3483,6 @@ func TestUploadSession_Errors(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			te := setup(t)
 			w := te.upload(t,
 				tt.filename, tt.content, tt.query)
 			assertStatus(t, w, http.StatusBadRequest)
@@ -3344,6 +3491,7 @@ func TestUploadSession_Errors(t *testing.T) {
 }
 
 func TestUploadSession_ExcludedOrTrashedConflict(t *testing.T) {
+
 	tests := []struct {
 		name  string
 		setup func(t *testing.T, te *testEnv, id string)
@@ -3394,6 +3542,7 @@ func TestUploadSession_ExcludedOrTrashedConflict(t *testing.T) {
 }
 
 func TestUploadSession_MultiSessionConflictDoesNotPartiallyWrite(t *testing.T) {
+
 	te := setup(t)
 
 	const filename = "upload-multi-conflict.jsonl"
@@ -3436,6 +3585,7 @@ func TestUploadSession_MultiSessionConflictDoesNotPartiallyWrite(t *testing.T) {
 }
 
 func TestUploadSession_ReuploadPreservesPins(t *testing.T) {
+
 	te := setup(t)
 
 	initial := testjsonl.NewSessionBuilder().
@@ -3578,6 +3728,11 @@ func TestTriggerSync_SSE(t *testing.T) {
 }
 
 func TestWatchSession_Events(t *testing.T) {
+	const watchPoll = 25 * time.Millisecond
+	t.Cleanup(sessionwatch.SetTimingsForTest(
+		watchPoll, 50*time.Millisecond,
+	))
+
 	te := setup(t)
 
 	b := testjsonl.NewSessionBuilder().
@@ -3610,7 +3765,7 @@ func TestWatchSession_Events(t *testing.T) {
 		close(done)
 	}()
 
-	time.Sleep(200 * time.Millisecond)
+	time.Sleep(2 * watchPoll)
 
 	updated := content + testjsonl.NewSessionBuilder().
 		AddClaudeAssistant(tsZeroS5, "response").
@@ -3631,6 +3786,11 @@ func TestWatchSession_Events(t *testing.T) {
 }
 
 func TestWatchSession_FileDisappearAndResolve(t *testing.T) {
+	const watchPoll = 25 * time.Millisecond
+	t.Cleanup(sessionwatch.SetTimingsForTest(
+		watchPoll, 50*time.Millisecond,
+	))
+
 	te := setup(t)
 
 	b := testjsonl.NewSessionBuilder().
@@ -3664,7 +3824,7 @@ func TestWatchSession_FileDisappearAndResolve(t *testing.T) {
 	}()
 
 	// Let the monitor start and record the initial mtime.
-	time.Sleep(200 * time.Millisecond)
+	time.Sleep(2 * watchPoll)
 
 	// Delete the source file to simulate disappearance.
 	if err := os.Remove(sessionPath); err != nil {
@@ -3673,7 +3833,7 @@ func TestWatchSession_FileDisappearAndResolve(t *testing.T) {
 
 	// Wait for at least one poll tick to notice the missing
 	// file and clear the cached path.
-	time.Sleep(2 * time.Second)
+	time.Sleep(2 * watchPoll)
 
 	// Recreate the file with updated content at a NEW location
 	// so we verify that FindSourceFile re-scans and the
@@ -4107,7 +4267,7 @@ func TestGetVersion(t *testing.T) {
 		)
 	}
 	assert.True(t, resp.InsightGenerationAvailable)
-	assert.Equal(t, 1, resp.APIVersion)
+	assert.Equal(t, 2, resp.APIVersion)
 	assert.Equal(t, db.CurrentDataVersion(), resp.DataVersion)
 }
 
@@ -4121,7 +4281,7 @@ func TestGetVersion_Default(t *testing.T) {
 	if resp.Version != "" {
 		t.Errorf("version = %q, want empty", resp.Version)
 	}
-	assert.Equal(t, 1, resp.APIVersion)
+	assert.Equal(t, 2, resp.APIVersion)
 	assert.Equal(t, db.CurrentDataVersion(), resp.DataVersion)
 }
 
@@ -4188,14 +4348,9 @@ func TestEvents_StreamsDataChangedAfterSync(t *testing.T) {
 		close(done)
 	}()
 
-	// Give the handler time to subscribe.
-	time.Sleep(100 * time.Millisecond)
-
 	// Emit directly via the broadcaster to isolate the handler
 	// from sync engine timing.
-	te.broadcaster.Emit("messages")
-
-	te.waitForSSEEvent(t, w, "data_changed", 3*time.Second)
+	te.emitUntilSSEEvent(t, w, "messages", "data_changed", 3*time.Second)
 	cancel()
 	<-done
 }
@@ -4214,10 +4369,7 @@ func TestEvents_StreamsInLocalNoSyncMode(t *testing.T) {
 		close(done)
 	}()
 
-	time.Sleep(100 * time.Millisecond)
-	te.broadcaster.Emit("sessions")
-
-	te.waitForSSEEvent(t, w, "data_changed", 3*time.Second)
+	te.emitUntilSSEEvent(t, w, "sessions", "data_changed", 3*time.Second)
 	cancel()
 	<-done
 }
@@ -4260,9 +4412,7 @@ func TestEvents_AuthViaQueryTokenSucceeds(t *testing.T) {
 		close(done)
 	}()
 
-	time.Sleep(100 * time.Millisecond)
-	te.broadcaster.Emit("messages")
-	te.waitForSSEEvent(t, w, "data_changed", 2*time.Second)
+	te.emitUntilSSEEvent(t, w, "messages", "data_changed", 2*time.Second)
 
 	cancel()
 	<-done
@@ -4284,9 +4434,7 @@ func TestEvents_AuthViaBearerHeaderSucceeds(t *testing.T) {
 		close(done)
 	}()
 
-	time.Sleep(100 * time.Millisecond)
-	te.broadcaster.Emit("messages")
-	te.waitForSSEEvent(t, w, "data_changed", 2*time.Second)
+	te.emitUntilSSEEvent(t, w, "messages", "data_changed", 2*time.Second)
 
 	cancel()
 	<-done

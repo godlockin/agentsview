@@ -446,9 +446,11 @@ func (db *DB) DecodeCursor(s string) (SessionCursor, error) {
 
 // SessionFilter specifies how to query sessions.
 type SessionFilter struct {
-	Project          string
-	ExcludeProject   string // exclude sessions with this project name
-	Machine          string
+	Project        string
+	ExcludeProject string // exclude sessions with this project name
+	Machine        string
+	// GitBranch is a branchListSep-joined list of opaque (project, branch) tokens (EncodeBranchFilterToken).
+	GitBranch        string
 	Agent            string
 	Date             string   // exact date YYYY-MM-DD
 	DateFrom         string   // range start (inclusive)
@@ -1445,8 +1447,8 @@ func (db *DB) RefreshSessionName(id string, sessionName *string) error {
 	return err
 }
 
-// FindSessionIDsByPartial returns up to limit session IDs that
-// contain the given substring. Used by CLI lookups so users can
+// FindSessionIDsByPartial returns up to limit session IDs that contain the
+// given literal, case-sensitive substring. Used by CLI lookups so users can
 // reference sessions by a short prefix shown in list output.
 // Excludes soft-deleted sessions.
 func (db *DB) FindSessionIDsByPartial(
@@ -1460,14 +1462,14 @@ func (db *DB) FindSessionIDsByPartial(
 	}
 	rows, err := db.getReader().QueryContext(ctx,
 		`SELECT id FROM sessions
-		 WHERE id LIKE ? AND deleted_at IS NULL
+		 WHERE instr(id, ?) > 0 AND deleted_at IS NULL
 		 ORDER BY COALESCE(
 		     NULLIF(ended_at, ''),
 		     NULLIF(started_at, ''),
 		     created_at
 		 ) DESC
 		 LIMIT ?`,
-		"%"+partial+"%", limit,
+		partial, limit,
 	)
 	if err != nil {
 		return nil, fmt.Errorf(
@@ -1742,6 +1744,29 @@ func (db *DB) GetSessionForIncremental(
 	info.HasPeakContextTokens =
 		info.HasPeakContextTokens || info.PeakContextTokens != 0
 	return &info, true
+}
+
+// FileIdentityChanged reports whether any active session row for path has a
+// known file identity that differs from the current file identity.
+func (db *DB) FileIdentityChanged(path string, inode, device int64) bool {
+	if path == "" || inode == 0 || device == 0 {
+		return false
+	}
+
+	var count int
+	err := db.getReader().QueryRow(
+		`SELECT COUNT(*)
+		 FROM sessions
+		 WHERE file_path = ?
+		   AND deleted_at IS NULL
+		   AND file_inode IS NOT NULL
+		   AND file_device IS NOT NULL
+		   AND file_inode != 0
+		   AND file_device != 0
+		   AND (file_inode != ? OR file_device != ?)`,
+		path, inode, device,
+	).Scan(&count)
+	return err == nil && count > 0
 }
 
 // UpdateSessionIncremental updates only the fields that change
@@ -2415,6 +2440,56 @@ func (db *DB) GetMachines(
 		machines = append(machines, m)
 	}
 	return machines, rows.Err()
+}
+
+// BranchInfo is a (project, branch) pair, keyed by project so same-named
+// branches across repos stay distinct.
+type BranchInfo struct {
+	Project string `json:"project"`
+	Branch  string `json:"branch"`
+	Token   string `json:"token"`
+}
+
+// GetBranches returns distinct (project, git_branch) pairs, including the empty
+// branch used for sessions with no recorded branch. Scoping matches
+// GetProjects/GetAgents (root sessions with messages) so the dropdown reflects
+// real work rather than subagents.
+func (db *DB) GetBranches(
+	ctx context.Context,
+	excludeOneShot, excludeAutomated bool,
+) ([]BranchInfo, error) {
+	q := `SELECT DISTINCT project, git_branch
+		FROM sessions
+		WHERE message_count > 0
+		  AND relationship_type NOT IN ('subagent', 'fork')
+		  AND deleted_at IS NULL`
+	if excludeOneShot {
+		if !excludeAutomated {
+			q += " AND (user_message_count > 1 OR is_automated = 1)"
+		} else {
+			q += " AND user_message_count > 1"
+		}
+	}
+	if excludeAutomated {
+		q += " AND is_automated = 0"
+	}
+	q += " ORDER BY project, git_branch"
+	rows, err := db.getReader().QueryContext(ctx, q)
+	if err != nil {
+		return nil, fmt.Errorf("querying branches: %w", err)
+	}
+	defer rows.Close()
+
+	branches := []BranchInfo{}
+	for rows.Next() {
+		var bi BranchInfo
+		if err := rows.Scan(&bi.Project, &bi.Branch); err != nil {
+			return nil, fmt.Errorf("scanning branch: %w", err)
+		}
+		bi.Token = EncodeBranchFilterToken(bi.Project, bi.Branch)
+		branches = append(branches, bi)
+	}
+	return branches, rows.Err()
 }
 
 // scanSessionRows iterates rows and scans each using

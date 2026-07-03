@@ -17,6 +17,7 @@ func TestWorkBuddyRegistryUsesRecursiveWatch(t *testing.T) {
 }
 
 func TestEngineClassifyWorkBuddyPaths(t *testing.T) {
+
 	db := openTestDB(t)
 	root := t.TempDir()
 	engine := NewEngine(db, EngineConfig{

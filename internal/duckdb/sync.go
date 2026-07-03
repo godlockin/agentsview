@@ -6,9 +6,11 @@ import (
 	"database/sql"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -31,8 +33,11 @@ type Sync struct {
 	duck            *sql.DB
 	local           *db.DB
 	machine         string
+	syncStateScope  string
 	projects        []string
 	excludeProjects []string
+	connectionKind  duckDBConnectionKind
+	quack           *quackClient
 
 	closeOnce sync.Once
 	closeErr  error
@@ -40,10 +45,18 @@ type Sync struct {
 	schemaOK  bool
 }
 
+type duckDBConnectionKind int
+
+const (
+	duckDBBaseConnection duckDBConnectionKind = iota
+	duckDBQuackClientConnection
+)
+
 // SyncOptions holds optional DuckDB push-scope filters.
 type SyncOptions struct {
 	Projects        []string
 	ExcludeProjects []string
+	SyncStateTarget string
 }
 
 // PushResult summarizes a DuckDB push operation.
@@ -52,9 +65,28 @@ type PushResult struct {
 	MessagesPushed int
 	Errors         int
 	Duration       time.Duration
+	Diagnostics    PushDiagnostics
 }
 
-// PushProgress is reported after each pushed session.
+// PushDiagnostics summarizes how a DuckDB push selected sessions.
+type PushDiagnostics struct {
+	Full                     bool
+	LastPushAt               string
+	Cutoff                   string
+	LocalSessions            PushSessionCounts
+	CandidateSessions        PushSessionCounts
+	SkippedUnchangedSessions PushSessionCounts
+	PushedSessions           PushSessionCounts
+	DeletedStaleSessions     int
+}
+
+// PushSessionCounts summarizes a set of sessions without exposing content.
+type PushSessionCounts struct {
+	Total   int
+	ByAgent map[string]int
+}
+
+// PushProgress is reported after each attempted session.
 type PushProgress struct {
 	SessionsDone  int
 	SessionsTotal int
@@ -74,11 +106,8 @@ type SyncStatus struct {
 func New(
 	path string, local *db.DB, machine string, opts SyncOptions,
 ) (*Sync, error) {
-	if local == nil {
-		return nil, fmt.Errorf("local db is required")
-	}
-	if machine == "" {
-		return nil, fmt.Errorf("machine name must not be empty")
+	if err := validateSyncInputs(local, machine); err != nil {
+		return nil, err
 	}
 	duck, err := Open(path)
 	if err != nil {
@@ -88,9 +117,20 @@ func New(
 		duck:            duck,
 		local:           local,
 		machine:         machine,
+		syncStateScope:  opts.SyncStateTarget,
 		projects:        opts.Projects,
 		excludeProjects: opts.ExcludeProjects,
 	}, nil
+}
+
+func validateSyncInputs(local *db.DB, machine string) error {
+	if local == nil {
+		return fmt.Errorf("local db is required")
+	}
+	if machine == "" {
+		return fmt.Errorf("machine name must not be empty")
+	}
+	return nil
 }
 
 // DB returns the underlying DuckDB connection.
@@ -108,6 +148,13 @@ func (s *Sync) isFiltered() bool {
 	return len(s.projects) > 0 || len(s.excludeProjects) > 0
 }
 
+func (s *Sync) syncStateKey(key string) string {
+	if s.syncStateScope == "" {
+		return key
+	}
+	return key + ":" + s.syncStateScope
+}
+
 // EnsureSchema creates or additively migrates the DuckDB mirror schema.
 func (s *Sync) EnsureSchema(ctx context.Context) error {
 	s.schemaMu.Lock()
@@ -115,7 +162,10 @@ func (s *Sync) EnsureSchema(ctx context.Context) error {
 	if s.schemaOK {
 		return nil
 	}
-	if err := EnsureSchema(ctx, s.duck); err != nil {
+	opts := schemaOptions{
+		createIndexes: s.connectionKind != duckDBQuackClientConnection,
+	}
+	if err := ensureSchema(ctx, s.duck, opts); err != nil {
 		return err
 	}
 	s.schemaOK = true
@@ -124,31 +174,18 @@ func (s *Sync) EnsureSchema(ctx context.Context) error {
 
 // Status returns current DuckDB mirror row counts.
 func (s *Sync) Status(ctx context.Context) (SyncStatus, error) {
-	lastPush, err := s.local.GetSyncState(lastPushStateKey)
+	lastPushKey := s.syncStateKey(lastPushStateKey)
+	lastPush, err := s.local.GetSyncState(lastPushKey)
 	if err != nil {
-		log.Printf("warning: reading %s: %v", lastPushStateKey, err)
+		log.Printf("warning: reading %s: %v", lastPushKey, err)
 	}
 	status := SyncStatus{Machine: s.machine, LastPushAt: lastPush}
 	if err := s.EnsureSchema(ctx); err != nil {
 		return SyncStatus{}, err
 	}
-	if err := s.duck.QueryRowContext(ctx,
-		`SELECT COUNT(*) FROM sessions WHERE machine = ?`,
-		s.machine,
-	).Scan(&status.DuckDBSessions); err != nil {
-		return SyncStatus{}, fmt.Errorf("counting duckdb sessions: %w", err)
-	}
-	if err := s.duck.QueryRowContext(ctx,
-		`SELECT COUNT(*)
-		 FROM messages
-		 WHERE session_id IN (
-			SELECT id FROM sessions WHERE machine = ?
-		 )`,
-		s.machine,
-	).Scan(&status.DuckDBMessages); err != nil {
-		return SyncStatus{}, fmt.Errorf("counting duckdb messages: %w", err)
-	}
-	return status, nil
+	return readMachineStatus(
+		ctx, s.duck, s.connectionKind, s.quack, s.machine, status.LastPushAt,
+	)
 }
 
 // Push syncs local sessions and dependent rows to DuckDB.
@@ -167,9 +204,10 @@ func (s *Sync) Push(
 		return result, err
 	}
 
-	lastPush, err := s.local.GetSyncState(lastPushStateKey)
+	lastPushKey := s.syncStateKey(lastPushStateKey)
+	lastPush, err := s.local.GetSyncState(lastPushKey)
 	if err != nil {
-		return result, fmt.Errorf("reading %s: %w", lastPushStateKey, err)
+		return result, fmt.Errorf("reading %s: %w", lastPushKey, err)
 	}
 	if full {
 		lastPush = ""
@@ -190,6 +228,9 @@ func (s *Sync) Push(
 	}
 
 	cutoff := time.Now().UTC().Format(localSyncTimestampLayout)
+	result.Diagnostics.Full = full
+	result.Diagnostics.LastPushAt = lastPush
+	result.Diagnostics.Cutoff = cutoff
 	sessions, err := s.local.ListSessionsModifiedBetween(
 		ctx, lastPush, cutoff, s.projects, s.excludeProjects,
 	)
@@ -227,107 +268,433 @@ func (s *Sync) Push(
 	if err != nil {
 		return result, fmt.Errorf("listing local sessions: %w", err)
 	}
+	result.Diagnostics.LocalSessions = countPushSessions(allLocalSessions)
 	sessionFingerprints, err := s.sessionFingerprints(ctx, sessions)
 	if err != nil {
 		return result, err
 	}
+	candidateSessions := append([]db.Session(nil), sessions...)
+	result.Diagnostics.CandidateSessions = countPushSessions(candidateSessions)
 	priorFingerprints := map[string]string{}
 	if !full {
-		priorFingerprints, err = readSyncFingerprints(s.local)
+		priorFingerprints, err = readSyncFingerprintsWithKey(
+			s.local,
+			s.syncStateKey(lastPushBoundaryStateKey),
+		)
 		if err != nil {
 			return result, err
 		}
 		sessions = filterUnchangedSessions(sessions, priorFingerprints, sessionFingerprints)
+		result.Diagnostics.SkippedUnchangedSessions = skippedPushSessions(
+			candidateSessions, sessions,
+		)
 	}
 	sort.Slice(sessions, func(i, j int) bool {
 		return sessions[i].ID < sessions[j].ID
 	})
 
-	tx, err := s.duck.BeginTx(ctx, nil)
-	if err != nil {
-		return result, fmt.Errorf("begin duckdb tx: %w", err)
-	}
-	defer func() { _ = tx.Rollback() }()
-
 	var staleIDs []string
-	staleIDs, err = deleteHardDeletedMirrorSessions(
-		ctx, tx, allLocalSessions, s.machine, s.projects, s.excludeProjects,
-	)
+	err = s.withDuckTx(ctx, "delete hard-deleted sessions", func(tx *sql.Tx) error {
+		var txErr error
+		staleIDs, txErr = s.deleteHardDeletedMirrorSessions(
+			ctx, tx, allLocalSessions, s.machine, s.projects, s.excludeProjects,
+		)
+		return txErr
+	})
 	if err != nil {
 		return result, err
 	}
 	for _, id := range staleIDs {
 		delete(priorFingerprints, id)
 	}
+	result.Diagnostics.DeletedStaleSessions = len(staleIDs)
 
 	pushed := make([]db.Session, 0, len(sessions))
-	for i, sess := range sessions {
-		messages, err := s.pushSession(ctx, tx, sess)
+	for start := 0; start < len(sessions); start += duckSessionPushBatchSize {
+		end := min(start+duckSessionPushBatchSize, len(sessions))
+		if err := s.pushSessionBatch(
+			ctx, sessions[start:end], start, len(sessions),
+			&result, &pushed, onProgress,
+		); err != nil {
+			return result, err
+		}
+	}
+	result.Diagnostics.PushedSessions = countPushSessions(pushed)
+	if result.Errors == 0 {
+		err = s.withDuckTx(ctx, "replace curation rows", func(tx *sql.Tx) error {
+			if !s.isFiltered() {
+				if err := s.replaceAllPinnedMessages(ctx, tx, allLocalSessions); err != nil {
+					return err
+				}
+			} else {
+				if err := s.replaceScopedPinnedMessages(ctx, tx, allLocalSessions); err != nil {
+					return err
+				}
+			}
+			return s.replaceStarredSessions(ctx, tx, allLocalSessions)
+		})
 		if err != nil {
 			return result, err
 		}
-		result.SessionsPushed++
-		result.MessagesPushed += messages
-		pushed = append(pushed, sess)
-		if onProgress != nil {
-			onProgress(PushProgress{
-				SessionsDone:  i + 1,
-				SessionsTotal: len(sessions),
-				MessagesDone:  result.MessagesPushed,
-				Errors:        result.Errors,
-			})
-		}
-	}
-	if !s.isFiltered() {
-		if err := s.replaceAllPinnedMessages(ctx, tx, allLocalSessions); err != nil {
-			return result, err
-		}
 	} else {
-		if err := s.replaceScopedPinnedMessages(ctx, tx, allLocalSessions); err != nil {
-			return result, err
-		}
-	}
-	if err := s.replaceStarredSessions(ctx, tx, allLocalSessions); err != nil {
-		return result, err
-	}
-	if err := tx.Commit(); err != nil {
-		return result, fmt.Errorf("commit duckdb tx: %w", err)
+		log.Printf(
+			"duckdbsync: skipping curation refresh after %d session push errors",
+			result.Errors,
+		)
 	}
 	if full && s.isFiltered() {
 		// Clear the global watermark so the next unfiltered push
 		// starts from scratch; finalizeState then persists fresh
 		// fingerprints keyed at cutoff for later filtered runs.
-		if err := clearDuckDBSyncState(s.local); err != nil {
+		if err := clearDuckDBSyncState(s.local, s.syncStateScope); err != nil {
 			return result, err
 		}
 	}
-	if err := s.finalizeState(lastPush, cutoff, pushed, priorFingerprints, sessionFingerprints); err != nil {
+	advanceWatermark := result.Errors == 0
+	if err := s.finalizeState(
+		lastPush, cutoff, pushed, priorFingerprints,
+		sessionFingerprints, advanceWatermark,
+	); err != nil {
 		return result, err
 	}
 	result.Duration = time.Since(start)
 	return result, nil
 }
 
-func clearSessionTables(ctx context.Context, tx *sql.Tx) error {
-	for _, stmt := range []string{
-		`DELETE FROM pinned_messages`,
-		`DELETE FROM secret_findings`,
-		`DELETE FROM tool_result_events`,
-		`DELETE FROM tool_calls`,
-		`DELETE FROM usage_events`,
-		`DELETE FROM messages`,
-		`DELETE FROM sessions`,
-	} {
-		if _, err := tx.ExecContext(ctx, stmt); err != nil {
-			return fmt.Errorf("clearing duckdb full-push session table: %w", err)
-		}
+func (s *Sync) withDuckTx(
+	ctx context.Context, label string, fn func(*sql.Tx) error,
+) error {
+	tx, err := s.duck.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin duckdb tx for %s: %w", label, err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	if err := fn(tx); err != nil {
+		return err
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit duckdb tx for %s: %w", label, err)
 	}
 	return nil
 }
 
+const duckSessionPushBatchSize = 100
+
+const duckRemoteMutationTimeoutBackoff = 30 * time.Second
+
+func (s *Sync) pushSessionBatch(
+	ctx context.Context,
+	sessions []db.Session,
+	offset int,
+	total int,
+	result *PushResult,
+	pushed *[]db.Session,
+	onProgress func(PushProgress),
+) error {
+	return pushSessionBatchWith(
+		ctx, sessions, offset, total, result, pushed, onProgress,
+		s.tryPushSessionBatch, s.pushSingleSession, waitAfterRemoteMutationTimeout,
+	)
+}
+
+func pushSessionBatchWith(
+	ctx context.Context,
+	sessions []db.Session,
+	offset int,
+	total int,
+	result *PushResult,
+	pushed *[]db.Session,
+	onProgress func(PushProgress),
+	tryBatch func(context.Context, []db.Session) ([]int, error),
+	pushSingle func(context.Context, db.Session) (int, error),
+	waitAfterTimeout func(context.Context) error,
+) error {
+	messagesBySession, err := tryBatch(ctx, sessions)
+	if err != nil {
+		if fatalErr := fatalDuckPushError(ctx, err); fatalErr != nil {
+			return fatalErr
+		}
+		if isDuckRemoteMutationTimeoutError(err) {
+			log.Printf(
+				"duckdbsync: session batch starting at %d timed out; waiting before retrying batch: %v",
+				offset, err,
+			)
+			if waitAfterTimeout != nil {
+				if waitErr := waitAfterTimeout(ctx); waitErr != nil {
+					return waitErr
+				}
+			}
+			messagesBySession, err = tryBatch(ctx, sessions)
+		}
+	}
+	if err == nil {
+		for i, sess := range sessions {
+			result.SessionsPushed++
+			result.MessagesPushed += messagesBySession[i]
+			*pushed = append(*pushed, sess)
+			reportDuckPushProgress(
+				offset+i+1, total, result, onProgress,
+			)
+		}
+		return nil
+	}
+	if err := fatalDuckPushError(ctx, err); err != nil {
+		return err
+	}
+	if isDuckRemoteMutationTimeoutError(err) {
+		return err
+	}
+	log.Printf(
+		"duckdbsync: session batch starting at %d failed; retrying sessions individually: %v",
+		offset, err,
+	)
+	for i, sess := range sessions {
+		if err := ctx.Err(); err != nil {
+			return abandonDuckPushFallback(
+				err, len(sessions)-i, offset+len(sessions),
+				total, result, onProgress,
+			)
+		}
+		messages, err := pushSingle(ctx, sess)
+		if err != nil {
+			if err := fatalDuckPushError(ctx, err); err != nil {
+				return abandonDuckPushFallback(
+					err, len(sessions)-i, offset+len(sessions),
+					total, result, onProgress,
+				)
+			}
+			result.Errors++
+			log.Printf("duckdbsync: skipping session %s after push error: %v", sess.ID, err)
+		} else {
+			result.SessionsPushed++
+			result.MessagesPushed += messages
+			*pushed = append(*pushed, sess)
+		}
+		reportDuckPushProgress(offset+i+1, total, result, onProgress)
+	}
+	return nil
+}
+
+func waitAfterRemoteMutationTimeout(ctx context.Context) error {
+	return sleepContext(ctx, duckRemoteMutationTimeoutBackoff)
+}
+
+func sleepContext(ctx context.Context, d time.Duration) error {
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
+}
+
+func abandonDuckPushFallback(
+	err error,
+	abandoned int,
+	done int,
+	total int,
+	result *PushResult,
+	onProgress func(PushProgress),
+) error {
+	if abandoned > 0 {
+		result.Errors += abandoned
+		log.Printf(
+			"duckdbsync: abandoning %d sessions after context cancellation during individual retry: %v",
+			abandoned, err,
+		)
+		reportDuckPushProgress(done, total, result, onProgress)
+	}
+	return err
+}
+
+func fatalDuckPushError(ctx context.Context, err error) error {
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return ctxErr
+	}
+	if err == nil {
+		return nil
+	}
+	if errors.Is(err, context.Canceled) ||
+		errors.Is(err, context.DeadlineExceeded) {
+		return err
+	}
+	return nil
+}
+
+func reportDuckPushProgress(
+	done int,
+	total int,
+	result *PushResult,
+	onProgress func(PushProgress),
+) {
+	if onProgress == nil {
+		return
+	}
+	onProgress(PushProgress{
+		SessionsDone:  done,
+		SessionsTotal: total,
+		MessagesDone:  result.MessagesPushed,
+		Errors:        result.Errors,
+	})
+}
+
+func (s *Sync) tryPushSessionBatch(
+	ctx context.Context, sessions []db.Session,
+) ([]int, error) {
+	if s.connectionKind == duckDBQuackClientConnection {
+		return s.tryPushRemoteSessionBatch(ctx, sessions)
+	}
+	tx, err := s.duck.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, fmt.Errorf("begin duckdb session batch tx: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	messagesBySession := make([]int, len(sessions))
+
+	for i, sess := range sessions {
+		messages, err := s.pushSession(ctx, tx, sess)
+		if err != nil {
+			return nil, fmt.Errorf("pushing duckdb session %s: %w", sess.ID, err)
+		}
+		messagesBySession[i] = messages
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, fmt.Errorf("commit duckdb session batch: %w", err)
+	}
+	return messagesBySession, nil
+}
+
+func (s *Sync) tryPushRemoteSessionBatch(
+	ctx context.Context, sessions []db.Session,
+) ([]int, error) {
+	const batchLabel = "duckdb remote session batch"
+
+	batch := &duckRemoteMutationBatch{}
+	messagesBySession := make([]int, len(sessions))
+
+	for i, sess := range sessions {
+		sessionBatch := &duckRemoteMutationBatch{}
+		messages, err := s.pushSession(ctx, sessionBatch, sess)
+		if err != nil {
+			return nil, fmt.Errorf("pushing duckdb remote session %s: %w", sess.ID, err)
+		}
+		if sessionBatch.transactionBytes() > duckRemoteMutationCoalesceMaxBytes {
+			if err := s.execRemoteMutationBatch(ctx, batchLabel, batch); err != nil {
+				return nil, err
+			}
+			batch = &duckRemoteMutationBatch{}
+			if err := s.execSingleRemoteMutationBatch(
+				ctx, "duckdb remote session "+sess.ID, sessionBatch,
+			); err != nil {
+				return nil, err
+			}
+			messagesBySession[i] = messages
+			continue
+		}
+		batch, err = appendDuckRemoteMutationBatch(
+			ctx,
+			s.execRemoteSQLRetry,
+			batchLabel,
+			batch,
+			sessionBatch,
+			duckRemoteMutationCoalesceMaxBytes,
+		)
+		if err != nil {
+			return nil, err
+		}
+		messagesBySession[i] = messages
+	}
+	if err := s.execRemoteMutationBatch(ctx, batchLabel, batch); err != nil {
+		return nil, err
+	}
+	return messagesBySession, nil
+}
+
+func (s *Sync) pushSingleSession(ctx context.Context, sess db.Session) (int, error) {
+	if s.connectionKind == duckDBQuackClientConnection {
+		return s.pushSingleRemoteSession(ctx, sess)
+	}
+	tx, err := s.duck.BeginTx(ctx, nil)
+	if err != nil {
+		return 0, fmt.Errorf("begin duckdb session tx %s: %w", sess.ID, err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	messages, err := s.pushSession(ctx, tx, sess)
+	if err != nil {
+		return 0, err
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, fmt.Errorf("commit duckdb session %s: %w", sess.ID, err)
+	}
+	return messages, nil
+}
+
+func (s *Sync) pushSingleRemoteSession(ctx context.Context, sess db.Session) (int, error) {
+	batch := &duckRemoteMutationBatch{}
+	messages, err := s.pushSession(ctx, batch, sess)
+	if err != nil {
+		return 0, err
+	}
+	if err := s.execSingleRemoteMutationBatch(
+		ctx, "duckdb remote session "+sess.ID, batch,
+	); err != nil {
+		return 0, err
+	}
+	return messages, nil
+}
+
+func (s *Sync) execSingleRemoteMutationBatch(
+	ctx context.Context, label string, batch *duckRemoteMutationBatch,
+) error {
+	return execDuckRemoteMutationBatchOversizeWithStatementFallback(
+		ctx,
+		s.execRemoteSQLRetry,
+		s.execRemoteSQLNoRetry,
+		label,
+		batch,
+		duckRemoteMutationCoalesceMaxBytes,
+	)
+}
+
+func countPushSessions(sessions []db.Session) PushSessionCounts {
+	counts := PushSessionCounts{Total: len(sessions)}
+	if len(sessions) == 0 {
+		return counts
+	}
+	counts.ByAgent = make(map[string]int)
+	for _, sess := range sessions {
+		agent := strings.TrimSpace(sess.Agent)
+		if agent == "" {
+			agent = "unknown"
+		}
+		counts.ByAgent[agent]++
+	}
+	return counts
+}
+
+func skippedPushSessions(
+	candidates []db.Session,
+	pushed []db.Session,
+) PushSessionCounts {
+	pushedIDs := make(map[string]struct{}, len(pushed))
+	for _, sess := range pushed {
+		pushedIDs[sess.ID] = struct{}{}
+	}
+	skipped := make([]db.Session, 0, len(candidates)-len(pushed))
+	for _, sess := range candidates {
+		if _, ok := pushedIDs[sess.ID]; ok {
+			continue
+		}
+		skipped = append(skipped, sess)
+	}
+	return countPushSessions(skipped)
+}
+
 func (s *Sync) sessionCount(ctx context.Context) (int, error) {
 	var count int
-	if err := s.duck.QueryRowContext(ctx,
+	if err := queryDuckDBRowContext(ctx, s.duck, s.connectionKind, s.quack,
 		`SELECT COUNT(*) FROM sessions WHERE machine = ?`,
 		s.machine,
 	).Scan(&count); err != nil {
@@ -341,6 +708,7 @@ func (s *Sync) finalizeState(
 	pushed []db.Session,
 	priorFingerprints map[string]string,
 	sessionFingerprints map[string]string,
+	advanceWatermark bool,
 ) error {
 	if s.isFiltered() {
 		// Filtered pushes must not advance the global watermark
@@ -354,31 +722,40 @@ func (s *Sync) finalizeState(
 			boundaryKey = cutoff
 		}
 		return writeSyncFingerprints(
-			s.local, boundaryKey, pushed, priorFingerprints, sessionFingerprints,
+			s.local, s.syncStateKey(lastPushBoundaryStateKey),
+			boundaryKey, pushed, priorFingerprints, sessionFingerprints,
 		)
 	}
-	if err := s.local.SetSyncState(lastPushStateKey, cutoff); err != nil {
-		return fmt.Errorf("updating %s: %w", lastPushStateKey, err)
+	lastPushKey := s.syncStateKey(lastPushStateKey)
+	if advanceWatermark {
+		if err := s.local.SetSyncState(lastPushKey, cutoff); err != nil {
+			return fmt.Errorf("updating %s: %w", lastPushKey, err)
+		}
 	}
 	return writeSyncFingerprints(
-		s.local, cutoff, pushed, priorFingerprints, sessionFingerprints,
+		s.local, s.syncStateKey(lastPushBoundaryStateKey),
+		cutoff, pushed, priorFingerprints, sessionFingerprints,
 	)
 }
 
-func clearDuckDBSyncState(local *db.DB) error {
-	if err := local.SetSyncState(lastPushStateKey, ""); err != nil {
-		return fmt.Errorf("clearing %s: %w", lastPushStateKey, err)
+func clearDuckDBSyncState(local *db.DB, scope string) error {
+	lastPushKey := scopedDuckDBSyncStateKey(lastPushStateKey, scope)
+	if err := local.SetSyncState(lastPushKey, ""); err != nil {
+		return fmt.Errorf("clearing %s: %w", lastPushKey, err)
 	}
-	if err := local.SetSyncState(lastPushBoundaryStateKey, ""); err != nil {
-		return fmt.Errorf("clearing %s: %w", lastPushBoundaryStateKey, err)
+	boundaryKey := scopedDuckDBSyncStateKey(lastPushBoundaryStateKey, scope)
+	if err := local.SetSyncState(boundaryKey, ""); err != nil {
+		return fmt.Errorf("clearing %s: %w", boundaryKey, err)
 	}
 	return nil
 }
 
-func readSyncFingerprints(local *db.DB) (map[string]string, error) {
-	raw, err := local.GetSyncState(lastPushBoundaryStateKey)
+func readSyncFingerprintsWithKey(
+	local *db.DB, key string,
+) (map[string]string, error) {
+	raw, err := local.GetSyncState(key)
 	if err != nil {
-		return nil, fmt.Errorf("reading %s: %w", lastPushBoundaryStateKey, err)
+		return nil, fmt.Errorf("reading %s: %w", key, err)
 	}
 	if raw == "" {
 		return map[string]string{}, nil
@@ -395,6 +772,7 @@ func readSyncFingerprints(local *db.DB) (map[string]string, error) {
 
 func writeSyncFingerprints(
 	local *db.DB,
+	key string,
 	cutoff string,
 	sessions []db.Session,
 	priorFingerprints map[string]string,
@@ -416,12 +794,19 @@ func writeSyncFingerprints(
 	}
 	data, err := json.Marshal(state)
 	if err != nil {
-		return fmt.Errorf("encoding %s: %w", lastPushBoundaryStateKey, err)
+		return fmt.Errorf("encoding %s: %w", key, err)
 	}
-	if err := local.SetSyncState(lastPushBoundaryStateKey, string(data)); err != nil {
-		return fmt.Errorf("writing %s: %w", lastPushBoundaryStateKey, err)
+	if err := local.SetSyncState(key, string(data)); err != nil {
+		return fmt.Errorf("writing %s: %w", key, err)
 	}
 	return nil
+}
+
+func scopedDuckDBSyncStateKey(key, scope string) string {
+	if scope == "" {
+		return key
+	}
+	return key + ":" + scope
 }
 
 func normalizeStoredFingerprint(value string) string {

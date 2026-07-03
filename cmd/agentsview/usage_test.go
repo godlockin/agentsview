@@ -17,6 +17,9 @@ import (
 	"go.kenn.io/agentsview/internal/config"
 	"go.kenn.io/agentsview/internal/cursorusage"
 	"go.kenn.io/agentsview/internal/db"
+	"go.kenn.io/agentsview/internal/dbtest"
+	"go.kenn.io/agentsview/internal/parser"
+	"go.kenn.io/agentsview/internal/parsertest"
 	"go.kenn.io/agentsview/internal/pricing"
 )
 
@@ -494,10 +497,16 @@ func TestRunUsageDailyOfflineUsesReadOnlyDBWhenWriteLockHeld(t *testing.T) {
 		"offline read-only usage must preserve custom pricing")
 }
 
-func TestArchiveQueryBackendNoSyncDoesNotAutostartDaemonForDailyUsage(t *testing.T) {
+func TestArchiveQueryBackendNoSyncStartsNoSyncDaemonForDailyUsage(t *testing.T) {
 	newAgentDataDir(t)
-	forbidStartBackgroundServeForTransport(t,
-		"--no-sync usage must not auto-start a daemon")
+	var started bool
+	stubStartBackgroundServeForTransport(t, func(
+		_ context.Context, cfg *config.Config, _ time.Duration,
+	) (*DaemonRuntime, error) {
+		started = true
+		assert.True(t, cfg.NoSync)
+		return &DaemonRuntime{Host: "127.0.0.1", Port: 12345}, nil
+	})
 
 	backend := resolveTestArchiveQueryBackend(t, defaultArchiveQueryPolicy(
 		func(p *archiveQueryPolicy) {
@@ -505,10 +514,11 @@ func TestArchiveQueryBackendNoSyncDoesNotAutostartDaemonForDailyUsage(t *testing
 			p.AutoStart = true
 		},
 	))
-	assert.IsType(t, localArchiveQueryBackend{}, backend)
+	assert.True(t, started)
+	assert.IsType(t, daemonArchiveQueryBackend{}, backend)
 }
 
-func TestArchiveQueryBackendIgnoresReadOnlyDaemonForDailyUsage(t *testing.T) {
+func TestArchiveQueryBackendRefusesReadOnlyDaemonForDailyUsage(t *testing.T) {
 	dataDir := newAgentDataDir(t)
 
 	var called bool
@@ -518,16 +528,22 @@ func TestArchiveQueryBackendIgnoresReadOnlyDaemonForDailyUsage(t *testing.T) {
 	})
 	registerTestRuntime(t, dataDir, ts.URL, true)
 
-	backend := resolveTestArchiveQueryBackend(t, defaultArchiveQueryPolicy(
-		func(p *archiveQueryPolicy) { p.AutoStart = true },
-	))
-	assert.IsType(t, localArchiveQueryBackend{}, backend)
+	_, cleanup, err := resolveArchiveQueryBackend(
+		context.Background(), defaultArchiveQueryPolicy(
+			func(p *archiveQueryPolicy) { p.AutoStart = true },
+		),
+	)
+	if cleanup != nil {
+		t.Cleanup(cleanup)
+	}
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "read-only")
 	assert.False(t, called)
 }
 
 func TestArchiveQueryBackendOfflineSkipsDaemonForDailyUsage(t *testing.T) {
 	dataDir := newAgentDataDir(t)
-	buildGoldenFixtureDB(t, sessionsDBPath(dataDir))
+	copyGoldenFixtureDB(t, sessionsDBPath(dataDir))
 
 	var called bool
 	ts := sessionUsageRuntimeServer(t, func(w http.ResponseWriter, r *http.Request) {
@@ -795,9 +811,7 @@ func TestNewUsageCursorCommandUsesConfigFallbacksAndSharedPagination(t *testing.
 	assert.Equal(t, float64(1), requests[0]["page"])
 	assert.Equal(t, float64(2), requests[1]["page"])
 
-	database, err := db.Open(filepath.Join(dataDir, "sessions.db"))
-	require.NoError(t, err, "open archive db")
-	t.Cleanup(func() { database.Close() })
+	database := dbtest.OpenTestDBAt(t, filepath.Join(dataDir, "sessions.db"))
 
 	var count int
 	require.NoError(t, database.Reader().QueryRow(
@@ -1163,4 +1177,103 @@ type pricingFetchRecorder struct {
 func (f *pricingFetchRecorder) fetch() ([]pricing.ModelPricing, error) {
 	f.calls++
 	return f.rows, f.err
+}
+
+// zeroTotalsCopilotUsageJSON is a daily-usage summary with sessions present
+// but zero token/cost totals — the "no token data" case.
+const zeroTotalsCopilotUsageJSON = `{
+  "daily": [],
+  "totals": {"inputTokens":0,"outputTokens":0,"cacheCreationTokens":0,"cacheReadTokens":0,"totalCost":0},
+  "sessionCounts": {"total":2,"byProject":{},"byAgent":{"copilot":2}}
+}`
+
+func TestRunUsageDailyHintsNoTokenDataForCopilot(t *testing.T) {
+	dataDir := newAgentDataDir(t)
+	ts := sessionUsageRuntimeServer(t, func(w http.ResponseWriter, r *http.Request) {
+		writeJSONResponse(w, zeroTotalsCopilotUsageJSON)
+	})
+	registerSyncRouteTestRuntime(t, dataDir, ts.URL)
+
+	stderr := captureStderr(t, func() {
+		runUsageDaily(UsageDailyConfig{Agent: "copilot", Timezone: "UTC"})
+	})
+
+	assert.Contains(t, stderr, "Copilot")
+	assert.Contains(t, stderr, "do not include token or cost data")
+}
+
+func TestRunUsageDailyNoHintWithoutAgentFilter(t *testing.T) {
+	dataDir := newAgentDataDir(t)
+	ts := sessionUsageRuntimeServer(t, func(w http.ResponseWriter, r *http.Request) {
+		writeJSONResponse(w, zeroTotalsCopilotUsageJSON)
+	})
+	registerSyncRouteTestRuntime(t, dataDir, ts.URL)
+
+	stderr := captureStderr(t, func() {
+		runUsageDaily(UsageDailyConfig{Timezone: "UTC"})
+	})
+
+	assert.NotContains(t, stderr, "token")
+}
+
+func TestRunUsageDailyNoHintWhenDataPresent(t *testing.T) {
+	dataDir := newAgentDataDir(t)
+	ts := sessionUsageRuntimeServer(t, func(w http.ResponseWriter, r *http.Request) {
+		writeJSONResponse(w, sampleDailyUsageJSON)
+	})
+	registerSyncRouteTestRuntime(t, dataDir, ts.URL)
+
+	stderr := captureStderr(t, func() {
+		runUsageDaily(UsageDailyConfig{Agent: "codex", Timezone: "UTC"})
+	})
+
+	assert.NotContains(t, stderr, "token-usage")
+}
+
+func TestNoTokenDataNote(t *testing.T) {
+	parsertest.StubAgentDefs(t,
+		parser.AgentDef{
+			Type:        parser.AgentType("no-token-agent"),
+			DisplayName: "No Token Agent",
+			Usage: parser.UsageCapabilities{
+				NoPerMessageTokenData: true,
+			},
+		},
+		parser.AgentDef{
+			Type:        parser.AgentType("credit-note-agent"),
+			DisplayName: "Credit Note Agent",
+			Usage: parser.UsageCapabilities{
+				NoPerMessageTokenData: true,
+				AICreditsDenominated:  true,
+			},
+		},
+	)
+
+	zero := db.UsageTotals{}
+	withData := db.UsageTotals{OutputTokens: 5}
+	copilotNote := "note: these GitHub Copilot records do not include token " +
+		"or cost data that agentsview can total."
+	genericNote := "note: matching sessions do not record per-message token usage."
+	cases := []struct {
+		name   string
+		agent  string
+		totals db.UsageTotals
+		want   string
+	}{
+		{"no agent filter", "", zero, ""},
+		{"non-copilot agent with zero totals", "codex", zero, ""},
+		{"copilot with token data", "copilot", withData, ""},
+		{"copilot with zero totals", "copilot", zero, copilotNote},
+		{"vscode-copilot with zero totals", "vscode-copilot", zero, copilotNote},
+		{"all-copilot CSV filter", "copilot,vscode-copilot", zero, copilotNote},
+		{"non-copilot no-token agent", "no-token-agent", zero, genericNote},
+		{"non-copilot ai-credit agent", "credit-note-agent", zero, genericNote},
+		{"mixed CSV filter", "copilot,claude", zero, ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			assert.Equal(t, tc.want,
+				noTokenDataNote(tc.agent, tc.totals))
+		})
+	}
 }

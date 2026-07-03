@@ -242,6 +242,40 @@ func scanPGSession(
 	return s, nil
 }
 
+func (s *Store) FindSessionIDsByPartial(
+	ctx context.Context, partial string, limit int,
+) ([]string, error) {
+	if partial == "" {
+		return nil, nil
+	}
+	if limit <= 0 {
+		limit = 5
+	}
+	rows, err := s.pg.QueryContext(ctx,
+		`SELECT id FROM sessions
+		 WHERE strpos(id, $1) > 0 AND deleted_at IS NULL
+		 ORDER BY COALESCE(ended_at, started_at, created_at) DESC
+		 LIMIT $2`,
+		partial, limit,
+	)
+	if err != nil {
+		return nil, fmt.Errorf(
+			"finding sessions by partial id %q: %w",
+			partial, err,
+		)
+	}
+	defer rows.Close()
+	var ids []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		ids = append(ids, id)
+	}
+	return ids, rows.Err()
+}
+
 // scanPGSessionRows iterates rows and scans each.
 func scanPGSessionRows(
 	rows *sql.Rows,
@@ -1065,4 +1099,43 @@ func (s *Store) GetMachines(
 		machines = append(machines, m)
 	}
 	return machines, rows.Err()
+}
+
+// GetBranches mirrors db.DB.GetBranches: distinct (project, branch) pairs,
+// including the empty no-branch value, scoped to root sessions with messages.
+func (s *Store) GetBranches(
+	ctx context.Context,
+	excludeOneShot, excludeAutomated bool,
+) ([]db.BranchInfo, error) {
+	q := `SELECT DISTINCT project, git_branch FROM sessions
+		WHERE message_count > 0
+		  AND relationship_type NOT IN ('subagent', 'fork')
+		  AND deleted_at IS NULL`
+	if excludeOneShot {
+		if !excludeAutomated {
+			q += " AND (user_message_count > 1 OR is_automated = TRUE)"
+		} else {
+			q += " AND user_message_count > 1"
+		}
+	}
+	if excludeAutomated {
+		q += " AND is_automated = FALSE"
+	}
+	q += " ORDER BY project, git_branch"
+	rows, err := s.pg.QueryContext(ctx, q)
+	if err != nil {
+		return nil, fmt.Errorf("querying branches: %w", err)
+	}
+	defer rows.Close()
+
+	branches := []db.BranchInfo{}
+	for rows.Next() {
+		var bi db.BranchInfo
+		if err := rows.Scan(&bi.Project, &bi.Branch); err != nil {
+			return nil, fmt.Errorf("scanning branch: %w", err)
+		}
+		bi.Token = db.EncodeBranchFilterToken(bi.Project, bi.Branch)
+		branches = append(branches, bi)
+	}
+	return branches, rows.Err()
 }

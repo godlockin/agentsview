@@ -4,11 +4,15 @@ package duckdb
 
 import (
 	"context"
+	"database/sql"
+	"database/sql/driver"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -19,6 +23,88 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
+
+type sessionVersionProbeDriver struct{}
+
+type sessionVersionProbeConn struct{}
+
+type sessionVersionProbeRows struct {
+	columns []string
+	values  [][]driver.Value
+	next    int
+}
+
+var sessionVersionProbeRegisterOnce sync.Once
+
+func newSessionVersionProbeStore(t *testing.T) *Store {
+	t.Helper()
+	sessionVersionProbeRegisterOnce.Do(func() {
+		sql.Register("agentsview_session_version_probe", sessionVersionProbeDriver{})
+	})
+	duck, err := sql.Open("agentsview_session_version_probe", t.Name())
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, duck.Close()) })
+	return &Store{
+		duck:           duck,
+		connectionKind: duckDBQuackClientConnection,
+	}
+}
+
+func (sessionVersionProbeDriver) Open(string) (driver.Conn, error) {
+	return sessionVersionProbeConn{}, nil
+}
+
+func (sessionVersionProbeConn) Prepare(string) (driver.Stmt, error) {
+	return nil, errors.New("prepare not implemented")
+}
+
+func (sessionVersionProbeConn) Close() error { return nil }
+
+func (sessionVersionProbeConn) Begin() (driver.Tx, error) {
+	return nil, errors.New("begin not implemented")
+}
+
+func (sessionVersionProbeConn) QueryContext(
+	_ context.Context, query string, args []driver.NamedValue,
+) (driver.Rows, error) {
+	if !strings.Contains(query, quackAttachmentName+".query(?)") {
+		return nil, errors.New("direct session version query should not be used")
+	}
+	if len(args) != 1 {
+		return nil, fmt.Errorf("remote query got %d args, want 1", len(args))
+	}
+	sqlText, ok := args[0].Value.(string)
+	if !ok {
+		return nil, fmt.Errorf("remote query arg has type %T", args[0].Value)
+	}
+	if !strings.Contains(sqlText, "FROM sessions WHERE id") {
+		return nil, fmt.Errorf("unexpected remote query: %s", sqlText)
+	}
+	return &sessionVersionProbeRows{
+		columns: []string{
+			"message_count", "file_mtime", "file_hash", "updated_at",
+		},
+		values: [][]driver.Value{{
+			int64(7), int64(123), "hash",
+			"2026-01-10T00:00:00Z",
+		}},
+	}, nil
+}
+
+func (r *sessionVersionProbeRows) Columns() []string {
+	return r.columns
+}
+
+func (r *sessionVersionProbeRows) Close() error { return nil }
+
+func (r *sessionVersionProbeRows) Next(dest []driver.Value) error {
+	if r.next >= len(r.values) {
+		return io.EOF
+	}
+	copy(dest, r.values[r.next])
+	r.next++
+	return nil
+}
 
 func TestDecodeCursorClearsLegacyTotal(t *testing.T) {
 	store := &Store{}
@@ -35,6 +121,21 @@ func TestDecodeCursorClearsLegacyTotal(t *testing.T) {
 
 	assert.Equal(t, "legacy-cursor", got.ID)
 	assert.Equal(t, 0, got.Total)
+}
+
+func TestQuackStoreGetSessionVersionUsesRemoteQuery(t *testing.T) {
+	store := newSessionVersionProbeStore(t)
+
+	count, marker, ok := store.GetSessionVersion("quoted ' session")
+
+	require.True(t, ok)
+	assert.Equal(t, 7, count)
+	assert.Equal(t,
+		db.SessionVersionMarker(
+			"123", "hash", "2026-01-10T00:00:00Z",
+		),
+		marker,
+	)
 }
 
 func TestStoreReadsSessionsMessagesAndMetadata(t *testing.T) {
@@ -85,6 +186,104 @@ func TestStoreReadsSessionsMessagesAndMetadata(t *testing.T) {
 	machines, err := store.GetMachines(ctx, false, false)
 	require.NoError(t, err)
 	assert.Equal(t, []string{"test-machine"}, machines)
+}
+
+func TestStoreGetStatsPreservesRootAndScopeFilters(t *testing.T) {
+	ctx := context.Background()
+	local := newLocalDB(t)
+	syncer := newInMemoryTestSync(t, local, SyncOptions{})
+	require.NoError(t, syncer.EnsureSchema(ctx))
+	duck := syncer.DB()
+	store := NewStoreFromDB(duck)
+
+	insertSession := func(
+		id, project, relationship, ts string,
+		messageCount, userMessageCount int,
+		automated bool,
+	) {
+		t.Helper()
+		_, err := duck.ExecContext(ctx, `
+			INSERT INTO sessions (
+				id, project, machine, agent, message_count,
+				user_message_count, relationship_type, is_automated,
+				started_at, created_at
+			) VALUES (
+				?, ?, 'stats-machine', 'claude', ?, ?, ?, ?,
+				CAST(? AS TIMESTAMP), CAST(? AS TIMESTAMP)
+			)`,
+			id, project, messageCount, userMessageCount, relationship,
+			automated, ts, ts,
+		)
+		require.NoError(t, err)
+	}
+
+	insertSession(
+		"stats-fork", "fork", "fork", "2025-12-26 00:00:00",
+		1, 2, false,
+	)
+	insertSession(
+		"stats-subagent", "child", "subagent", "2025-12-27 00:00:00",
+		1, 2, false,
+	)
+	insertSession(
+		"stats-empty", "empty", "root", "2025-12-28 00:00:00",
+		0, 2, false,
+	)
+	insertSession(
+		"stats-deleted", "deleted", "root", "2025-12-29 00:00:00",
+		1, 2, false,
+	)
+	insertSession(
+		"stats-one-shot", "beta", "root", "2025-12-30 00:00:00",
+		1, 1, false,
+	)
+	insertSession(
+		"stats-automated", "bot", "root", "2025-12-31 00:00:00",
+		1, 1, true,
+	)
+	insertSession(
+		"stats-human", "alpha", "root", "2026-01-01 00:00:00",
+		2, 2, false,
+	)
+	_, err := duck.ExecContext(ctx,
+		`UPDATE sessions SET deleted_at = CAST(? AS TIMESTAMP) WHERE id = ?`,
+		"2026-01-02 00:00:00", "stats-deleted",
+	)
+	require.NoError(t, err)
+
+	assertStats := func(
+		name string,
+		excludeOneShot, excludeAutomated bool,
+		wantSessions, wantMessages, wantProjects int,
+		wantEarliest string,
+	) {
+		t.Helper()
+		stats, err := store.GetStats(ctx, excludeOneShot, excludeAutomated)
+		require.NoError(t, err, name)
+		assert.Equal(t, wantSessions, stats.SessionCount, name)
+		assert.Equal(t, wantMessages, stats.MessageCount, name)
+		assert.Equal(t, wantProjects, stats.ProjectCount, name)
+		assert.Equal(t, 1, stats.MachineCount, name)
+		require.NotNil(t, stats.EarliestSession, name)
+		assert.Equal(t, wantEarliest, *stats.EarliestSession, name)
+	}
+
+	assertStats(
+		"include all root sessions", false, false, 3, 4, 3,
+		"2025-12-30T00:00:00Z",
+	)
+	assertStats(
+		"exclude one-shot keeps automated", true, false, 2, 3, 2,
+		"2025-12-31T00:00:00Z",
+	)
+	assertStats(
+		"exclude automated keeps human one-shot", false, true, 2, 3, 2,
+		"2025-12-30T00:00:00Z",
+	)
+	assertStats(
+		"exclude one-shot and automated", true, true, 1, 2, 1,
+		"2026-01-01T00:00:00Z",
+	)
 }
 
 func TestStoreMessageIDJoinsAreSessionScoped(t *testing.T) {
@@ -1078,6 +1277,54 @@ func TestSearchContentRegexOrdersBySessionRecency(t *testing.T) {
 	require.Len(t, got.Matches, 2)
 	assert.Equal(t, "z-new-regex", got.Matches[0].SessionID)
 	assert.Equal(t, "a-old-regex", got.Matches[1].SessionID)
+}
+
+func TestSearchContentGitBranchFilter(t *testing.T) {
+	ctx := context.Background()
+	local := newLocalDB(t)
+	alphaMain := syncSession("branch-alpha-main", "alpha", "main session", "2026-01-11T00:00:00Z", 1)
+	alphaMain.GitBranch = "main"
+	alphaFeature := syncSession("branch-alpha-feature", "alpha", "feature session", "2026-01-11T00:01:00Z", 1)
+	alphaFeature.GitBranch = "feature"
+	betaMain := syncSession("branch-beta-main", "beta", "beta session", "2026-01-11T00:02:00Z", 1)
+	betaMain.GitBranch = "main"
+	_, err := local.WriteSessionBatchAtomic([]db.SessionBatchWrite{
+		{
+			Session:         alphaMain,
+			Messages:        []db.Message{syncMessage(alphaMain.ID, 0, "user", "BRANCHNEEDLE alpha main", "2026-01-11T00:00:00Z")},
+			DataVersion:     1,
+			ReplaceMessages: true,
+		},
+		{
+			Session:         alphaFeature,
+			Messages:        []db.Message{syncMessage(alphaFeature.ID, 0, "user", "BRANCHNEEDLE alpha feature", "2026-01-11T00:01:00Z")},
+			DataVersion:     1,
+			ReplaceMessages: true,
+		},
+		{
+			Session:         betaMain,
+			Messages:        []db.Message{syncMessage(betaMain.ID, 0, "user", "BRANCHNEEDLE beta main", "2026-01-11T00:02:00Z")},
+			DataVersion:     1,
+			ReplaceMessages: true,
+		},
+	})
+	require.NoError(t, err)
+	syncer := newInMemoryTestSync(t, local, SyncOptions{})
+	_, err = syncer.Push(ctx, true, nil)
+	require.NoError(t, err)
+	store := NewStoreFromDB(syncer.DB())
+
+	got, err := store.SearchContent(ctx, db.ContentSearchFilter{
+		Pattern:        "BRANCHNEEDLE",
+		Mode:           "substring",
+		Sources:        []string{"messages"},
+		GitBranch:      db.EncodeBranchFilterToken("alpha", "main"),
+		IncludeOneShot: true,
+		Limit:          10,
+	})
+	require.NoError(t, err)
+	require.Len(t, got.Matches, 1)
+	assert.Equal(t, alphaMain.ID, got.Matches[0].SessionID)
 }
 
 func TestSearchContentSubstringPaginatesAfterGlobalOrdering(t *testing.T) {
@@ -2308,4 +2555,96 @@ func newSyncedStore(t *testing.T) (*Store, syncFixture) {
 	_, err := syncer.Push(ctx, true, nil)
 	require.NoError(t, err)
 	return NewStoreFromDB(syncer.DB()), fixture
+}
+
+func TestDuckDBBranchDimension(t *testing.T) {
+	ctx := context.Background()
+	local := newLocalDB(t)
+	require.NoError(t, local.UpsertModelPricing([]db.ModelPricing{{
+		ModelPattern: "claude-test", InputPerMTok: 3, OutputPerMTok: 15,
+	}}))
+
+	seed := []struct {
+		id, project, branch string
+		input, output       int
+	}{
+		{"d-a", "alpha", "main", 100, 10},
+		{"d-b", "alpha", "feature-x", 200, 20},
+		{"d-c", "beta", "main", 300, 30},
+		{"d-d", "alpha", "", 400, 40},
+		{"d-e", "alpha", "unknown", 500, 50},
+	}
+	var writes []db.SessionBatchWrite
+	for _, s := range seed {
+		sess := syncSession(s.id, s.project, s.id+" first", "2026-02-01T12:00:00.000Z", 1)
+		sess.GitBranch = s.branch
+		writes = append(writes, db.SessionBatchWrite{
+			Session: sess,
+			// A token-free user message so only the usage event below feeds the
+			// usage totals (syncMessage would inject a stray input token).
+			Messages: []db.Message{{
+				SessionID:     s.id,
+				Ordinal:       0,
+				Role:          "user",
+				Content:       s.id + " first",
+				Timestamp:     "2026-02-01T12:00:00.000Z",
+				ContentLength: len(s.id + " first"),
+			}},
+			UsageEvents: []db.UsageEvent{{
+				Source: "session", Model: "claude-test",
+				InputTokens: s.input, OutputTokens: s.output,
+				OccurredAt: "2026-02-01T12:01:00.000Z", DedupKey: s.id + "-usage",
+			}},
+			DataVersion:     1,
+			ReplaceMessages: true,
+		})
+	}
+	_, err := local.WriteSessionBatchAtomic(writes)
+	require.NoError(t, err)
+
+	syncer := newInMemoryTestSync(t, local, SyncOptions{})
+	_, err = syncer.Push(ctx, true, nil)
+	require.NoError(t, err)
+	store := NewStoreFromDB(syncer.DB())
+
+	branches, err := store.GetBranches(ctx, false, false)
+	require.NoError(t, err)
+	assert.Equal(t, []db.BranchInfo{
+		{
+			Project: "alpha",
+			Branch:  "",
+			Token:   db.EncodeBranchFilterToken("alpha", ""),
+		},
+		{
+			Project: "alpha",
+			Branch:  "feature-x",
+			Token:   db.EncodeBranchFilterToken("alpha", "feature-x"),
+		},
+		{
+			Project: "alpha",
+			Branch:  "main",
+			Token:   db.EncodeBranchFilterToken("alpha", "main"),
+		},
+		{
+			Project: "alpha",
+			Branch:  "unknown",
+			Token:   db.EncodeBranchFilterToken("alpha", "unknown"),
+		},
+		{
+			Project: "beta",
+			Branch:  "main",
+			Token:   db.EncodeBranchFilterToken("beta", "main"),
+		},
+	}, branches)
+
+	filtered, err := store.GetDailyUsage(ctx, db.UsageFilter{
+		From: "2026-01-01", To: "2026-12-31",
+		GitBranch: db.EncodeBranchFilterToken("alpha", "main"),
+	})
+	require.NoError(t, err)
+	total := 0
+	for _, day := range filtered.Daily {
+		total += day.InputTokens
+	}
+	assert.Equal(t, 100, total, "branch filter restricts usage to alpha/main")
 }
