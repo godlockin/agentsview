@@ -8,7 +8,21 @@ LDFLAGS := -X main.version=$(VERSION) \
            -X main.commit=$(COMMIT) \
            -X main.buildDate=$(BUILD_DATE)
 
-LDFLAGS_RELEASE := $(LDFLAGS) -s -w
+# Release builds normally strip both the symbol table (-s) and DWARF (-w)
+# to save a few MB on the binary. That cost is profile readability: once -s
+# is applied, the pprof symbol map disappears and go tool pprof only sees
+# raw PCs that cannot be mapped back to function names.
+#
+# Set STRIPPED=0 (the default) to keep -s so end users still ship a
+# tighter binary. Set STRIPPED=1 when you need to attach a runtime
+# pprof to a release artifact and read the profiles back home; the
+# resulting binary is a few MB larger but every line of the captured
+# stack traces will resolve.
+STRIPPED ?= 0
+LDFLAGS_RELEASE := $(LDFLAGS)
+ifeq ($(STRIPPED),0)
+LDFLAGS_RELEASE += -s -w
+endif
 DESKTOP_DIST_DIR := dist/desktop
 GOLANGCI_LINT_VERSION ?= v2.11.4
 CUSTOM_GCL := ./custom-gcl
@@ -20,7 +34,7 @@ AIR_BIN := $(shell if command -v air >/dev/null 2>&1; then command -v air; \
 	elif [ -x "$(GOPATH_FIRST)/bin/air" ]; then printf "%s" "$(GOPATH_FIRST)/bin/air"; \
 	fi)
 
-.PHONY: build build-release install frontend frontend-dev dev check-air air-install desktop-dev desktop-build desktop-macos-app desktop-macos-dmg desktop-windows-installer desktop-linux-appimage desktop-app docs-install docs-build docs-serve docs-check docs-screenshots docs-assets-branch docs-generated-assets-branch docs-deploy-staging docs-deploy test test-short bench-backends test-postgres test-postgres-ci test-s3 postgres-up postgres-down test-ssh test-ssh-ci ssh-up ssh-down e2e e2e-duckdb vet lint lint-ci lint-golangci lint-golangci-ci nilaway nilaway-golangci-build lint-tools tidy clean release release-darwin-arm64 release-darwin-amd64 release-universal-apple build-local-apple-silicon run-offline run-offline-universal release-linux-amd64 install-hooks ensure-embed-dir pricing-snapshot dev-snapshot help
+.PHONY: build build-release build-release-profiled install frontend frontend-dev dev check-air air-install desktop-dev desktop-build desktop-macos-app desktop-macos-dmg desktop-windows-installer desktop-linux-appimage desktop-app docs-install docs-build docs-serve docs-check docs-screenshots docs-assets-branch docs-generated-assets-branch docs-deploy-staging docs-deploy test test-short bench-backends test-postgres test-postgres-ci test-s3 postgres-up postgres-down test-ssh test-ssh-ci ssh-up ssh-down e2e e2e-duckdb vet lint lint-ci lint-golangci lint-golangci-ci nilaway nilaway-golangci-build lint-tools tidy clean release release-darwin-arm64 release-darwin-amd64 release-universal-apple build-local-apple-silicon run-offline run-offline-universal release-linux-amd64 install-hooks ensure-embed-dir pricing-snapshot dev-snapshot help
 
 # Ensure go:embed has at least one file (no-op if frontend is built)
 ensure-embed-dir:
@@ -44,6 +58,17 @@ build: pricing-snapshot frontend
 build-release: pricing-snapshot frontend
 	CGO_ENABLED=1 go build -tags fts5 -ldflags="$(LDFLAGS_RELEASE)" -trimpath -o agentsview ./cmd/agentsview
 	@chmod +x agentsview
+
+# Build release with the symbol table preserved so go tool pprof can
+# resolve captured stack traces against the running binary. Trade-off:
+# roughly 5-10 MiB larger binary. Use this when reproducing a CPU or
+# memory profile from a production-shaped artifact.
+build-release-profiled: pricing-snapshot frontend
+	@mkdir -p dist
+	STRIPPED=0 CGO_ENABLED=1 go build -tags fts5 \
+		-ldflags="$(LDFLAGS)" -trimpath \
+		-o dist/agentsview-darwin-arm64-profiled ./cmd/agentsview
+	@file dist/agentsview-darwin-arm64-profiled
 
 # Install to ~/.local/bin, $GOBIN, or $GOPATH/bin.
 # Copy to a temp file in the destination directory, then rename into place.

@@ -1,6 +1,11 @@
 package pricing
 
-import "go.kenn.io/agentsview/internal/pricing/catalog"
+import (
+	"fmt"
+	"time"
+
+	"go.kenn.io/agentsview/internal/pricing/catalog"
+)
 
 // ModelPricing holds per-model token pricing in cost per
 // million tokens. Separate from db.ModelPricing — the CLI
@@ -45,6 +50,59 @@ func ParseOpenRouterPricing(data []byte) ([]ModelPricing, error) {
 type PricingSource struct {
 	Name string
 	Fetch func() ([]ModelPricing, error)
+}
+
+// fetchWithTimeout races a Fetch against a per-source
+// timeout so a hung upstream cannot stall the daemon's
+// pricing refresh goroutine forever. The timeout mirrors
+// the per-source HTTPClient timeout in catalog.FetchLiteLLMPricing
+// and is layered on top so a connection that hangs at the
+// socket layer (which the http.Client deadline already times
+// out at 30 s) still cannot block longer than pricingFetchTimeout.
+//
+// We deliberately keep the existing Fetch signature rather
+// than threading context.Context through every fetcher so
+// callers that want unbounded behavior (tests, bulk
+// importers) do not have to mock a context.
+func fetchWithTimeout(src PricingSource, timeout time.Duration) ([]ModelPricing, error) {
+	type result struct {
+		prices []ModelPricing
+		err    error
+	}
+	ch := make(chan result, 1)
+	go func() {
+		prices, err := src.Fetch()
+		ch <- result{prices, err}
+	}()
+	select {
+	case <-time.After(timeout):
+		return nil, fmt.Errorf("%s: timed out after %s", src.Name, timeout)
+	case r := <-ch:
+		return r.prices, r.err
+	}
+}
+
+// pricingFetchTimeout bounds a single pricing source fetch
+// so a hung LiteLLM or OpenRouter endpoint can never stall the
+// daemon's background refresh goroutine indefinitely. The
+// underlying catalog fetchers already cap each HTTP round at
+// 30 s; this is a defence-in-depth cap with a sensible
+// multiple of that.
+const pricingFetchTimeout = 45 * time.Second
+
+// PricingFetchTimeout exposes the per-source fetch timeout
+// for callers (cmd/agentsview) so they can mention it in
+// their log messages without hard-coding the same number in
+// two places.
+func PricingFetchTimeout() time.Duration { return pricingFetchTimeout }
+
+// FetchWithTimeout runs src.Fetch() in a goroutine and races
+// it against the package-level pricingFetchTimeout. Used by
+// the daemon's refresh loop to keep a hung LiteLLM or
+// OpenRouter endpoint from blocking the rest of the
+// background refresh path.
+func FetchWithTimeout(src PricingSource, timeout time.Duration) ([]ModelPricing, error) {
+	return fetchWithTimeout(src, timeout)
 }
 
 // DefaultPricingSources returns the built-in pricing sources

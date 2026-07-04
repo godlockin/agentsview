@@ -154,9 +154,32 @@ func (w *Watcher) Stop() {
 
 func (w *Watcher) loop() {
 	defer close(w.done)
-	ticker := time.NewTicker(w.debounce)
-	defer ticker.Stop()
 
+	// Two-rate flush timer. While events keep arriving we run the
+	// tight debounce w.debounce so users still see burst-time flush
+	// in well under one debounce-multiple of their first edit.
+	// After idleAfter consecutive flushes that find nothing to do
+	// (the pending map is empty), the timer is reset to idleStep
+	// (5 s) so the goroutine stops being scheduled 120 times a
+	// minute just to confirm there is nothing to do. The first new
+	// event after a quiet period returns the timer to w.debounce
+	// so low-volume activity is not penalised.
+	const (
+		idleAfter = 3               // consecutive empty flushes
+		idleStep  = 5 * time.Second // length of the relaxed interval
+	)
+	idleHits := 0
+	timer := time.NewTimer(w.debounce)
+	defer timer.Stop()
+	armTimer := func(d time.Duration) {
+		if !timer.Stop() {
+			select {
+			case <-timer.C:
+			default:
+			}
+		}
+		timer.Reset(d)
+	}
 	for {
 		select {
 		case <-w.stop:
@@ -167,6 +190,13 @@ func (w *Watcher) loop() {
 				return
 			}
 			w.handleEvent(event)
+			// A new event re-arms the tight debounce so the
+			// next flush happens promptly, regardless of how
+			// long the watcher has been idle.
+			if timer.Stop() {
+				armTimer(w.debounce)
+			}
+			idleHits = 0
 
 		case err, ok := <-w.watcher.Errors:
 			if !ok {
@@ -174,8 +204,21 @@ func (w *Watcher) loop() {
 			}
 			log.Printf("watcher error: %v", err)
 
-		case <-ticker.C:
+		case <-timer.C:
 			w.flush()
+			// If nothing happened, drift toward a slower
+			// poll. As soon as an event shows up the next
+			// iteration of the select drops the interval
+			// back to debounce.
+			idleHits++
+			if idleHits >= idleAfter {
+				armTimer(idleStep)
+				// Reset the counter so we don't re-arm on
+				// every tick once we're already relaxed.
+				idleHits = 0
+			} else {
+				armTimer(w.debounce)
+			}
 		}
 	}
 }

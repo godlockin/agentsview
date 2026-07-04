@@ -288,6 +288,19 @@ const (
 // the WAL because another connection still had pages pinned.
 var ErrWALCheckpointBusy = errors.New("wal checkpoint busy")
 
+// readerMaxOpenConns is the maximum number of concurrent
+// read-only SQLite connections agentsview allows per
+// database handle. The previous value (4) was the queue
+// ceiling observed during a 50-burst CPU profile: every
+// request above the 4th got serialised behind connMu and
+// spent its time in pthread_cond_wait. SQLite in WAL mode
+// supports an unlimited number of readers, limited only by
+// the kernel file descriptor limit. 16 leaves comfortable
+// headroom for the typical UI burst (sidebar + dashboard
+// queries arriving at once) without bumping into fd limits
+// on a default macOS /proc/sys/fs/file-max of ~25600.
+const readerMaxOpenConns = 16
+
 // DataVersionTooNewError reports that an archive was written by a newer
 // agentsview parser than the current binary understands.
 type DataVersionTooNewError struct {
@@ -704,7 +717,7 @@ func OpenReadOnly(path string) (*DB, error) {
 	if err != nil {
 		return nil, fmt.Errorf("opening read-only reader: %w", err)
 	}
-	reader.SetMaxOpenConns(4)
+	reader.SetMaxOpenConns(readerMaxOpenConns)
 	if err := reader.Ping(); err != nil {
 		reader.Close()
 		return nil, fmt.Errorf("opening read-only reader: %w", err)
@@ -2122,7 +2135,7 @@ func openAndInit(path string) (*DB, error) {
 		writer.Close()
 		return nil, fmt.Errorf("opening reader: %w", err)
 	}
-	reader.SetMaxOpenConns(4)
+	reader.SetMaxOpenConns(readerMaxOpenConns)
 
 	db := &DB{path: path}
 	db.writer.Store(writer)
@@ -2493,7 +2506,7 @@ func (db *DB) reopenLocked() error {
 		writer.Close()
 		return fmt.Errorf("reopening reader: %w", err)
 	}
-	reader.SetMaxOpenConns(4)
+	reader.SetMaxOpenConns(readerMaxOpenConns)
 
 	db.connMu.Lock()
 	retired := append([]*sql.DB(nil), db.retired...)

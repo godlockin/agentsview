@@ -415,10 +415,14 @@ func seedFallbackPricing(database *db.DB) error {
 // prevent the other from seeding. All successful results are
 // merged (first non-zero field wins per model_pattern) and
 // upserted as a single batch.
+//
+// Each per-source fetch is bounded by
+// pricing.pricingFetchTimeout (45 s) so a hung upstream cannot
+// stall the goroutine indefinitely.
 func refreshPricingFromSources(database *db.DB) {
 	fetched := make(map[string][]pricing.ModelPricing)
 	for _, src := range pricing.DefaultPricingSources() {
-		prices, err := src.Fetch()
+		prices, err := pricing.FetchWithTimeout(src, pricing.PricingFetchTimeout())
 		if err != nil {
 			log.Printf(
 				"pricing refresh: %s fetch failed: %v",
