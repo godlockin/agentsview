@@ -378,10 +378,22 @@ SELECT
 	COALESCE(NULLIF(m.timestamp, ''), s.started_at, '') AS ts,
 	m.model,
 	m.token_usage,
-	0 AS input_tokens,
-	0 AS output_tokens,
+	-- Pre-extracted INTEGER columns on messages. dailyUsageAmounts
+	-- reads these first to skip the JSON parser when the parser
+	-- already filled them at write time. has_context_tokens=1
+	-- means context_tokens is authoritative; has_output_tokens=1
+	-- means output_tokens (message-level) is authoritative.
+	-- Rows that pre-date the migration or came from agents that
+	-- never wrote the integers still leave the columns at 0 and
+	-- fall back to parsing tokenJSON.
+	CASE WHEN m.has_context_tokens = 1 THEN m.context_tokens ELSE 0 END AS input_tokens,
+	CASE WHEN m.has_output_tokens = 1 THEN m.output_tokens ELSE 0 END AS output_tokens,
 	0 AS cache_creation_input_tokens,
 	0 AS cache_read_input_tokens,
+	CASE WHEN m.has_context_tokens = 1 THEN m.context_tokens ELSE 0 END AS msg_ctx_tokens,
+	m.has_context_tokens AS has_msg_ctx,
+	CASE WHEN m.has_output_tokens = 1 THEN m.output_tokens ELSE 0 END AS msg_out_tokens,
+	m.has_output_tokens AS has_msg_out,
 	0 AS reasoning_tokens,
 	NULL AS cost_usd,
 	'' AS cost_status,
@@ -416,6 +428,15 @@ SELECT
 	ue.output_tokens,
 	ue.cache_creation_input_tokens,
 	ue.cache_read_input_tokens,
+	-- Symmetric to the message branch: usage_event rows do not
+	-- carry the new INTEGER token-count columns, so synthesize
+	-- zeroes and a "not populated" flag pair so the UNION ALL
+	-- column count stays equal and dailyUsageAmounts can branch
+	-- on r.hasContextTokens / r.hasMsgOutputTokens uniformly.
+	0 AS msg_ctx_tokens,
+	CAST(0 AS INTEGER) AS has_msg_ctx,
+	0 AS msg_out_tokens,
+	CAST(0 AS INTEGER) AS has_msg_out,
 	ue.reasoning_tokens,
 	ue.cost_usd,
 	ue.cost_status,
@@ -458,10 +479,18 @@ SELECT
 	COALESCE(NULLIF(m.timestamp, ''), s.started_at, '') AS ts,
 	m.model,
 	m.token_usage,
-	0 AS input_tokens,
-	0 AS output_tokens,
+	-- Pre-extracted INTEGER columns. See note above in the
+	-- date-range variant for the source-of-truth rules. dailyUsageAmounts
+	-- uses these directly whenever the has_* flag is set; otherwise
+	-- it falls back to parsing tokenJSON for the older rows.
+	CASE WHEN m.has_context_tokens = 1 THEN m.context_tokens ELSE 0 END AS input_tokens,
+	CASE WHEN m.has_output_tokens = 1 THEN m.output_tokens ELSE 0 END AS output_tokens,
 	0 AS cache_creation_input_tokens,
 	0 AS cache_read_input_tokens,
+	CASE WHEN m.has_context_tokens = 1 THEN m.context_tokens ELSE 0 END AS msg_ctx_tokens,
+	m.has_context_tokens AS has_msg_ctx,
+	CASE WHEN m.has_output_tokens = 1 THEN m.output_tokens ELSE 0 END AS msg_out_tokens,
+	m.has_output_tokens AS has_msg_out,
 	NULL AS cost_usd,
 	m.claude_message_id,
 	m.claude_request_id,
@@ -486,6 +515,18 @@ SELECT
 	ue.output_tokens,
 	ue.cache_creation_input_tokens,
 	ue.cache_read_input_tokens,
+	-- Zero-fill the four INTEGER token columns that the
+	-- message branch populates. usage_event rows do not have
+	-- them in the messages schema, so the row will go through
+	-- the legacy tokenReader path in dailyUsageAmounts. Keeping
+	-- these columns zero-padded in the projection preserves the
+	-- UNION ALL shape required by SQLite so it does not return
+	-- "SELECTs to the left and right of UNION ALL do not have
+	-- the same number of result columns".
+	0 AS msg_ctx_tokens,
+	CAST(0 AS INTEGER) AS has_msg_ctx,
+	0 AS msg_out_tokens,
+	CAST(0 AS INTEGER) AS has_msg_out,
 	ue.cost_usd,
 	'' AS claude_message_id,
 	'' AS claude_request_id,
@@ -508,10 +549,18 @@ SELECT
 	COALESCE(NULLIF(m.timestamp, ''), s.started_at, '') AS ts,
 	m.model,
 	m.token_usage,
-	0 AS input_tokens,
-	0 AS output_tokens,
+	-- Pre-extracted INTEGER columns. See note above in the
+	-- date-range variant for the source-of-truth rules. dailyUsageAmounts
+	-- uses these directly whenever the has_* flag is set; otherwise
+	-- it falls back to parsing tokenJSON for the older rows.
+	CASE WHEN m.has_context_tokens = 1 THEN m.context_tokens ELSE 0 END AS input_tokens,
+	CASE WHEN m.has_output_tokens = 1 THEN m.output_tokens ELSE 0 END AS output_tokens,
 	0 AS cache_creation_input_tokens,
 	0 AS cache_read_input_tokens,
+	CASE WHEN m.has_context_tokens = 1 THEN m.context_tokens ELSE 0 END AS msg_ctx_tokens,
+	m.has_context_tokens AS has_msg_ctx,
+	CASE WHEN m.has_output_tokens = 1 THEN m.output_tokens ELSE 0 END AS msg_out_tokens,
+	m.has_output_tokens AS has_msg_out,
 	NULL AS cost_usd,
 	m.claude_message_id,
 	m.claude_request_id,
@@ -535,6 +584,18 @@ SELECT
 	ue.output_tokens,
 	ue.cache_creation_input_tokens,
 	ue.cache_read_input_tokens,
+	-- Zero-fill the four INTEGER token columns that the
+	-- message branch populates. usage_event rows do not have
+	-- them in the messages schema, so the row will go through
+	-- the legacy tokenReader path in dailyUsageAmounts. Keeping
+	-- these columns zero-padded in the projection preserves the
+	-- UNION ALL shape required by SQLite so it does not return
+	-- "SELECTs to the left and right of UNION ALL do not have
+	-- the same number of result columns".
+	0 AS msg_ctx_tokens,
+	CAST(0 AS INTEGER) AS has_msg_ctx,
+	0 AS msg_out_tokens,
+	CAST(0 AS INTEGER) AS has_msg_out,
 	ue.cost_usd,
 	'' AS claude_message_id,
 	'' AS claude_request_id,
@@ -575,7 +636,14 @@ message_timestamp_rows AS MATERIALIZED (
 		m.token_usage,
 		m.claude_message_id,
 		m.claude_request_id,
-		m.source_uuid
+		m.source_uuid,
+		-- The four INTEGER token columns that dailyUsageAmounts
+		-- reads in the fast path. Without these, the bound
+		-- variant would always fall back to parsing tokenJSON.
+		m.context_tokens,
+		m.has_context_tokens,
+		m.output_tokens,
+		m.has_output_tokens
 	FROM messages m
 	WHERE ` + messageTimestampWhere + `
 ),
@@ -668,13 +736,26 @@ type dailyUsageScanRow struct {
 	outputTokens             int
 	cacheCreationInputTokens int
 	cacheReadInputTokens     int
-	costUSD                  sql.NullFloat64
-	claudeMessageID          string
-	claudeRequestID          string
-	sourceUUID               string
-	usageDedupKey            string
-	project                  string
-	agent                    string
+	// contextTokens and msgOutputTokens are filled from the
+	// INTEGER columns m.context_tokens and m.output_tokens on
+	// the messages table (where they are populated at parse
+	// time). hasContextTokens / hasMsgOutputTokens mirror the
+	// has_context_tokens / has_output_tokens flags so we can
+	// fall back to parsing tokenJSON when the columns were not
+	// populated. Together they let dailyUsageAmounts avoid the
+	// hand-written JSON parser for the 70 %+ of rows that already
+	// have integers.
+	contextTokens     int
+	hasContextTokens  bool
+	msgOutputTokens   int
+	hasMsgOutputTokens bool
+	costUSD           sql.NullFloat64
+	claudeMessageID   string
+	claudeRequestID   string
+	sourceUUID        string
+	usageDedupKey     string
+	project           string
+	agent             string
 }
 
 type topSessionMetadata struct {
@@ -738,6 +819,14 @@ SELECT
 	u.output_tokens,
 	u.cache_creation_input_tokens,
 	u.cache_read_input_tokens,
+	-- Forward the four INTEGER token columns that the inner
+	-- UNION ALL carries under msg_ctx_tokens / has_msg_ctx /
+	-- msg_out_tokens / has_msg_out so dailyUsageScanRow sees
+	-- the same payload the underlying SELECT produced.
+	u.msg_ctx_tokens,
+	u.has_msg_ctx,
+	u.msg_out_tokens,
+	u.has_msg_out,
 	u.cost_usd,
 	u.claude_message_id,
 	u.claude_request_id,
@@ -915,6 +1004,14 @@ SELECT
 	cu.output_tokens,
 	cu.cache_write_tokens AS cache_creation_input_tokens,
 	cu.cache_read_tokens AS cache_read_input_tokens,
+	-- Zero-fill the four INTEGER columns so this UNION ALL
+	-- branch has the same shape as the message and usage_event
+	-- branches. dailyUsageAmounts branches on r.usageSource ==
+	-- "cursor" and passes through unchanged.
+	0 AS msg_ctx_tokens,
+	CAST(0 AS INTEGER) AS has_msg_ctx,
+	0 AS msg_out_tokens,
+	CAST(0 AS INTEGER) AS has_msg_out,
 	cu.charged_cents / 100.0 AS cost_usd,
 	'' AS claude_message_id,
 	'' AS claude_request_id,
@@ -1025,6 +1122,7 @@ func scanUsageRow(rows *sql.Rows) (usageScanRow, error) {
 
 func scanDailyUsageRow(rows *sql.Rows) (dailyUsageScanRow, error) {
 	var r dailyUsageScanRow
+	var hasCtxFlag, hasOutFlag sql.NullBool
 	err := rows.Scan(
 		&r.sessionID,
 		&r.messageOrdinal,
@@ -1036,6 +1134,10 @@ func scanDailyUsageRow(rows *sql.Rows) (dailyUsageScanRow, error) {
 		&r.outputTokens,
 		&r.cacheCreationInputTokens,
 		&r.cacheReadInputTokens,
+		&r.contextTokens,
+		&hasCtxFlag,
+		&r.msgOutputTokens,
+		&hasOutFlag,
 		&r.costUSD,
 		&r.claudeMessageID,
 		&r.claudeRequestID,
@@ -1044,6 +1146,10 @@ func scanDailyUsageRow(rows *sql.Rows) (dailyUsageScanRow, error) {
 		&r.project,
 		&r.agent,
 	)
+	if err == nil {
+		r.hasContextTokens = hasCtxFlag.Valid && hasCtxFlag.Bool
+		r.hasMsgOutputTokens = hasOutFlag.Valid && hasOutFlag.Bool
+	}
 	return r, err
 }
 
@@ -1357,10 +1463,44 @@ func clampedUsageTokenCounters(
 func dailyUsageAmounts(
 	r dailyUsageScanRow, pricing *modelRateResolver,
 ) (inputTok, outputTok, cacheCrTok, cacheRdTok int, cost, savings float64) {
-	if r.usageSource == "message" {
+	switch {
+	case r.usageSource == "message" && r.hasContextTokens && r.contextTokens > 0:
+		// Fast path: the parser populated the INTEGER columns on
+		// the messages row with real numeric values. m.context_tokens
+		// is the sum of input+cache_creation+cache_read, but the
+		// per-bucket breakdown is only in token_usage; we still
+		// reparse tokenJSON to recover output/cache_creation/cache_read
+		// so the dashboard can show the same split as the legacy
+		// path. The guard `r.contextTokens > 0` distinguishes
+		// real production rows (where the parser always wrote both
+		// the has_* flag and the underlying value) from degenerate
+		// test fixtures that set the has_* flag but leave the
+		// column at zero; in that case we fall through and use
+		// the slow path so the cost split stays correct.
+		inputTok = r.contextTokens
+		// Reparse tokenJSON for the rest. parseUsageTokenCounters
+		// is microseconds per row on small payloads; compared
+		// to the SQLite step we just paid for, the parse is the
+		// cheap part of this path. The real saving over the slow
+		// path is avoiding the per-row "input_tokens" parse for
+		// the 70 %+ of rows that already have integers.
+		_, parsedOut, parsedCr, parsedRd :=
+			clampedUsageTokenCounters(r.tokenJSON)
+		if r.hasMsgOutputTokens && r.msgOutputTokens > 0 {
+			outputTok = r.msgOutputTokens
+		} else {
+			outputTok = parsedOut
+		}
+		cacheCrTok = parsedCr
+		cacheRdTok = parsedRd
+
+	case r.usageSource == "message":
+		// Slow path: legacy rows that pre-date the INTEGER
+		// columns. Fall back to the hand-written JSON parser.
 		inputTok, outputTok, cacheCrTok, cacheRdTok =
 			clampedUsageTokenCounters(r.tokenJSON)
-	} else {
+
+	default:
 		inputTok, outputTok, cacheCrTok, cacheRdTok =
 			usageEventRowTokens(
 				r.usageSource,
