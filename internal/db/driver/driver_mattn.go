@@ -1,9 +1,9 @@
-//go:build !moderncsqlite
-// +build !moderncsqlite
+//go:build mattnsqlite
+// +build mattnsqlite
 
 // Package driver selects the underlying SQLite driver via build
-// tags. The mattn driver (CGO) is the default; modernc.org/sqlite
-// (pure Go) takes over when the build tag `moderncsqlite` is set.
+// tags. modernc.org/sqlite (pure Go) is the default; the mattn
+// driver (CGO) takes over when the build tag `mattnsqlite` is set.
 // Call sites use DriverName to open connections so they don't
 // have to know which driver is active.
 package driver
