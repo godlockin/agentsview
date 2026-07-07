@@ -13,6 +13,8 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"go.kenn.io/agentsview/internal/db/driver"
 )
 
 // TestRealDBUsagePayload measures the JSON payload the dashboard must
@@ -26,7 +28,7 @@ func TestRealDBUsagePayload(t *testing.T) {
 	if path == "" {
 		t.Skip("set REAL_DB to the sessions.db path to run")
 	}
-	reader, err := sql.Open("sqlite3", makeDSN(path, true))
+	reader, err := sql.Open(driver.DriverName, makeDSN(path, true))
 	if err != nil {
 		t.Fatalf("open reader: %v", err)
 	}
@@ -85,7 +87,7 @@ func TestRealDBUsagePerf(t *testing.T) {
 
 	// makeDSN(path, true) sets mode=ro: this connection cannot write.
 	// No Open(), so no migrations / drops touch the archive.
-	reader, err := sql.Open("sqlite3", makeDSN(path, true))
+	reader, err := sql.Open(driver.DriverName, makeDSN(path, true))
 	if err != nil {
 		t.Fatalf("open reader: %v", err)
 	}

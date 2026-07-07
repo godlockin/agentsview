@@ -1,3 +1,6 @@
+//go:build !moderncsqlite
+// +build !moderncsqlite
+
 package db
 
 import (

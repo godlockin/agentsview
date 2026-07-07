@@ -13,6 +13,8 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"go.kenn.io/agentsview/internal/db/driver"
 )
 
 const largeSessionPerfCeiling = 10 * time.Second
@@ -383,7 +385,7 @@ func TestMigration_ThinkingTextColumn(t *testing.T) {
 
 	// Remove thinking_text via ALTER TABLE DROP COLUMN
 	// (SQLite 3.35+) to simulate a legacy schema.
-	conn, err := sql.Open("sqlite3", path)
+	conn, err := sql.Open(driver.DriverName, path)
 	require.NoError(t, err, "raw open")
 	_, err = conn.Exec(
 		`ALTER TABLE messages DROP COLUMN thinking_text`,

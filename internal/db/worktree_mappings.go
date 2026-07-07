@@ -9,7 +9,7 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/mattn/go-sqlite3"
+	"go.kenn.io/agentsview/internal/db/sqliteerr"
 	"go.kenn.io/agentsview/internal/parser"
 )
 
@@ -985,7 +985,9 @@ func (db *DB) applyWorktreeProjectMappingsToSessionsByPath(
 }
 
 func isSQLiteUniqueConstraint(err error) bool {
-	var sqliteErr sqlite3.Error
-	return errors.As(err, &sqliteErr) &&
-		sqliteErr.ExtendedCode == sqlite3.ErrConstraintUnique
+	if se, ok := sqliteerr.As(err); ok {
+		return se.ExtendedCode == sqliteerr.ErrConstraintUnique ||
+			se.Code == sqliteerr.ErrConstraintUniquePrimary
+	}
+	return false
 }

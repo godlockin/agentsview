@@ -8,11 +8,13 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"go.kenn.io/agentsview/internal/db/driver"
 )
 
 func TestExecWithoutCancelDropsTempTableWithCanceledContext(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "test.db")
-	pool, err := sql.Open("sqlite3", path)
+	pool, err := sql.Open(driver.DriverName, path)
 	require.NoError(t, err, "open sqlite")
 	defer pool.Close()
 

@@ -14,6 +14,7 @@ import (
 	"github.com/spf13/cobra"
 	"go.kenn.io/agentsview/internal/config"
 	"go.kenn.io/agentsview/internal/db"
+	"go.kenn.io/agentsview/internal/db/driver"
 	"go.kenn.io/agentsview/internal/parser"
 )
 
@@ -122,7 +123,7 @@ func inspectDoctorDB(path string) doctorDBInspection {
 		return insp
 	}
 
-	conn, err := sql.Open("sqlite3", doctorReadOnlyDSN(path))
+	conn, err := sql.Open(driver.DriverName, doctorReadOnlyDSN(path))
 	if err != nil {
 		insp.DBError = err
 		return insp

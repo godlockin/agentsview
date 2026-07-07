@@ -11,7 +11,7 @@ import (
 	"time"
 	"unicode"
 
-	_ "github.com/mattn/go-sqlite3"
+	_ "go.kenn.io/agentsview/internal/db/driver"
 )
 
 // Antigravity IDE sessions live under ~/.gemini/antigravity/:

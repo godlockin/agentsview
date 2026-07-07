@@ -14,6 +14,7 @@ import (
 	"github.com/stretchr/testify/require"
 	"go.kenn.io/agentsview/internal/config"
 	"go.kenn.io/agentsview/internal/db"
+	"go.kenn.io/agentsview/internal/db/driver"
 )
 
 func TestServeDaemonReplacementDecisionAutoReplacesOlderRelease(t *testing.T) {
@@ -586,7 +587,7 @@ func TestPrepareForegroundServeDaemonReplaceChecksTooNewDatabaseBeforeStop(t *te
 	require.NoError(t, database.Close())
 
 	futureVersion := db.CurrentDataVersion() + 10
-	conn, err := sql.Open("sqlite3", dbPath)
+	conn, err := sql.Open(driver.DriverName, dbPath)
 	require.NoError(t, err)
 	_, err = conn.Exec(fmt.Sprintf("PRAGMA user_version = %d", futureVersion))
 	require.NoError(t, err)
@@ -626,7 +627,7 @@ func TestPrepareForegroundServeDaemonReplaceChecksDatabaseEvenWithCurrentRuntime
 	require.NoError(t, database.Close())
 
 	futureVersion := db.CurrentDataVersion() + 10
-	conn, err := sql.Open("sqlite3", dbPath)
+	conn, err := sql.Open(driver.DriverName, dbPath)
 	require.NoError(t, err)
 	_, err = conn.Exec(fmt.Sprintf("PRAGMA user_version = %d", futureVersion))
 	require.NoError(t, err)
@@ -662,7 +663,7 @@ func TestPrepareForegroundServeDaemonAutoReplaceChecksTooNewDatabaseBeforeStop(t
 	require.NoError(t, database.Close())
 
 	futureVersion := db.CurrentDataVersion() + 10
-	conn, err := sql.Open("sqlite3", dbPath)
+	conn, err := sql.Open(driver.DriverName, dbPath)
 	require.NoError(t, err)
 	_, err = conn.Exec(fmt.Sprintf("PRAGMA user_version = %d", futureVersion))
 	require.NoError(t, err)

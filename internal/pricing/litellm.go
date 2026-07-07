@@ -48,7 +48,7 @@ func ParseOpenRouterPricing(data []byte) ([]ModelPricing, error) {
 // fetch contributes its rows to the merged result so
 // downstream callers see the union.
 type PricingSource struct {
-	Name string
+	Name  string
 	Fetch func() ([]ModelPricing, error)
 }
 

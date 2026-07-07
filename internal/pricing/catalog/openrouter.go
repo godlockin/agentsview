@@ -44,15 +44,15 @@ func FetchOpenRouterPricing() ([]ModelPricing, error) {
 }
 
 type openrouterEntry struct {
-	ID         string  `json:"id"`
+	ID           string `json:"id"`
 	Architecture struct {
 		Modality string `json:"modality"`
 	} `json:"architecture"`
 	Pricing struct {
-		Prompt            string `json:"prompt"`
-		Completion        string `json:"completion"`
-		InputCacheRead    string `json:"input_cache_read"`
-		InputCacheWrite   string `json:"input_cache_write"`
+		Prompt          string `json:"prompt"`
+		Completion      string `json:"completion"`
+		InputCacheRead  string `json:"input_cache_read"`
+		InputCacheWrite string `json:"input_cache_write"`
 	} `json:"pricing"`
 }
 

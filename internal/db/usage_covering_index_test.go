@@ -6,6 +6,8 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/require"
+
+	"go.kenn.io/agentsview/internal/db/driver"
 )
 
 func TestUsageCoveringIndexMigration(t *testing.T) {
@@ -20,7 +22,7 @@ func TestUsageCoveringIndexMigration(t *testing.T) {
 	requireIndexPresence(t, path, "idx_messages_usage_covering", 1)
 	requireIndexPresence(t, path, "idx_messages_usage_timestamp", 0)
 
-	conn, err := sql.Open("sqlite3", path)
+	conn, err := sql.Open(driver.DriverName, path)
 	requireNoError(t, err, "raw open")
 	_, err = conn.Exec(`DROP INDEX IF EXISTS idx_messages_usage_covering`)
 	requireNoError(t, err, "drop covering index")
@@ -45,7 +47,7 @@ func TestUsageCoveringIndexMigration(t *testing.T) {
 
 func requireIndexPresence(t *testing.T, path, name string, want int) {
 	t.Helper()
-	conn, err := sql.Open("sqlite3", path)
+	conn, err := sql.Open(driver.DriverName, path)
 	requireNoError(t, err, "raw open for index check")
 	defer conn.Close()
 

@@ -11,7 +11,7 @@ import (
 	"strconv"
 	"strings"
 
-	_ "github.com/mattn/go-sqlite3"
+	_ "go.kenn.io/agentsview/internal/db/driver"
 )
 
 const (

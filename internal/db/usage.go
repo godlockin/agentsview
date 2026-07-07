@@ -745,17 +745,17 @@ type dailyUsageScanRow struct {
 	// populated. Together they let dailyUsageAmounts avoid the
 	// hand-written JSON parser for the 70 %+ of rows that already
 	// have integers.
-	contextTokens     int
-	hasContextTokens  bool
-	msgOutputTokens   int
+	contextTokens      int
+	hasContextTokens   bool
+	msgOutputTokens    int
 	hasMsgOutputTokens bool
-	costUSD           sql.NullFloat64
-	claudeMessageID   string
-	claudeRequestID   string
-	sourceUUID        string
-	usageDedupKey     string
-	project           string
-	agent             string
+	costUSD            sql.NullFloat64
+	claudeMessageID    string
+	claudeRequestID    string
+	sourceUUID         string
+	usageDedupKey      string
+	project            string
+	agent              string
 }
 
 type topSessionMetadata struct {

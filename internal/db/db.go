@@ -16,7 +16,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	_ "github.com/mattn/go-sqlite3"
+	"go.kenn.io/agentsview/internal/db/driver"
 
 	"go.kenn.io/agentsview/internal/config"
 	"go.kenn.io/agentsview/internal/parser"
@@ -713,7 +713,7 @@ func OpenReadOnly(path string) (*DB, error) {
 		)
 	}
 
-	reader, err := sql.Open("sqlite3", makeDSN(path, true))
+	reader, err := sql.Open(driver.DriverName, makeDSN(path, true))
 	if err != nil {
 		return nil, fmt.Errorf("opening read-only reader: %w", err)
 	}
@@ -778,7 +778,7 @@ var (
 
 func readOnlyRequiredSchema() (map[string][]string, error) {
 	readOnlyRequiredSchemaOnce.Do(func() {
-		conn, err := sql.Open("sqlite3", ":memory:")
+		conn, err := sql.Open(driver.DriverName, ":memory:")
 		if err != nil {
 			readOnlyRequiredSchemaErr = fmt.Errorf(
 				"opening schema probe: %w", err,
@@ -939,7 +939,7 @@ func probeDatabase(
 			"checking database file: %w", err,
 		)
 	}
-	conn, err := sql.Open("sqlite3", makeDSN(path, true))
+	conn, err := sql.Open(driver.DriverName, makeDSN(path, true))
 	if err != nil {
 		return false, false, fmt.Errorf(
 			"probing schema: %w", err,
@@ -2120,7 +2120,7 @@ func dropDatabase(path string) error {
 }
 
 func openAndInit(path string) (*DB, error) {
-	writer, err := sql.Open("sqlite3", makeDSN(path, false))
+	writer, err := sql.Open(driver.DriverName, makeDSN(path, false))
 	if err != nil {
 		return nil, fmt.Errorf("opening writer: %w", err)
 	}
@@ -2130,7 +2130,7 @@ func openAndInit(path string) (*DB, error) {
 		return nil, fmt.Errorf("configuring wal: %w", err)
 	}
 
-	reader, err := sql.Open("sqlite3", makeDSN(path, true))
+	reader, err := sql.Open(driver.DriverName, makeDSN(path, true))
 	if err != nil {
 		writer.Close()
 		return nil, fmt.Errorf("opening reader: %w", err)
@@ -2488,7 +2488,7 @@ func (db *DB) Reopen() error {
 // so the struct never points at closed handles on failure.
 func (db *DB) reopenLocked() error {
 	writer, err := sql.Open(
-		"sqlite3", makeDSN(db.path, false),
+		driver.DriverName, makeDSN(db.path, false),
 	)
 	if err != nil {
 		return fmt.Errorf("reopening writer: %w", err)
@@ -2500,7 +2500,7 @@ func (db *DB) reopenLocked() error {
 	}
 
 	reader, err := sql.Open(
-		"sqlite3", makeDSN(db.path, true),
+		driver.DriverName, makeDSN(db.path, true),
 	)
 	if err != nil {
 		writer.Close()

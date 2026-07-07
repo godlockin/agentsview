@@ -15,8 +15,8 @@ import (
 	"strings"
 	"time"
 
-	_ "github.com/mattn/go-sqlite3"
 	"github.com/tidwall/gjson"
+	_ "go.kenn.io/agentsview/internal/db/driver"
 )
 
 type hermesStateSession struct {

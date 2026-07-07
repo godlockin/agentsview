@@ -13,6 +13,7 @@ import (
 	"github.com/stretchr/testify/require"
 	"go.kenn.io/agentsview/internal/config"
 	"go.kenn.io/agentsview/internal/db"
+	"go.kenn.io/agentsview/internal/db/driver"
 	"go.kenn.io/agentsview/internal/dbtest"
 )
 
@@ -58,7 +59,7 @@ func TestDoctorSyncStaleDatabaseReportsLikelyAbortedResync(t *testing.T) {
 	}), "insert session")
 	require.NoError(t, database.Close(), "close db")
 
-	conn, err := sql.Open("sqlite3", dbPath)
+	conn, err := sql.Open(driver.DriverName, dbPath)
 	require.NoError(t, err, "raw sqlite open")
 	_, err = conn.Exec("PRAGMA user_version = 0")
 	require.NoError(t, err, "downgrade user_version")
@@ -95,7 +96,7 @@ func TestDoctorSyncNewerDatabaseReportsRefusedStartup(t *testing.T) {
 	require.NoError(t, database.Close(), "close db")
 
 	futureVersion := db.CurrentDataVersion() + 10
-	conn, err := sql.Open("sqlite3", dbPath)
+	conn, err := sql.Open(driver.DriverName, dbPath)
 	require.NoError(t, err, "raw sqlite open")
 	_, err = conn.Exec(fmt.Sprintf("PRAGMA user_version = %d", futureVersion))
 	require.NoError(t, err, "set future user_version")

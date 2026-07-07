@@ -13,6 +13,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.kenn.io/agentsview/internal/db"
+	"go.kenn.io/agentsview/internal/db/driver"
 )
 
 func executeCommand(root *cobra.Command, args ...string) (string, error) {
@@ -155,7 +156,7 @@ func TestServeCheckDataVersionRejectsNewerDatabase(t *testing.T) {
 	require.NoError(t, database.Close(), "close db")
 
 	futureVersion := db.CurrentDataVersion() + 10
-	conn, err := sql.Open("sqlite3", dbPath)
+	conn, err := sql.Open(driver.DriverName, dbPath)
 	require.NoError(t, err, "raw sqlite open")
 	_, err = conn.Exec(fmt.Sprintf("PRAGMA user_version = %d", futureVersion))
 	require.NoError(t, err, "set future user_version")

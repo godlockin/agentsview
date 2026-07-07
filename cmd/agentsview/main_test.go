@@ -17,6 +17,7 @@ import (
 	"github.com/stretchr/testify/require"
 	"go.kenn.io/agentsview/internal/config"
 	"go.kenn.io/agentsview/internal/db"
+	"go.kenn.io/agentsview/internal/db/driver"
 	"go.kenn.io/agentsview/internal/dbtest"
 	"go.kenn.io/agentsview/internal/parser"
 	"go.kenn.io/agentsview/internal/remotesync"
@@ -464,7 +465,7 @@ func TestRemoteHostSyncFuncForcesFullWhenDatabaseNeedsResync(t *testing.T) {
 	require.NoError(t, err)
 	require.NoError(t, database.Close())
 
-	raw, err := sql.Open("sqlite3", dbPath)
+	raw, err := sql.Open(driver.DriverName, dbPath)
 	require.NoError(t, err)
 	_, err = raw.Exec("PRAGMA user_version = 0")
 	require.NoError(t, err)

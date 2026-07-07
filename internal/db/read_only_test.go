@@ -7,9 +7,10 @@ import (
 	"path/filepath"
 	"testing"
 
-	_ "github.com/mattn/go-sqlite3"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"go.kenn.io/agentsview/internal/db/driver"
 )
 
 func tempDBPath(t *testing.T, name string) string {
@@ -63,7 +64,7 @@ func openReadOnlyTestDB(t *testing.T, path string) *DB {
 
 func execRawSQLite(t *testing.T, path, query string, args ...any) {
 	t.Helper()
-	raw, err := sql.Open("sqlite3", path)
+	raw, err := sql.Open(driver.DriverName, path)
 	require.NoError(t, err)
 	_, err = raw.Exec(query, args...)
 	require.NoError(t, err)
@@ -243,7 +244,7 @@ func TestReadOnlyRequiredSchemaDerivedFromSchemaDDL(t *testing.T) {
 	required, err := readOnlyRequiredSchema()
 	require.NoError(t, err)
 
-	conn, err := sql.Open("sqlite3", ":memory:")
+	conn, err := sql.Open(driver.DriverName, ":memory:")
 	require.NoError(t, err)
 	t.Cleanup(func() { require.NoError(t, conn.Close()) })
 	_, err = conn.Exec(schemaSQL)
@@ -281,7 +282,7 @@ func readOnlyTableColumns(
 
 func openReadOnlySchemaProbe(t *testing.T) *sql.DB {
 	t.Helper()
-	conn, err := sql.Open("sqlite3", ":memory:")
+	conn, err := sql.Open(driver.DriverName, ":memory:")
 	require.NoError(t, err)
 	t.Cleanup(func() { require.NoError(t, conn.Close()) })
 	_, err = conn.Exec(schemaSQL)

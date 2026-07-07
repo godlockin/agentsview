@@ -11,11 +11,11 @@ import (
 	"strings"
 	"testing"
 
-	_ "github.com/mattn/go-sqlite3"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.kenn.io/agentsview/internal/config"
 	"go.kenn.io/agentsview/internal/db"
+	"go.kenn.io/agentsview/internal/db/driver"
 )
 
 // unreachablePGURL points at a deliberately-closed port (1) so
@@ -101,7 +101,7 @@ func seedClassifierHash(t *testing.T, cfg config.Config) {
 // deletes it).
 func classifierHashInSQLite(t *testing.T, dbPath string) string {
 	t.Helper()
-	conn, err := sql.Open("sqlite3", dbPath)
+	conn, err := sql.Open(driver.DriverName, dbPath)
 	require.NoError(t, err, "open raw sqlite")
 	defer conn.Close()
 	var v string

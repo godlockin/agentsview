@@ -23,6 +23,9 @@ import (
 	"github.com/google/go-cmp/cmp"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	_ "go.kenn.io/agentsview/internal/db/driver"
+	dbdriver "go.kenn.io/agentsview/internal/db/driver"
 )
 
 func reflectedFieldValue(v any, name string) reflect.Value {
@@ -628,7 +631,7 @@ func TestOpenDataVersionBump_PreservesData(t *testing.T) {
 	d.Close()
 
 	// Set user_version to 0 to simulate stale data version.
-	conn, err := sql.Open("sqlite3", path)
+	conn, err := sql.Open(dbdriver.DriverName, path)
 	requireNoError(t, err, "raw open")
 	_, err = conn.Exec("PRAGMA user_version = 0")
 	requireNoError(t, err, "reset version")
@@ -677,7 +680,7 @@ func TestOpenDataVersionBump_SurvivesRestart(t *testing.T) {
 	insertSession(t, d, "s1", "proj")
 	d.Close()
 
-	conn, err := sql.Open("sqlite3", path)
+	conn, err := sql.Open(dbdriver.DriverName, path)
 	requireNoError(t, err, "raw open")
 	_, err = conn.Exec("PRAGMA user_version = 0")
 	requireNoError(t, err, "reset version")
@@ -729,7 +732,7 @@ func TestMigration_ResultContentColumn(t *testing.T) {
 
 	// Remove result_content via raw SQL: recreate tool_calls
 	// without the column to simulate a legacy schema.
-	conn, err := sql.Open("sqlite3", path)
+	conn, err := sql.Open(dbdriver.DriverName, path)
 	requireNoError(t, err, "raw open")
 	_, err = conn.Exec(`
 		CREATE TABLE tool_calls_old AS
@@ -796,7 +799,7 @@ func TestMigration_ToolResultEventsTable(t *testing.T) {
 	insertSession(t, d, "s1", "proj")
 	d.Close()
 
-	conn, err := sql.Open("sqlite3", path)
+	conn, err := sql.Open(dbdriver.DriverName, path)
 	requireNoError(t, err, "raw open")
 	legacyVersion := dataVersion - 1
 	_, err = conn.Exec(fmt.Sprintf(`
@@ -960,7 +963,7 @@ func TestOpenRejectsNewerDataVersion(t *testing.T) {
 	require.Error(t, openErr, "newer database must be rejected")
 
 	var version int
-	conn, err := sql.Open("sqlite3", path)
+	conn, err := sql.Open(dbdriver.DriverName, path)
 	requireNoError(t, err, "raw sqlite open")
 	defer conn.Close()
 	err = conn.QueryRow(
@@ -4135,7 +4138,7 @@ func TestCopyOrphanedDataFrom_AtomicOnFailure(t *testing.T) {
 
 	// Corrupt source: drop the messages table so the
 	// message-copy step fails.
-	raw, err := sql.Open("sqlite3", srcPath)
+	raw, err := sql.Open(dbdriver.DriverName, srcPath)
 	requireNoError(t, err, "raw open")
 	_, err = raw.Exec("PRAGMA foreign_keys = OFF")
 	requireNoError(t, err, "disable fk")
@@ -4177,7 +4180,7 @@ func TestCopyOrphanedDataFrom_LegacyNoIsSystem(t *testing.T) {
 	srcDB.Close()
 
 	// Drop is_system via raw SQL to simulate legacy schema.
-	raw, err := sql.Open("sqlite3", srcPath)
+	raw, err := sql.Open(dbdriver.DriverName, srcPath)
 	requireNoError(t, err, "raw open")
 	// SQLite doesn't support DROP COLUMN before 3.35;
 	// recreate the table without is_system.
@@ -4552,7 +4555,7 @@ func TestCopySyncStateFrom_NoSourceTable(t *testing.T) {
 
 	// Source DB with no tables (legacy DB shape missing pg_sync_state).
 	srcPath := filepath.Join(dir, "src.db")
-	srcConn, err := sql.Open("sqlite3", srcPath)
+	srcConn, err := sql.Open(dbdriver.DriverName, srcPath)
 	require.NoError(t, err, "open src")
 	require.NoError(t, srcConn.Close(), "close src")
 
@@ -4972,7 +4975,7 @@ func TestOpenMigratesColumnsWithoutDrop(t *testing.T) {
 
 	// Create a database with the pre-branch schema: sessions
 	// table lacks display_name and deleted_at columns.
-	conn, err := sql.Open("sqlite3", makeDSN(path, false))
+	conn, err := sql.Open(dbdriver.DriverName, makeDSN(path, false))
 	requireNoError(t, err, "opening legacy db")
 	conn.SetMaxOpenConns(1)
 
@@ -5091,7 +5094,7 @@ func TestOpenBackfillsLegacyTokenCoverageFlags(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "legacy-token-flags.db")
 
-	conn, err := sql.Open("sqlite3", makeDSN(path, false))
+	conn, err := sql.Open(dbdriver.DriverName, makeDSN(path, false))
 	requireNoError(t, err, "opening legacy db")
 	conn.SetMaxOpenConns(1)
 
@@ -6147,7 +6150,7 @@ func TestMigration_TerminationStatusColumn(t *testing.T) {
 	insertSession(t, d, "s1", "proj")
 	d.Close()
 
-	conn, err := sql.Open("sqlite3", path)
+	conn, err := sql.Open(dbdriver.DriverName, path)
 	requireNoError(t, err, "raw open")
 
 	// SQLite supports DROP COLUMN as of 3.35; the in-tree driver is
