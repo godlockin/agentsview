@@ -426,3 +426,32 @@ CREATE INDEX IF NOT EXISTS idx_secret_findings_session
     ON secret_findings(session_id);
 CREATE INDEX IF NOT EXISTS idx_secret_findings_rule
     ON secret_findings(rule_name);
+
+-- daily_usage_rollup: pre-aggregated token counts by
+-- (day, agent, project, model). Populated by the sync engine
+-- after every completed sync via RecomputeRecentDailyUsage,
+-- which reruns the same UNION ALL + dedup logic that
+-- GetDailyUsage uses and UPSERTs the resulting per-day totals.
+-- Cost is not stored: pricing changes independently of tokens,
+-- and cost = tokens * rate is cheap enough to recompute at
+-- read time from the ~10^3-row rollup. This table is what
+-- lets GetDailyUsage skip the 10^5-10^6 row UNION ALL scan
+-- when the requested window is fully covered by rollups.
+CREATE TABLE IF NOT EXISTS daily_usage_rollup (
+    day                    TEXT NOT NULL,
+    agent                  TEXT NOT NULL,
+    project                TEXT NOT NULL,
+    model                  TEXT NOT NULL,
+    input_tokens           INTEGER NOT NULL DEFAULT 0,
+    output_tokens          INTEGER NOT NULL DEFAULT 0,
+    cache_creation_tokens  INTEGER NOT NULL DEFAULT 0,
+    cache_read_tokens      INTEGER NOT NULL DEFAULT 0,
+    reasoning_tokens       INTEGER NOT NULL DEFAULT 0,
+    message_count          INTEGER NOT NULL DEFAULT 0,
+    updated_at             TEXT NOT NULL
+        DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+    PRIMARY KEY (day, agent, project, model)
+);
+
+CREATE INDEX IF NOT EXISTS idx_daily_usage_rollup_day
+    ON daily_usage_rollup(day);

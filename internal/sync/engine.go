@@ -2025,10 +2025,33 @@ func (e *Engine) syncAllLocked(
 
 	if recordSyncState && providerFailures == 0 {
 		e.recordSyncFinished()
+		// Recompute the daily_usage_rollup for the trailing window
+		// so GetDailyUsage can serve dashboard reads without
+		// UNION ALL-scanning ~10^6 message/usage_event/cursor rows.
+		// Runs inline in the sync goroutine (post-persist), so it
+		// sees the rows the just-finished sync wrote. Errors are
+		// logged only — a failed rollup falls back to the live
+		// scan in GetDailyUsage, so we do not fail the sync.
+		e.recomputeDailyUsageRollup(ctx)
 	}
 	// Emission happens in SyncAll / SyncAllSince after syncMu is
 	// released; syncAllLocked runs under the caller's lock.
 	return stats
+}
+
+// recomputeDailyUsageRollup rebuilds the trailing-window entries in
+// daily_usage_rollup from the live UNION ALL scan. Skipped for
+// ephemeral engines because they have no persistent DB to serve
+// the rollup from anyway.
+func (e *Engine) recomputeDailyUsageRollup(ctx context.Context) {
+	if e.ephemeral {
+		return
+	}
+	if err := e.db.RecomputeDailyUsageRollup(
+		ctx, db.DefaultRollupRecomputeDays,
+	); err != nil {
+		log.Printf("recompute daily usage rollup: %v", err)
+	}
 }
 
 // slowProviderDiscoveryThreshold is the per-provider discovery duration above

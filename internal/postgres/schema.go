@@ -338,6 +338,24 @@ CREATE INDEX IF NOT EXISTS idx_insights_lookup
 CREATE INDEX IF NOT EXISTS idx_insights_cache
     ON insights (cache_key, created_at DESC)
     WHERE cache_key <> '';
+
+CREATE TABLE IF NOT EXISTS daily_usage_rollup (
+    day                    TEXT NOT NULL,
+    agent                  TEXT NOT NULL,
+    project                TEXT NOT NULL,
+    model                  TEXT NOT NULL,
+    input_tokens           BIGINT NOT NULL DEFAULT 0,
+    output_tokens          BIGINT NOT NULL DEFAULT 0,
+    cache_creation_tokens  BIGINT NOT NULL DEFAULT 0,
+    cache_read_tokens      BIGINT NOT NULL DEFAULT 0,
+    reasoning_tokens       BIGINT NOT NULL DEFAULT 0,
+    message_count          BIGINT NOT NULL DEFAULT 0,
+    updated_at             TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (day, agent, project, model)
+);
+
+CREATE INDEX IF NOT EXISTS idx_daily_usage_rollup_day
+    ON daily_usage_rollup (day);
 `
 
 // EnsureSchema creates the schema (if needed), then runs
