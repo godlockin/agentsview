@@ -1083,6 +1083,40 @@ func TestEnsurePricingWithFetcherSkipsFetchWithinCooldown(t *testing.T) {
 	assert.Nil(t, networkOnly, "cooldown should prevent network upsert")
 }
 
+// TestPeriodicPricingRefresh_ZeroIntervalReturnsImmediately guards
+// against a bad config value (interval <= 0) turning into a hot
+// spin loop.
+func TestPeriodicPricingRefresh_ZeroIntervalReturnsImmediately(t *testing.T) {
+	done := make(chan struct{})
+	go func() {
+		periodicPricingRefresh(context.Background(), nil, nil, 0)
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("periodicPricingRefresh did not return on interval<=0")
+	}
+}
+
+// TestPeriodicPricingRefresh_StopsOnContextCancel ensures the
+// goroutine unwinds cleanly when the server is shutting down.
+func TestPeriodicPricingRefresh_StopsOnContextCancel(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		// Long interval so the ticker never fires during the test.
+		periodicPricingRefresh(ctx, nil, nil, time.Hour)
+		close(done)
+	}()
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("periodicPricingRefresh did not stop after cancel")
+	}
+}
+
 // sampleDailyUsageJSON is a full usage summary body with a single day and
 // non-zero totals, shared by the HTTP and daemon usage tests.
 const sampleDailyUsageJSON = `{
