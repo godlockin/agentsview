@@ -84,13 +84,15 @@ func ParseOpenRouterPricing(data []byte) ([]ModelPricing, error) {
 	// an ambiguous unqualified row.
 	suffixCounts := make(map[string]int)
 	for _, e := range envelope.Data {
+		if !producesText(e.Architecture.Modality) {
+			continue
+		}
 		if bare := bareSuffix(e.ID); bare != "" && bare != e.ID {
 			suffixCounts[bare]++
 		}
 	}
 	for _, e := range envelope.Data {
-		modality := e.Architecture.Modality
-		if modality != "" && modality != "text->text" {
+		if !producesText(e.Architecture.Modality) {
 			continue
 		}
 		prompt, okPrompt := parsePricePerToken(e.Pricing.Prompt)
@@ -132,6 +134,25 @@ func bareSuffix(id string) string {
 		return ""
 	}
 	return id[i+1:]
+}
+
+// producesText reports whether an OpenRouter modality string
+// describes a model whose output is text tokens (the only
+// modality agentsview knows how to bill). Empty modality is
+// treated as text->text since OpenRouter omits the field for
+// pure text models. Multimodal inputs (text+image->text,
+// text+image+video->text) are accepted because the model still
+// bills prompt/completion in tokens and users routinely reach
+// them from agents that log a bare model name.
+func producesText(modality string) bool {
+	if modality == "" {
+		return true
+	}
+	arrow := strings.Index(modality, "->")
+	if arrow < 0 {
+		return false
+	}
+	return modality[arrow+2:] == "text"
 }
 
 // parsePricePerToken turns OpenRouter's quoted string
