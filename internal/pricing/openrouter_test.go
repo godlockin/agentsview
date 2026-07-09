@@ -39,14 +39,52 @@ func TestParseOpenRouterPricing_TextGenerationOnly(t *testing.T) {
 
 	prices, err := ParseOpenRouterPricing(body)
 	require.NoError(t, err)
-	require.Len(t, prices, 1, "only the text->text priced entry should survive")
+	require.Len(t, prices, 2,
+		"one prefixed entry plus its unique bare-suffix alias")
 
+	// Prefixed row keeps the OpenRouter id verbatim.
 	got := prices[0]
 	assert.Equal(t, "MiniMax/MiniMax-M3", got.ModelPattern)
 	assert.InDelta(t, 5.0, got.InputPerMTok, 1e-9, "input")
 	assert.InDelta(t, 25.0, got.OutputPerMTok, 1e-9, "output")
 	assert.InDelta(t, 0.5, got.CacheReadPerMTok, 1e-9, "cache_read")
 	assert.InDelta(t, 6.25, got.CacheCreationPerMTok, 1e-9, "cache_creation")
+
+	// Bare alias so sessions that record just "MiniMax-M3" resolve.
+	alias := prices[1]
+	assert.Equal(t, "MiniMax-M3", alias.ModelPattern)
+	assert.InDelta(t, 5.0, alias.InputPerMTok, 1e-9, "alias input")
+	assert.InDelta(t, 25.0, alias.OutputPerMTok, 1e-9, "alias output")
+}
+
+// TestParseOpenRouterPricing_AmbiguousBareSuffixSuppressed verifies
+// that when two OpenRouter entries share the same bare suffix
+// (e.g. two providers publishing "kimi-k2.5"), the unqualified
+// alias is NOT emitted for either, so the canonical resolver does
+// not see fabricated ambiguity from within OpenRouter itself.
+func TestParseOpenRouterPricing_AmbiguousBareSuffixSuppressed(t *testing.T) {
+	body := []byte(`{
+		"data": [
+			{
+				"id": "moonshotai/kimi-k2.5",
+				"architecture": {"modality": "text->text"},
+				"pricing": {"prompt": "0.0000006", "completion": "0.0000025"}
+			},
+			{
+				"id": "baseten/moonshotai/kimi-k2.5",
+				"architecture": {"modality": "text->text"},
+				"pricing": {"prompt": "0.0000006", "completion": "0.0000025"}
+			}
+		]
+	}`)
+
+	prices, err := ParseOpenRouterPricing(body)
+	require.NoError(t, err)
+	require.Len(t, prices, 2, "two prefixed rows, no bare alias")
+	for _, p := range prices {
+		assert.NotEqual(t, "kimi-k2.5", p.ModelPattern,
+			"bare alias must be suppressed when suffix is shared")
+	}
 }
 
 // TestMergePricing_FirstNonZeroWins verifies that when two
