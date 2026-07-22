@@ -83,6 +83,18 @@ func TestGetActivityReport_BasicConcurrency(t *testing.T) {
 	assert.GreaterOrEqual(t, len(r.ByModel), 2)
 }
 
+func TestActivityReportEmptyProjectsMapExcludesUnrelatedObservations(t *testing.T) {
+	d := testDB(t)
+	ctx := context.Background()
+	seedProjectIdentityObservation(t, d, "unrelated-project")
+
+	r, err := d.GetActivityReport(ctx, AnalyticsFilter{Timezone: "UTC"},
+		dayQuery(t, "2026-06-16", "UTC"))
+	require.NoError(t, err)
+	assert.Empty(t, r.BySession)
+	assert.Empty(t, r.Projects)
+}
+
 func TestGetActivityReport_UsageCostAndTokens(t *testing.T) {
 	d := testDB(t)
 	ctx := context.Background()
@@ -114,6 +126,173 @@ func TestGetActivityReport_UsageCostAndTokens(t *testing.T) {
 	assert.Equal(t, 500, r.Totals.OutputTokens)
 	// Cost = (1000*3 + 500*15) / 1e6 = 0.0105
 	assert.InDelta(t, 0.0105, r.Totals.Cost, 1e-9)
+}
+
+func TestGetActivityReport_CopilotReportedCostReplacesSessionEstimates(t *testing.T) {
+	d := testDB(t)
+	ctx := context.Background()
+	require.NoError(t, d.UpsertModelPricing([]ModelPricing{
+		{ModelPattern: "copilot-model-a", InputPerMTok: 10},
+		{ModelPattern: "copilot-model-b", InputPerMTok: 20},
+	}))
+	insertSession(t, d, "copilot:activity-authoritative", "proj1", func(s *Session) {
+		s.Agent = "copilot"
+		s.StartedAt = Ptr("2026-06-16T10:00:00Z")
+		s.EndedAt = Ptr("2026-06-16T10:10:00Z")
+	})
+	reportedCost := 0.03
+	require.NoError(t, d.ReplaceSessionUsageEvents(
+		"copilot:activity-authoritative",
+		[]UsageEvent{
+			{
+				Source: "shutdown", Model: "copilot-model-a",
+				InputTokens: 1_000_000,
+				OccurredAt:  "2026-06-16T10:05:00Z", DedupKey: "first",
+			},
+			{
+				Source: "shutdown", Model: "copilot-model-b",
+				InputTokens: 1_000_000,
+				CostUSD:     &reportedCost, CostStatus: "exact",
+				CostSource: CopilotReportedCostSource,
+				OccurredAt: "2026-06-16T10:10:00Z", DedupKey: "final",
+			},
+		},
+	))
+
+	r, err := d.GetActivityReport(ctx, AnalyticsFilter{Timezone: "UTC"},
+		dayQuery(t, "2026-06-16", "UTC"))
+	require.NoError(t, err)
+	assert.InDelta(t, reportedCost, r.Totals.Cost, 1e-12)
+	require.Len(t, r.BySession, 1)
+	assert.InDelta(t, reportedCost, r.BySession[0].Cost, 1e-12)
+	modelCosts := make(map[string]float64, len(r.ByModel))
+	for _, model := range r.ByModel {
+		modelCosts[model.Key] = model.Cost
+	}
+	assert.InDelta(t, 0.01, modelCosts["copilot-model-a"], 1e-12)
+	assert.InDelta(t, 0.02, modelCosts["copilot-model-b"], 1e-12)
+	assert.Equal(t, r.Totals.Cost,
+		modelCosts["copilot-model-a"]+modelCosts["copilot-model-b"])
+}
+
+func TestGetActivityReport_PricingModelsOnlyIncludeDedupSurvivors(t *testing.T) {
+	d := testDB(t)
+	ctx := context.Background()
+	require.NoError(t, d.UpsertModelPricing([]ModelPricing{
+		{
+			ModelPattern:  "kept-model",
+			InputPerMTok:  3.0,
+			OutputPerMTok: 15.0,
+		},
+		{
+			ModelPattern:  "discarded-model",
+			InputPerMTok:  3.0,
+			OutputPerMTok: 15.0,
+		},
+	}), "UpsertModelPricing")
+
+	insertSession(t, d, "earlier", "proj1", func(s *Session) {
+		s.Agent = "claude"
+		s.StartedAt = Ptr("2026-06-16T10:30:00Z")
+		s.EndedAt = Ptr("2026-06-16T10:30:00Z")
+	})
+	insertMessages(t, d, Message{
+		SessionID: "earlier", Ordinal: 0, Role: "assistant", Content: "x",
+		Timestamp:       "2026-06-16T10:30:00Z",
+		Model:           "kept-model",
+		ClaudeMessageID: "m-dup", ClaudeRequestID: "r-dup",
+		TokenUsage: json.RawMessage(`{"input_tokens":1000,"output_tokens":500}`),
+	})
+	insertSession(t, d, "later", "proj1", func(s *Session) {
+		s.Agent = "claude"
+		s.StartedAt = Ptr("2026-06-16T10:31:00Z")
+		s.EndedAt = Ptr("2026-06-16T10:31:00Z")
+	})
+	insertMessages(t, d, Message{
+		SessionID: "later", Ordinal: 0, Role: "assistant", Content: "x",
+		Timestamp:       "2026-06-16T10:31:00Z",
+		Model:           "discarded-model",
+		ClaudeMessageID: "m-dup", ClaudeRequestID: "r-dup",
+		TokenUsage: json.RawMessage(`{"input_tokens":2000,"output_tokens":900}`),
+	})
+
+	r, err := d.GetActivityReport(ctx, AnalyticsFilter{Timezone: "UTC"},
+		dayQuery(t, "2026-06-16", "UTC"))
+	require.NoError(t, err)
+	assert.Equal(t, 500, r.Totals.OutputTokens)
+	require.NotNil(t, r.Pricing)
+	assert.Contains(t, r.Pricing.Models, "kept-model")
+	assert.NotContains(t, r.Pricing.Models, "discarded-model")
+}
+
+// TestGetActivityReport_IncludesSubagentUsage confirms subagent and fork
+// sessions are candidates so their usage lands in the totals, keeping the
+// activity cost consistent with GetDailyUsage (which never filters by
+// relationship_type). A fork whose only usage row replays the root's
+// Claude ids contributes a session row but no extra cost: the aggregator's
+// first-seen dedup collapses the duplicate, the same guarantee
+// GetDailyUsage relies on.
+func TestGetActivityReport_IncludesSubagentUsage(t *testing.T) {
+	d := testDB(t)
+	ctx := context.Background()
+	require.NoError(t, d.UpsertModelPricing([]ModelPricing{
+		{ModelPattern: "root-model", InputPerMTok: 3.0, OutputPerMTok: 15.0},
+		{ModelPattern: "sub-model", InputPerMTok: 3.0, OutputPerMTok: 15.0},
+	}), "UpsertModelPricing")
+
+	insertSession(t, d, "root", "proj1", func(s *Session) {
+		s.Agent = "claude"
+		s.StartedAt = Ptr("2026-06-16T10:00:00Z")
+		s.EndedAt = Ptr("2026-06-16T10:10:00Z")
+	})
+	insertMessages(t, d, Message{
+		SessionID: "root", Ordinal: 0, Role: "assistant", Content: "x",
+		Timestamp: "2026-06-16T10:00:00Z", Model: "root-model",
+		ClaudeMessageID: "m-root", ClaudeRequestID: "r-root",
+		TokenUsage: json.RawMessage(`{"input_tokens":1000,"output_tokens":500}`),
+	})
+	insertSession(t, d, "agent-sub", "proj1", func(s *Session) {
+		s.Agent = "claude"
+		s.ParentSessionID = Ptr("root")
+		s.RelationshipType = "subagent"
+		s.StartedAt = Ptr("2026-06-16T10:02:00Z")
+		s.EndedAt = Ptr("2026-06-16T10:04:00Z")
+	})
+	insertMessages(t, d, Message{
+		SessionID: "agent-sub", Ordinal: 0, Role: "assistant", Content: "y",
+		Timestamp: "2026-06-16T10:03:00Z", Model: "sub-model",
+		ClaudeMessageID: "m-sub", ClaudeRequestID: "r-sub",
+		TokenUsage: json.RawMessage(`{"input_tokens":2000,"output_tokens":700}`),
+	})
+	// Fork replaying the root's message: same Claude ids, so the dedup
+	// must drop its usage row while the session itself still appears.
+	insertSession(t, d, "fork", "proj1", func(s *Session) {
+		s.Agent = "claude"
+		s.ParentSessionID = Ptr("root")
+		s.RelationshipType = "fork"
+		s.StartedAt = Ptr("2026-06-16T10:05:00Z")
+		s.EndedAt = Ptr("2026-06-16T10:06:00Z")
+	})
+	insertMessages(t, d, Message{
+		SessionID: "fork", Ordinal: 0, Role: "assistant", Content: "x",
+		Timestamp: "2026-06-16T10:05:00Z", Model: "root-model",
+		ClaudeMessageID: "m-root", ClaudeRequestID: "r-root",
+		TokenUsage: json.RawMessage(`{"input_tokens":1000,"output_tokens":500}`),
+	})
+
+	r, err := d.GetActivityReport(ctx, AnalyticsFilter{Timezone: "UTC"},
+		dayQuery(t, "2026-06-16", "UTC"))
+	require.NoError(t, err)
+	ids := reportSessionIDs(r.BySession)
+	assert.Contains(t, ids, "root")
+	assert.Contains(t, ids, "agent-sub",
+		"subagent session must be a candidate")
+	assert.Contains(t, ids, "fork", "fork session must be a candidate")
+	assert.Equal(t, 1200, r.Totals.OutputTokens,
+		"totals include subagent usage; the fork's replayed row dedups away")
+	// Cost = root (1000*3+500*15)/1e6 + subagent (2000*3+700*15)/1e6; the
+	// fork's duplicate row contributes nothing.
+	assert.InDelta(t, 0.0105+0.0165, r.Totals.Cost, 1e-9)
 }
 
 // TestGetActivityReport_ExcludesOtherDays confirms the candidate-session
@@ -466,6 +645,26 @@ func TestGetActivityReport_TitleSkipsEmptyDisplayName(t *testing.T) {
 	require.Len(t, r.BySession, 1)
 	assert.Equal(t, "real-session-name", r.BySession[0].Title,
 		"empty display_name must not mask the real session_name")
+}
+
+func TestGetActivityReport_TitleNeverFallsBackToFirstMessage(t *testing.T) {
+	d := testDB(t)
+	ctx := context.Background()
+	insertSession(t, d, "private-title", "safe-project", func(s *Session) {
+		s.Agent = "claude"
+		s.FirstMessage = Ptr("distinctive private prompt sentinel")
+		s.StartedAt = Ptr("2026-06-16T10:00:00Z")
+		s.EndedAt = Ptr("2026-06-16T10:02:00Z")
+	})
+	seedMessage(t, d, "private-title", 1, "user", "2026-06-16T10:00:00Z", "")
+	seedMessage(t, d, "private-title", 2, "assistant", "2026-06-16T10:02:00Z", "opus")
+
+	r, err := d.GetActivityReport(ctx, AnalyticsFilter{Timezone: "UTC"},
+		dayQuery(t, "2026-06-16", "UTC"))
+	require.NoError(t, err)
+	require.Len(t, r.BySession, 1)
+	assert.Equal(t, "safe-project", r.BySession[0].Title)
+	assert.NotContains(t, r.BySession[0].Title, "private prompt sentinel")
 }
 
 // TestGetActivityReport_OpenSessionWithInRangeMessageIncluded confirms a

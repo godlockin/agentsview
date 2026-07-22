@@ -4,6 +4,7 @@ import {
   agentColor,
   agentForeground,
   agentLabel,
+  entrypointBadge,
 } from "./agents.js";
 
 describe("KNOWN_AGENTS", () => {
@@ -14,6 +15,7 @@ describe("KNOWN_AGENTS", () => {
       "cowork",
       "codex",
       "copilot",
+      "devin",
       "gemini",
       "opencode",
       "openhands",
@@ -37,10 +39,13 @@ describe("KNOWN_AGENTS", () => {
       "kiro-ide",
       "cortex",
       "workbuddy",
+      "qoder",
       "piebald",
       "antigravity",
       "antigravity-cli",
       "vibe",
+      "posit-assistant",
+      "roocode",
     ]);
   });
 
@@ -61,6 +66,9 @@ describe("agentColor", () => {
     );
     expect(agentColor("copilot")).toBe(
       "var(--accent-amber)",
+    );
+    expect(agentColor("devin")).toBe(
+      "var(--accent-red)",
     );
     expect(agentColor("gemini")).toBe(
       "var(--accent-rose)",
@@ -110,6 +118,9 @@ describe("agentColor", () => {
     expect(agentColor("piebald")).toBe(
       "var(--accent-orange)",
     );
+    expect(agentColor("roocode")).toBe(
+      "var(--accent-rose)",
+    );
   });
 
   it("falls back to blue for unknown agents", () => {
@@ -147,7 +158,25 @@ describe("agentForeground", () => {
   });
 });
 
+describe("entrypointBadge", () => {
+	it("shows non-default entrypoints and hides the default cli value", () => {
+		expect(entrypointBadge("sdk-cli")).toBe("sdk-cli");
+		expect(entrypointBadge(" sdk-cli ")).toBe("sdk-cli");
+		expect(entrypointBadge("cli")).toBeNull();
+		expect(entrypointBadge(" cli ")).toBeNull();
+		expect(entrypointBadge("")).toBeNull();
+		expect(entrypointBadge("   ")).toBeNull();
+		expect(entrypointBadge(null)).toBeNull();
+		expect(entrypointBadge(undefined)).toBeNull();
+	});
+});
+
 describe("agentLabel", () => {
+	it("uses a non-empty raw session override and ignores whitespace-only values", () => {
+		expect(agentLabel("claude", "triage")).toBe("triage");
+		expect(agentLabel("claude", " triage ")).toBe(" triage ");
+		expect(agentLabel("claude", "   ")).toBe("Claude");
+	});
   it("returns explicit labels for hyphenated agents", () => {
     expect(agentLabel("vscode-copilot")).toBe(
       "VS Code Copilot",
@@ -156,6 +185,7 @@ describe("agentLabel", () => {
       "Visual Studio Copilot",
     );
     expect(agentLabel("openhands")).toBe("OpenHands");
+    expect(agentLabel("devin")).toBe("Devin");
     expect(agentLabel("openclaw")).toBe("OpenClaw");
     expect(agentLabel("qclaw")).toBe("QClaw");
     expect(agentLabel("iflow")).toBe("iFlow");
@@ -165,6 +195,8 @@ describe("agentLabel", () => {
     expect(agentLabel("qwen")).toBe("Qwen Code");
     expect(agentLabel("qwenpaw")).toBe("QwenPaw");
     expect(agentLabel("deepseek-tui")).toBe("DeepSeek TUI");
+    expect(agentLabel("qoder")).toBe("Qoder");
+    expect(agentLabel("roocode")).toBe("RooCode");
   });
 
   it("capitalizes simple agent names", () => {

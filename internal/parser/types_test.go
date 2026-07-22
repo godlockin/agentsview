@@ -229,6 +229,7 @@ func TestAgentByType(t *testing.T) {
 		{AgentVSCodeCopilot, true},
 		{AgentPi, true},
 		{AgentOMP, true},
+		{AgentDevin, true},
 		{AgentDeepSeekTUI, true},
 		{"unknown", false},
 	}
@@ -333,6 +334,12 @@ func TestAgentByPrefix(t *testing.T) {
 			true,
 		},
 		{
+			"devin prefix",
+			"devin:session-id",
+			AgentDevin,
+			true,
+		},
+		{
 			"zed prefix",
 			"zed:sess-id",
 			AgentZed,
@@ -357,6 +364,12 @@ func TestAgentByPrefix(t *testing.T) {
 			"deepseek tui prefix",
 			"deepseek-tui:sess-id",
 			AgentDeepSeekTUI,
+			true,
+		},
+		{
+			"qoder prefix",
+			"qoder:sess-id",
+			AgentQoder,
 			true,
 		},
 		{
@@ -410,6 +423,8 @@ func TestRegistryCompleteness(t *testing.T) {
 		AgentCursor,
 		AgentAmp,
 		AgentVSCodeCopilot,
+		AgentWindsurf,
+		AgentTrae,
 		AgentVSCopilot,
 		AgentPi,
 		AgentOMP,
@@ -425,10 +440,14 @@ func TestRegistryCompleteness(t *testing.T) {
 		AgentKiroIDE,
 		AgentCortex,
 		AgentHermes,
+		AgentGrok,
 		AgentForge,
+		AgentDevin,
 		AgentPiebald,
 		AgentWarp,
 		AgentPositron,
+		AgentPositAssistant,
+		AgentZCode,
 		AgentZed,
 		AgentAntigravity,
 		AgentAntigravityCLI,
@@ -437,11 +456,13 @@ func TestRegistryCompleteness(t *testing.T) {
 		AgentWorkBuddy,
 		AgentZencoder,
 		AgentGptme,
+		AgentQoder,
 		AgentQwenPaw,
 		AgentShelley,
 		AgentVibe,
 		AgentAider,
 		AgentReasonix,
+		AgentRooCode,
 	}
 
 	expected := make(map[AgentType]bool, len(allTypes))
@@ -578,6 +599,17 @@ func TestZedRegistryEntry(t *testing.T) {
 	assert.Equal(t, "zed:", def.IDPrefix)
 }
 
+func TestZCodeRegistryEntry(t *testing.T) {
+	def, ok := AgentByType(AgentZCode)
+	require.True(t, ok, "AgentZCode missing from Registry")
+	require.False(t, def.FileBased, "ZCode FileBased")
+	assert.Equal(t, "ZCODE_DIR", def.EnvVar)
+	assert.Equal(t, "zcode_dirs", def.ConfigKey)
+	assert.Equal(t, []string{".zcode/cli/db", ".zcode/cli"}, def.DefaultDirs)
+	assert.Equal(t, "zcode:", def.IDPrefix)
+	assert.True(t, def.Usage.NoPerMessageTokenData)
+}
+
 func TestShelleyRegistryEntry(t *testing.T) {
 	def, ok := AgentByType(AgentShelley)
 	require.True(t, ok, "AgentShelley missing from Registry")
@@ -651,6 +683,20 @@ func TestCommandCodeRegistryEntry(t *testing.T) {
 	require.True(t, def.FileBased, "Command Code FileBased")
 	assert.Equal(t, []string{".commandcode/projects"}, def.DefaultDirs)
 	assert.Equal(t, "commandcode:", def.IDPrefix)
+}
+
+func TestDevinRegistryEntry(t *testing.T) {
+	def, ok := AgentByType(AgentDevin)
+	require.True(t, ok, "AgentDevin missing from Registry")
+	require.False(t, def.FileBased, "Devin FileBased")
+	assert.Equal(t, "Devin", def.DisplayName)
+	assert.Equal(t, "DEVIN_DIR", def.EnvVar)
+	assert.Equal(t, "devin_dirs", def.ConfigKey)
+	assert.Equal(t, []string{
+		"Library/Application Support/devin",
+		".local/share/devin",
+	}, def.DefaultDirs)
+	assert.Equal(t, "devin:", def.IDPrefix)
 }
 
 func TestDeepSeekTUIRegistryEntry(t *testing.T) {
@@ -1047,6 +1093,12 @@ func TestAgentByPrefixRemote(t *testing.T) {
 			true,
 		},
 		{
+			"remote devin",
+			"devbox1~devin:session-id",
+			AgentDevin,
+			true,
+		},
+		{
 			"remote gemini",
 			"myhost~gemini:sess-id",
 			AgentGemini,
@@ -1105,6 +1157,35 @@ func TestVSCodeCopilotDefaultDirs(t *testing.T) {
 		assert.Truef(t, slices.Contains(def.DefaultDirs, path),
 			"missing default dir: %s", path)
 	}
+}
+
+func TestWindsurfRegistryEntry(t *testing.T) {
+	def, ok := AgentByType(AgentWindsurf)
+	require.True(t, ok, "AgentWindsurf not in Registry")
+
+	assert.Equal(t, "Windsurf", def.DisplayName)
+	assert.Equal(t, "WINDSURF_DIR", def.EnvVar)
+	assert.Equal(t, "windsurf_dirs", def.ConfigKey)
+	assert.Equal(t, "windsurf:", def.IDPrefix)
+	assert.True(t, def.FileBased)
+	assert.Contains(t, def.WatchSubdirs, "workspaceStorage")
+
+	required := []string{
+		"AppData/Roaming/Windsurf/User",
+		"AppData/Roaming/Windsurf - Next/User",
+		"Library/Application Support/Windsurf/User",
+		"Library/Application Support/Windsurf - Next/User",
+		".config/Windsurf/User",
+		".config/Windsurf - Next/User",
+	}
+	for _, path := range required {
+		assert.Truef(t, slices.Contains(def.DefaultDirs, path),
+			"missing default dir: %s", path)
+	}
+
+	byPrefix, ok := AgentByPrefix("windsurf:session-a")
+	require.True(t, ok)
+	assert.Equal(t, AgentWindsurf, byPrefix.Type)
 }
 
 func TestApplyUsageEventTokenTotals(t *testing.T) {

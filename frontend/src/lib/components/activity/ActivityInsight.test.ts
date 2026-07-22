@@ -23,7 +23,11 @@ const mocks = vi.hoisted(() => ({
 vi.mock("../../api/generated/index", () => ({
   InsightsService: { getApiV1Insights: mocks.getInsights },
 }));
-vi.mock("../../api/runtime.js", () => ({ configureGeneratedClient: vi.fn() }));
+vi.mock("../../api/runtime.js", () => ({
+  configureGeneratedClient: vi.fn(),
+  callGenerated: vi.fn((request: () => Promise<unknown>) => request()),
+  isAbortError: vi.fn(() => false),
+}));
 vi.mock("../../api/client.js", () => ({
   generateInsight: mocks.generateInsight,
 }));
@@ -53,7 +57,19 @@ vi.mock("../../stores/router.svelte.js", () => ({
 
 import ActivityInsight from "./ActivityInsight.svelte";
 
+// jsdom has no ResizeObserver; the kit-ui Typeahead observes its open
+// option list to keep the fixed-position popover placed correctly.
+class ResizeObserverMock {
+  observe = vi.fn();
+  disconnect = vi.fn();
+}
+
 beforeEach(() => {
+  Object.defineProperty(globalThis, "ResizeObserver", {
+    configurable: true,
+    writable: true,
+    value: ResizeObserverMock,
+  });
   for (const m of Object.values(mocks)) {
     if (typeof m === "function") m.mockReset();
   }

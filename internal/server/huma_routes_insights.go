@@ -202,8 +202,29 @@ func (s *Server) humaGenerateInsight(
 		return nil, apiError(http.StatusBadRequest,
 			"invalid type: must be daily_activity, agent_analysis, or llm_canned")
 	}
+	if req.SessionID != "" && req.Type != "agent_analysis" {
+		return nil, apiError(http.StatusBadRequest,
+			"session_id is only supported for agent_analysis")
+	}
 	if req.Type == insight.CannedType {
 		return s.humaGenerateCannedInsight(req)
+	}
+	if req.SessionID != "" {
+		session, err := s.db.GetSession(ctx, req.SessionID)
+		if err != nil {
+			return nil, serverError(err)
+		}
+		if session == nil {
+			return nil, apiError(http.StatusNotFound, "session not found")
+		}
+		date := insightSessionDate(session)
+		if req.DateFrom == "" && date != "" {
+			req.DateFrom = date
+		}
+		if req.DateTo == "" && date != "" {
+			req.DateTo = date
+		}
+		req.Project = session.Project
 	}
 	if !timeutil.IsValidDate(req.DateFrom) {
 		return nil, apiError(http.StatusBadRequest,
@@ -253,6 +274,7 @@ func (s *Server) humaGenerateInsight(
 			DateTo:         req.DateTo,
 			Project:        req.Project,
 			Prompt:         req.Prompt,
+			SessionID:      req.SessionID,
 			AutomatedScope: req.AutomatedScope,
 		}
 		// Attach the activity summary for any valid range, single day
@@ -433,6 +455,29 @@ func (s *Server) humaGenerateInsight(
 	}}, nil
 }
 
+func insightSessionDate(session *db.Session) string {
+	if session == nil {
+		return ""
+	}
+	for _, ts := range []string{
+		insightStringValue(session.StartedAt),
+		insightStringValue(session.EndedAt),
+		session.CreatedAt,
+	} {
+		if len(ts) >= len("2006-01-02") {
+			return ts[:10]
+		}
+	}
+	return ""
+}
+
+func insightStringValue(s *string) string {
+	if s == nil {
+		return ""
+	}
+	return *s
+}
+
 // activityRangeSummary resolves the requested range into an activity report and
 // condenses it into a RangeSummary for the insight prompt. The range spans the
 // local days [DateFrom, DateTo] in req.Timezone (empty means UTC): the bounds
@@ -440,10 +485,10 @@ func (s *Server) humaGenerateInsight(
 // derived from, so a non-UTC viewer's summary covers the window the dashboard
 // shows rather than a UTC-shifted one. It applies the same automated-session
 // scope as BuildPrompt's session list so the summary reflects the same work the
-// prompt focuses on; the two otherwise select sessions differently (this uses
-// the activity report's half-open window with an ended_at fallback, BuildPrompt
-// uses ListSessions' calendar-date match on the start date), so the summary is a
-// range-level overview, not a row-for-row mirror of BuildPrompt's session list.
+// prompt focuses on. Both use session activity windows instead of start dates,
+// including the latest-message fallback for open sessions. The report resolves
+// its bounds in the requested timezone, so it remains a range-level overview
+// rather than a row-for-row mirror of BuildPrompt's UTC calendar-date filter.
 func (s *Server) activityRangeSummary(
 	ctx context.Context, req generateInsightRequest,
 ) (*insight.RangeSummary, error) {

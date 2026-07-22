@@ -1,7 +1,7 @@
 <script lang="ts">
+  import { Typeahead } from "@kenn-io/kit-ui";
   import { m } from "../../i18n/index.js";
   import type { ProjectInfo } from "../../api/types/core.js";
-  import OptionTypeahead from "./OptionTypeahead.svelte";
 
   interface Props {
     projects: ProjectInfo[];
@@ -19,12 +19,15 @@
   };
 
   const options = $derived.by(() => {
-    const items = projects.map((p) => ({
-      name: p.name,
-      label: `${p.name} (${p.session_count})`,
-      displayLabel: p.name,
-      count: p.session_count,
-    }));
+    // An empty-name project would duplicate the all-projects key, and "" already means unfiltered.
+    const items = projects
+      .filter((p) => p.name !== "")
+      .map((p) => ({
+        name: p.name,
+        label: `${p.name} (${p.session_count})`,
+        displayLabel: p.name,
+        count: p.session_count,
+      }));
     return [allOption, ...items];
   });
 
@@ -33,7 +36,7 @@
   );
 </script>
 
-<OptionTypeahead
+<Typeahead
   {options}
   {value}
   fallbackLabel={displayValue}

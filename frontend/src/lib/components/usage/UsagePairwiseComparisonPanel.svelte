@@ -1,7 +1,5 @@
 <script lang="ts">
-  import OptionTypeahead, {
-    type TypeaheadOption,
-  } from "../layout/OptionTypeahead.svelte";
+  import { Card, Typeahead, type TypeaheadOption } from "@kenn-io/kit-ui";
   import { usage } from "../../stores/usage.svelte.js";
   import { m } from "../../i18n/index.js";
   import type { UsagePairwiseDimension } from "../../api/types/usage.js";
@@ -77,7 +75,9 @@
   ): TypeaheadOption[] {
     return optionsFor(dimension).map((option) => ({
       name: option,
-      label: option,
+      label: dimension === "project"
+        ? usage.pairwiseProjectLabel(option)
+        : option,
     }));
   }
 
@@ -177,13 +177,13 @@
   </div>
 
   <div class="selectors">
-    <div class="side">
+    <Card level="default" padding="none" class="side">
       <span class="side-label">{m.usage_pairwise_left()}</span>
       <div class="side-controls">
         <label>
           <span>{m.usage_pairwise_dimension()}</span>
           <div class="pairwise-typeahead">
-            <OptionTypeahead
+            <Typeahead
               options={dimensionOptions}
               value={usage.pairwiseSelection.left.dimension}
               fallbackLabel={dimensionLabel(usage.pairwiseSelection.left.dimension)}
@@ -201,7 +201,7 @@
         <label>
           <span>{m.usage_pairwise_value()}</span>
           <div class="pairwise-typeahead">
-            <OptionTypeahead
+            <Typeahead
               options={typeaheadOptionsFor(usage.pairwiseSelection.left.dimension)}
               value={usage.pairwiseSelection.left.value}
               fallbackLabel={usage.pairwiseSelection.left.value || m.usage_pairwise_select_value()}
@@ -217,15 +217,15 @@
           </div>
         </label>
       </div>
-    </div>
+    </Card>
 
-    <div class="side">
+    <Card level="default" padding="none" class="side">
       <span class="side-label">{m.usage_pairwise_right()}</span>
       <div class="side-controls">
         <label>
           <span>{m.usage_pairwise_dimension()}</span>
           <div class="pairwise-typeahead">
-            <OptionTypeahead
+            <Typeahead
               options={dimensionOptions}
               value={usage.pairwiseSelection.right.dimension}
               fallbackLabel={dimensionLabel(usage.pairwiseSelection.right.dimension)}
@@ -243,7 +243,7 @@
         <label>
           <span>{m.usage_pairwise_value()}</span>
           <div class="pairwise-typeahead">
-            <OptionTypeahead
+            <Typeahead
               options={typeaheadOptionsFor(usage.pairwiseSelection.right.dimension)}
               value={usage.pairwiseSelection.right.value}
               fallbackLabel={usage.pairwiseSelection.right.value || m.usage_pairwise_select_value()}
@@ -259,22 +259,22 @@
           </div>
         </label>
       </div>
-    </div>
+    </Card>
   </div>
 
   {#if usage.errors.pairwise}
-    <div class="error-bar">
+    <Card level="default" padding="none" class="error-bar">
       <span>{usage.errors.pairwise}</span>
       <button class="retry-btn" onclick={() => usage.fetchAll()}>
         {m.shared_retry()}
       </button>
-    </div>
+    </Card>
   {:else if !hasSelection}
-    <div class="empty-state">
+    <Card level="default" padding="none" class="pairwise-note">
       {m.usage_pairwise_not_enough_data()}
-    </div>
+    </Card>
   {:else if usage.loading.pairwise && rows.length === 0}
-    <div class="empty-state">{m.shared_refresh()}</div>
+    <Card level="default" padding="none" class="pairwise-note">{m.shared_refresh()}</Card>
   {:else if rows.length > 0}
     <div class="table-wrap">
       <table>
@@ -341,11 +341,8 @@
     gap: 12px;
   }
 
-  .side {
+  .selectors :global(.side) {
     padding: 12px;
-    border: 1px solid var(--border-muted);
-    border-radius: var(--radius-md);
-    background: color-mix(in srgb, var(--bg-surface) 92%, transparent);
   }
 
   .side-label {
@@ -361,7 +358,7 @@
   .side-controls {
     display: grid;
     grid-template-columns: repeat(2, minmax(0, 1fr));
-    gap: 10px;
+    gap: var(--space-5);
   }
 
   label {
@@ -374,9 +371,8 @@
 
   .pairwise-typeahead {
     min-width: 0;
-  }
-
-  .pairwise-typeahead :global(.typeahead) {
+    /* Custom properties inherit into the child kit-ui .kit-typeahead, so the
+       trigger fills its label column instead of kit-ui's default 180-300px. */
     --typeahead-min-width: 100%;
     --typeahead-max-width: 100%;
   }
@@ -423,22 +419,24 @@
     font-size: 11px;
   }
 
-  .empty-state,
-  .error-bar {
+  .pairwise-panel :global(.pairwise-note) {
     padding: 12px;
-    border: 1px solid var(--border-muted);
-    border-radius: var(--radius-md);
-    background: var(--bg-surface);
     color: var(--text-muted);
     font-size: 12px;
   }
 
-  .error-bar {
+  .pairwise-panel :global(.error-bar) {
     display: flex;
     align-items: center;
     gap: 8px;
+    padding: 12px;
     border-color: var(--accent-red);
     color: var(--accent-red);
+    font-size: 12px;
+  }
+
+  .pairwise-panel :global(.error-bar > .kit-card__body) {
+    display: contents;
   }
 
   .retry-btn {
@@ -455,7 +453,7 @@
     color: var(--accent-red-foreground);
   }
 
-  @media (max-width: 800px) {
+  @media (max-width: 760px) {
     .selectors,
     .side-controls {
       grid-template-columns: 1fr;

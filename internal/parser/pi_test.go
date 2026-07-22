@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -123,6 +124,76 @@ func TestPiProviderParsesSessionInfoLastNameWins(t *testing.T) {
 	sess, _ := runPiParserTest(t, content)
 
 	assert.Equal(t, "Final name", sess.SessionName)
+}
+
+// TestPiProviderParsesOMPTitleSlot verifies that OMP's fixed-width title
+// slot line before the session header is skipped and its title becomes the
+// session name (issue #959: OMP v16.3+ session files start with the slot,
+// not the session header).
+func TestPiProviderParsesOMPTitleSlot(t *testing.T) {
+	content := strings.Join([]string{
+		`{"type":"title","v":1,"title":"Build Bloom filter research artifact","source":"auto","updatedAt":"2026-07-03T06:32:44.479Z","pad":"    "}`,
+		`{"type":"session","version":3,"id":"omp-sess","timestamp":"2026-07-03T06:30:58.508Z","cwd":"/Users/alice/code/my-project","title":"Follow PROJECT.md instructions","titleSource":"auto"}`,
+		`{"type":"model_change","id":"mc-1","parentId":null,"timestamp":"2026-07-03T06:30:58.610Z","model":"anthropic/claude-opus-4-8"}`,
+		`{"type":"thinking_level_change","id":"tl-1","parentId":"mc-1","timestamp":"2026-07-03T06:30:58.611Z","thinkingLevel":"high"}`,
+		`{"type":"message","id":"msg-1","parentId":"tl-1","timestamp":"2026-07-03T06:31:00.000Z","message":{"role":"user","content":[{"type":"text","text":"hello"}]}}`,
+		`{"type":"message","id":"msg-2","parentId":"msg-1","timestamp":"2026-07-03T06:31:05.000Z","message":{"role":"assistant","content":[{"type":"text","text":"hi"}],"model":"claude-opus-4-8","usage":{"input":2,"output":4}}}`,
+		"",
+	}, "\n")
+
+	sess, msgs := runPiParserTest(t, content)
+
+	assert.Equal(t, "pi:omp-sess", sess.ID)
+	assert.Equal(t, "/Users/alice/code/my-project", sess.Cwd)
+	assert.Equal(t, "Build Bloom filter research artifact", sess.SessionName,
+		"title slot title should become the session name")
+	assert.Equal(t, 2, sess.MessageCount,
+		"the title slot must not count as a message")
+	require.Len(t, msgs, 2)
+	assert.Equal(t, "hello", sess.FirstMessage)
+}
+
+// TestPiProviderParsesOMPHeaderTitleFallback verifies that when the title
+// slot is empty (session not yet titled) the header's auto-generated title
+// is used instead.
+func TestPiProviderParsesOMPHeaderTitleFallback(t *testing.T) {
+	content := strings.Join([]string{
+		`{"type":"title","v":1,"title":"","updatedAt":"2026-07-03T06:30:58.508Z","pad":"    "}`,
+		`{"type":"session","version":3,"id":"omp-sess","timestamp":"2026-07-03T06:30:58.508Z","cwd":"/Users/alice/code/my-project","title":"Header auto title","titleSource":"auto"}`,
+		`{"type":"message","id":"msg-1","parentId":null,"timestamp":"2026-07-03T06:31:00.000Z","message":{"role":"user","content":"hello"}}`,
+		"",
+	}, "\n")
+
+	sess, _ := runPiParserTest(t, content)
+
+	assert.Equal(t, "Header auto title", sess.SessionName)
+}
+
+// TestPiProviderParsesOMPTitleSlotWinsOverSessionInfo pins the title
+// precedence: the slot is rewritten in place and always holds the current
+// title, so it outranks session_info renames and the header title.
+func TestPiProviderParsesOMPTitleSlotWinsOverSessionInfo(t *testing.T) {
+	content := strings.Join([]string{
+		`{"type":"title","v":1,"title":"Slot title","source":"user","updatedAt":"2026-07-03T06:32:00.000Z","pad":" "}`,
+		`{"type":"session","version":3,"id":"omp-sess","timestamp":"2026-07-03T06:30:58.508Z","cwd":"/Users/alice/code/my-project","title":"Header title"}`,
+		`{"type":"session_info","id":"info-1","parentId":null,"timestamp":"2026-07-03T06:31:00.000Z","name":"Info name"}`,
+		`{"type":"message","id":"msg-1","parentId":"info-1","timestamp":"2026-07-03T06:31:01.000Z","message":{"role":"user","content":"hello"}}`,
+		"",
+	}, "\n")
+
+	sess, _ := runPiParserTest(t, content)
+
+	assert.Equal(t, "Slot title", sess.SessionName)
+}
+
+// TestPiProviderParsesOMPTitleSlotWithoutHeader verifies that a file with
+// only a title slot and no session header is still rejected.
+func TestPiProviderParsesOMPTitleSlotWithoutHeader(t *testing.T) {
+	path := createTestFile(t, "pi-session.jsonl",
+		`{"type":"title","v":1,"title":"orphan","updatedAt":"2026-07-03T06:30:58.508Z","pad":" "}`+"\n")
+	_, _, err := parsePiTestSession(t, path, "my_project", "local")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "not a pi session")
 }
 
 // TestPiProviderParsesUserMessages verifies user message content and ordinals
@@ -379,6 +450,179 @@ func TestPiProviderParsesBranchedFrom(t *testing.T) {
 			"PRSR-10: basename of branchedFrom without .jsonl extension, prefixed",
 		)
 	})
+}
+
+// parsePiLikeTestSession parses content as the given pi-family agent
+// (AgentPi or AgentOMP) so tests can exercise provider-specific header
+// handling such as OMP's parentSession branch lineage. The project is
+// hard-coded so callers need not deal with cwd extraction.
+func parsePiLikeTestSession(
+	t *testing.T, agent AgentType, content string,
+) (*ParsedSession, []ParsedMessage) {
+	t.Helper()
+	path := createTestFile(t, "pilike-session.jsonl", content)
+	provider, ok := NewProvider(agent, ProviderConfig{
+		Roots:   []string{filepath.Dir(filepath.Dir(path))},
+		Machine: "local",
+	})
+	require.True(t, ok)
+	outcome, err := provider.Parse(context.Background(), ParseRequest{
+		Source: SourceRef{
+			Provider:       agent,
+			Key:            path,
+			DisplayPath:    path,
+			FingerprintKey: path,
+			ProjectHint:    "my_project",
+			Opaque: JSONLSource{
+				Root: filepath.Dir(filepath.Dir(path)),
+				Path: path,
+			},
+		},
+		Machine: "local",
+	})
+	require.NoError(t, err)
+	require.Len(t, outcome.Results, 1)
+	result := outcome.Results[0].Result
+	return &result.Session, result.Messages
+}
+
+// TestPiProviderParsesOMPParentSession verifies OMP (Oh My Pi) branch
+// lineage (kata 9nz9): OMP v3 headers record the parent as parentSession,
+// a session ID, rather than pi's branchedFrom, a file path. parentSession
+// is mapped to ParentSessionID with the agent's ID prefix, but only as a
+// fallback -- branchedFrom keeps winning when present, and upstream pi
+// sessions ignore parentSession entirely.
+func TestPiProviderParsesOMPParentSession(t *testing.T) {
+	const ts = `"timestamp":"2026-07-03T06:30:58.508Z"`
+	tests := []struct {
+		name    string
+		agent   AgentType
+		header  string
+		wantPSI string
+	}{
+		{
+			name:    "OMP parentSession only is mapped and prefixed",
+			agent:   AgentOMP,
+			header:  `{"type":"session","version":3,"id":"child",` + ts + `,"cwd":"/repos/x","parentSession":"parent-abc"}`,
+			wantPSI: "omp:parent-abc",
+		},
+		{
+			name:    "OMP branchedFrom wins over parentSession",
+			agent:   AgentOMP,
+			header:  `{"type":"session","version":3,"id":"child",` + ts + `,"cwd":"/repos/x","branchedFrom":"/data/2026-07-03T06-00-00-000Z_parent-file.jsonl","parentSession":"parent-abc"}`,
+			wantPSI: "omp:2026-07-03T06-00-00-000Z_parent-file",
+		},
+		{
+			name:    "OMP with neither field yields empty parent",
+			agent:   AgentOMP,
+			header:  `{"type":"session","version":3,"id":"child",` + ts + `,"cwd":"/repos/x"}`,
+			wantPSI: "",
+		},
+		{
+			name:    "pi ignores parentSession (branchedFrom-only lineage)",
+			agent:   AgentPi,
+			header:  `{"type":"session","version":3,"id":"child",` + ts + `,"cwd":"/repos/x","parentSession":"parent-abc"}`,
+			wantPSI: "",
+		},
+		{
+			name:    "pi branchedFrom still maps unchanged",
+			agent:   AgentPi,
+			header:  `{"type":"session","version":3,"id":"child",` + ts + `,"cwd":"/repos/x","branchedFrom":"/data/2026-07-03T06-00-00-000Z_parent-file.jsonl"}`,
+			wantPSI: "pi:2026-07-03T06-00-00-000Z_parent-file",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			content := strings.Join([]string{
+				tt.header,
+				`{"type":"message","id":"msg-1","parentId":null,"timestamp":"2026-07-03T06:31:00.000Z","message":{"role":"user","content":"hello"}}`,
+				"",
+			}, "\n")
+			sess, _ := parsePiLikeTestSession(t, tt.agent, content)
+			assert.Equal(t, tt.wantPSI, sess.ParentSessionID)
+		})
+	}
+}
+
+// TestPiProviderOMPParentSessionMatchesParentID proves the mapped
+// ParentSessionID resolves: a child OMP session's parentSession header
+// (the parent's raw session ID) maps to exactly the stored ID of the
+// parent session, so lineage links up rather than dangling.
+func TestPiProviderOMPParentSessionMatchesParentID(t *testing.T) {
+	parentContent := strings.Join([]string{
+		`{"type":"session","version":3,"id":"parent-abc","timestamp":"2026-07-03T06:00:00.000Z","cwd":"/repos/x"}`,
+		`{"type":"message","id":"p1","parentId":null,"timestamp":"2026-07-03T06:00:01.000Z","message":{"role":"user","content":"root"}}`,
+		"",
+	}, "\n")
+	childContent := strings.Join([]string{
+		`{"type":"session","version":3,"id":"child-def","timestamp":"2026-07-03T06:30:00.000Z","cwd":"/repos/x","parentSession":"parent-abc"}`,
+		`{"type":"message","id":"c1","parentId":null,"timestamp":"2026-07-03T06:30:01.000Z","message":{"role":"user","content":"branch"}}`,
+		"",
+	}, "\n")
+
+	parent, _ := parsePiLikeTestSession(t, AgentOMP, parentContent)
+	child, _ := parsePiLikeTestSession(t, AgentOMP, childContent)
+
+	assert.Equal(t, "omp:parent-abc", parent.ID)
+	assert.Equal(t, "omp:child-def", child.ID)
+	assert.Equal(t, parent.ID, child.ParentSessionID,
+		"child parentSession must map to the parent's stored session ID")
+}
+
+func TestPiProviderOMPSubagentUsesV1ParentFilenameID(t *testing.T) {
+	root := t.TempDir()
+	projectDir := filepath.Join(root, "project")
+	parentPath := filepath.Join(projectDir, "parent-v1.jsonl")
+	childDir := filepath.Join(projectDir, "parent-v1")
+	childPath := filepath.Join(childDir, "agent-worker.jsonl")
+	require.NoError(t, os.MkdirAll(childDir, 0o755))
+	require.NoError(t, os.WriteFile(parentPath, []byte(strings.Join([]string{
+		`{"type":"session","version":1,"timestamp":"2026-07-03T06:00:00.000Z","cwd":"/repos/x"}`,
+		`{"type":"message","timestamp":"2026-07-03T06:00:01.000Z","message":{"role":"user","content":"root"}}`,
+		"",
+	}, "\n")), 0o644))
+	require.NoError(t, os.WriteFile(childPath, []byte(strings.Join([]string{
+		`{"type":"session","version":3,"id":"child-def","timestamp":"2026-07-03T06:30:00.000Z","cwd":"/repos/x"}`,
+		`{"type":"message","id":"c1","parentId":null,"timestamp":"2026-07-03T06:30:01.000Z","message":{"role":"user","content":"branch"}}`,
+		"",
+	}, "\n")), 0o644))
+
+	child, _, err := parsePiLikeSession(childPath, "my_project", "local", AgentOMP, "omp:")
+	require.NoError(t, err)
+
+	assert.Equal(t, "omp:child-def", child.ID)
+	assert.Equal(t, "omp:parent-v1", child.ParentSessionID)
+	assert.Equal(t, RelSubagent, child.RelationshipType)
+}
+
+func TestPiProviderOMPSubagentFollowsSymlinkedParent(t *testing.T) {
+	root := t.TempDir()
+	projectDir := filepath.Join(root, "project")
+	realParent := filepath.Join(root, "real-parent.jsonl")
+	parentLink := filepath.Join(projectDir, "linked-parent.jsonl")
+	childDir := filepath.Join(projectDir, "linked-parent")
+	childPath := filepath.Join(childDir, "agent-worker.jsonl")
+	require.NoError(t, os.MkdirAll(childDir, 0o755))
+	require.NoError(t, os.WriteFile(realParent, []byte(strings.Join([]string{
+		`{"type":"session","version":3,"id":"real-parent-id","timestamp":"2026-07-03T06:00:00.000Z","cwd":"/repos/x"}`,
+		`{"type":"message","id":"p1","parentId":null,"timestamp":"2026-07-03T06:00:01.000Z","message":{"role":"user","content":"root"}}`,
+		"",
+	}, "\n")), 0o644))
+	if err := os.Symlink(realParent, parentLink); err != nil {
+		t.Skipf("symlink not supported: %v", err)
+	}
+	require.NoError(t, os.WriteFile(childPath, []byte(strings.Join([]string{
+		`{"type":"session","version":3,"id":"child-def","timestamp":"2026-07-03T06:30:00.000Z","cwd":"/repos/x"}`,
+		`{"type":"message","id":"c1","parentId":null,"timestamp":"2026-07-03T06:30:01.000Z","message":{"role":"user","content":"branch"}}`,
+		"",
+	}, "\n")), 0o644))
+
+	child, _, err := parsePiLikeSession(childPath, "my_project", "local", AgentOMP, "omp:")
+	require.NoError(t, err)
+
+	assert.Equal(t, "omp:child-def", child.ID)
+	assert.Equal(t, "omp:real-parent-id", child.ParentSessionID)
+	assert.Equal(t, RelSubagent, child.RelationshipType)
 }
 
 func TestParsePiSession_MessageLineageContinuity(t *testing.T) {

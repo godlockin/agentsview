@@ -9,6 +9,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"os"
 	"regexp"
 	"sort"
 	"strings"
@@ -24,9 +26,23 @@ import (
 // Compile-time check: *Store satisfies db.Store.
 var _ db.Store = (*Store)(nil)
 
-// Store wraps a DuckDB connection for read-mostly serve mode.
+// Store wraps a DuckDB connection for read-mostly serve mode. path and
+// handleMu support live reopening after a mirror rebuild swaps in a new
+// file (see WatchMirrorReplacement in mirror_watch.go): handleMu guards
+// duck, fileInfo, and aliasPath so an in-flight query never observes a
+// handle mid-swap. path is empty for NewStoreFromDB and remote/Quack
+// stores, which have no local file to watch. aliasPath is the hardlink
+// (<base>.reopen-N inside the mirror's work directory) that duck is
+// actually opened against once the Store has reopened at least once (see
+// openMirrorAlias); it is "" for the original connection NewStore opens
+// directly on path.
 type Store struct {
-	duck           *sql.DB
+	path      string
+	handleMu  sync.RWMutex
+	duck      *sql.DB
+	fileInfo  os.FileInfo
+	aliasPath string
+
 	quack          *quackClient
 	connectionKind duckDBConnectionKind
 	cursorMu       sync.RWMutex
@@ -34,34 +50,83 @@ type Store struct {
 	customPricing  map[string]config.CustomModelRate
 }
 
-// NewStore opens a local DuckDB mirror file as a db.Store.
+// NewStore opens a local DuckDB mirror file as a db.Store. The handle is
+// read-only, so a serving Store coexists with other read-only opens (other
+// serve processes, push probes) and never blocks a push's probe; the Store's
+// db.Store surface is read-only anyway (see ReadOnly).
+//
+// The file identity is captured BEFORE the mirror is opened, matching
+// checkMirrorReplacement's stat-then-open order. If a rebuild swaps the
+// file inside the stat/open window, the connection serves the new
+// generation while fileInfo still describes the old one, so the
+// replacement watcher fires once and reopens onto the file it is already
+// serving — a harmless extra reopen. The reverse order inverts the race:
+// the connection serves the old generation while fileInfo describes the
+// new one, so the watcher never sees a change and the Store serves stale
+// data until the next rebuild.
 func NewStore(path string) (*Store, error) {
-	conn, err := Open(path)
+	info, err := os.Stat(path)
+	if err != nil {
+		return nil, fmt.Errorf("statting duckdb mirror %s: %w", path, err)
+	}
+	PrimeFileIdentity(info)
+	conn, err := OpenReadOnly(path)
 	if err != nil {
 		return nil, err
 	}
-	return &Store{duck: conn}, nil
+	return &Store{path: path, duck: conn, fileInfo: info}, nil
 }
 
 // NewStoreFromDB wraps an existing DuckDB connection.
 func NewStoreFromDB(conn *sql.DB) *Store { return &Store{duck: conn} }
 
-func (s *Store) DB() *sql.DB { return s.duck }
+// DB returns the current handle under a read lock. Callers that hold onto
+// the returned *sql.DB across a mirror replacement keep using the old
+// handle until they call DB() again; this is acceptable for the existing
+// callers, which only use DB() once at startup for compat checks.
+func (s *Store) DB() *sql.DB {
+	s.handleMu.RLock()
+	defer s.handleMu.RUnlock()
+	return s.duck
+}
 
-func (s *Store) Close() error { return s.duck.Close() }
+func (s *Store) Close() error {
+	s.handleMu.Lock()
+	defer s.handleMu.Unlock()
+	err := s.duck.Close()
+	removeMirrorAlias(s.aliasPath)
+	return err
+}
 
+// queryContext runs a read query against the current handle. The read
+// lock is held across the query START, not just a handle snapshot: a
+// snapshot taken under a released lock could be Close()d by
+// WatchMirrorReplacement's swapHandle before QueryContext begins,
+// surfacing as intermittent "sql: database is closed" errors during
+// mirror adoption. Once QueryContext returns, the *sql.Rows holds a
+// checked-out connection that database/sql keeps alive across DB.Close
+// (busy connections are only closed when returned to the pool), so
+// iterating the rows after the lock is released is safe. The quack-remote
+// path performs an HTTP round trip under this read lock; that is
+// acceptable because replacement swaps only occur for local mirrors.
 func (s *Store) queryContext(
 	ctx context.Context, query string, args ...any,
 ) (*sql.Rows, error) {
+	s.handleMu.RLock()
+	defer s.handleMu.RUnlock()
 	return queryDuckDBContext(ctx, s.duck, s.connectionKind, s.quack, query, args...)
 }
 
+// queryRowContext holds the read lock across the query start for the same
+// reason as queryContext. sql.DB.QueryRowContext executes the query
+// eagerly (the returned row only carries the already-fetched result), so
+// releasing the lock before Scan is safe.
 func (s *Store) queryRowContext(
 	ctx context.Context, query string, args ...any,
 ) interface{ Scan(...any) error } {
-	return queryDuckDBRowContext(
-		ctx, s.duck, s.connectionKind, s.quack, query, args...,
-	)
+	s.handleMu.RLock()
+	defer s.handleMu.RUnlock()
+	return queryDuckDBRowContext(ctx, s.duck, s.connectionKind, s.quack, query, args...)
 }
 
 func queryDuckDBContext(
@@ -138,7 +203,54 @@ func (s *Store) SetCursorSecret(secret []byte) {
 
 func (s *Store) ReadOnly() bool { return true }
 
+func (s *Store) ListRecallEntries(
+	_ context.Context, _ db.RecallQuery,
+) ([]db.RecallEntry, error) {
+	return nil, db.ErrReadOnly
+}
+
+func (s *Store) GetRecallEntry(
+	_ context.Context, _ string,
+) (*db.RecallEntry, error) {
+	return nil, db.ErrReadOnly
+}
+
+func (s *Store) QueryRecallEntries(
+	_ context.Context, _ db.RecallQuery,
+) (db.RecallPage, error) {
+	return db.RecallPage{}, db.ErrReadOnly
+}
+
+func (s *Store) RecordRecallQueryEvent(
+	_ context.Context, _ db.RecallQueryEvent,
+) (string, error) {
+	return "", db.ErrReadOnly
+}
+
+func (s *Store) InsertRecallEntry(_ db.RecallEntry) (string, error) {
+	return "", db.ErrReadOnly
+}
+
+func (s *Store) ImportAcceptedRecallEntriesJSONL(
+	_ context.Context, _ io.Reader,
+) (db.RecallImportResult, error) {
+	return db.RecallImportResult{}, db.ErrReadOnly
+}
+
+func (s *Store) ImportAcceptedRecallEntriesJSONLWithOptions(
+	_ context.Context, _ io.Reader, _ db.RecallImportOptions,
+) (db.RecallImportResult, error) {
+	return db.RecallImportResult{}, db.ErrReadOnly
+}
+
+func (s *Store) IngestEvalTrajectory(
+	_ context.Context, _ db.EvalTrajectoryIngest,
+) (db.EvalTrajectoryIngestResult, error) {
+	return db.EvalTrajectoryIngestResult{}, db.ErrReadOnly
+}
+
 const duckSessionCols = `id, project, machine, agent,
+	agent_label, entrypoint,
 	first_message, COALESCE(display_name, session_name) AS display_name, created_at, started_at,
 	ended_at, message_count, user_message_count,
 	parent_session_id, relationship_type,
@@ -161,7 +273,7 @@ const duckSessionCols = `id, project, machine, agent,
 	cwd, git_branch, source_session_id, source_version, transcript_fidelity,
 	parser_malformed_lines, is_truncated,
 	secret_leak_count, secrets_rules_version,
-	deleted_at, termination_status`
+	deleted_at, termination_status, transcript_revision`
 
 func scanSession(rs interface{ Scan(...any) error }) (db.Session, error) {
 	var s db.Session
@@ -169,6 +281,7 @@ func scanSession(rs interface{ Scan(...any) error }) (db.Session, error) {
 	var startedAt, endedAt, deletedAt any
 	err := rs.Scan(
 		&s.ID, &s.Project, &s.Machine, &s.Agent,
+		&s.AgentLabel, &s.Entrypoint,
 		&s.FirstMessage, &s.DisplayName,
 		&createdAt, &startedAt, &endedAt,
 		&s.MessageCount, &s.UserMessageCount,
@@ -194,7 +307,7 @@ func scanSession(rs interface{ Scan(...any) error }) (db.Session, error) {
 		&s.SourceSessionID, &s.SourceVersion, &s.TranscriptFidelity,
 		&s.ParserMalformedLines, &s.IsTruncated,
 		&s.SecretLeakCount, &s.SecretsRulesVersion,
-		&deletedAt, &s.TerminationStatus,
+		&deletedAt, &s.TerminationStatus, &s.TranscriptRevision,
 	)
 	if err != nil {
 		return s, err
@@ -397,6 +510,8 @@ func (s *Store) GetSidebarSessionIndex(ctx context.Context, f db.SessionFilter) 
 			project,
 			machine,
 			agent,
+			agent_label,
+			entrypoint,
 			COALESCE(display_name, session_name) AS display_name,
 			started_at,
 			ended_at,
@@ -404,6 +519,7 @@ func (s *Store) GetSidebarSessionIndex(ctx context.Context, f db.SessionFilter) 
 			termination_status,
 			message_count,
 			user_message_count,
+			transcript_revision,
 			is_automated,
 			position('<teammate-message' in COALESCE(first_message, '')) > 0
 		FROM sessions
@@ -432,6 +548,8 @@ func (s *Store) GetSidebarSessionIndex(ctx context.Context, f db.SessionFilter) 
 			&row.Project,
 			&row.Machine,
 			&row.Agent,
+			&row.AgentLabel,
+			&row.Entrypoint,
 			&row.DisplayName,
 			&startedAt,
 			&endedAt,
@@ -439,6 +557,7 @@ func (s *Store) GetSidebarSessionIndex(ctx context.Context, f db.SessionFilter) 
 			&row.TerminationStatus,
 			&row.MessageCount,
 			&row.UserMessageCount,
+			&row.TranscriptRevision,
 			&row.IsAutomated,
 			&row.IsTeammate,
 		); err != nil {
@@ -586,6 +705,28 @@ func (s *Store) GetProjects(ctx context.Context, excludeOneShot, excludeAutomate
 	return out, rows.Err()
 }
 
+func (s *Store) GetActiveProjectLabels(ctx context.Context) ([]string, error) {
+	rows, err := s.queryContext(ctx,
+		`SELECT DISTINCT project
+		 FROM sessions
+		 WHERE deleted_at IS NULL
+		 ORDER BY project`)
+	if err != nil {
+		return nil, fmt.Errorf("querying active project labels: %w", err)
+	}
+	defer rows.Close()
+
+	var labels []string
+	for rows.Next() {
+		var label string
+		if err := rows.Scan(&label); err != nil {
+			return nil, fmt.Errorf("scanning active project label: %w", err)
+		}
+		labels = append(labels, label)
+	}
+	return labels, rows.Err()
+}
+
 func (s *Store) GetAgents(ctx context.Context, excludeOneShot, excludeAutomated bool) ([]db.AgentInfo, error) {
 	rows, err := s.queryContext(ctx,
 		`SELECT agent, COUNT(*) FROM sessions WHERE agent <> '' AND `+
@@ -629,7 +770,7 @@ func (s *Store) GetMachines(ctx context.Context, excludeOneShot, excludeAutomate
 }
 
 func (s *Store) GetBranches(ctx context.Context, excludeOneShot, excludeAutomated bool) ([]db.BranchInfo, error) {
-	rows, err := s.duck.QueryContext(ctx,
+	rows, err := s.queryContext(ctx,
 		`SELECT DISTINCT project, git_branch FROM sessions WHERE `+
 			rootSessionWhere(excludeOneShot, excludeAutomated)+
 			` ORDER BY project, git_branch`,
@@ -668,6 +809,11 @@ func rootSessionWhere(excludeOneShot, excludeAutomated bool) string {
 }
 
 func (s *Store) HasFTS() bool { return true }
+
+// HasSemantic returns false: the DuckDB store has no VectorSearcher seam
+// yet, so SearchContent rejects "semantic"/"hybrid" modes up front with
+// db.ErrSemanticUnavailable.
+func (s *Store) HasSemantic() bool { return false }
 
 func (s *Store) Search(ctx context.Context, f db.SearchFilter) (db.SearchPage, error) {
 	if f.Limit <= 0 || f.Limit > db.MaxSearchLimit {
@@ -857,6 +1003,28 @@ func (s *Store) SearchContent(ctx context.Context, f db.ContentSearchFilter) (db
 	if f.Pattern == "" {
 		return db.ContentSearchPage{}, nil
 	}
+
+	// Semantic and hybrid validate Sources themselves (messages only) ahead
+	// of the substring/regex/fts source-set default just below, which fills
+	// in tool_input/tool_result that neither mode supports -- mirroring
+	// internal/db's SearchContent so an empty Sources field is not defaulted
+	// out from under ValidateSemanticFilter's empty-or-messages-only check.
+	if f.Mode == "semantic" || f.Mode == "hybrid" {
+		// Validate input the same way SQLite's semantic/hybrid paths do
+		// before reporting the capability gate: an invalid request (bad
+		// cursor, non-messages source) must return the same 400
+		// SearchInputError on every backend rather than a 501 here and a
+		// 400 on SQLite (backend parity, see AGENTS.md).
+		if err := db.ValidateSemanticFilter(f); err != nil {
+			return db.ContentSearchPage{}, err
+		}
+		// No VectorSearcher seam on the DuckDB store yet (HasSemantic always
+		// false): gate after input validation.
+		return db.ContentSearchPage{}, db.NewSemanticUnavailableError(
+			"semantic search is not supported by the DuckDB backend",
+		)
+	}
+
 	if len(f.Sources) == 0 {
 		f.Sources = []string{"messages", "tool_input", "tool_result"}
 	}
@@ -882,6 +1050,12 @@ func (s *Store) SearchContent(ctx context.Context, f db.ContentSearchFilter) (db
 	if len(matches) > f.Limit {
 		page.Matches = matches[:f.Limit]
 		page.NextCursor = f.Cursor + f.Limit
+	}
+	// Post-truncation derivation, O(page): every lexical match gets its
+	// conversation-unit OrdinalRange and lineage fields via the shared
+	// batched pass, matching the SQLite and PG backends.
+	if err := s.deriveLexicalUnitsDuck(ctx, page.Matches); err != nil {
+		return db.ContentSearchPage{}, err
 	}
 	return page, nil
 }
@@ -953,7 +1127,7 @@ func (s *Store) collectContentSubstringMatches(
 			branches = append(branches, `
 				SELECT m.session_id, s.project, s.agent, 'message' AS location,
 					m.role, '' AS tool_name, m.ordinal,
-					COALESCE(CAST(m.timestamp AS TEXT), '') AS ts,
+					m.timestamp AS ts,
 					m.content AS body,
 					COALESCE(s.ended_at, s.started_at, s.created_at) AS sort_ts,
 					0 AS src, COALESCE(m.id, 0) AS row_id,
@@ -967,7 +1141,7 @@ func (s *Store) collectContentSubstringMatches(
 			branches = append(branches, `
 				SELECT tc.session_id, s.project, s.agent, 'tool_input' AS location,
 					'assistant' AS role, tc.tool_name, m.ordinal,
-					COALESCE(CAST(m.timestamp AS TEXT), '') AS ts,
+					m.timestamp AS ts,
 					tc.input_json AS body,
 					COALESCE(s.ended_at, s.started_at, s.created_at) AS sort_ts,
 					1 AS src, COALESCE(tc.id, 0) AS row_id,
@@ -982,7 +1156,7 @@ func (s *Store) collectContentSubstringMatches(
 			branches = append(branches, `
 					SELECT tc.session_id, s.project, s.agent, 'tool_result' AS location,
 						'assistant' AS role, tc.tool_name, m.ordinal,
-						COALESCE(CAST(m.timestamp AS TEXT), '') AS ts,
+						m.timestamp AS ts,
 						tc.result_content AS body,
 						COALESCE(s.ended_at, s.started_at, s.created_at) AS sort_ts,
 						2 AS src, COALESCE(tc.id, 0) AS row_id,
@@ -1003,7 +1177,7 @@ func (s *Store) collectContentSubstringMatches(
 					SELECT tre.session_id, s.project, s.agent, 'tool_result' AS location,
 						'assistant' AS role, '' AS tool_name,
 						tre.tool_call_message_ordinal AS ordinal,
-						COALESCE(CAST(tre.timestamp AS TEXT), '') AS ts,
+						tre.timestamp AS ts,
 						tre.content AS body,
 						COALESCE(s.ended_at, s.started_at, s.created_at) AS sort_ts,
 						3 AS src, COALESCE(tre.id, 0) AS row_id,
@@ -1173,7 +1347,7 @@ func (s *Store) collectContentSource(
 	switch source {
 	case "messages":
 		query = `SELECT m.session_id, s.project, s.agent, 'message',
-			m.role, '', m.ordinal, COALESCE(CAST(m.timestamp AS TEXT), ''),
+			m.role, '', m.ordinal, m.timestamp,
 			m.content,
 			COALESCE(s.ended_at, s.started_at, s.created_at) AS sort_ts,
 			0 AS src, COALESCE(m.id, 0) AS row_id,
@@ -1190,7 +1364,7 @@ func (s *Store) collectContentSource(
 		orderBy = "m.session_id, m.ordinal, COALESCE(m.id, 0)"
 	case "tool_input":
 		query = `SELECT tc.session_id, s.project, s.agent, 'tool_input',
-				'assistant', tc.tool_name, m.ordinal, COALESCE(CAST(m.timestamp AS TEXT), ''),
+				'assistant', tc.tool_name, m.ordinal, m.timestamp,
 				COALESCE(tc.input_json, ''),
 				COALESCE(s.ended_at, s.started_at, s.created_at) AS sort_ts,
 				1 AS src, COALESCE(tc.id, 0) AS row_id,
@@ -1217,7 +1391,7 @@ func (s *Store) collectContentSource(
 				FROM (
 					SELECT tc.session_id, s.project, s.agent, 'tool_result' AS location,
 						'assistant' AS role, tc.tool_name, m.ordinal,
-						COALESCE(CAST(m.timestamp AS TEXT), '') AS ts,
+						m.timestamp AS ts,
 						COALESCE(tc.result_content, '') AS body,
 						COALESCE(s.ended_at, s.started_at, s.created_at) AS sort_ts,
 						2 AS src,
@@ -1238,7 +1412,7 @@ func (s *Store) collectContentSource(
 					SELECT tre.session_id, s.project, s.agent, 'tool_result' AS location,
 						'assistant' AS role, '' AS tool_name,
 						tre.tool_call_message_ordinal AS ordinal,
-						COALESCE(CAST(tre.timestamp AS TEXT), '') AS ts,
+						tre.timestamp AS ts,
 						tre.content AS body,
 						COALESCE(s.ended_at, s.started_at, s.created_at) AS sort_ts,
 						3 AS src,
@@ -1283,11 +1457,13 @@ func scanDuckContentRows(rows *sql.Rows, makeSnippet func(string) string) ([]db.
 	for rows.Next() {
 		var m db.ContentMatch
 		var body string
+		var ts any
 		if err := rows.Scan(&m.SessionID, &m.Project, &m.Agent,
 			&m.Location, &m.Role, &m.ToolName, &m.Ordinal,
-			&m.Timestamp, &body); err != nil {
+			&ts, &body); err != nil {
 			return nil, err
 		}
+		m.Timestamp = formatDBTime(ts)
 		m.Snippet = makeSnippet(body)
 		out = append(out, m)
 	}
@@ -1300,16 +1476,18 @@ func scanDuckContentCandidateRows(rows *sql.Rows) ([]duckContentCandidate, error
 	for rows.Next() {
 		var candidate duckContentCandidate
 		var sortTS any
+		var ts any
 		if err := rows.Scan(
 			&candidate.match.SessionID, &candidate.match.Project,
 			&candidate.match.Agent, &candidate.match.Location,
 			&candidate.match.Role, &candidate.match.ToolName,
-			&candidate.match.Ordinal, &candidate.match.Timestamp,
+			&candidate.match.Ordinal, &ts,
 			&candidate.body, &sortTS, &candidate.sourceRank,
 			&candidate.rowID, &candidate.callIndex, &candidate.eventIndex,
 		); err != nil {
 			return nil, err
 		}
+		candidate.match.Timestamp = formatDBTime(ts)
 		candidate.sortTS = formatDBTime(sortTS)
 		candidate.sortTime, candidate.hasSort = parseAnalyticsTime(candidate.sortTS)
 		candidate.match.Snippet = candidate.body

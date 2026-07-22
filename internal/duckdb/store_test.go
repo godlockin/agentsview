@@ -18,7 +18,9 @@ import (
 
 	"go.kenn.io/agentsview/internal/config"
 	"go.kenn.io/agentsview/internal/db"
+	"go.kenn.io/agentsview/internal/export"
 	pricingpkg "go.kenn.io/agentsview/internal/pricing"
+	"go.kenn.io/agentsview/internal/service"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -192,7 +194,7 @@ func TestStoreGetStatsPreservesRootAndScopeFilters(t *testing.T) {
 	ctx := context.Background()
 	local := newLocalDB(t)
 	syncer := newInMemoryTestSync(t, local, SyncOptions{})
-	require.NoError(t, syncer.EnsureSchema(ctx))
+	require.NoError(t, createSchema(ctx, syncer.DB()))
 	duck := syncer.DB()
 	store := NewStoreFromDB(duck)
 
@@ -284,6 +286,12 @@ func TestStoreGetStatsPreservesRootAndScopeFilters(t *testing.T) {
 		"exclude one-shot and automated", true, true, 1, 2, 1,
 		"2026-01-01T00:00:00Z",
 	)
+
+	labels, err := store.GetActiveProjectLabels(ctx)
+	require.NoError(t, err)
+	assert.Equal(t, []string{
+		"alpha", "beta", "bot", "child", "empty", "fork",
+	}, labels)
 }
 
 func TestStoreMessageIDJoinsAreSessionScoped(t *testing.T) {
@@ -415,7 +423,8 @@ func TestSearchContentFTSMatchesNonContiguousTerms(t *testing.T) {
 	require.NoError(t, err)
 
 	syncer := newInMemoryTestSync(t, local, SyncOptions{})
-	_, err = syncer.Push(ctx, true, nil)
+	require.NoError(t, createSchema(ctx, syncer.DB()))
+	_, err = syncer.pushEverything(ctx, nil)
 	require.NoError(t, err)
 	store := NewStoreFromDB(syncer.DB())
 
@@ -431,6 +440,175 @@ func TestSearchContentFTSMatchesNonContiguousTerms(t *testing.T) {
 	assert.Equal(t, "duck-fts-both", got.Matches[0].SessionID)
 	assert.Contains(t, got.Matches[0].Snippet, "quick")
 	assert.Contains(t, got.Matches[0].Snippet, "fox")
+}
+
+// TestSearchContentMatchTimestampIsRFC3339 pins the wire format of
+// ContentMatch.Timestamp for the DuckDB (quack) read backend. The mirror
+// stores message and tool_result_events timestamps as a DuckDB TIMESTAMP
+// column; the search-content queries used to project that column via
+// COALESCE(CAST(m.timestamp AS TEXT), the empty string), which DuckDB renders SQL-style
+// ("2026-03-22 10:15:30", space-separated, no zone) rather than
+// RFC3339/RFC3339Nano. Callers (e.g. the CLI's AGE column and the
+// PostgreSQL/SQLite backends via FormatISO8601) expect RFC3339Nano UTC, so
+// every source branch (messages, tool_input, tool_result via tool_calls, and
+// tool_result via tool_result_events) must format the raw timestamp the same
+// way formatDBTime already does for session timestamps.
+func TestSearchContentMatchTimestampIsRFC3339(t *testing.T) {
+	ctx := context.Background()
+	local := newLocalDB(t)
+	sessionID := "duck-ts-format"
+	msgTS := "2026-03-22T10:15:30.000Z"
+	toolTS := "2026-03-22T10:15:31.000Z"
+	eventTS := "2026-03-22T10:15:32.000Z"
+	wantMsg, err := time.Parse(time.RFC3339Nano, msgTS)
+	require.NoError(t, err)
+	wantTool, err := time.Parse(time.RFC3339Nano, toolTS)
+	require.NoError(t, err)
+	wantEvent, err := time.Parse(time.RFC3339Nano, eventTS)
+	require.NoError(t, err)
+
+	// call0 has no ToolUseID, so it always surfaces via the tc.result_content
+	// branch (the tool_result_events exclusion only fires when tc.tool_use_id
+	// is non-empty and matches an event). call1 has a ToolUseID matching a
+	// ResultEvent, so it is excluded from the tc.result_content branch and
+	// instead surfaces via the tool_result_events branch, which reads the
+	// event's own timestamp rather than the owning message's.
+	call0 := db.ToolCall{
+		CallIndex:     0,
+		ToolName:      "shell",
+		InputJSON:     `{"cmd":"timestampneedle-input"}`,
+		ResultContent: "timestampneedle-toolresult",
+	}
+	call1 := db.ToolCall{
+		CallIndex:     1,
+		ToolName:      "shell",
+		ToolUseID:     "evt-1",
+		ResultContent: "no-match-here",
+		ResultEvents: []db.ToolResultEvent{{
+			ToolUseID:     "evt-1",
+			Source:        "test",
+			Status:        "success",
+			Content:       "timestampneedle-event",
+			ContentLength: len("timestampneedle-event"),
+			Timestamp:     eventTS,
+			EventIndex:    0,
+		}},
+	}
+	msg0 := syncMessage(sessionID, 0, "user", "timestampneedle-message", msgTS)
+	msg1 := syncMessage(sessionID, 1, "assistant", "reply", toolTS, call0, call1)
+
+	_, err = local.WriteSessionBatchAtomic([]db.SessionBatchWrite{{
+		Session:         syncSession(sessionID, "alpha", "first", msgTS, 2),
+		Messages:        []db.Message{msg0, msg1},
+		DataVersion:     1,
+		ReplaceMessages: true,
+	}})
+	require.NoError(t, err)
+
+	syncer := newInMemoryTestSync(t, local, SyncOptions{})
+	require.NoError(t, createSchema(ctx, syncer.DB()))
+	_, err = syncer.pushEverything(ctx, nil)
+	require.NoError(t, err)
+
+	store := NewStoreFromDB(syncer.DB())
+
+	for _, mode := range []string{"substring", "regex"} {
+		t.Run(mode+"/message", func(t *testing.T) {
+			got, err := store.SearchContent(ctx, db.ContentSearchFilter{
+				Pattern:        "timestampneedle-message",
+				Mode:           mode,
+				Sources:        []string{"messages"},
+				IncludeOneShot: true,
+				Limit:          10,
+			})
+			require.NoError(t, err)
+			require.Len(t, got.Matches, 1)
+			parsed, err := time.Parse(time.RFC3339Nano, got.Matches[0].Timestamp)
+			require.NoError(t, err, "match timestamp must parse as RFC3339Nano, got %q", got.Matches[0].Timestamp)
+			assert.True(t, wantMsg.Equal(parsed), "want %v, got %v", wantMsg, parsed)
+		})
+
+		t.Run(mode+"/tool_input", func(t *testing.T) {
+			got, err := store.SearchContent(ctx, db.ContentSearchFilter{
+				Pattern:        "timestampneedle-input",
+				Mode:           mode,
+				Sources:        []string{"tool_input"},
+				IncludeOneShot: true,
+				Limit:          10,
+			})
+			require.NoError(t, err)
+			require.Len(t, got.Matches, 1)
+			parsed, err := time.Parse(time.RFC3339Nano, got.Matches[0].Timestamp)
+			require.NoError(t, err, "match timestamp must parse as RFC3339Nano, got %q", got.Matches[0].Timestamp)
+			assert.True(t, wantTool.Equal(parsed), "want %v, got %v", wantTool, parsed)
+		})
+
+		t.Run(mode+"/tool_result", func(t *testing.T) {
+			got, err := store.SearchContent(ctx, db.ContentSearchFilter{
+				Pattern:        "timestampneedle-event",
+				Mode:           mode,
+				Sources:        []string{"tool_result"},
+				IncludeOneShot: true,
+				Limit:          10,
+			})
+			require.NoError(t, err)
+			require.Len(t, got.Matches, 1)
+			parsed, err := time.Parse(time.RFC3339Nano, got.Matches[0].Timestamp)
+			require.NoError(t, err, "match timestamp must parse as RFC3339Nano, got %q", got.Matches[0].Timestamp)
+			assert.True(t, wantEvent.Equal(parsed), "want %v, got %v", wantEvent, parsed)
+		})
+	}
+}
+
+// TestSearchContentOrdinalRangeSelfRange pins the ordinal_range contract on
+// DuckDB content search: the field is always present and derived from the
+// conversation-unit rules, never a zero-valued [0, 0] at a nonzero anchor
+// ordinal. This fixture's assistant anchor is a single-member run bounded by
+// the user opener, so the derived range equals the self-range. Substring and
+// regex modes cover the two scan paths (scanDuckContentRows and the regex
+// candidate loop).
+func TestSearchContentOrdinalRangeSelfRange(t *testing.T) {
+	ctx := context.Background()
+	local := newLocalDB(t)
+	_, err := local.WriteSessionBatchAtomic([]db.SessionBatchWrite{{
+		Session: syncSession(
+			"duck-range", "alpha", "first",
+			"2026-03-22T10:00:00.000Z", 2,
+		),
+		Messages: []db.Message{
+			syncMessage("duck-range", 0, "user",
+				"an unrelated opener", "2026-03-22T10:00:00.000Z"),
+			syncMessage("duck-range", 1, "assistant",
+				"the rangeneedle reply", "2026-03-22T10:00:01.000Z"),
+		},
+		DataVersion:     1,
+		ReplaceMessages: true,
+	}})
+	require.NoError(t, err)
+
+	syncer := newInMemoryTestSync(t, local, SyncOptions{})
+	require.NoError(t, createSchema(ctx, syncer.DB()))
+	_, err = syncer.pushEverything(ctx, nil)
+	require.NoError(t, err)
+	store := NewStoreFromDB(syncer.DB())
+
+	for _, mode := range []string{"substring", "regex"} {
+		t.Run(mode, func(t *testing.T) {
+			got, err := store.SearchContent(ctx, db.ContentSearchFilter{
+				Pattern:        "rangeneedle",
+				Mode:           mode,
+				Sources:        []string{"messages"},
+				IncludeOneShot: true,
+				Limit:          10,
+			})
+			require.NoError(t, err)
+			require.Len(t, got.Matches, 1)
+			m := got.Matches[0]
+			require.Equal(t, 1, m.Ordinal, "anchor ordinal")
+			assert.Equal(t, [2]int{1, 1}, m.OrdinalRange,
+				"ordinal_range must be the derived single-member run, not [0, 0]")
+		})
+	}
 }
 
 func TestSearchContentInvalidModeReturnsInputError(t *testing.T) {
@@ -464,7 +642,8 @@ func TestSearchContentRedactsSecretsUnlessRevealed(t *testing.T) {
 	require.NoError(t, err)
 
 	syncer := newInMemoryTestSync(t, local, SyncOptions{})
-	_, err = syncer.Push(ctx, true, nil)
+	require.NoError(t, createSchema(ctx, syncer.DB()))
+	_, err = syncer.pushEverything(ctx, nil)
 	require.NoError(t, err)
 	store := NewStoreFromDB(syncer.DB())
 
@@ -517,7 +696,8 @@ func TestSearchGroupsMessagesAndIncludesNameMatches(t *testing.T) {
 	require.NoError(t, err)
 
 	syncer := newInMemoryTestSync(t, local, SyncOptions{})
-	_, err = syncer.Push(ctx, true, nil)
+	require.NoError(t, createSchema(ctx, syncer.DB()))
+	_, err = syncer.pushEverything(ctx, nil)
 	require.NoError(t, err)
 	store := NewStoreFromDB(syncer.DB())
 
@@ -544,7 +724,8 @@ func TestSearchGroupsMessagesAndIncludesNameMatches(t *testing.T) {
 
 	renamed := "needle override rename"
 	require.NoError(t, local.RenameSession("duck-search-name", &renamed))
-	_, err = syncer.Push(ctx, false, nil)
+	require.NoError(t, createSchema(ctx, syncer.DB()))
+	_, err = syncer.pushEverything(ctx, nil)
 	require.NoError(t, err)
 	overridden, err := store.Search(ctx, db.SearchFilter{Query: "override", Limit: 10})
 	require.NoError(t, err)
@@ -574,7 +755,8 @@ func TestSearchOperatorTokenNoError(t *testing.T) {
 	require.NoError(t, err)
 
 	syncer := newInMemoryTestSync(t, local, SyncOptions{})
-	_, err = syncer.Push(ctx, true, nil)
+	require.NoError(t, createSchema(ctx, syncer.DB()))
+	_, err = syncer.pushEverything(ctx, nil)
 	require.NoError(t, err)
 	store := NewStoreFromDB(syncer.DB())
 
@@ -614,7 +796,8 @@ func TestSearchMultiTermAND(t *testing.T) {
 	require.NoError(t, err)
 
 	syncer := newInMemoryTestSync(t, local, SyncOptions{})
-	_, err = syncer.Push(ctx, true, nil)
+	require.NoError(t, createSchema(ctx, syncer.DB()))
+	_, err = syncer.pushEverything(ctx, nil)
 	require.NoError(t, err)
 	store := NewStoreFromDB(syncer.DB())
 
@@ -737,14 +920,14 @@ func TestStoreAnalyticsUsageAndTrends(t *testing.T) {
 	assert.Equal(t, 2, counts.Total)
 	assert.Equal(t, 1, counts.ByProject["alpha"])
 
-	sessionUsage, err := store.GetSessionUsage(ctx, fixture.alphaID)
+	sessionUsage, err := store.GetSessionUsage(ctx, fixture.alphaID, true)
 	require.NoError(t, err)
 	require.NotNil(t, sessionUsage)
 	assert.True(t, sessionUsage.HasCost)
 	assert.Equal(t, []string{"claude-test"}, sessionUsage.Models)
 }
 
-func TestLoadPricingSeedsFallbackAndOverlaysOverrides(t *testing.T) {
+func TestLoadPricingUsesDBRowsAsEffectiveTableAndOverlaysOverrides(t *testing.T) {
 	ctx := context.Background()
 	conn := openTestDuckDB(t)
 	require.NoError(t, EnsureSchema(ctx, conn))
@@ -758,11 +941,168 @@ func TestLoadPricingSeedsFallbackAndOverlaysOverrides(t *testing.T) {
 	_, err := conn.ExecContext(ctx, `
 		INSERT INTO model_pricing (
 			model_pattern, input_per_mtok, output_per_mtok,
-			cache_creation_per_mtok, cache_read_per_mtok
+			cache_creation_per_mtok, cache_read_per_mtok, updated_at
 		) VALUES
-			('claude-sonnet-4-6', 30, 150, 37.5, 3.0),
-			('_fallback_version', 999, 999, 999, 999)`)
+			('claude-sonnet-4-6', 30, 150, 37.5, 3.0, '2026-06-08T12:00:00Z'),
+			('_fallback_version', 999, 999, 999, 999, '')`)
 	require.NoError(t, err)
+
+	got, err := store.loadPricing(ctx)
+	require.NoError(t, err)
+
+	assert.NotContains(t, got, "gpt-5.5")
+	assert.Equal(t, duckRates{
+		input: 30, output: 150, cacheCreation: 37.5, cacheRead: 3.0,
+		updatedAt: ptrTime(t, "2026-06-08T12:00:00Z"),
+		source:    export.PricingRowSourceFetched,
+	}, got["claude-sonnet-4-6"])
+	assert.NotContains(t, got, "_fallback_version")
+	assert.Equal(t, duckRates{
+		input: 9, output: 10, cacheCreation: 11, cacheRead: 12,
+		source: export.PricingRowSourceCustom,
+	}, got["custom-model"])
+}
+
+func TestProjectIdentityMapLegacyFallbackUsesFilePath(t *testing.T) {
+	ctx := context.Background()
+	conn := openTestDuckDB(t)
+	require.NoError(t, EnsureSchema(ctx, conn))
+	store := NewStoreFromDB(conn)
+
+	_, err := conn.ExecContext(ctx, `
+		INSERT INTO source_archives (source_archive_id, source_archive_salt)
+		VALUES (?, ?)`, "legacy-test-archive", "legacy-test-salt")
+	require.NoError(t, err)
+
+	_, err = conn.ExecContext(ctx, `
+		INSERT INTO sessions (id, project, machine, agent, cwd, file_path)
+		VALUES (?, ?, ?, ?, ?, ?)`,
+		"file-path-identity", "file-project", "laptop", "codex", "",
+		"/fixtures/duck-file-project/session.jsonl",
+	)
+	require.NoError(t, err)
+
+	got, err := store.BuildProjectIdentityMap(ctx, []string{"file-project"})
+	require.NoError(t, err)
+	require.Equal(t, export.ProjectResolutionUnknown,
+		got["file-project"].Resolution)
+	assert.Nil(t, got["file-project"].Identity)
+}
+
+func TestProjectIdentityMapLegacySessionsUseDistinctFallbackKeys(t *testing.T) {
+	ctx := context.Background()
+	conn := openTestDuckDB(t)
+	require.NoError(t, EnsureSchema(ctx, conn))
+	_, err := conn.ExecContext(ctx, `
+		INSERT INTO sessions (id, project, machine, agent)
+		VALUES
+			('legacy-alpha', 'alpha', 'host', 'codex'),
+			('legacy-beta', 'beta', 'host', 'codex')`)
+	require.NoError(t, err)
+
+	store := NewStoreFromDB(conn)
+	first, err := store.BuildProjectIdentityMap(ctx, []string{"alpha", "beta"})
+	require.NoError(t, err)
+	second, err := store.BuildProjectIdentityMap(ctx, []string{"alpha", "beta"})
+	require.NoError(t, err)
+
+	assert.NotEmpty(t, first["alpha"].ProjectKey)
+	assert.NotEmpty(t, first["beta"].ProjectKey)
+	assert.NotEqual(t, first["alpha"].ProjectKey, first["beta"].ProjectKey)
+	assert.Equal(t, first["alpha"].ProjectKey, second["alpha"].ProjectKey)
+	assert.Equal(t, first["beta"].ProjectKey, second["beta"].ProjectKey)
+	assert.Len(t, export.ProjectMapForWire(first), 2)
+}
+
+func TestProjectIdentityObservationRoundTripsRepositoryContext(t *testing.T) {
+	ctx := context.Background()
+	conn := openTestDuckDB(t)
+	require.NoError(t, EnsureSchema(ctx, conn))
+	observedAt := time.Date(2026, 7, 10, 12, 0, 0, 0, time.UTC)
+	_, err := conn.ExecContext(ctx, `
+		INSERT INTO source_project_identity_observations (
+			source_archive_id, source_archive_salt,
+			project, machine, root_path, git_remote, git_remote_name,
+			repository_path, worktree_name, worktree_root_path,
+			worktree_relationship, checkout_state, git_branch,
+			remote_resolution, remote_candidate_count, observed_at
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		"archive-source", "archive-salt",
+		"app", "host", "/private/app-worktree", "", "",
+		"/private/app/.git", "feature", "/private/app-worktree",
+		export.WorktreeLinked, export.CheckoutDetached, "",
+		export.ProjectResolutionAmbiguous, 2, observedAt,
+	)
+	require.NoError(t, err)
+
+	got, err := NewStoreFromDB(conn).ListProjectIdentityObservations(ctx, []string{"app"})
+	require.NoError(t, err)
+	require.Len(t, got, 1)
+	assert.Equal(t, "archive-source", got[0].SourceArchiveID)
+	assert.Equal(t, "archive-salt", got[0].SourceArchiveSalt)
+	assert.Equal(t, "/private/app/.git", got[0].RepositoryPath)
+	assert.Equal(t, export.WorktreeLinked, got[0].WorktreeRelationship)
+	assert.Equal(t, export.CheckoutDetached, got[0].CheckoutState)
+	assert.Equal(t, export.ProjectResolutionAmbiguous, got[0].RemoteResolution)
+	assert.Equal(t, 2, got[0].RemoteCandidateCount)
+}
+
+func TestProjectIdentityObservationsAggregateSourceArchives(t *testing.T) {
+	ctx := context.Background()
+	conn := openTestDuckDB(t)
+	require.NoError(t, EnsureSchema(ctx, conn))
+	for i, archiveID := range []string{"archive-a", "archive-b"} {
+		_, err := conn.ExecContext(ctx, `
+			INSERT INTO source_archives (source_archive_id, source_archive_salt)
+			VALUES (?, ?)`, archiveID, archiveID+"-salt")
+		require.NoError(t, err)
+		_, err = conn.ExecContext(ctx, `
+			INSERT INTO source_project_identity_observations (
+				source_archive_id, source_archive_salt, project, machine,
+				root_path, git_remote, observed_at
+			) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+			archiveID, archiveID+"-salt", "app", "host", "/repo/app",
+			fmt.Sprintf("https://github.com/acme/app-%d.git", i), time.Now().UTC(),
+		)
+		require.NoError(t, err)
+	}
+
+	store := NewStoreFromDB(conn)
+	all, err := store.ListProjectIdentityObservations(ctx, []string{"app"})
+	require.NoError(t, err)
+	require.Len(t, all, 2)
+	aggregate, err := store.BuildProjectIdentityMap(ctx, []string{"app", "missing"})
+	require.NoError(t, err)
+	assert.NotEmpty(t, aggregate["app"].ProjectKey)
+	assert.NotEmpty(t, aggregate["missing"].ProjectKey)
+	assert.Contains(t, export.ProjectMapForWire(aggregate), aggregate["app"].ProjectKey)
+	assert.Contains(t, export.ProjectMapForWire(aggregate), aggregate["missing"].ProjectKey)
+
+}
+
+func TestSourceArchiveScopeRejectsSaltMismatch(t *testing.T) {
+	ctx := context.Background()
+	conn := openTestDuckDB(t)
+	require.NoError(t, EnsureSchema(ctx, conn))
+	exec := func(query string, args ...any) error {
+		_, err := conn.ExecContext(ctx, query, args...)
+		return err
+	}
+
+	queryRow := func(query string, args ...any) *sql.Row {
+		return conn.QueryRowContext(ctx, query, args...)
+	}
+	require.NoError(t, upsertSourceArchiveScope(
+		exec, queryRow, "archive-a", "salt-a"))
+	err := upsertSourceArchiveScope(exec, queryRow, "archive-a", "salt-b")
+	require.ErrorContains(t, err, "archive salt mismatch")
+}
+
+func TestLoadPricingUsesFallbackWhenEffectiveTableEmpty(t *testing.T) {
+	ctx := context.Background()
+	conn := openTestDuckDB(t)
+	require.NoError(t, EnsureSchema(ctx, conn))
+	store := NewStoreFromDB(conn)
 
 	got, err := store.loadPricing(ctx)
 	require.NoError(t, err)
@@ -771,13 +1111,31 @@ func TestLoadPricingSeedsFallbackAndOverlaysOverrides(t *testing.T) {
 	require.Contains(t, got, "gpt-5.5")
 	assert.Equal(t, fallback.InputPerMTok, got["gpt-5.5"].input)
 	assert.Equal(t, fallback.OutputPerMTok, got["gpt-5.5"].output)
-	assert.Equal(t, duckRates{
-		input: 30, output: 150, cacheCreation: 37.5, cacheRead: 3.0,
-	}, got["claude-sonnet-4-6"])
-	assert.NotContains(t, got, "_fallback_version")
-	assert.Equal(t, duckRates{
-		input: 9, output: 10, cacheCreation: 11, cacheRead: 12,
-	}, got["custom-model"])
+	assert.Equal(t, export.PricingRowSourceEmbedded, got["gpt-5.5"].source)
+}
+
+func TestLoadPricingRetainsCustomOverrideSource(t *testing.T) {
+	ctx := context.Background()
+	conn := openTestDuckDB(t)
+	require.NoError(t, EnsureSchema(ctx, conn))
+	store := NewStoreFromDB(conn)
+	fallback := pricingByPattern(t, pricingpkg.FallbackPricing(), "gpt-5.5")
+	store.SetCustomPricing(map[string]config.CustomModelRate{
+		"gpt-5.5": {
+			Input:         fallback.InputPerMTok,
+			Output:        fallback.OutputPerMTok,
+			CacheCreation: fallback.CacheCreationPerMTok,
+			CacheRead:     fallback.CacheReadPerMTok,
+		},
+	})
+
+	got, err := store.loadPricing(ctx)
+	require.NoError(t, err)
+	block, err := export.NewPricingResolver(duckPricingRows(got)).BuildBlock()
+	require.NoError(t, err)
+
+	assert.Equal(t, "custom+embedded", block.Source)
+	assert.Equal(t, 1, block.CustomOverrideCount)
 }
 
 func pricingByPattern(t *testing.T, prices []pricingpkg.ModelPricing, pattern string) pricingpkg.ModelPricing {
@@ -789,6 +1147,14 @@ func pricingByPattern(t *testing.T, prices []pricingpkg.ModelPricing, pattern st
 	}
 	t.Fatalf("missing fallback pricing for %s", pattern)
 	return pricingpkg.ModelPricing{}
+}
+
+func ptrTime(t *testing.T, value string) *time.Time {
+	t.Helper()
+	parsed, err := time.Parse(time.RFC3339Nano, value)
+	require.NoError(t, err)
+	utc := parsed.UTC()
+	return &utc
 }
 
 func TestAnalyticsTopSessionsFiltersMetricEligibility(t *testing.T) {
@@ -847,7 +1213,8 @@ func TestAnalyticsTopSessionsFiltersMetricEligibility(t *testing.T) {
 	_, err := local.WriteSessionBatchAtomic(writes)
 	require.NoError(t, err)
 	syncer := newInMemoryTestSync(t, local, SyncOptions{})
-	_, err = syncer.Push(ctx, true, nil)
+	require.NoError(t, createSchema(ctx, syncer.DB()))
+	_, err = syncer.pushEverything(ctx, nil)
 	require.NoError(t, err)
 
 	_, err = syncer.DB().ExecContext(ctx, `
@@ -973,7 +1340,8 @@ func TestAnalyticsTopSessionsDurationUsesActiveDuration(t *testing.T) {
 	require.NoError(t, err)
 
 	syncer := newInMemoryTestSync(t, local, SyncOptions{})
-	_, err = syncer.Push(ctx, true, nil)
+	require.NoError(t, createSchema(ctx, syncer.DB()))
+	_, err = syncer.pushEverything(ctx, nil)
 	require.NoError(t, err)
 
 	store := NewStoreFromDB(syncer.DB())
@@ -1026,7 +1394,8 @@ func TestAnalyticsProjectsPopulateDailyTrendAndSortByMessages(t *testing.T) {
 	require.NoError(t, err)
 
 	syncer := newInMemoryTestSync(t, local, SyncOptions{})
-	_, err = syncer.Push(ctx, true, nil)
+	require.NoError(t, createSchema(ctx, syncer.DB()))
+	_, err = syncer.pushEverything(ctx, nil)
 	require.NoError(t, err)
 	store := NewStoreFromDB(syncer.DB())
 
@@ -1067,7 +1436,8 @@ func TestAnalyticsVelocityUsesMessageCyclesAndBreakdowns(t *testing.T) {
 	require.NoError(t, err)
 
 	syncer := newInMemoryTestSync(t, local, SyncOptions{})
-	_, err = syncer.Push(ctx, true, nil)
+	require.NoError(t, createSchema(ctx, syncer.DB()))
+	_, err = syncer.pushEverything(ctx, nil)
 	require.NoError(t, err)
 	store := NewStoreFromDB(syncer.DB())
 
@@ -1101,7 +1471,8 @@ func TestAnalyticsVelocitySingleMessageSessionsReturnArrays(t *testing.T) {
 	require.NoError(t, err)
 
 	syncer := newInMemoryTestSync(t, local, SyncOptions{})
-	_, err = syncer.Push(ctx, true, nil)
+	require.NoError(t, createSchema(ctx, syncer.DB()))
+	_, err = syncer.pushEverything(ctx, nil)
 	require.NoError(t, err)
 	store := NewStoreFromDB(syncer.DB())
 
@@ -1142,7 +1513,8 @@ func TestGetSessionTimingPopulatesSharedTimingPayload(t *testing.T) {
 	require.NoError(t, err)
 
 	syncer := newInMemoryTestSync(t, local, SyncOptions{})
-	_, err = syncer.Push(ctx, true, nil)
+	require.NoError(t, createSchema(ctx, syncer.DB()))
+	_, err = syncer.pushEverything(ctx, nil)
 	require.NoError(t, err)
 	store := NewStoreFromDB(syncer.DB())
 
@@ -1186,7 +1558,8 @@ func TestGetAllMessagesDoesNotTruncateAtDefaultLimit(t *testing.T) {
 	require.NoError(t, err)
 
 	syncer := newInMemoryTestSync(t, local, SyncOptions{})
-	_, err = syncer.Push(ctx, true, nil)
+	require.NoError(t, createSchema(ctx, syncer.DB()))
+	_, err = syncer.pushEverything(ctx, nil)
 	require.NoError(t, err)
 	store := NewStoreFromDB(syncer.DB())
 
@@ -1262,7 +1635,8 @@ func TestSearchContentRegexOrdersBySessionRecency(t *testing.T) {
 	})
 	require.NoError(t, err)
 	syncer := newInMemoryTestSync(t, local, SyncOptions{})
-	_, err = syncer.Push(ctx, true, nil)
+	require.NoError(t, createSchema(ctx, syncer.DB()))
+	_, err = syncer.pushEverything(ctx, nil)
 	require.NoError(t, err)
 	store := NewStoreFromDB(syncer.DB())
 
@@ -1310,7 +1684,8 @@ func TestSearchContentGitBranchFilter(t *testing.T) {
 	})
 	require.NoError(t, err)
 	syncer := newInMemoryTestSync(t, local, SyncOptions{})
-	_, err = syncer.Push(ctx, true, nil)
+	require.NoError(t, createSchema(ctx, syncer.DB()))
+	_, err = syncer.pushEverything(ctx, nil)
 	require.NoError(t, err)
 	store := NewStoreFromDB(syncer.DB())
 
@@ -1384,7 +1759,8 @@ func TestSearchContentToolResultEmptyToolUseIDNotSuppressedByEvents(t *testing.T
 	}})
 	require.NoError(t, err)
 	syncer := newInMemoryTestSync(t, local, SyncOptions{})
-	_, err = syncer.Push(ctx, true, nil)
+	require.NoError(t, createSchema(ctx, syncer.DB()))
+	_, err = syncer.pushEverything(ctx, nil)
 	require.NoError(t, err)
 	store := NewStoreFromDB(syncer.DB())
 
@@ -1443,7 +1819,8 @@ func TestSearchContentLegacyToolResultsUseCallIndexTieBreaker(t *testing.T) {
 	}})
 	require.NoError(t, err)
 	syncer := newInMemoryTestSync(t, local, SyncOptions{})
-	_, err = syncer.Push(ctx, true, nil)
+	require.NoError(t, createSchema(ctx, syncer.DB()))
+	_, err = syncer.pushEverything(ctx, nil)
 	require.NoError(t, err)
 	store := NewStoreFromDB(syncer.DB())
 
@@ -1518,7 +1895,8 @@ func TestSearchContentToolResultEventsUseCallIndexTieBreaker(t *testing.T) {
 	}})
 	require.NoError(t, err)
 	syncer := newInMemoryTestSync(t, local, SyncOptions{})
-	_, err = syncer.Push(ctx, true, nil)
+	require.NoError(t, createSchema(ctx, syncer.DB()))
+	_, err = syncer.pushEverything(ctx, nil)
 	require.NoError(t, err)
 	store := NewStoreFromDB(syncer.DB())
 
@@ -1598,7 +1976,8 @@ func TestAnalyticsActivityCountsToolCallRows(t *testing.T) {
 	}})
 	require.NoError(t, err)
 	syncer := newInMemoryTestSync(t, local, SyncOptions{})
-	_, err = syncer.Push(ctx, true, nil)
+	require.NoError(t, createSchema(ctx, syncer.DB()))
+	_, err = syncer.pushEverything(ctx, nil)
 	require.NoError(t, err)
 	_, err = syncer.DB().ExecContext(ctx,
 		`UPDATE messages SET has_tool_use = FALSE WHERE session_id = ?`,
@@ -1633,7 +2012,8 @@ func TestAnalyticsActivitySkipsSystemUserMessages(t *testing.T) {
 	}})
 	require.NoError(t, err)
 	syncer := newInMemoryTestSync(t, local, SyncOptions{})
-	_, err = syncer.Push(ctx, true, nil)
+	require.NoError(t, createSchema(ctx, syncer.DB()))
+	_, err = syncer.pushEverything(ctx, nil)
 	require.NoError(t, err)
 	store := NewStoreFromDB(syncer.DB())
 
@@ -1671,7 +2051,8 @@ func TestAnalyticsSessionFiltersUseMessageTimeForHourAndDay(t *testing.T) {
 	})
 	require.NoError(t, err)
 	syncer := newInMemoryTestSync(t, local, SyncOptions{})
-	_, err = syncer.Push(ctx, true, nil)
+	require.NoError(t, createSchema(ctx, syncer.DB()))
+	_, err = syncer.pushEverything(ctx, nil)
 	require.NoError(t, err)
 	store := NewStoreFromDB(syncer.DB())
 
@@ -1724,7 +2105,8 @@ func TestAnalyticsTerminationFilterUsesSharedStateSemantics(t *testing.T) {
 	})
 	require.NoError(t, err)
 	syncer := newInMemoryTestSync(t, local, SyncOptions{})
-	_, err = syncer.Push(ctx, true, nil)
+	require.NoError(t, createSchema(ctx, syncer.DB()))
+	_, err = syncer.pushEverything(ctx, nil)
 	require.NoError(t, err)
 	store := NewStoreFromDB(syncer.DB())
 
@@ -1756,7 +2138,8 @@ func TestAnalyticsActiveSinceParsesEquivalentOffsets(t *testing.T) {
 	require.NoError(t, err)
 
 	syncer := newInMemoryTestSync(t, local, SyncOptions{})
-	_, err = syncer.Push(ctx, true, nil)
+	require.NoError(t, createSchema(ctx, syncer.DB()))
+	_, err = syncer.pushEverything(ctx, nil)
 	require.NoError(t, err)
 	store := NewStoreFromDB(syncer.DB())
 
@@ -1787,7 +2170,8 @@ func TestAnalyticsHourOfWeekRespectsSessionFilters(t *testing.T) {
 	})
 	require.NoError(t, err)
 	syncer := newInMemoryTestSync(t, local, SyncOptions{})
-	_, err = syncer.Push(ctx, true, nil)
+	require.NoError(t, createSchema(ctx, syncer.DB()))
+	_, err = syncer.pushEverything(ctx, nil)
 	require.NoError(t, err)
 	store := NewStoreFromDB(syncer.DB())
 
@@ -1820,7 +2204,8 @@ func TestAnalyticsHourOfWeekIncludesOvernightMessages(t *testing.T) {
 	})
 	require.NoError(t, err)
 	syncer := newInMemoryTestSync(t, local, SyncOptions{})
-	_, err = syncer.Push(ctx, true, nil)
+	require.NoError(t, createSchema(ctx, syncer.DB()))
+	_, err = syncer.pushEverything(ctx, nil)
 	require.NoError(t, err)
 	store := NewStoreFromDB(syncer.DB())
 
@@ -1862,7 +2247,8 @@ func TestTrendsTermsApplySessionFiltersAndSystemPrefixExclusion(t *testing.T) {
 	})
 	require.NoError(t, err)
 	syncer := newInMemoryTestSync(t, local, SyncOptions{})
-	_, err = syncer.Push(ctx, true, nil)
+	require.NoError(t, createSchema(ctx, syncer.DB()))
+	_, err = syncer.pushEverything(ctx, nil)
 	require.NoError(t, err)
 	store := NewStoreFromDB(syncer.DB())
 
@@ -1902,7 +2288,8 @@ func TestDailyUsageDefaultsToLocalTimezone(t *testing.T) {
 	}})
 	require.NoError(t, err)
 	syncer := newInMemoryTestSync(t, local, SyncOptions{})
-	_, err = syncer.Push(ctx, true, nil)
+	require.NoError(t, createSchema(ctx, syncer.DB()))
+	_, err = syncer.pushEverything(ctx, nil)
 	require.NoError(t, err)
 	store := NewStoreFromDB(syncer.DB())
 
@@ -1937,7 +2324,8 @@ func TestDailyUsageActiveSinceUsesSessionActivity(t *testing.T) {
 	require.NoError(t, err)
 
 	syncer := newInMemoryTestSync(t, local, SyncOptions{})
-	_, err = syncer.Push(ctx, true, nil)
+	require.NoError(t, createSchema(ctx, syncer.DB()))
+	_, err = syncer.pushEverything(ctx, nil)
 	require.NoError(t, err)
 	store := NewStoreFromDB(syncer.DB())
 
@@ -1985,7 +2373,8 @@ func TestDailyUsageHandlesBlankMessageTimestampWithoutSessionStart(t *testing.T)
 	require.NoError(t, err)
 
 	syncer := newInMemoryTestSync(t, local, SyncOptions{})
-	_, err = syncer.Push(ctx, true, nil)
+	require.NoError(t, createSchema(ctx, syncer.DB()))
+	_, err = syncer.pushEverything(ctx, nil)
 	require.NoError(t, err)
 	store := NewStoreFromDB(syncer.DB())
 
@@ -2046,7 +2435,8 @@ func TestUsageDedupesClaudeMessageIDs(t *testing.T) {
 	require.NoError(t, err)
 
 	syncer := newInMemoryTestSync(t, local, SyncOptions{})
-	_, err = syncer.Push(ctx, true, nil)
+	require.NoError(t, createSchema(ctx, syncer.DB()))
+	_, err = syncer.pushEverything(ctx, nil)
 	require.NoError(t, err)
 	store := NewStoreFromDB(syncer.DB())
 	filter := db.UsageFilter{From: "2026-01-01", To: "2026-01-31"}
@@ -2067,12 +2457,25 @@ func TestUsageDedupesClaudeMessageIDs(t *testing.T) {
 	assert.Equal(t, 1, counts.ByProject["alpha"])
 	assert.NotContains(t, counts.ByProject, "beta")
 
-	sessionUsage, err := store.GetSessionUsage(ctx, "duck-usage-b")
+	sessionUsage, err := store.GetSessionUsage(ctx, "duck-usage-b", true)
 	require.NoError(t, err)
 	require.NotNil(t, sessionUsage)
 	assert.True(t, sessionUsage.HasCost)
 	assert.InDelta(t, 0.000033, sessionUsage.CostUSD, 0.000001)
 	assert.Equal(t, []string{"claude-test"}, sessionUsage.Models)
+	require.Len(t, sessionUsage.Breakdown, 1)
+	entry := sessionUsage.Breakdown[0]
+	assert.Equal(t, 1, entry.Ordinal)
+	require.NotNil(t, entry.MessageOrdinal)
+	assert.Equal(t, 0, *entry.MessageOrdinal)
+	assert.Equal(t, "message", entry.Source)
+	assert.Equal(t, "Prompt 1", entry.Label)
+	assert.Equal(t, "2026-01-13T00:01:00Z", entry.Timestamp)
+	assert.Equal(t, "claude-test", entry.Model)
+	assert.Equal(t, 1, entry.InputTokens)
+	assert.Equal(t, 2, entry.OutputTokens)
+	assert.True(t, entry.HasCost)
+	assert.InDelta(t, 0.000033, entry.CostUSD, 0.000001)
 }
 
 func TestUsageDedupesSourceUUIDWhenClaudePairIncomplete(t *testing.T) {
@@ -2108,7 +2511,8 @@ func TestUsageDedupesSourceUUIDWhenClaudePairIncomplete(t *testing.T) {
 	require.NoError(t, err)
 
 	syncer := newInMemoryTestSync(t, local, SyncOptions{})
-	_, err = syncer.Push(ctx, true, nil)
+	require.NoError(t, createSchema(ctx, syncer.DB()))
+	_, err = syncer.pushEverything(ctx, nil)
 	require.NoError(t, err)
 	store := NewStoreFromDB(syncer.DB())
 	filter := db.UsageFilter{From: "2026-01-01", To: "2026-01-31"}
@@ -2129,12 +2533,15 @@ func TestUsageDedupesSourceUUIDWhenClaudePairIncomplete(t *testing.T) {
 	assert.Equal(t, 1, counts.ByProject["alpha"])
 	assert.NotContains(t, counts.ByProject, "beta")
 
-	sessionUsage, err := store.GetSessionUsage(ctx, "duck-usage-source-b")
+	sessionUsage, err := store.GetSessionUsage(ctx, "duck-usage-source-b", true)
 	require.NoError(t, err)
 	require.NotNil(t, sessionUsage)
 	assert.True(t, sessionUsage.HasCost)
 	assert.InDelta(t, 0.000033, sessionUsage.CostUSD, 0.000001)
 	assert.Equal(t, []string{"claude-test"}, sessionUsage.Models)
+	require.Len(t, sessionUsage.Breakdown, 1)
+	require.NotNil(t, sessionUsage.Breakdown[0].MessageOrdinal)
+	assert.Equal(t, 0, *sessionUsage.Breakdown[0].MessageOrdinal)
 }
 
 func TestUsagePreservesSessionSummaryUsageEventTokens(t *testing.T) {
@@ -2172,7 +2579,8 @@ func TestUsagePreservesSessionSummaryUsageEventTokens(t *testing.T) {
 	require.NoError(t, err)
 
 	syncer := newInMemoryTestSync(t, local, SyncOptions{})
-	_, err = syncer.Push(ctx, true, nil)
+	require.NoError(t, createSchema(ctx, syncer.DB()))
+	_, err = syncer.pushEverything(ctx, nil)
 	require.NoError(t, err)
 	store := NewStoreFromDB(syncer.DB())
 	filter := db.UsageFilter{From: "2026-01-01", To: "2026-01-31", Timezone: "UTC"}
@@ -2190,7 +2598,7 @@ func TestUsagePreservesSessionSummaryUsageEventTokens(t *testing.T) {
 	wantCost := (float64(rawInput)*1 + float64(rawOutput)*2) / 1_000_000
 	assert.InDelta(t, wantCost, top[0].Cost, 0.000001)
 
-	sessionUsage, err := store.GetSessionUsage(ctx, sessionID)
+	sessionUsage, err := store.GetSessionUsage(ctx, sessionID, true)
 	require.NoError(t, err)
 	require.NotNil(t, sessionUsage)
 	assert.Equal(t, rawOutput, sessionUsage.TotalOutputTokens)
@@ -2198,6 +2606,403 @@ func TestUsagePreservesSessionSummaryUsageEventTokens(t *testing.T) {
 	assert.True(t, sessionUsage.HasCost)
 	assert.InDelta(t, wantCost, sessionUsage.CostUSD, 0.000001)
 	assert.Equal(t, []string{"summary-model"}, sessionUsage.Models)
+	require.Len(t, sessionUsage.Breakdown, 1)
+	entry := sessionUsage.Breakdown[0]
+	assert.Equal(t, "session", entry.Source)
+	assert.Equal(t, "session", entry.Label)
+	assert.Nil(t, entry.MessageOrdinal)
+	assert.Equal(t, rawInput, entry.InputTokens)
+	assert.Equal(t, rawOutput, entry.OutputTokens)
+	assert.True(t, entry.HasCost)
+	assert.InDelta(t, wantCost, entry.CostUSD, 0.000001)
+}
+
+func TestCopilotReportedCostSurvivesDuckDBPush(t *testing.T) {
+	ctx := context.Background()
+	local := newLocalDB(t)
+	require.NoError(t, local.UpsertModelPricing([]db.ModelPricing{{
+		ModelPattern: "claude-opus-4-6", InputPerMTok: 10, OutputPerMTok: 15,
+	}}))
+	reportedCost := 0.035
+	sess := syncSession(
+		"copilot:duck-reported", "alpha", "reported cost",
+		"2026-01-18T00:00:00.000Z", 0)
+	sess.Agent = "copilot"
+	_, err := local.WriteSessionBatchAtomic([]db.SessionBatchWrite{{
+		Session: sess,
+		UsageEvents: []db.UsageEvent{
+			{
+				Source: "shutdown", Model: "claude-opus-4-6",
+				InputTokens: 1000, OutputTokens: 500,
+				OccurredAt: "2026-01-18T00:01:00.000Z",
+				DedupKey:   "shutdown-1",
+			},
+			{
+				Source: "shutdown", Model: "claude-opus-4-6",
+				InputTokens: 1000, OutputTokens: 500,
+				CostUSD: &reportedCost, CostStatus: "exact",
+				CostSource: db.CopilotReportedCostSource,
+				OccurredAt: "2026-01-19T00:01:00.000Z",
+				DedupKey:   "shutdown-2",
+			},
+		},
+		DataVersion: 1, ReplaceMessages: true,
+	}})
+	require.NoError(t, err)
+
+	syncer := newInMemoryTestSync(t, local, SyncOptions{})
+	require.NoError(t, createSchema(ctx, syncer.DB()))
+	_, err = syncer.pushEverything(ctx, nil)
+	require.NoError(t, err)
+	store := NewStoreFromDB(syncer.DB())
+
+	usage, err := store.GetSessionUsage(ctx, sess.ID, true)
+	require.NoError(t, err)
+	require.NotNil(t, usage)
+	assert.InDelta(t, reportedCost, usage.CostUSD, 1e-12)
+	assert.InDelta(t, reportedCost/0.01, usage.AICredits, 1e-9)
+	require.Len(t, usage.Breakdown, 2)
+	assert.InDelta(t, 0.0175, usage.Breakdown[0].CostUSD, 1e-12)
+	assert.InDelta(t, 0.0175, usage.Breakdown[1].CostUSD, 1e-12)
+	assert.Equal(t, usage.CostUSD,
+		usage.Breakdown[0].CostUSD+usage.Breakdown[1].CostUSD)
+
+	daily, err := store.GetDailyUsage(ctx, db.UsageFilter{
+		From: "2026-01-18", To: "2026-01-19", Timezone: "UTC",
+	})
+	require.NoError(t, err)
+	require.Len(t, daily.Daily, 2)
+	assert.InDelta(t, 0.0175, daily.Daily[0].TotalCost, 1e-12)
+	assert.InDelta(t, 0.0175, daily.Daily[1].TotalCost, 1e-12)
+	for _, day := range daily.Daily {
+		require.Len(t, day.ModelBreakdowns, 1)
+		assert.Equal(t, day.TotalCost, day.ModelBreakdowns[0].Cost)
+	}
+	assert.InDelta(t, reportedCost, daily.Totals.TotalCost, 1e-12)
+	require.NotNil(t, daily.Pricing)
+	assert.Equal(t, export.CostSourceMixed, daily.Pricing.CostSource,
+		"authoritative reported cost must surface in pricing provenance")
+	assert.Equal(t, export.CostSourceComputed,
+		daily.Pricing.Models["claude-opus-4-6"].CostSource)
+}
+
+func TestDuckDBDailyUsageKeepsAuthoritativeCostSessionScoped(t *testing.T) {
+	ctx := context.Background()
+	local := newLocalDB(t)
+	require.NoError(t, local.UpsertModelPricing([]db.ModelPricing{{
+		ModelPattern:  "claude-sonnet-4-6",
+		InputPerMTok:  10,
+		OutputPerMTok: 20,
+	}}))
+	reportedCost := 0.035
+	authoritative := syncSession(
+		"copilot:authoritative", "alpha", "reported",
+		"2026-01-18T00:00:00.000Z", 1,
+	)
+	authoritative.Agent = "copilot"
+	estimated := syncSession(
+		"copilot:estimated", "alpha", "estimated",
+		"2026-01-18T01:00:00.000Z", 1,
+	)
+	estimated.Agent = "copilot"
+	_, err := local.WriteSessionBatchAtomic([]db.SessionBatchWrite{
+		{
+			Session: authoritative,
+			UsageEvents: []db.UsageEvent{{
+				Source: "shutdown", Model: "claude-sonnet-4-6",
+				InputTokens: 1000, OutputTokens: 500,
+				CostUSD: &reportedCost, CostStatus: "exact",
+				CostSource: db.CopilotReportedCostSource,
+				OccurredAt: "2026-01-18T00:01:00.000Z",
+				DedupKey:   "authoritative",
+			}},
+			DataVersion: 1, ReplaceMessages: true,
+		},
+		{
+			Session: estimated,
+			UsageEvents: []db.UsageEvent{{
+				Source: "shutdown", Model: "claude-sonnet-4-6",
+				InputTokens: 1000, OutputTokens: 500,
+				OccurredAt: "2026-01-18T01:01:00.000Z",
+				DedupKey:   "estimated",
+			}},
+			DataVersion: 1, ReplaceMessages: true,
+		},
+	})
+	require.NoError(t, err)
+
+	filter := db.UsageFilter{
+		From: "2026-01-18", To: "2026-01-18", Timezone: "UTC",
+	}
+	want, err := local.GetDailyUsage(ctx, filter)
+	require.NoError(t, err)
+	syncer := newInMemoryTestSync(t, local, SyncOptions{})
+	require.NoError(t, createSchema(ctx, syncer.DB()))
+	_, err = syncer.pushEverything(ctx, nil)
+	require.NoError(t, err)
+	got, err := NewStoreFromDB(syncer.DB()).GetDailyUsage(ctx, filter)
+	require.NoError(t, err)
+
+	assert.InDelta(t, 0.055, want.Totals.TotalCost, 1e-12)
+	assert.InDelta(t, want.Totals.TotalCost, got.Totals.TotalCost, 1e-12)
+	assert.InDelta(t, 5.5, want.Totals.CopilotAICredits, 1e-9,
+		"credits derive from the authoritative-substituted totals")
+	assert.InDelta(t, want.Totals.CopilotAICredits,
+		got.Totals.CopilotAICredits, 1e-9)
+	require.Len(t, got.Daily, 1)
+	require.Len(t, want.Daily, 1)
+	assert.Equal(t, want.Daily[0].Date, got.Daily[0].Date)
+	assert.Equal(t, want.Daily[0].InputTokens, got.Daily[0].InputTokens)
+	assert.Equal(t, want.Daily[0].OutputTokens, got.Daily[0].OutputTokens)
+	assert.Equal(t, want.Daily[0].ModelsUsed, got.Daily[0].ModelsUsed)
+	assert.InDelta(t, want.Daily[0].TotalCost, got.Daily[0].TotalCost, 1e-12)
+	require.Len(t, got.Daily[0].ModelBreakdowns, 1)
+	require.Len(t, want.Daily[0].ModelBreakdowns, 1)
+	assert.Equal(t, want.Daily[0].ModelBreakdowns[0].ModelName,
+		got.Daily[0].ModelBreakdowns[0].ModelName)
+	assert.InDelta(t, want.Daily[0].ModelBreakdowns[0].Cost,
+		got.Daily[0].ModelBreakdowns[0].Cost, 1e-12)
+}
+
+func TestDuckDBCostOnlyReportedSessionMatchesSQLite(t *testing.T) {
+	ctx := context.Background()
+	local := newLocalDB(t)
+	reportedCost := 0.0175
+	sess := syncSession(
+		"copilot:cost-only", "alpha", "cost only",
+		"2026-01-18T00:00:00.000Z", 0)
+	sess.Agent = "copilot"
+	_, err := local.WriteSessionBatchAtomic([]db.SessionBatchWrite{{
+		Session: sess,
+		UsageEvents: []db.UsageEvent{{
+			Source: "shutdown", Model: "copilot",
+			CostUSD: &reportedCost, CostStatus: "exact",
+			CostSource: db.CopilotReportedCostSource,
+			OccurredAt: "2026-01-18T00:01:00.000Z",
+			DedupKey:   "cost-only",
+		}},
+		DataVersion: 1, ReplaceMessages: true,
+	}})
+	require.NoError(t, err)
+
+	want, err := local.GetSessionUsage(ctx, sess.ID, true)
+	require.NoError(t, err)
+	require.NotNil(t, want)
+
+	syncer := newInMemoryTestSync(t, local, SyncOptions{})
+	require.NoError(t, createSchema(ctx, syncer.DB()))
+	_, err = syncer.pushEverything(ctx, nil)
+	require.NoError(t, err)
+	store := NewStoreFromDB(syncer.DB())
+
+	got, err := store.GetSessionUsage(ctx, sess.ID, true)
+	require.NoError(t, err)
+	require.NotNil(t, got)
+	assert.True(t, got.HasCost)
+	assert.InDelta(t, reportedCost, got.CostUSD, 1e-12)
+	assert.False(t, got.HasTokenData,
+		"a cost-only reported row is not token data")
+	assert.Empty(t, got.Models,
+		"a cost-only carrier row must not surface a model")
+	assert.Zero(t, got.BreakdownCount)
+	assert.Empty(t, got.Breakdown)
+	assert.Equal(t, want.HasTokenData, got.HasTokenData)
+	assert.Equal(t, want.Models, got.Models)
+	assert.Equal(t, want.BreakdownCount, got.BreakdownCount)
+	assert.InDelta(t, want.CostUSD, got.CostUSD, 1e-12)
+
+	gotNoBreakdown, err := store.GetSessionUsage(ctx, sess.ID, false)
+	require.NoError(t, err)
+	require.NotNil(t, gotNoBreakdown)
+	assert.Zero(t, gotNoBreakdown.BreakdownCount,
+		"the row-count path must exclude cost-only reported rows")
+}
+
+func TestDailyUsageCostsReasoningOnlyRows(t *testing.T) {
+	ctx := context.Background()
+	local := newLocalDB(t)
+	require.NoError(t, local.UpsertModelPricing([]db.ModelPricing{{
+		ModelPattern:  "reasoning-only",
+		OutputPerMTok: 2,
+	}}))
+
+	sessionID := "duck-reasoning-only"
+	_, err := local.WriteSessionBatchAtomic([]db.SessionBatchWrite{{
+		Session: syncSession(
+			sessionID, "alpha", "reasoning only",
+			"2026-01-19T00:00:00.000Z", 0),
+		UsageEvents: []db.UsageEvent{{
+			Source:          "provider",
+			Model:           "reasoning-only",
+			ReasoningTokens: 300,
+			OccurredAt:      "2026-01-19T00:01:00.000Z",
+			DedupKey:        "reasoning-only",
+		}},
+		DataVersion:     1,
+		ReplaceMessages: true,
+	}})
+	require.NoError(t, err)
+
+	syncer := newInMemoryTestSync(t, local, SyncOptions{})
+	require.NoError(t, createSchema(ctx, syncer.DB()))
+	_, err = syncer.pushEverything(ctx, nil)
+	require.NoError(t, err)
+	store := NewStoreFromDB(syncer.DB())
+	filter := db.UsageFilter{From: "2026-01-01", To: "2026-01-31", Timezone: "UTC"}
+	wantCost := float64(300) * 2 / 1_000_000
+
+	daily, err := store.GetDailyUsage(ctx, filter)
+	require.NoError(t, err)
+	assert.Zero(t, daily.Totals.OutputTokens,
+		"reasoning-only rows do not change reported output-token totals")
+	assert.InDelta(t, wantCost, daily.Totals.TotalCost, 0.000001)
+
+	top, err := store.GetTopSessionsByCost(ctx, filter, 10)
+	require.NoError(t, err)
+	require.Len(t, top, 1)
+	assert.InDelta(t, wantCost, top[0].Cost, 0.000001)
+
+	sessionUsage, err := store.GetSessionUsage(ctx, sessionID, true)
+	require.NoError(t, err)
+	require.NotNil(t, sessionUsage)
+	assert.True(t, sessionUsage.HasCost)
+	assert.InDelta(t, wantCost, sessionUsage.CostUSD, 0.000001)
+	require.Len(t, sessionUsage.Breakdown, 1,
+		"reasoning-only rows must appear in the breakdown")
+	entry := sessionUsage.Breakdown[0]
+	assert.Equal(t, "provider", entry.Source)
+	assert.Zero(t, entry.OutputTokens,
+		"reasoning stays out of reported output tokens")
+	assert.True(t, entry.HasCost)
+	assert.InDelta(t, wantCost, entry.CostUSD, 0.000001,
+		"reasoning-only breakdown row bills at the output rate")
+}
+
+func TestDailyUsageCostsMessageReasoningTokens(t *testing.T) {
+	ctx := context.Background()
+	local := newLocalDB(t)
+	require.NoError(t, local.UpsertModelPricing([]db.ModelPricing{{
+		ModelPattern:  "gpt-5.4",
+		InputPerMTok:  1,
+		OutputPerMTok: 2,
+	}}))
+
+	msg := syncMessage(
+		"duck-message-reasoning", 0, "assistant", "message reasoning",
+		"2026-01-19T00:01:00.000Z")
+	msg.Model = "gpt-5.4"
+	msg.TokenUsage = json.RawMessage(
+		`{"input_tokens":1000,"output_tokens":0,"reasoning_tokens":500}`)
+	_, err := local.WriteSessionBatchAtomic([]db.SessionBatchWrite{{
+		Session: syncSession(
+			"duck-message-reasoning", "alpha", "message reasoning",
+			"2026-01-19T00:00:00.000Z", 1),
+		Messages:        []db.Message{msg},
+		DataVersion:     1,
+		ReplaceMessages: true,
+	}})
+	require.NoError(t, err)
+
+	syncer := newInMemoryTestSync(t, local, SyncOptions{})
+	require.NoError(t, createSchema(ctx, syncer.DB()))
+	_, err = syncer.pushEverything(ctx, nil)
+	require.NoError(t, err)
+	store := NewStoreFromDB(syncer.DB())
+	filter := db.UsageFilter{From: "2026-01-01", To: "2026-01-31", Timezone: "UTC"}
+
+	daily, err := store.GetDailyUsage(ctx, filter)
+	require.NoError(t, err)
+	assert.Equal(t, 1000, daily.Totals.InputTokens)
+	assert.Zero(t, daily.Totals.OutputTokens)
+	assert.InDelta(t, 0.002, daily.Totals.TotalCost, 0.000001)
+
+	sessionUsage, err := store.GetSessionUsage(ctx, "duck-message-reasoning", true)
+	require.NoError(t, err)
+	require.NotNil(t, sessionUsage)
+	assert.True(t, sessionUsage.HasCost)
+	assert.InDelta(t, 0.002, sessionUsage.CostUSD, 0.000001)
+	require.Len(t, sessionUsage.Breakdown, 1,
+		"reasoning-bearing message must appear in the breakdown")
+	entry := sessionUsage.Breakdown[0]
+	assert.Equal(t, "message", entry.Source)
+	assert.Equal(t, 1000, entry.InputTokens)
+	assert.Zero(t, entry.OutputTokens)
+	assert.True(t, entry.HasCost)
+	assert.InDelta(t, 0.002, entry.CostUSD, 0.000001,
+		"breakdown cost must include reasoning billed as output")
+}
+
+func TestDailyUsageCostsMixedOutputAndReasoningOnlyRows(t *testing.T) {
+	ctx := context.Background()
+	local := newLocalDB(t)
+	require.NoError(t, local.UpsertModelPricing([]db.ModelPricing{{
+		ModelPattern:  "reasoning-mix",
+		OutputPerMTok: 2,
+	}}))
+
+	sessionID := "duck-reasoning-mixed"
+	_, err := local.WriteSessionBatchAtomic([]db.SessionBatchWrite{{
+		Session: syncSession(
+			sessionID, "alpha", "reasoning mixed",
+			"2026-01-19T00:00:00.000Z", 0),
+		UsageEvents: []db.UsageEvent{
+			{
+				Source:          "provider",
+				Model:           "reasoning-mix",
+				OutputTokens:    100,
+				ReasoningTokens: 20,
+				OccurredAt:      "2026-01-19T00:01:00.000Z",
+				DedupKey:        "normal-output",
+			},
+			{
+				Source:          "provider",
+				Model:           "reasoning-mix",
+				ReasoningTokens: 300,
+				OccurredAt:      "2026-01-19T00:02:00.000Z",
+				DedupKey:        "reasoning-only",
+			},
+		},
+		DataVersion:     1,
+		ReplaceMessages: true,
+	}})
+	require.NoError(t, err)
+
+	syncer := newInMemoryTestSync(t, local, SyncOptions{})
+	require.NoError(t, createSchema(ctx, syncer.DB()))
+	_, err = syncer.pushEverything(ctx, nil)
+	require.NoError(t, err)
+	store := NewStoreFromDB(syncer.DB())
+	filter := db.UsageFilter{From: "2026-01-01", To: "2026-01-31", Timezone: "UTC"}
+	wantCost := float64(100+300) * 2 / 1_000_000
+
+	daily, err := store.GetDailyUsage(ctx, filter)
+	require.NoError(t, err)
+	assert.Equal(t, 100, daily.Totals.OutputTokens,
+		"reasoning-only rows do not change reported output-token totals")
+	assert.InDelta(t, wantCost, daily.Totals.TotalCost, 0.000001)
+	require.NotNil(t, daily.Pricing)
+	assert.Equal(t, export.CostSourceComputed,
+		daily.Pricing.Models["reasoning-mix"].CostSource)
+
+	top, err := store.GetTopSessionsByCost(ctx, filter, 10)
+	require.NoError(t, err)
+	require.Len(t, top, 1)
+	assert.InDelta(t, wantCost, top[0].Cost, 0.000001)
+
+	sessionUsage, err := store.GetSessionUsage(ctx, sessionID, true)
+	require.NoError(t, err)
+	require.NotNil(t, sessionUsage)
+	assert.True(t, sessionUsage.HasCost)
+	assert.InDelta(t, wantCost, sessionUsage.CostUSD, 0.000001)
+	require.Len(t, sessionUsage.Breakdown, 2,
+		"both output and reasoning-only rows must appear in the breakdown")
+	breakdownCost := 0.0
+	for _, entry := range sessionUsage.Breakdown {
+		assert.True(t, entry.HasCost)
+		breakdownCost += entry.CostUSD
+	}
+	assert.InDelta(t, wantCost, breakdownCost, 0.000001,
+		"breakdown costs must sum to the session cost")
 }
 
 func TestUsageDedupPrefersInRangeDuplicate(t *testing.T) {
@@ -2233,7 +3038,8 @@ func TestUsageDedupPrefersInRangeDuplicate(t *testing.T) {
 	require.NoError(t, err)
 
 	syncer := newInMemoryTestSync(t, local, SyncOptions{})
-	_, err = syncer.Push(ctx, true, nil)
+	require.NoError(t, createSchema(ctx, syncer.DB()))
+	_, err = syncer.pushEverything(ctx, nil)
 	require.NoError(t, err)
 	store := NewStoreFromDB(syncer.DB())
 
@@ -2267,7 +3073,8 @@ func TestPushSyncsCursorUsageEventsIntoDuckDBDailyUsage(t *testing.T) {
 	}}), "InsertCursorUsageEvents")
 
 	syncer := newInMemoryTestSync(t, local, SyncOptions{})
-	_, err := syncer.Push(ctx, false, nil)
+	require.NoError(t, createSchema(ctx, syncer.DB()))
+	_, err := syncer.pushEverything(ctx, nil)
 	require.NoError(t, err)
 	assertDuckDBCount(t, syncer.DB(), "cursor_usage_events", 1)
 
@@ -2285,6 +3092,8 @@ func TestPushSyncsCursorUsageEventsIntoDuckDBDailyUsage(t *testing.T) {
 	assert.Equal(t, 12, result.Daily[0].CacheCreationTokens)
 	assert.Equal(t, 34, result.Daily[0].CacheReadTokens)
 	assert.InDelta(t, 0.1566, result.Daily[0].TotalCost, 1e-9)
+	assert.Empty(t, result.Projects, "cursor-only usage should not emit project identities")
+	assert.NotContains(t, result.Projects, "")
 	assert.Equal(t, 0, result.SessionCounts.Total)
 	assert.Empty(t, result.SessionCounts.ByAgent)
 	assert.Empty(t, result.SessionCounts.ByProject)
@@ -2307,7 +3116,8 @@ func TestTrendsTermsWordBoundaryAndOverlapParity(t *testing.T) {
 	}})
 	require.NoError(t, err)
 	syncer := newInMemoryTestSync(t, local, SyncOptions{})
-	_, err = syncer.Push(ctx, true, nil)
+	require.NoError(t, createSchema(ctx, syncer.DB()))
+	_, err = syncer.pushEverything(ctx, nil)
 	require.NoError(t, err)
 	store := NewStoreFromDB(syncer.DB())
 
@@ -2343,8 +3153,17 @@ func TestDailyUsageBreakdownsAndCacheSavings(t *testing.T) {
 		CacheReadPerMTok:     0.5,
 	}}))
 	sessionID := "duck-usage-breakdowns"
+	primarySession := syncSession(
+		sessionID, "alpha", "usage first", "2026-01-17T00:00:00.000Z", 1,
+	)
+	primarySession.Machine = "host-a"
+	secondaryID := "duck-usage-breakdowns-secondary"
+	secondarySession := syncSession(
+		secondaryID, "alpha", "usage second", "2026-01-17T00:02:00.000Z", 1,
+	)
+	secondarySession.Machine = "host-b"
 	_, err := local.WriteSessionBatchAtomic([]db.SessionBatchWrite{{
-		Session:  syncSession(sessionID, "alpha", "usage first", "2026-01-17T00:00:00.000Z", 1),
+		Session:  primarySession,
 		Messages: []db.Message{syncMessage(sessionID, 0, "user", "usage first", "2026-01-17T00:00:00.000Z")},
 		UsageEvents: []db.UsageEvent{{
 			Source:               "hermes",
@@ -2357,11 +3176,33 @@ func TestDailyUsageBreakdownsAndCacheSavings(t *testing.T) {
 		}},
 		DataVersion:     1,
 		ReplaceMessages: true,
+	}, {
+		Session:  secondarySession,
+		Messages: []db.Message{syncMessage(secondaryID, 0, "user", "usage second", "2026-01-17T00:02:00.000Z")},
+		UsageEvents: []db.UsageEvent{{
+			Source:       "hermes",
+			Model:        "claude-test",
+			InputTokens:  2,
+			OutputTokens: 1,
+			OccurredAt:   "2026-01-17T00:03:00.000Z",
+			DedupKey:     "breakdown-secondary",
+		}},
+		DataVersion:     1,
+		ReplaceMessages: true,
 	}})
 	require.NoError(t, err)
 
 	syncer := newInMemoryTestSync(t, local, SyncOptions{})
-	_, err = syncer.Push(ctx, true, nil)
+	require.NoError(t, createSchema(ctx, syncer.DB()))
+	_, err = syncer.pushEverything(ctx, nil)
+	require.NoError(t, err)
+	_, err = syncer.DB().ExecContext(ctx, `
+		UPDATE sessions
+		SET machine = CASE id
+			WHEN ? THEN 'host-a'
+			WHEN ? THEN 'host-b'
+			ELSE machine
+		END`, sessionID, secondaryID)
 	require.NoError(t, err)
 	store := NewStoreFromDB(syncer.DB())
 
@@ -2376,8 +3217,13 @@ func TestDailyUsageBreakdownsAndCacheSavings(t *testing.T) {
 	require.Len(t, day.ModelBreakdowns, 1)
 	require.Len(t, day.ProjectBreakdowns, 1)
 	require.Len(t, day.AgentBreakdowns, 1)
+	require.Len(t, day.MachineBreakdowns, 2)
 	assert.Equal(t, "alpha", day.ProjectBreakdowns[0].Project)
 	assert.Equal(t, "claude", day.AgentBreakdowns[0].Agent)
+	assert.Equal(t, "host-a", day.MachineBreakdowns[0].MachineName)
+	assert.Equal(t, "host-b", day.MachineBreakdowns[1].MachineName)
+	assert.InDelta(t, day.TotalCost,
+		day.MachineBreakdowns[0].Cost+day.MachineBreakdowns[1].Cost, 0.000001)
 	assert.InDelta(t, 0.00001, got.Totals.CacheSavings, 0.000001)
 
 	noCounts, err := store.GetDailyUsage(ctx, db.UsageFilter{
@@ -2420,7 +3266,8 @@ func TestGetChildSessionsOrderedByStartedAt(t *testing.T) {
 	require.NoError(t, local.SoftDeleteSession("duck-child-deleted"))
 
 	syncer := newInMemoryTestSync(t, local, SyncOptions{})
-	_, err = syncer.Push(ctx, true, nil)
+	require.NoError(t, createSchema(ctx, syncer.DB()))
+	_, err = syncer.pushEverything(ctx, nil)
 	require.NoError(t, err)
 	store := NewStoreFromDB(syncer.DB())
 
@@ -2429,6 +3276,193 @@ func TestGetChildSessionsOrderedByStartedAt(t *testing.T) {
 	assert.Equal(t,
 		[]string{"duck-child-early", "duck-child-late"},
 		duckSessionIDs(children))
+}
+
+func TestStoreSessionUsageRollupParity(t *testing.T) {
+	ctx := context.Background()
+	local := newLocalDB(t)
+	require.NoError(t, local.UpsertModelPricing([]db.ModelPricing{{
+		ModelPattern: "claude-test", InputPerMTok: 3, OutputPerMTok: 15,
+	}}))
+	root := syncSession("duck-rollup-root", "alpha", "root", "2026-01-10T00:00:00.000Z", 1)
+	continuation := syncSession("duck-rollup-continuation", "alpha", "continuation", "2026-01-10T00:30:00.000Z", 0)
+	child := syncSession("duck-rollup-child", "alpha", "child", "2026-01-10T01:00:00.000Z", 1)
+	parentID := root.ID
+	continuationParentID := continuation.ID
+	continuation.ParentSessionID = &parentID
+	continuation.RelationshipType = "continuation"
+	child.ParentSessionID = &continuationParentID
+	child.RelationshipType = "subagent"
+	rootMessage := syncMessage(root.ID, 0, "assistant", "root", *root.StartedAt)
+	childMessage := syncMessage(child.ID, 0, "assistant", "child", *child.StartedAt)
+	childUnique := syncMessage(child.ID, 1, "assistant", "child unique", "2026-01-10T01:05:00.000Z")
+	rootMessage.ClaudeMessageID, rootMessage.ClaudeRequestID = "duck-rollup-shared", "duck-rollup-request"
+	childMessage.ClaudeMessageID, childMessage.ClaudeRequestID = "duck-rollup-shared", "duck-rollup-request"
+	_, err := local.WriteSessionBatchAtomic([]db.SessionBatchWrite{
+		{Session: root, Messages: []db.Message{rootMessage}, DataVersion: 1, ReplaceMessages: true},
+		{Session: continuation, DataVersion: 1, ReplaceMessages: true},
+		{Session: child, Messages: []db.Message{childMessage, childUnique}, DataVersion: 1, ReplaceMessages: true},
+	})
+	require.NoError(t, err)
+	syncer := newInMemoryTestSync(t, local, SyncOptions{})
+	require.NoError(t, createSchema(ctx, syncer.DB()))
+	_, err = syncer.pushEverything(ctx, nil)
+	require.NoError(t, err)
+
+	rollup, err := service.GetSessionUsageRollup(
+		ctx, NewStoreFromDB(syncer.DB()), root.ID, false,
+	)
+	require.NoError(t, err)
+	require.Equal(t, 1, rollup.SubagentCount)
+	require.True(t, rollup.HasCost)
+	assert.InDelta(t, 0.000066, rollup.CostUSD, 1e-12)
+}
+
+func TestStoreSessionUsageRollupUsesCopilotReportedSessionCost(t *testing.T) {
+	ctx := context.Background()
+	local := newLocalDB(t)
+	require.NoError(t, local.UpsertModelPricing([]db.ModelPricing{{
+		ModelPattern: "gpt-5.1", InputPerMTok: 3, OutputPerMTok: 15,
+	}}))
+	root := syncSession(
+		"duck-copilot-rollup-root", "alpha", "root",
+		"2026-01-10T00:00:00.000Z", 1)
+	root.Agent = "copilot"
+	child := syncSession(
+		"duck-copilot-rollup-child", "alpha", "child",
+		"2026-01-10T01:00:00.000Z", 1)
+	child.Agent = "copilot"
+	parentID := root.ID
+	child.ParentSessionID = &parentID
+	child.RelationshipType = "subagent"
+	reportedRootCost := 0.03
+	reportedChildCost := 0.02
+	_, err := local.WriteSessionBatchAtomic([]db.SessionBatchWrite{
+		{
+			Session: root,
+			UsageEvents: []db.UsageEvent{
+				{
+					Source: "shutdown", Model: "gpt-5.1",
+					InputTokens: 1000, OutputTokens: 500,
+					OccurredAt: "2026-01-10T00:01:00.000Z", DedupKey: "first",
+				},
+				{
+					Source: "shutdown", Model: "gpt-5.1",
+					InputTokens: 1000, OutputTokens: 500,
+					CostUSD: &reportedRootCost, CostStatus: "exact",
+					CostSource: db.CopilotReportedCostSource,
+					OccurredAt: "2026-01-10T00:02:00.000Z", DedupKey: "final",
+				},
+			},
+			DataVersion: 1, ReplaceMessages: true,
+		},
+		{
+			Session: child,
+			UsageEvents: []db.UsageEvent{{
+				Source: "provider", Model: "gpt-5.1",
+				CostUSD: &reportedChildCost, CostStatus: "exact", CostSource: "provider",
+				OccurredAt: "2026-01-10T01:01:00.000Z", DedupKey: "child",
+			}},
+			DataVersion: 1, ReplaceMessages: true,
+		},
+	})
+	require.NoError(t, err)
+	syncer := newInMemoryTestSync(t, local, SyncOptions{})
+	require.NoError(t, createSchema(ctx, syncer.DB()))
+	_, err = syncer.pushEverything(ctx, nil)
+	require.NoError(t, err)
+
+	rollup, err := service.GetSessionUsageRollup(
+		ctx, NewStoreFromDB(syncer.DB()), root.ID, false)
+	require.NoError(t, err)
+	require.True(t, rollup.HasCost)
+	assert.InDelta(t, reportedRootCost+reportedChildCost,
+		rollup.CostUSD, 1e-12)
+}
+
+func TestStoreSessionUsageRollupIncludesUntimedRows(t *testing.T) {
+	ctx := context.Background()
+	local := newLocalDB(t)
+	require.NoError(t, local.UpsertModelPricing([]db.ModelPricing{{
+		ModelPattern: "claude-test", InputPerMTok: 3, OutputPerMTok: 15,
+	}}))
+	root := syncSession("duck-rollup-untimed-root", "alpha", "root", "2026-01-10T00:00:00.000Z", 1)
+	child := syncSession("duck-rollup-untimed-child", "alpha", "child", "2026-01-10T01:00:00.000Z", 1)
+	parentID := root.ID
+	child.ParentSessionID = &parentID
+	child.RelationshipType = "subagent"
+	rootMessage := syncMessage(root.ID, 0, "assistant", "root", "")
+	childMessage := syncMessage(child.ID, 0, "assistant", "child", "")
+	_, err := local.WriteSessionBatchAtomic([]db.SessionBatchWrite{
+		{
+			Session:         root,
+			Messages:        []db.Message{rootMessage},
+			DataVersion:     1,
+			ReplaceMessages: true,
+		},
+		{
+			Session:         child,
+			Messages:        []db.Message{childMessage},
+			DataVersion:     1,
+			ReplaceMessages: true,
+		},
+	})
+	require.NoError(t, err)
+	syncer := newInMemoryTestSync(t, local, SyncOptions{})
+	require.NoError(t, createSchema(ctx, syncer.DB()))
+	_, err = syncer.pushEverything(ctx, nil)
+	require.NoError(t, err)
+
+	rollup, err := service.GetSessionUsageRollup(
+		ctx, NewStoreFromDB(syncer.DB()), root.ID, false,
+	)
+	require.NoError(t, err)
+	require.Equal(t, 1, rollup.SubagentCount)
+	require.True(t, rollup.HasCost)
+	assert.InDelta(t, 0.000066, rollup.CostUSD, 1e-12)
+}
+
+func TestStoreSessionUsageRollupHandlesNullMessageAndSessionTimestamps(t *testing.T) {
+	ctx := context.Background()
+	local := newLocalDB(t)
+	require.NoError(t, local.UpsertModelPricing([]db.ModelPricing{{
+		ModelPattern: "claude-test", InputPerMTok: 3, OutputPerMTok: 15,
+	}}))
+	root := syncSession("duck-rollup-null-ts-root", "alpha", "root", "2026-01-10T00:00:00.000Z", 1)
+	child := syncSession("duck-rollup-null-ts-child", "alpha", "child", "2026-01-10T01:00:00.000Z", 1)
+	parentID := root.ID
+	child.ParentSessionID = &parentID
+	child.RelationshipType = "subagent"
+	child.StartedAt = nil
+	rootMessage := syncMessage(root.ID, 0, "assistant", "root", *root.StartedAt)
+	childMessage := syncMessage(child.ID, 0, "assistant", "child", "")
+	_, err := local.WriteSessionBatchAtomic([]db.SessionBatchWrite{
+		{
+			Session:         root,
+			Messages:        []db.Message{rootMessage},
+			DataVersion:     1,
+			ReplaceMessages: true,
+		},
+		{
+			Session:         child,
+			Messages:        []db.Message{childMessage},
+			DataVersion:     1,
+			ReplaceMessages: true,
+		},
+	})
+	require.NoError(t, err)
+	syncer := newInMemoryTestSync(t, local, SyncOptions{})
+	require.NoError(t, createSchema(ctx, syncer.DB()))
+	_, err = syncer.pushEverything(ctx, nil)
+	require.NoError(t, err)
+
+	rollup, err := service.GetSessionUsageRollup(
+		ctx, NewStoreFromDB(syncer.DB()), root.ID, false,
+	)
+	require.NoError(t, err)
+	require.Equal(t, 1, rollup.SubagentCount)
+	require.True(t, rollup.HasCost)
+	assert.InDelta(t, 0.000066, rollup.CostUSD, 1e-12)
 }
 
 // TestDuckGetAnalyticsSkillsAggregatesAcrossWeeks exercises the SQL
@@ -2464,13 +3498,14 @@ func TestDuckGetAnalyticsSkillsAggregatesAcrossWeeks(t *testing.T) {
 	require.NoError(t, err)
 
 	syncer := newInMemoryTestSync(t, local, SyncOptions{})
-	_, err = syncer.Push(ctx, true, nil)
+	require.NoError(t, createSchema(ctx, syncer.DB()))
+	_, err = syncer.pushEverything(ctx, nil)
 	require.NoError(t, err)
 	store := NewStoreFromDB(syncer.DB())
 
 	resp, err := store.GetAnalyticsSkills(ctx, db.AnalyticsFilter{
 		From: "2026-01-01", To: "2026-01-31", Timezone: "UTC",
-	})
+	}, "week")
 	require.NoError(t, err, "GetAnalyticsSkills")
 	require.Len(t, resp.BySkill, 1, "BySkill")
 	assert.Equal(t, "deploy", resp.BySkill[0].SkillName)
@@ -2522,13 +3557,14 @@ func TestDuckGetAnalyticsSkillsFiltersByMessageDate(t *testing.T) {
 	require.NoError(t, err)
 
 	syncer := newInMemoryTestSync(t, local, SyncOptions{})
-	_, err = syncer.Push(ctx, true, nil)
+	require.NoError(t, createSchema(ctx, syncer.DB()))
+	_, err = syncer.pushEverything(ctx, nil)
 	require.NoError(t, err)
 	store := NewStoreFromDB(syncer.DB())
 
 	resp, err := store.GetAnalyticsSkills(ctx, db.AnalyticsFilter{
 		From: "2026-02-01", To: "2026-02-28", Timezone: "UTC",
-	})
+	}, "week")
 	require.NoError(t, err, "GetAnalyticsSkills")
 	require.Len(t, resp.BySkill, 1, "BySkill")
 	assert.Equal(t, "deploy", resp.BySkill[0].SkillName)
@@ -2552,7 +3588,8 @@ func newSyncedStore(t *testing.T) (*Store, syncFixture) {
 	local := newLocalDB(t)
 	fixture := seedDuckDBSyncFixture(t, local)
 	syncer := newInMemoryTestSync(t, local, SyncOptions{})
-	_, err := syncer.Push(ctx, true, nil)
+	require.NoError(t, createSchema(ctx, syncer.DB()))
+	_, err := syncer.pushEverything(ctx, nil)
 	require.NoError(t, err)
 	return NewStoreFromDB(syncer.DB()), fixture
 }
@@ -2603,7 +3640,8 @@ func TestDuckDBBranchDimension(t *testing.T) {
 	require.NoError(t, err)
 
 	syncer := newInMemoryTestSync(t, local, SyncOptions{})
-	_, err = syncer.Push(ctx, true, nil)
+	require.NoError(t, createSchema(ctx, syncer.DB()))
+	_, err = syncer.pushEverything(ctx, nil)
 	require.NoError(t, err)
 	store := NewStoreFromDB(syncer.DB())
 

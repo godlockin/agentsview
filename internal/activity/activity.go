@@ -1,13 +1,15 @@
 // Package activity aggregates a resolved time range of agent activity into a
-// concurrency- and usage-oriented report. It is pure: it depends only on the
-// time and sort packages and operates on in-memory input streams supplied by a
-// storage backend, so the same aggregation runs identically across SQLite,
-// PostgreSQL, and DuckDB.
+// concurrency- and usage-oriented report. It operates on in-memory input
+// streams supplied by a storage backend, so the same aggregation runs
+// identically across SQLite, PostgreSQL, and DuckDB. Export contract types are
+// referenced only for optional report metadata.
 package activity
 
 import (
 	"sort"
 	"time"
+
+	"go.kenn.io/agentsview/internal/export"
 )
 
 // Params controls one range aggregation. RangeStart/RangeEnd are the resolved
@@ -56,6 +58,10 @@ type UsageRow struct {
 	Timestamp       string // ts, RFC3339 or ""
 	OutputTokens    int
 	Cost            float64
+	CostSource      export.CostSource
+	SessionCost     *float64
+	Priced          bool
+	Contributes     bool
 	Agent           string
 	ClaudeMessageID string
 	ClaudeRequestID string
@@ -63,26 +69,115 @@ type UsageRow struct {
 	UsageDedupKey   string
 }
 
+type UsageCostAllocation struct {
+	Cost        float64
+	CostSource  export.CostSource
+	Priced      bool
+	Contributes bool
+}
+
+// AllocateUsageCosts selects aggregate row costs. A session may carry one
+// session total; when it does, that settlement replaces the session's row
+// estimates and is distributed by their catalog-cost weights.
+func AllocateUsageCosts(usage []UsageRow) []UsageCostAllocation {
+	type sessionCost struct {
+		carrier int
+		cost    float64
+		indices []int
+	}
+	allocated := make([]UsageCostAllocation, len(usage))
+	sessionCosts := make(map[string]*sessionCost)
+	for i, row := range usage {
+		allocated[i] = UsageCostAllocation{
+			Cost: row.Cost, CostSource: row.CostSource,
+			Priced: row.Priced, Contributes: row.Contributes,
+		}
+		if row.SessionCost != nil {
+			sessionCosts[row.SessionID] = &sessionCost{
+				carrier: i,
+				cost:    *row.SessionCost,
+			}
+		}
+	}
+	for i, row := range usage {
+		selected := sessionCosts[row.SessionID]
+		if selected == nil || !allocated[i].Contributes {
+			continue
+		}
+		selected.indices = append(selected.indices, i)
+	}
+	for _, selected := range sessionCosts {
+		if len(selected.indices) == 0 {
+			allocated[selected.carrier] = UsageCostAllocation{
+				Cost: selected.cost, CostSource: export.CostSourceReported,
+				Priced: true, Contributes: true,
+			}
+			continue
+		}
+		weights := make([]float64, len(selected.indices))
+		for i, index := range selected.indices {
+			weights[i] = usage[index].Cost
+		}
+		costs := export.AllocateCostByWeight(selected.cost, weights)
+		for i, index := range selected.indices {
+			allocated[index] = UsageCostAllocation{
+				Cost: costs[i], CostSource: export.CostSourceReported,
+				Priced: true, Contributes: true,
+			}
+		}
+	}
+	return allocated
+}
+
 // Report is the API payload.
 type Report struct {
-	Timezone           string           `json:"timezone"`
-	RangeStart         string           `json:"range_start"`
-	RangeEnd           string           `json:"range_end"`
-	BucketUnit         string           `json:"bucket_unit"`
-	BucketSeconds      int              `json:"bucket_seconds"`
-	BucketCount        int              `json:"bucket_count"`
-	Partial            bool             `json:"partial"`
-	AsOf               *string          `json:"as_of"`
-	EffectiveEnd       string           `json:"effective_end"`
-	ElapsedBucketCount int              `json:"elapsed_bucket_count"`
-	Buckets            []Bucket         `json:"buckets"`
-	Peak               Peak             `json:"peak"`
-	Totals             Totals           `json:"totals"`
-	ByProject          []KeyMinutes     `json:"by_project"`
-	ByModel            []KeyMinutes     `json:"by_model"`
-	ByAgent            []KeyMinutes     `json:"by_agent"`
-	BySession          []SessionRow     `json:"by_session"`
-	Intervals          []ReportInterval `json:"intervals"`
+	SchemaVersion      int                               `json:"schema_version,omitempty"`
+	Pricing            *export.PricingBlock              `json:"pricing,omitempty"`
+	Projects           map[string]export.ProjectMapEntry `json:"projects"`
+	Timezone           string                            `json:"timezone"`
+	RangeStart         string                            `json:"range_start"`
+	RangeEnd           string                            `json:"range_end"`
+	BucketUnit         string                            `json:"bucket_unit"`
+	BucketSeconds      int                               `json:"bucket_seconds"`
+	BucketCount        int                               `json:"bucket_count"`
+	Partial            bool                              `json:"partial"`
+	AsOf               *string                           `json:"as_of"`
+	EffectiveEnd       string                            `json:"effective_end"`
+	ElapsedBucketCount int                               `json:"elapsed_bucket_count"`
+	Buckets            []Bucket                          `json:"buckets"`
+	Peak               Peak                              `json:"peak"`
+	Totals             Totals                            `json:"totals"`
+	ByProject          []KeyMinutes                      `json:"by_project"`
+	ByModel            []KeyMinutes                      `json:"by_model"`
+	ByAgent            []KeyMinutes                      `json:"by_agent"`
+	BySession          []SessionRow                      `json:"by_session"`
+	Intervals          []ReportInterval                  `json:"intervals"`
+}
+
+func SanitizeProjectLabels(
+	report *Report, projects map[string]export.ProjectMapEntry,
+) {
+	for i := range report.ByProject {
+		report.ByProject[i].ProjectKey = export.ProjectKeyForEntry(
+			projects[report.ByProject[i].Key],
+		)
+		report.ByProject[i].Key = export.SafeProjectDisplayLabel(
+			report.ByProject[i].Key,
+		)
+	}
+	for i := range report.BySession {
+		title := export.SafeProjectDisplayLabel(report.BySession[i].Title)
+		if title == "" {
+			title = report.BySession[i].SessionID
+		}
+		report.BySession[i].Title = title
+		report.BySession[i].ProjectKey = export.ProjectKeyForEntry(
+			projects[report.BySession[i].Project],
+		)
+		report.BySession[i].Project = export.SafeProjectDisplayLabel(
+			report.BySession[i].Project,
+		)
+	}
 }
 
 type Bucket struct {
@@ -141,6 +236,7 @@ type Totals struct {
 // additive automated/interactive segments of each, exposed for a stacked-bar
 // rendering the current UI does not yet draw (it shows the combined metric).
 type KeyMinutes struct {
+	ProjectKey              string  `json:"project_key,omitempty"`
 	Key                     string  `json:"key"`
 	AgentMinutes            float64 `json:"agent_minutes"`
 	Cost                    float64 `json:"cost"`
@@ -152,6 +248,7 @@ type KeyMinutes struct {
 
 type SessionRow struct {
 	SessionID     string   `json:"session_id"`
+	ProjectKey    string   `json:"project_key"`
 	Title         string   `json:"title"`
 	Project       string   `json:"project"`
 	Agent         string   `json:"agent"`
@@ -547,17 +644,16 @@ func usageDedupTokenForRow(u UsageRow) (usageDedupToken, bool) {
 	return usageDedupToken{}, false
 }
 
-// dedupUsage filters usage rows to the range and applies the two-tier,
-// first-seen-wins dedup that mirrors GetDailyUsage. Rows arrive pre-sorted by
-// (ts, session_id, COALESCE(message_ordinal,-1)). The half-open instant filter
-// drops rows before start or at/after end; on a partial range effEnd is the
-// as-of clip, so rows at or after effEnd are dropped before they can claim a
-// dedup key, matching the activity/bucket clipping Aggregate applies. For a
-// full range effEnd == end, so nothing extra is excluded.
-func dedupUsage(start, end, effEnd time.Time, usage []UsageRow) []UsageRow {
+// UsageSurvivorMask returns a same-length mask for rows that survive the
+// report's range, effective-end, and first-seen dedup filters.
+func UsageSurvivorMask(start, end, effEnd time.Time, usage []UsageRow) []bool {
+	return usageSurvivorMask(start, end, effEnd, usage)
+}
+
+func usageSurvivorMask(start, end, effEnd time.Time, usage []UsageRow) []bool {
 	seen := map[usageDedupToken]struct{}{}
-	out := make([]UsageRow, 0, len(usage))
-	for _, u := range usage {
+	out := make([]bool, len(usage))
+	for i, u := range usage {
 		t, ok := parseTS(u.Timestamp)
 		if !ok || t.Before(start) || !t.Before(end) {
 			continue // out-of-range rows never claim a key
@@ -571,7 +667,25 @@ func dedupUsage(start, end, effEnd time.Time, usage []UsageRow) []UsageRow {
 			}
 			seen[k] = struct{}{}
 		}
-		out = append(out, u)
+		out[i] = true
+	}
+	return out
+}
+
+// dedupUsage filters usage rows to the range and applies the two-tier,
+// first-seen-wins dedup that mirrors GetDailyUsage. Rows arrive pre-sorted by
+// (ts, session_id, COALESCE(message_ordinal,-1)). The half-open instant filter
+// drops rows before start or at/after end; on a partial range effEnd is the
+// as-of clip, so rows at or after effEnd are dropped before they can claim a
+// dedup key, matching the activity/bucket clipping Aggregate applies. For a
+// full range effEnd == end, so nothing extra is excluded.
+func dedupUsage(start, end, effEnd time.Time, usage []UsageRow) []UsageRow {
+	out := make([]UsageRow, 0, len(usage))
+	mask := usageSurvivorMask(start, end, effEnd, usage)
+	for i, keep := range mask {
+		if keep {
+			out = append(out, usage[i])
+		}
 	}
 	return out
 }
@@ -581,18 +695,21 @@ func dedupUsage(start, end, effEnd time.Time, usage []UsageRow) []UsageRow {
 // timestamp.
 func applyUsage(r *Report, p Params, windows []BucketWindow, start, end time.Time,
 	usage []UsageRow, automatedBy map[string]bool) {
-	for _, u := range dedupUsage(start, end, p.EffectiveEnd, usage) {
+	usage = dedupUsage(start, end, p.EffectiveEnd, usage)
+	allocated := AllocateUsageCosts(usage)
+	for i, u := range usage {
+		cost := allocated[i].Cost
 		r.Totals.OutputTokens += u.OutputTokens
-		r.Totals.Cost += u.Cost
+		r.Totals.Cost += cost
 		if automatedBy[u.SessionID] {
-			r.Totals.AutomatedCost += u.Cost
+			r.Totals.AutomatedCost += cost
 		} else {
-			r.Totals.InteractiveCost += u.Cost
+			r.Totals.InteractiveCost += cost
 		}
 		t, _ := parseTS(u.Timestamp)
 		if b := windowIndex(windows, t); b >= 0 && b < len(r.Buckets) {
 			r.Buckets[b].OutputTokens += u.OutputTokens
-			r.Buckets[b].Cost += u.Cost
+			r.Buckets[b].Cost += cost
 		}
 	}
 }
@@ -661,16 +778,18 @@ func buildSessionsTable(r *Report, start, end, effEnd time.Time,
 	}
 	// Per-session cost/tokens/models from deduped usage.
 	cost := map[string]*usageAgg{}
-	for _, u := range dedupUsage(start, end, effEnd, usage) {
+	usage = dedupUsage(start, end, effEnd, usage)
+	allocated := AllocateUsageCosts(usage)
+	for i, u := range usage {
 		c := cost[u.SessionID]
 		if c == nil {
 			c = &usageAgg{models: map[string]float64{}}
 			cost[u.SessionID] = c
 		}
-		c.cost += u.Cost
+		c.cost += allocated[i].Cost
 		c.outputTokens += u.OutputTokens
 		if u.Model != "" {
-			c.models[u.Model] += u.Cost
+			c.models[u.Model] += allocated[i].Cost
 		}
 	}
 	projSet := map[string]struct{}{}

@@ -3,15 +3,16 @@
 /* tslint:disable */
 /* eslint-disable */
 export type DbDailyUsageEntry = {
-  agentBreakdowns?: any[] | null;
+  agentBreakdowns: any[] | null;
   cacheCreationTokens: number;
   cacheReadTokens: number;
   date: string;
   inputTokens: number;
-  modelBreakdowns?: any[] | null;
+  machineBreakdowns: any[] | null;
+  modelBreakdowns: any[] | null;
   modelsUsed: any[] | null;
   outputTokens: number;
-  projectBreakdowns?: any[] | null;
+  projectBreakdowns: any[] | null;
   totalCost: number;
 };
 

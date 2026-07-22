@@ -128,6 +128,7 @@ function makeTools(): ToolsAnalyticsResponse {
     total_calls: 0,
     by_category: [],
     by_agent: [],
+    by_tool: [],
     trend: [],
   };
 }
@@ -256,6 +257,7 @@ function resetStore() {
   analytics.to = "2024-01-31";
   analytics.isPinned = false;
   analytics.windowDays = 365;
+  analytics.skillsGranularity = "week";
   // Clear cached data fields so each test starts from a clean
   // "no data" state. Prior tests leave the singleton populated,
   // which breaks assertions like `loading === true during fetch`
@@ -393,6 +395,44 @@ describe("AnalyticsStore.setDateRange", () => {
     expect(analyticsService.getApiV1AnalyticsVelocity).toHaveBeenLastCalledWith(expected);
     expect(analyticsService.getApiV1AnalyticsTools).toHaveBeenLastCalledWith(expected);
     expect(analyticsService.getApiV1AnalyticsSkills).toHaveBeenLastCalledWith(expected);
+  });
+});
+
+describe("AnalyticsStore.setSkillsGranularity", () => {
+  it("applies the new granularity only after its response arrives", async () => {
+    analytics.skills = makeSkills();
+    let resolve!: (value: SkillsAnalyticsResponse) => void;
+    vi.mocked(
+      analyticsService.getApiV1AnalyticsSkills,
+    ).mockReturnValueOnce(new Promise((r) => { resolve = r; }));
+
+    const pending = analytics.setSkillsGranularity("month");
+
+    expect(analytics.skillsGranularity).toBe("week");
+    expect(analytics.querying.skills).toBe(true);
+    expect(
+      analyticsService.getApiV1AnalyticsSkills,
+    ).toHaveBeenLastCalledWith(
+      expect.objectContaining({ granularity: "month" }),
+    );
+
+    resolve(makeSkills());
+    await pending;
+
+    expect(analytics.skillsGranularity).toBe("month");
+    expect(analytics.querying.skills).toBe(false);
+  });
+
+  it("keeps the applied granularity when the request fails", async () => {
+    analytics.skills = makeSkills();
+    vi.mocked(
+      analyticsService.getApiV1AnalyticsSkills,
+    ).mockRejectedValueOnce(new Error("network down"));
+
+    const result = await analytics.setSkillsGranularity("month");
+
+    expect(result).toBe("error");
+    expect(analytics.skillsGranularity).toBe("week");
   });
 });
 
@@ -956,6 +996,24 @@ describe("executeFetch concurrency and error handling", () => {
     expect(signals[0]).toBeDefined();
     expect(signals[0]?.aborted).toBe(true);
   });
+
+  it("aborts visible panel requests on teardown", async () => {
+    const signals: (AbortSignal | undefined)[] = [];
+    vi.mocked(callGenerated).mockImplementation(
+      (request: () => Promise<unknown>, signal?: AbortSignal) => {
+        signals.push(signal);
+        return request();
+      },
+    );
+    vi.mocked(analyticsService.getApiV1AnalyticsSummary)
+      .mockImplementationOnce(() => new Promise(() => {}));
+
+    void analytics.fetchSummary();
+    await Promise.resolve();
+    analytics.cancelInFlightReads();
+
+    expect(signals[0]?.aborted).toBe(true);
+  });
 });
 
 describe("AnalyticsStore rolling default date range", () => {
@@ -972,20 +1030,20 @@ describe("AnalyticsStore rolling default date range", () => {
     const { analytics } = await loadAnalyticsStore();
     expect(analytics.isPinned).toBe(false);
     expect(analytics.windowDays).toBe(365);
-    expect(analytics.from).toBe("2025-04-25");
+    expect(analytics.from).toBe("2025-04-26");
     expect(analytics.to).toBe("2026-04-25");
   });
 
   it("fetchAll re-derives from/to against the current clock while unpinned", async () => {
     const { analytics } = await loadAnalyticsStore();
 
-    expect(analytics.from).toBe("2025-04-25");
+    expect(analytics.from).toBe("2025-04-26");
     expect(analytics.to).toBe("2026-04-25");
 
     vi.setSystemTime(new Date("2026-04-26T12:00:00"));
     await analytics.fetchAll();
 
-    expect(analytics.from).toBe("2025-04-26");
+    expect(analytics.from).toBe("2025-04-27");
     expect(analytics.to).toBe("2026-04-26");
   });
 
@@ -1013,19 +1071,19 @@ describe("AnalyticsStore rolling default date range", () => {
 
     expect(analytics.isPinned).toBe(false);
     expect(analytics.windowDays).toBe(7);
-    expect(analytics.from).toBe("2026-04-18");
+    expect(analytics.from).toBe("2026-04-19");
     expect(analytics.to).toBe("2026-04-25");
   });
 
   it("after setRollingWindow, fetchAll keeps rolling", async () => {
     const { analytics } = await loadAnalyticsStore();
     analytics.setRollingWindow(7);
-    expect(analytics.from).toBe("2026-04-18");
+    expect(analytics.from).toBe("2026-04-19");
 
     vi.setSystemTime(new Date("2026-04-26T12:00:00"));
     await analytics.fetchAll();
 
-    expect(analytics.from).toBe("2026-04-19");
+    expect(analytics.from).toBe("2026-04-20");
     expect(analytics.to).toBe("2026-04-26");
   });
 
@@ -1078,11 +1136,11 @@ describe("AnalyticsStore rolling default date range", () => {
     vi.setSystemTime(new Date("2026-04-26T12:00:00"));
     await analytics.fetchSignalsForInsights();
 
-    expect(analytics.from).toBe("2026-04-19");
+    expect(analytics.from).toBe("2026-04-20");
     expect(analytics.to).toBe("2026-04-26");
     expect(analyticsService.getApiV1AnalyticsSignals).toHaveBeenLastCalledWith(
       expect.objectContaining({
-        from: "2026-04-19",
+        from: "2026-04-20",
         to: "2026-04-26",
       }),
     );

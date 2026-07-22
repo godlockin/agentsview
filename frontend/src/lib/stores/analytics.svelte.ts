@@ -19,7 +19,7 @@ import {
 } from "../api/runtime.js";
 import { sessions } from "./sessions.svelte.js";
 import { perf, type PerfEntryStatus } from "./perf.svelte.js";
-import { daysAgo, today } from "../utils/dates.js";
+import { rollingRange, today } from "../utils/dates.js";
 
 type AnalyticsParams = Parameters<
   typeof AnalyticsService.getApiV1AnalyticsSummary
@@ -52,11 +52,12 @@ type Panel =
 type FetchResult = "ok" | "error" | "aborted";
 
 class AnalyticsStore {
-  from: string = $state(daysAgo(365));
+  from: string = $state(rollingRange(365).from);
   to: string = $state(today());
   isPinned: boolean = $state(false);
   windowDays: number = $state(365);
   granularity: Granularity = $state("day");
+  skillsGranularity: Granularity = $state("week");
   metric: HeatmapMetric = $state("messages");
   selectedDate: string | null = $state(null);
   project: string = $state("");
@@ -545,6 +546,17 @@ class AnalyticsStore {
     }
   }
 
+  cancelInFlightReads(): void {
+    this.fetchAllVersion++;
+    for (const panel of Object.keys(this.abortControllers) as Panel[]) {
+      this.versions[panel]++;
+      this.abortControllers[panel]?.abort();
+      delete this.abortControllers[panel];
+      this.querying[panel] = false;
+      this.loading[panel] = false;
+    }
+  }
+
   private markRefreshComplete(): void {
     this.lastUpdatedAt = Date.now();
     this.hasNewData = false;
@@ -552,8 +564,9 @@ class AnalyticsStore {
 
   private rollDates(): void {
     if (this.isPinned) return;
-    this.from = daysAgo(this.windowDays);
-    this.to = today();
+    const { from, to } = rollingRange(this.windowDays);
+    this.from = from;
+    this.to = to;
   }
 
   async fetchAll() {
@@ -700,15 +713,19 @@ class AnalyticsStore {
     );
   }
 
-  async fetchSkills(): Promise<FetchResult> {
+  async fetchSkills(
+    granularity: Granularity = this.skillsGranularity,
+  ): Promise<FetchResult> {
     return await this.executeFetch(
       "skills",
       () =>
-        AnalyticsService.getApiV1AnalyticsSkills(
-          this.filterParams(),
-        ) as unknown as Promise<SkillsAnalyticsResponse>,
+        AnalyticsService.getApiV1AnalyticsSkills({
+          ...this.filterParams(),
+          granularity,
+      }) as unknown as Promise<SkillsAnalyticsResponse>,
       (data) => {
         this.skills = data;
+        this.skillsGranularity = granularity;
       },
       () => this.skills !== null,
     );
@@ -826,6 +843,11 @@ class AnalyticsStore {
   setGranularity(g: Granularity) {
     this.granularity = g;
     this.fetchActivity();
+  }
+
+  async setSkillsGranularity(g: Granularity): Promise<FetchResult> {
+    if (this.skillsGranularity === g) return "ok";
+    return await this.fetchSkills(g);
   }
 
   setMetric(m: HeatmapMetric) {

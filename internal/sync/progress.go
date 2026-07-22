@@ -51,13 +51,14 @@ type SyncResult struct {
 // produced at least one session — used by ResyncAll to compare
 // against Failed on the same unit.
 type SyncStats struct {
-	TotalSessions  int      `json:"total_sessions"`
-	Synced         int      `json:"synced"`
-	Skipped        int      `json:"skipped"`
-	Failed         int      `json:"failed"`
-	OrphanedCopied int      `json:"orphaned_copied,omitempty"`
-	Warnings       []string `json:"warnings,omitempty"`
-	Aborted        bool     `json:"aborted,omitempty"`
+	TotalSessions  int                 `json:"total_sessions"`
+	Synced         int                 `json:"synced"`
+	Skipped        int                 `json:"skipped"`
+	Failed         int                 `json:"failed"`
+	OrphanedCopied int                 `json:"orphaned_copied,omitempty"`
+	Warnings       []string            `json:"warnings,omitempty"`
+	Aborted        bool                `json:"aborted,omitempty"`
+	RebuildPhases  []RebuildPhaseStats `json:"rebuild_phases,omitempty"`
 
 	// Anomalies aggregates per-run parser/sanitizer anomaly signals
 	// surfaced in the CLI sync summary. These are live per-run counters
@@ -76,6 +77,16 @@ type SyncStats struct {
 	messagesIndexed        int // unexported: progress message counter
 	parserExcludedFiles    int // file-level intentional parser exclusions
 	parserExcludedIDs      []string
+	// cwdFilteredSessions counts sessions vetoed by the
+	// sync_include_cwd_prefixes allow-list. The resync abort guard uses
+	// it so a run where every discovered session is filtered reads as
+	// an intentional result rather than an unsafe empty rebuild.
+	cwdFilteredSessions int
+	// cwdFilteredFiles counts files whose every parsed session was
+	// vetoed by the allow-list. Together with parserExcludedFiles it
+	// must account for all of filesOK before the resync abort guard
+	// treats a zero-write run as intentional.
+	cwdFilteredFiles int
 }
 
 // AnomalyStats aggregates parser-output anomaly signals observed during a
@@ -101,6 +112,16 @@ type AnomalyStats struct {
 	UnknownSchemaSessionsByAgent map[string]int `json:"unknown_schema_sessions_by_agent,omitempty"`
 	// UnknownSchemaSessionsTotal is the grand total across all agents.
 	UnknownSchemaSessionsTotal int `json:"unknown_schema_sessions_total,omitempty"`
+
+	// GenMetadataWithoutUsageByAgent maps an agent type to the number of
+	// Antigravity sessions written this run that carried gen_metadata rows
+	// but decoded into zero usage events -- an early warning that a newer agy
+	// build changed the gen_metadata wire format the token-block heuristic
+	// depends on. Like the unknown-schema counter this counts whole SESSIONS.
+	// Only non-zero agents are present.
+	GenMetadataWithoutUsageByAgent map[string]int `json:"gen_metadata_without_usage_by_agent,omitempty"`
+	// GenMetadataWithoutUsageTotal is the grand total across all agents.
+	GenMetadataWithoutUsageTotal int `json:"gen_metadata_without_usage_total,omitempty"`
 
 	// Sanitize aggregates the central validation/sanitization fix counts
 	// across every session, message, and usage event written this run.
@@ -135,6 +156,7 @@ func (s SanitizeStats) IsZero() bool {
 func (a AnomalyStats) IsZero() bool {
 	return a.MalformedLinesTotal == 0 &&
 		a.UnknownSchemaSessionsTotal == 0 &&
+		a.GenMetadataWithoutUsageTotal == 0 &&
 		a.Sanitize.IsZero()
 }
 
@@ -166,6 +188,20 @@ func (a *AnomalyStats) RecordUnknownSchemaSessions(agent string, n int) {
 	a.UnknownSchemaSessionsTotal += n
 }
 
+// RecordGenMetadataWithoutUsage attributes n gen_metadata-without-usage
+// sessions to the given agent and updates the grand total. A non-positive
+// count is ignored so clean agents do not appear in the per-agent breakdown.
+func (a *AnomalyStats) RecordGenMetadataWithoutUsage(agent string, n int) {
+	if n <= 0 {
+		return
+	}
+	if a.GenMetadataWithoutUsageByAgent == nil {
+		a.GenMetadataWithoutUsageByAgent = make(map[string]int)
+	}
+	a.GenMetadataWithoutUsageByAgent[agent] += n
+	a.GenMetadataWithoutUsageTotal += n
+}
+
 // addSanitize accumulates the per-category counts from one
 // validateAndSanitize pass into the aggregate.
 func (a *AnomalyStats) addSanitize(v validationStats) {
@@ -183,6 +219,9 @@ func (a *AnomalyStats) merge(o AnomalyStats) {
 	}
 	for agent, n := range o.UnknownSchemaSessionsByAgent {
 		a.RecordUnknownSchemaSessions(agent, n)
+	}
+	for agent, n := range o.GenMetadataWithoutUsageByAgent {
+		a.RecordGenMetadataWithoutUsage(agent, n)
 	}
 	a.Sanitize.ControlCharsStripped += o.Sanitize.ControlCharsStripped
 	a.Sanitize.ModelClamped += o.Sanitize.ModelClamped
@@ -248,6 +287,16 @@ func (a *anomalyAccumulator) recordMalformedLines(
 func (a *anomalyAccumulator) recordUnknownSchemaSession(agent string) {
 	a.mu.Lock()
 	a.stats.RecordUnknownSchemaSessions(agent, 1)
+	a.mu.Unlock()
+}
+
+// recordGenMetadataWithoutUsageSession attributes one
+// gen_metadata-without-usage session to the given agent. Like the
+// unknown-schema counter it counts whole sessions, so a source that forks
+// into several sessions records each fork.
+func (a *anomalyAccumulator) recordGenMetadataWithoutUsageSession(agent string) {
+	a.mu.Lock()
+	a.stats.RecordGenMetadataWithoutUsage(agent, 1)
 	a.mu.Unlock()
 }
 

@@ -166,6 +166,175 @@ func TestPGGetActivityReportUsageCostAndTokens(t *testing.T) {
 	assert.InDelta(t, 0.0105, r.Totals.Cost, 1e-9)
 }
 
+func TestPGGetActivityReportCopilotReportedCostReplacesSessionEstimates(t *testing.T) {
+	_, store := prepareUsageSchema(t, "agentsview_activity_copilot_authoritative_test")
+	ctx := context.Background()
+	_, err := store.DB().ExecContext(ctx, `
+		INSERT INTO model_pricing (
+			model_pattern, input_per_mtok, output_per_mtok,
+			cache_creation_per_mtok, cache_read_per_mtok, updated_at
+		) VALUES
+			('copilot-model-a', 10, 0, 0, 0, 'seed'),
+			('copilot-model-b', 20, 0, 0, 0, 'seed')`)
+	require.NoError(t, err)
+	_, err = store.DB().ExecContext(ctx, `
+		INSERT INTO sessions (
+			id, machine, project, agent, started_at, ended_at,
+			message_count, user_message_count
+		) VALUES (
+			'copilot:activity-authoritative', 'test-machine', 'proj1', 'copilot',
+			'2026-06-16T10:00:00Z'::timestamptz,
+			'2026-06-16T10:10:00Z'::timestamptz, 1, 1
+		)`)
+	require.NoError(t, err)
+	_, err = store.DB().ExecContext(ctx, `
+		INSERT INTO usage_events (
+			session_id, source, model, input_tokens, cost_usd,
+			cost_status, cost_source, occurred_at, dedup_key
+		) VALUES
+			('copilot:activity-authoritative', 'shutdown', 'copilot-model-a',
+			 1000000, NULL, '', '', '2026-06-16T10:05:00Z'::timestamptz, 'first'),
+			('copilot:activity-authoritative', 'shutdown', 'copilot-model-b',
+			 1000000, 0.03, 'exact', 'copilot-reported',
+			 '2026-06-16T10:10:00Z'::timestamptz, 'final')`)
+	require.NoError(t, err)
+
+	r, err := store.GetActivityReport(
+		ctx, db.AnalyticsFilter{Timezone: "UTC"},
+		pgDayQuery(t, "2026-06-16", "UTC"))
+	require.NoError(t, err)
+	assert.InDelta(t, 0.03, r.Totals.Cost, 1e-12)
+	require.Len(t, r.BySession, 1)
+	assert.InDelta(t, 0.03, r.BySession[0].Cost, 1e-12)
+	modelCosts := make(map[string]float64, len(r.ByModel))
+	for _, model := range r.ByModel {
+		modelCosts[model.Key] = model.Cost
+	}
+	assert.InDelta(t, 0.01, modelCosts["copilot-model-a"], 1e-12)
+	assert.InDelta(t, 0.02, modelCosts["copilot-model-b"], 1e-12)
+	assert.Equal(t, r.Totals.Cost,
+		modelCosts["copilot-model-a"]+modelCosts["copilot-model-b"])
+}
+
+// TestPGGetActivityReportIncludesSubagentUsage mirrors the SQLite
+// TestGetActivityReport_IncludesSubagentUsage: subagent and fork sessions
+// are candidates so their usage lands in the totals (matching
+// GetDailyUsage, which never filters by relationship_type). The fork's
+// replayed usage row dedups away, so it adds a session row but no cost.
+func TestPGGetActivityReportIncludesSubagentUsage(t *testing.T) {
+	_, store := prepareUsageSchema(t, "agentsview_daily_report_subagent_test")
+	ctx := context.Background()
+
+	_, err := store.DB().ExecContext(ctx, `
+		INSERT INTO model_pricing (
+			model_pattern, input_per_mtok, output_per_mtok,
+			cache_creation_per_mtok, cache_read_per_mtok, updated_at
+		) VALUES
+			('root-model', 3, 15, 0, 0, 'seed'),
+			('sub-model', 3, 15, 0, 0, 'seed')`)
+	require.NoError(t, err, "insert pricing")
+	_, err = store.DB().ExecContext(ctx, `
+		INSERT INTO sessions (
+			id, machine, project, agent, started_at, ended_at,
+			message_count, user_message_count,
+			parent_session_id, relationship_type
+		) VALUES
+			('root', 'test-machine', 'proj1', 'claude',
+			 '2026-06-16T10:00:00Z'::timestamptz,
+			 '2026-06-16T10:10:00Z'::timestamptz, 1, 1, NULL, ''),
+			('agent-sub', 'test-machine', 'proj1', 'claude',
+			 '2026-06-16T10:02:00Z'::timestamptz,
+			 '2026-06-16T10:04:00Z'::timestamptz, 1, 1, 'root', 'subagent'),
+			('fork', 'test-machine', 'proj1', 'claude',
+			 '2026-06-16T10:05:00Z'::timestamptz,
+			 '2026-06-16T10:06:00Z'::timestamptz, 1, 1, 'root', 'fork')`)
+	require.NoError(t, err, "insert sessions")
+	_, err = store.DB().ExecContext(ctx, `
+		INSERT INTO messages (
+			session_id, ordinal, role, content, timestamp,
+			content_length, model, token_usage,
+			claude_message_id, claude_request_id
+		) VALUES
+			('root', 0, 'assistant', 'x',
+			 '2026-06-16T10:00:00Z'::timestamptz, 1, 'root-model',
+			 '{"input_tokens":1000,"output_tokens":500}', 'm-root', 'r-root'),
+			('agent-sub', 0, 'assistant', 'y',
+			 '2026-06-16T10:03:00Z'::timestamptz, 1, 'sub-model',
+			 '{"input_tokens":2000,"output_tokens":700}', 'm-sub', 'r-sub'),
+			('fork', 0, 'assistant', 'x',
+			 '2026-06-16T10:05:00Z'::timestamptz, 1, 'root-model',
+			 '{"input_tokens":1000,"output_tokens":500}', 'm-root', 'r-root')`)
+	require.NoError(t, err, "insert messages")
+
+	r, err := store.GetActivityReport(
+		ctx, db.AnalyticsFilter{Timezone: "UTC"},
+		pgDayQuery(t, "2026-06-16", "UTC"))
+	require.NoError(t, err)
+	ids := make(map[string]struct{}, len(r.BySession))
+	for _, s := range r.BySession {
+		ids[s.SessionID] = struct{}{}
+	}
+	assert.Contains(t, ids, "root")
+	assert.Contains(t, ids, "agent-sub",
+		"subagent session must be a candidate")
+	assert.Contains(t, ids, "fork", "fork session must be a candidate")
+	assert.Equal(t, 1200, r.Totals.OutputTokens,
+		"totals include subagent usage; the fork's replayed row dedups away")
+	// Cost = root (1000*3+500*15)/1e6 + subagent (2000*3+700*15)/1e6; the
+	// fork's duplicate row contributes nothing.
+	assert.InDelta(t, 0.0105+0.0165, r.Totals.Cost, 1e-9)
+}
+
+func TestPGGetActivityReportPricingModelsOnlyIncludeDedupSurvivors(t *testing.T) {
+	_, store := prepareUsageSchema(t, "agentsview_daily_report_pricing_survivor_test")
+	ctx := context.Background()
+
+	_, err := store.DB().ExecContext(ctx, `
+		INSERT INTO model_pricing (
+			model_pattern, input_per_mtok, output_per_mtok,
+			cache_creation_per_mtok, cache_read_per_mtok, updated_at
+		) VALUES
+			('kept-model', 3, 15, 0, 0, 'seed'),
+			('discarded-model', 3, 15, 0, 0, 'seed')`)
+	require.NoError(t, err, "insert pricing")
+	_, err = store.DB().ExecContext(ctx, `
+		INSERT INTO sessions (
+			id, machine, project, agent, started_at, ended_at,
+			message_count, user_message_count
+		) VALUES
+			('earlier', 'test-machine', 'proj1', 'claude',
+			 '2026-06-16T10:30:00Z'::timestamptz,
+			 '2026-06-16T10:30:00Z'::timestamptz, 1, 1),
+			('later', 'test-machine', 'proj1', 'claude',
+			 '2026-06-16T10:31:00Z'::timestamptz,
+			 '2026-06-16T10:31:00Z'::timestamptz, 1, 1)`)
+	require.NoError(t, err, "insert sessions")
+	_, err = store.DB().ExecContext(ctx, `
+		INSERT INTO messages (
+			session_id, ordinal, role, content, timestamp,
+			content_length, model, token_usage,
+			claude_message_id, claude_request_id
+		) VALUES
+			('earlier', 0, 'assistant', 'x',
+			 '2026-06-16T10:30:00Z'::timestamptz, 1,
+			 'kept-model',
+			 '{"input_tokens":1000,"output_tokens":500}', 'M1', 'R1'),
+			('later', 0, 'assistant', 'x',
+			 '2026-06-16T10:31:00Z'::timestamptz, 1,
+			 'discarded-model',
+			 '{"input_tokens":2000,"output_tokens":900}', 'M1', 'R1')`)
+	require.NoError(t, err, "insert messages")
+
+	r, err := store.GetActivityReport(
+		ctx, db.AnalyticsFilter{Timezone: "UTC"},
+		pgDayQuery(t, "2026-06-16", "UTC"))
+	require.NoError(t, err)
+	assert.Equal(t, 500, r.Totals.OutputTokens)
+	require.NotNil(t, r.Pricing)
+	assert.Contains(t, r.Pricing.Models, "kept-model")
+	assert.NotContains(t, r.Pricing.Models, "discarded-model")
+}
+
 // TestPGGetActivityReportExcludesOtherDays confirms the candidate-session
 // window plus the usage ts-bounds keep a session whose only activity
 // falls outside the target day from contributing to that day.
@@ -401,33 +570,29 @@ func TestPGGetActivityReportDedupsAcrossChunks(t *testing.T) {
 	require.Greater(t, len(ids), maxPGVars,
 		"candidate IDs must exceed one chunk to span the boundary")
 
-	lower := paddedUTCBound("2026-06-16T00:00:00Z", -14)
-	upper := paddedUTCBound("2026-06-16T23:59:59Z", 14)
-	usage, err := store.activityReportUsage(ctx, ids, lower, upper)
+	q := pgDayQuery(t, "2026-06-16", "UTC")
+	lower := paddedUTCBound(q.RangeStart.UTC().Format(time.RFC3339), -14)
+	upper := paddedUTCBound(q.RangeEnd.UTC().Format(time.RFC3339), 14)
+	usage, _, err := store.activityReportUsage(ctx, ids, lower, upper, q)
 	require.NoError(t, err)
 
-	// Only dup-a and dup-b carry eligible usage; the fillers have no rows.
+	// Only dup-a and dup-b carry eligible usage; the fillers have no rows, and
+	// the shared dedup identity leaves one survivor.
 	var shared []activity.UsageRow
 	for _, u := range usage {
 		if u.SessionID == "dup-a" || u.SessionID == "dup-b" {
 			shared = append(shared, u)
 		}
 	}
-	require.Len(t, shared, 2,
-		"both dedup-identity rows fetched across the chunk boundary")
+	require.Len(t, shared, 1,
+		"only one dedup-identity row survives across the chunk boundary")
 	require.NotEmpty(t, shared[0].ClaudeMessageID, "rows carry a message id")
-	assert.Equal(t, shared[0].ClaudeMessageID, shared[1].ClaudeMessageID,
-		"dup-a and dup-b share claude_message_id")
-	assert.Equal(t, shared[0].ClaudeRequestID, shared[1].ClaudeRequestID,
-		"and claude_request_id, so first-seen order picks the survivor")
 	// The global re-sort by timestamp must place dup-a (10:00, fetched in
 	// the LATER chunk) before dup-b (10:05, fetched in the EARLIER chunk).
-	// A per-chunk-order regression returns [dup-b, dup-a] and fails here.
+	// A per-chunk-order regression keeps dup-b and fails here.
 	assert.Equal(t, "dup-a", shared[0].SessionID,
 		"earlier-timestamp row sorts first despite its later chunk")
 	assert.Equal(t, 500, shared[0].OutputTokens, "dup-a survives first-seen")
-	assert.Equal(t, "dup-b", shared[1].SessionID)
-	assert.Equal(t, 900, shared[1].OutputTokens)
 }
 
 func TestPGGetActivityReportUsageDedupFallsBackToSourceUUID(t *testing.T) {

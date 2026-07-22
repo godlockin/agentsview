@@ -1,9 +1,12 @@
 <script lang="ts">
   import { onDestroy } from "svelte";
+  import { EmptyState } from "@kenn-io/kit-ui";
+  // kit-ui-check-ignore: MessageList uses the local TanStack wrapper for pinned-message scroll reconciliation and per-session measurement cache resets; kit-ui VirtualList does not expose those controls yet.
   import type { Virtualizer } from "@tanstack/virtual-core";
   import { messages } from "../../stores/messages.svelte.js";
   import { ui } from "../../stores/ui.svelte.js";
   import { sessions } from "../../stores/sessions.svelte.js";
+  import { readProgress } from "../../stores/read-progress.svelte.js";
   import { MessageSquareIcon } from "../../icons.js";
   import { createVirtualizer } from "../../virtual/createVirtualizer.svelte.js";
   import MessageContent from "./MessageContent.svelte";
@@ -39,6 +42,11 @@
   let followSettleTimer:
     | ReturnType<typeof setTimeout>
     | null = null;
+  let visibleProgressSignature: string | null = $state(null);
+  let visibleProgressRaf: number | null = null;
+  let unreadTraversalKey: string | null = null;
+  let unreadBoundarySeen = false;
+  let unreadLatestSeen = false;
 
   let baseMessages: Message[] = $derived.by(() =>
     messages.messages.filter((m) => !isSystemMessage(m)),
@@ -91,6 +99,14 @@
       },
     ).filter(isItemVisible);
   });
+
+  let displayedOrdinals = $derived.by(() =>
+    displayItemsAsc.flatMap((item) => item.ordinals),
+  );
+
+  let displayedOrdinalsSignature = $derived(
+    displayedOrdinals.join(","),
+  );
 
   function itemAt(index: number) {
     if (ui.sortNewestFirst) {
@@ -169,6 +185,134 @@
     sessionActivity.firstVisibleTimestamp = null;
   }
 
+  function recordVisibleProgress() {
+    const v = virtualizer.instance;
+    const sessionId = messages.sessionId;
+    const currentToken = messages.activeSessionToken;
+    const marker = sessionId
+      ? readProgress.get(sessionId)
+      : null;
+    if (
+      !v ||
+      !sessionId ||
+      !currentToken ||
+      !marker ||
+      marker.token === currentToken
+    ) {
+      return;
+    }
+
+    if (baseMessages.length === 0) {
+      readProgress.markRead(
+        sessionId,
+        currentToken,
+        latestRawLoadedOrdinal,
+      );
+      return;
+    }
+
+    const latestDisplayedOrdinal = displayedOrdinals.at(-1);
+    if (latestDisplayedOrdinal === undefined) {
+      readProgress.markRead(
+        sessionId,
+        currentToken,
+        latestLoadedOrdinal,
+      );
+      return;
+    }
+
+    const top = v.scrollOffset ?? containerRef?.scrollTop ?? 0;
+    const height = containerRef?.clientHeight || v.scrollRect?.height || 0;
+    const bottom = top + height;
+    let maxVisibleOrdinal: number | null = null;
+    const visibleOrdinals = new Set<number>();
+
+    for (const row of v.getVirtualItems()) {
+      if (row.end <= top || row.start >= bottom) continue;
+      const item = itemAt(row.index);
+      if (!item) continue;
+      if (item.kind === "message") {
+        visibleOrdinals.add(item.message.ordinal);
+        maxVisibleOrdinal = maxVisibleOrdinal === null
+          ? item.message.ordinal
+          : Math.max(maxVisibleOrdinal, item.message.ordinal);
+        continue;
+      }
+
+      for (const ordinal of visibleToolGroupOrdinals(row.index)) {
+        visibleOrdinals.add(ordinal);
+        maxVisibleOrdinal = maxVisibleOrdinal === null
+          ? ordinal
+          : Math.max(maxVisibleOrdinal, ordinal);
+      }
+    }
+
+    if (maxVisibleOrdinal === null || latestLoadedOrdinal === null) return;
+
+    const rawUnreadBoundary = unreadBoundaryOrdinal(
+      latestLoadedOrdinal,
+    );
+    const unreadBoundary = displayedOrdinals.find((ordinal) =>
+      ordinal >= rawUnreadBoundary
+    ) ?? latestDisplayedOrdinal;
+    const traversalKey =
+      `${sessionId}|${currentToken}|${unreadBoundary}|${latestDisplayedOrdinal}`;
+    if (unreadTraversalKey !== traversalKey) {
+      unreadTraversalKey = traversalKey;
+      unreadBoundarySeen = false;
+      unreadLatestSeen = false;
+    }
+    if (visibleOrdinals.has(unreadBoundary)) {
+      unreadBoundarySeen = true;
+    }
+    if (visibleOrdinals.has(latestDisplayedOrdinal)) {
+      unreadLatestSeen = true;
+    }
+
+    if (ui.sortNewestFirst) {
+      if (unreadBoundarySeen && unreadLatestSeen) {
+        readProgress.markRead(
+          sessionId,
+          currentToken,
+          latestLoadedOrdinal,
+        );
+      }
+      return;
+    }
+
+    if (
+      unreadBoundarySeen &&
+      maxVisibleOrdinal >= latestDisplayedOrdinal
+    ) {
+      readProgress.markRead(
+        sessionId,
+        currentToken,
+        latestLoadedOrdinal,
+      );
+      return;
+    }
+  }
+
+  function visibleToolGroupOrdinals(
+    rowIndex: number,
+  ): number[] {
+    if (!containerRef) return [];
+    const row = containerRef.querySelector<HTMLElement>(
+      `.virtual-row[data-index="${rowIndex}"]`,
+    );
+    if (!row) return [];
+    const rootRect = containerRef.getBoundingClientRect();
+    const ordinals: number[] = [];
+    for (const node of row.querySelectorAll<HTMLElement>("[data-message-ordinal]")) {
+      const ordinal = Number(node.dataset.messageOrdinal);
+      if (!Number.isInteger(ordinal) || ordinal < 0) continue;
+      const rect = node.getBoundingClientRect();
+      if (rect.bottom <= rootRect.top || rect.top >= rootRect.bottom) continue;
+      ordinals.push(ordinal);
+    }
+    return ordinals;
+  }
+
   // Recompute visible timestamp when minimap opens or
   // message content changes (e.g. SSE reload).
   $effect(() => {
@@ -179,6 +323,79 @@
       publishVisibleTimestamp();
     }
   });
+
+  let latestLoadedOrdinal = $derived(
+    baseMessages[baseMessages.length - 1]?.ordinal ?? null,
+  );
+
+  let latestRawLoadedOrdinal = $derived(
+    messages.messages[messages.messages.length - 1]?.ordinal ?? null,
+  );
+
+  function unreadBoundaryOrdinal(
+    latestOrdinal: number,
+  ): number {
+    const explicit = messages.activeSessionUnreadOrdinal;
+    const earliestOrdinal = baseMessages[0]?.ordinal ?? latestOrdinal;
+    const boundary = explicit ?? earliestOrdinal;
+    return baseMessages.find((message) =>
+      message.ordinal >= boundary
+    )?.ordinal ?? latestOrdinal;
+  }
+
+  $effect(() => {
+    const sessionId = messages.sessionId;
+    const currentToken = messages.activeSessionToken;
+    const loading = messages.loading;
+    const latestOrdinal =
+      latestLoadedOrdinal ?? latestRawLoadedOrdinal;
+    if (!sessionId || !currentToken || loading) return;
+    readProgress.baseline(sessionId, currentToken, latestOrdinal);
+  });
+
+  $effect(() => {
+    const sessionId = messages.sessionId;
+    const currentToken = messages.activeSessionToken;
+    const loading = messages.loading;
+    const count = messages.messageCount;
+    const latest = latestDisplaySignature();
+    const displayed = displayedOrdinalsSignature;
+    const unreadOrdinal = messages.activeSessionUnreadOrdinal;
+    if (!sessionId || !currentToken || loading || !containerRef) return;
+    const signature =
+      `${sessionId}|${currentToken}|${count}|${latest}|${unreadOrdinal}|${displayed}`;
+    if (
+      visibleProgressSignature === null ||
+      !visibleProgressSignature.startsWith(`${sessionId}|`)
+    ) {
+      visibleProgressSignature = signature;
+      scheduleVisibleProgress(sessionId, currentToken);
+      return;
+    }
+    if (visibleProgressSignature === signature) return;
+    visibleProgressSignature = signature;
+    scheduleVisibleProgress(sessionId, currentToken);
+  });
+
+  function scheduleVisibleProgress(
+    sessionId: string,
+    currentToken: string,
+  ) {
+    if (visibleProgressRaf !== null) {
+      cancelAnimationFrame(visibleProgressRaf);
+    }
+    visibleProgressRaf = requestAnimationFrame(() => {
+      visibleProgressRaf = null;
+      if (
+        messages.sessionId !== sessionId ||
+        messages.loading ||
+        messages.activeSessionToken !== currentToken
+      ) {
+        return;
+      }
+      recordVisibleProgress();
+    });
+  }
 
   function handleScroll() {
     if (!containerRef) return;
@@ -207,6 +424,8 @@
       if (ui.vitalsOpen) {
         publishVisibleTimestamp();
       }
+
+      recordVisibleProgress();
 
     });
   }
@@ -262,6 +481,10 @@
   }
 
   onDestroy(() => {
+    if (visibleProgressRaf !== null) {
+      cancelAnimationFrame(visibleProgressRaf);
+      visibleProgressRaf = null;
+    }
     if (scrollRaf !== null) {
       cancelAnimationFrame(scrollRaf);
       scrollRaf = null;
@@ -336,6 +559,21 @@
           Math.round(offset),
           { align: getAlignedOffsetScrollAlign(align) },
         );
+        return;
+      }
+      v.scrollToIndex(index, { align });
+      if (scrollRetries < 15) {
+        requestAnimationFrame(() => {
+          requestAnimationFrame(() => {
+            scrollToDisplayIndex(
+              index,
+              waitFrames,
+              scrollRetries + 1,
+              reqId,
+              align,
+            );
+          });
+        });
       }
       return;
     }
@@ -483,6 +721,14 @@
     return `${m.ordinal}:${m.content_length}:${m.timestamp}`;
   }
 
+  function itemOrdinals(item: DisplayItem): number[] {
+    if (item.kind === "message") return [item.message.ordinal];
+    const source = ui.sortNewestFirst
+      ? [...item.messages].reverse()
+      : item.messages;
+    return source.map((message) => message.ordinal);
+  }
+
   $effect(() => {
     const follow = ui.followLatest;
     if (!follow) {
@@ -525,19 +771,73 @@
   let effectiveLayout = $derived(
     resolveMessageLayout(ui.messageLayout, highlightQuery !== ""),
   );
+
+  let readProgressDivider = $derived.by(() => {
+    const sessionId = messages.sessionId;
+    const currentToken = messages.activeSessionToken;
+    const marker = sessionId
+      ? readProgress.get(sessionId)
+      : null;
+    const latestOrdinal = latestLoadedOrdinal;
+    if (
+      !sessionId ||
+      !currentToken ||
+      !marker ||
+      marker.token === currentToken ||
+      latestOrdinal === null
+    ) {
+      return null;
+    }
+
+    const unreadBoundary = unreadBoundaryOrdinal(latestOrdinal);
+
+    const items = ui.sortNewestFirst
+      ? [...displayItemsAsc].reverse()
+      : displayItemsAsc;
+
+    if (ui.sortNewestFirst) {
+      if (messages.activeSessionUnreadOrdinal === null) {
+        return null;
+      }
+      const dividerBoundary = marker.ordinal !== null &&
+          unreadBoundary === marker.ordinal + 1
+        ? marker.ordinal
+        : unreadBoundary;
+      for (const item of items) {
+        for (const ordinal of itemOrdinals(item)) {
+          if (ordinal <= dividerBoundary) {
+            return {
+              ordinal,
+              label: m.read_progress_earlier_messages(),
+            };
+          }
+        }
+      }
+      return null;
+    }
+
+    for (const item of items) {
+      for (const ordinal of itemOrdinals(item)) {
+        if (ordinal >= unreadBoundary) {
+          return {
+            ordinal,
+            label: m.read_progress_new_messages(),
+          };
+        }
+      }
+    }
+    return null;
+  });
 </script>
 
 {#if !sessions.activeSessionId}
-  <div class="empty-state">
-    <div class="empty-icon">
+  <EmptyState title={m.message_list_empty()}>
+    {#snippet icon()}
       <MessageSquareIcon size="36" strokeWidth="1.5" aria-hidden="true" />
-    </div>
-    <p class="empty-text">{m.message_list_empty()}</p>
-  </div>
+    {/snippet}
+  </EmptyState>
 {:else if messages.loading && messages.messages.length === 0}
-  <div class="empty-state">
-    <p class="empty-text">{m.message_list_loading()}</p>
-  </div>
+  <EmptyState title={m.message_list_loading()} />
 {:else}
   <SessionFindBar />
   <div
@@ -570,12 +870,21 @@
               ui.selectOrdinal(item.ordinals[0]!);
             }}
           >
+            {#if item.kind !== "tool-group" && readProgressDivider !== null && item.ordinals.includes(readProgressDivider.ordinal)}
+              <div class="read-progress-divider" role="separator" aria-label={m.read_progress_boundary()}>
+                {readProgressDivider.label}
+              </div>
+            {/if}
             {#if item.kind === "tool-group"}
               <ToolCallGroup
                 messages={item.messages}
                 timestamp={item.timestamp}
                 highlightQuery={highlightQuery}
                 isCurrentHighlight={item.ordinals.includes(inSessionSearch.currentOrdinal ?? -1)}
+                sortNewestFirst={ui.sortNewestFirst}
+                divider={readProgressDivider !== null && item.ordinals.includes(readProgressDivider.ordinal)
+                  ? readProgressDivider
+                  : undefined}
               />
             {:else if item.message.is_compact_boundary}
               <CompactBoundaryDivider message={item.message} />
@@ -619,23 +928,26 @@
     border-radius: var(--radius-md, 6px);
   }
 
-  .empty-state {
-    flex: 1;
+  .read-progress-divider {
     display: flex;
-    flex-direction: column;
     align-items: center;
-    justify-content: center;
-    color: var(--text-muted);
-    gap: 12px;
+    gap: 8px;
+    margin-bottom: 8px;
+    color: var(--accent-blue);
+    font-size: 11px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
   }
 
-  .empty-icon {
-    opacity: 0.25;
-  }
-
-  .empty-text {
-    font-size: 14px;
-    font-weight: 500;
+  .read-progress-divider::before,
+  .read-progress-divider::after {
+    content: "";
+    height: 1px;
+    flex: 1;
+    background: color-mix(
+      in srgb, var(--accent-blue) 35%, transparent
+    );
   }
 
   /* ── Compact layout ── */

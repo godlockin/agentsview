@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"sort"
 	"strings"
 	"time"
 
@@ -20,6 +21,11 @@ const (
 	copilotEventAssistantReason = "assistant.reasoning"
 	copilotEventModelChange     = "session.model_change"
 	copilotEventSessionShutdown = "session.shutdown"
+	copilotReportedCostSource   = "copilot-reported"
+)
+
+var copilotUsageBasedPricingStartedAt = time.Date(
+	2026, time.June, 1, 0, 0, 0, 0, time.UTC,
 )
 
 // copilotSessionBuilder accumulates state while scanning a
@@ -244,7 +250,26 @@ func (b *copilotSessionBuilder) handleAssistantReasoning() {
 func (b *copilotSessionBuilder) handleShutdown(
 	data gjson.Result, ts time.Time,
 ) {
+	useReportedCost := !b.startedAt.IsZero() &&
+		!b.startedAt.Before(copilotUsageBasedPricingStartedAt)
+	totalNanoAiu := data.Get("totalNanoAiu")
+	hasReportedCost := useReportedCost && totalNanoAiu.Type == gjson.Number &&
+		totalNanoAiu.Num >= 0
+
+	// totalNanoAiu is cumulative. Keep its authoritative cost on only the
+	// latest shutdown, including when that final value is zero.
+	if hasReportedCost {
+		for i := range b.usageEvents {
+			if b.usageEvents[i].CostSource == copilotReportedCostSource {
+				b.usageEvents[i].CostUSD = nil
+				b.usageEvents[i].CostStatus = ""
+				b.usageEvents[i].CostSource = ""
+			}
+		}
+	}
+
 	occurredAt := timeString(ts, b.startedAt)
+	var events []ParsedUsageEvent
 	data.Get("modelMetrics").ForEach(
 		func(modelKey, metrics gjson.Result) bool {
 			usage := metrics.Get("usage")
@@ -263,7 +288,7 @@ func (b *copilotSessionBuilder) handleShutdown(
 				return true
 			}
 
-			b.usageEvents = append(b.usageEvents, ParsedUsageEvent{
+			events = append(events, ParsedUsageEvent{
 				Source:                   "shutdown",
 				Model:                    normalizeCopilotModel(modelKey.Str),
 				InputTokens:              freshInput,
@@ -276,6 +301,26 @@ func (b *copilotSessionBuilder) handleShutdown(
 			return true
 		},
 	)
+	sort.Slice(events, func(i, j int) bool {
+		return events[i].Model < events[j].Model
+	})
+
+	if hasReportedCost {
+		if len(events) == 0 {
+			events = append(events, ParsedUsageEvent{
+				Source:     "shutdown",
+				Model:      "copilot",
+				OccurredAt: occurredAt,
+			})
+		}
+		costUSD := float64(totalNanoAiu.Int()) / 1e11
+		// Carry the session-wide total on exactly one stable row so storage
+		// and sync remain row-oriented without multiplying it by model count.
+		events[0].CostUSD = &costUSD
+		events[0].CostStatus = "exact"
+		events[0].CostSource = copilotReportedCostSource
+	}
+	b.usageEvents = append(b.usageEvents, events...)
 }
 
 func formatCopilotToolCalls(
@@ -356,6 +401,7 @@ func (p *copilotProvider) parseSession(
 	defer f.Close()
 
 	lr := newLineReader(f, maxLineSize)
+	defer releaseLineReader(lr)
 	b := newCopilotSessionBuilder()
 
 	for {

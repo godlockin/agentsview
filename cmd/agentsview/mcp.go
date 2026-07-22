@@ -6,6 +6,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"os"
 	"os/signal"
@@ -17,6 +18,7 @@ import (
 	"github.com/spf13/cobra"
 
 	"go.kenn.io/agentsview/internal/config"
+	"go.kenn.io/agentsview/internal/db"
 	mcpserver "go.kenn.io/agentsview/internal/mcp"
 	"go.kenn.io/agentsview/internal/service"
 )
@@ -314,6 +316,46 @@ func (s *mcpDaemonService) UsagePairwiseComparison(
 		return nil, err
 	}
 	return svc.UsagePairwiseComparison(ctx, req)
+}
+
+func (s *mcpDaemonService) ListRecallEntries(
+	ctx context.Context, f service.RecallFilter,
+) (*service.RecallList, error) {
+	svc, err := s.daemonService(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return svc.ListRecallEntries(ctx, f)
+}
+
+func (s *mcpDaemonService) GetRecallEntry(
+	ctx context.Context, id string,
+) (*db.RecallEntry, error) {
+	svc, err := s.daemonService(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return svc.GetRecallEntry(ctx, id)
+}
+
+func (s *mcpDaemonService) QueryRecallEntries(
+	ctx context.Context, req service.RecallQuery,
+) (*service.RecallQueryResult, error) {
+	svc, err := s.daemonService(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return svc.QueryRecallEntries(ctx, req)
+}
+
+func (s *mcpDaemonService) ImportRecallEntries(
+	ctx context.Context, r io.Reader, opts db.RecallImportOptions,
+) (*db.RecallImportResult, error) {
+	svc, err := s.daemonService(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return svc.ImportRecallEntries(ctx, r, opts)
 }
 
 func (s *mcpDaemonService) ListSecrets(

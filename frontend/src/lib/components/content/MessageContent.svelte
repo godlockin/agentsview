@@ -28,8 +28,9 @@
   import ToolBlock from "./ToolBlock.svelte";
   import ParallelGroup from "./ParallelGroup.svelte";
   import CodeBlock from "./CodeBlock.svelte";
+  import MermaidBlock from "./MermaidBlock.svelte";
   import SkillBlock from "./SkillBlock.svelte";
-  import CopyButton from "../shared/CopyButton.svelte";
+  import { CopyButton } from "@kenn-io/kit-ui";
   import { ui } from "../../stores/ui.svelte.js";
   import { pins } from "../../stores/pins.svelte.js";
   import { sessions } from "../../stores/sessions.svelte.js";
@@ -379,6 +380,7 @@
       {roleLabel}
     </span>
     <CopyButton
+      revealOnHover
       {copied}
       ariaLabel={m.message_content_copy_message()}
       copiedAriaLabel={m.message_content_copied_message()}
@@ -456,12 +458,26 @@
              (v1 simplification: text first, then all tools). -->
       {:else if segment.type === "code"}
         {#if hasSearchQuery || ui.isBlockVisible("code")}
-          <CodeBlock
-            content={segment.content}
-            language={segment.label}
-            highlightQuery={highlightQuery}
-            isCurrentHighlight={isCurrentHighlight}
-          />
+          {@const codeLabel = segment.label?.trim().toLowerCase()}
+          {#if codeLabel === "mermaid"}
+            {#if hasSearchQuery}
+              <CodeBlock
+                content={segment.content}
+                language={segment.label}
+                highlightQuery={highlightQuery}
+                isCurrentHighlight={isCurrentHighlight}
+              />
+            {:else}
+              <MermaidBlock content={segment.content} />
+            {/if}
+          {:else}
+            <CodeBlock
+              content={segment.content}
+              language={segment.label}
+              highlightQuery={highlightQuery}
+              isCurrentHighlight={isCurrentHighlight}
+            />
+          {/if}
         {/if}
       {:else if segment.type === "skill"}
         {#if showText}
@@ -604,10 +620,10 @@
     font-family: var(--font-mono);
     font-size: 10px;
     color: var(--text-muted);
-    background: rgba(255, 255, 255, 0.04);
+    background: color-mix(in srgb, var(--text-primary) 4%, transparent);
     padding: 2px 8px;
     border-radius: var(--radius-sm);
-    border: 1px solid rgba(255, 255, 255, 0.04);
+    border: 1px solid color-mix(in srgb, var(--text-primary) 4%, transparent);
     white-space: nowrap;
     flex-shrink: 0;
   }
@@ -625,7 +641,7 @@
     animation: duration-pulse 1.6s ease-in-out infinite;
   }
 
-  .message:hover :global(.copy-btn) {
+  .message:hover :global(.kit-copy-btn) {
     opacity: 1;
   }
 

@@ -22,6 +22,9 @@ import (
 	"go.kenn.io/agentsview/internal/config"
 	"go.kenn.io/agentsview/internal/db"
 	"go.kenn.io/agentsview/internal/insight"
+	"go.kenn.io/agentsview/internal/postgres"
+	"go.kenn.io/agentsview/internal/pricingrefresh"
+	"go.kenn.io/agentsview/internal/remotesync"
 	"go.kenn.io/agentsview/internal/service"
 	"go.kenn.io/agentsview/internal/sync"
 	"go.kenn.io/agentsview/internal/web"
@@ -38,6 +41,11 @@ type VersionInfo struct {
 	APIVersion                 int    `json:"api_version"`
 	DataVersion                int    `json:"data_version"`
 }
+
+// APIVersion is shared by HTTP version reporting and local daemon discovery.
+// Bump it when a client-visible contract cannot be decoded safely by an older
+// CLI or daemon.
+const APIVersion = 3
 
 const daemonService = "agentsview"
 
@@ -60,6 +68,8 @@ type Server struct {
 	httpSrv        *http.Server
 	version        VersionInfo
 	dataDir        string
+
+	httpRemoteCleanupRegistry *remotesync.CleanupRegistry
 
 	// baseCtx, when set, is used as the base context for all
 	// incoming requests. Cancelling it causes SSE handlers to
@@ -90,10 +100,41 @@ type Server struct {
 	basePath string
 	idle     *IdleTracker
 
+	// sessionMutationNotify, when set, is called after a route changes a
+	// session's lifecycle (trash, restore, permanent delete), so consumers
+	// that reconcile against session state — the recall-extraction
+	// scheduler's retraction pass — hear about changes that no sync
+	// activity would otherwise surface. Called synchronously; it must not
+	// block.
+	sessionMutationNotify func()
+
 	// pprofEnabled registers net/http/pprof handlers under
 	// /debug/pprof/ so a running daemon can be profiled. Off by
 	// default; enabled by the hidden serve --pprof flag.
 	pprofEnabled bool
+
+	// embeddingsManager, when set, backs the /api/v1/embeddings/...
+	// build lifecycle routes. Nil (the default) leaves those routes
+	// unregistered, e.g. when semantic search is not configured.
+	embeddingsManager EmbeddingsManager
+
+	// embeddingsUnavailableReason, when non-empty, replaces the generic
+	// "embeddings manager not available" 501 message on the embeddings
+	// routes with a cause-specific one (e.g. vector serving disabled at
+	// startup because vectors.write.lock was held).
+	embeddingsUnavailableReason string
+
+	// embeddingsIncludeAutomatedDefault is the daemon's configured
+	// [vector].include_automated scope, applied to HTTP build requests
+	// that leave include_automated unset.
+	embeddingsIncludeAutomatedDefault bool
+
+	// vectorPushSource, when set, supplies the local vectors.db active
+	// generation to the daemon's pg push handler. Nil leaves the vector
+	// push phase skipped, e.g. when [vector] is disabled.
+	vectorPushSource postgres.VectorPushSource
+
+	ensurePricing func(context.Context, *db.DB) error
 }
 
 // New creates a new Server.
@@ -124,8 +165,10 @@ func New(
 		engine:                    engine,
 		sessions:                  sessions,
 		mux:                       http.NewServeMux(),
+		httpRemoteCleanupRegistry: new(remotesync.CleanupRegistry),
 		insightLogDrainTimeout:    defaultInsightLogDrainTimeout,
 		insightLogStopWaitTimeout: defaultInsightLogStopWaitTimeout,
+		ensurePricing:             pricingrefresh.EnsureCurrent,
 		generateStreamFunc: func(
 			ctx context.Context, agent, prompt string,
 			onLog insight.LogFunc,
@@ -144,7 +187,7 @@ func New(
 		opt(s)
 	}
 	if s.version.APIVersion == 0 {
-		s.version.APIVersion = 2
+		s.version.APIVersion = APIVersion
 	}
 	if s.version.DataVersion == 0 {
 		s.version.DataVersion = db.CurrentDataVersion()
@@ -192,6 +235,16 @@ func WithDataDir(dir string) Option {
 // exit and unblocking graceful shutdown.
 func WithBaseContext(ctx context.Context) Option {
 	return func(s *Server) { s.baseCtx = ctx }
+}
+
+// WithHTTPRemoteCleanupRegistry shares cleanup ownership with other HTTP sync
+// entry points in the same process, such as scheduled daemon syncs.
+func WithHTTPRemoteCleanupRegistry(registry *remotesync.CleanupRegistry) Option {
+	return func(s *Server) {
+		if registry != nil {
+			s.httpRemoteCleanupRegistry = registry
+		}
+	}
 }
 
 // WithBroadcaster wires an event broadcaster into the server so the
@@ -259,6 +312,14 @@ func WithIdleTracker(t *IdleTracker) Option {
 	return func(s *Server) { s.idle = t }
 }
 
+// WithSessionMutationNotifier registers fn to run after a route changes a
+// session's lifecycle (trash, restore, permanent delete). fn is called
+// synchronously on the request path and must not block; a non-blocking
+// scheduler signal is the intended shape.
+func WithSessionMutationNotifier(fn func()) Option {
+	return func(s *Server) { s.sessionMutationNotify = fn }
+}
+
 // WithPprof enables the net/http/pprof handlers under
 // /debug/pprof/ for live profiling of a running daemon.
 func WithPprof(enabled bool) Option {
@@ -302,6 +363,24 @@ func (s *Server) routes() {
 		s.mux.HandleFunc("/debug/pprof/trace", httppprof.Trace)
 	}
 
+	s.mux.Handle("GET /api/v1/recall/entries", s.withTimeout(
+		"GET /api/v1/recall/entries",
+		s.handleListRecallEntries,
+	))
+	s.mux.Handle("GET /api/v1/recall/entries/{id}", s.withTimeout(
+		"GET /api/v1/recall/entries/{id}",
+		s.handleGetRecallEntry,
+	))
+	s.mux.Handle("POST /api/v1/recall/query", s.withTimeout(
+		"POST /api/v1/recall/query",
+		s.handleQueryRecallEntries,
+	))
+	s.mux.Handle("POST /api/v1/recall/import", s.withTimeout(
+		"POST /api/v1/recall/import",
+		s.handleImportRecallEntries,
+	))
+	s.registerEvalIngestRoutes()
+
 	// SPA fallback: serve embedded frontend
 	// Do not use timeout handler for static assets to avoid buffering.
 	s.mux.Handle("/", http.HandlerFunc(s.handleSPA))
@@ -317,6 +396,13 @@ func (s *Server) handleSPA(w http.ResponseWriter, r *http.Request) {
 	f, err := s.spaFS.Open(path)
 	if err == nil {
 		f.Close()
+		if path == "index.html" {
+			w.Header().Set("Cache-Control", "no-cache")
+		}
+		if strings.HasPrefix(path, "assets/") {
+			w.Header().Set("Cache-Control",
+				"public, max-age=31536000, immutable")
+		}
 		// For index.html with a base path, inject <base href>.
 		if s.basePath != "" && path == "index.html" {
 			s.serveIndexWithBase(w, r)
@@ -326,7 +412,16 @@ func (s *Server) handleSPA(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Fingerprinted frontend assets are files, not client-side routes.
+	// Returning index.html here disguises stale asset URLs as successful
+	// JavaScript or CSS responses after an upgrade.
+	if strings.HasPrefix(path, "assets/") {
+		http.NotFound(w, r)
+		return
+	}
+
 	// SPA fallback: serve index.html for all routes
+	w.Header().Set("Cache-Control", "no-cache")
 	if s.basePath != "" {
 		s.serveIndexWithBase(w, r)
 		return
@@ -965,7 +1060,7 @@ func corsMiddleware(
 				)
 				w.Header().Set(
 					"Access-Control-Allow-Headers",
-					"Content-Type, Authorization",
+					"Content-Type, Authorization, "+service.SemanticSearchIntentHeader,
 				)
 				if r.Method == http.MethodOptions {
 					w.WriteHeader(http.StatusNoContent)
@@ -1002,7 +1097,7 @@ func corsMiddleware(
 			)
 			w.Header().Set(
 				"Access-Control-Allow-Headers",
-				"Content-Type, Authorization",
+				"Content-Type, Authorization, "+service.SemanticSearchIntentHeader,
 			)
 			if r.Method == http.MethodOptions {
 				if !safeForReads {

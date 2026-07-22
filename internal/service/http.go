@@ -26,10 +26,37 @@ import (
 // explicitly below.
 var errHTTPNotFound = errors.New("http: not found")
 
-// errHTTPNotImplemented is returned by getJSON for 501 responses so
-// callers can map a capability-absent daemon (e.g. search with no FTS
-// index) to a typed sentinel instead of string-matching the status.
+// errHTTPNotImplemented is returned (wrapped in *errNotImplementedBody) by
+// getJSON for 501 responses so callers can map a capability-absent daemon
+// (e.g. search with no FTS index) to a typed sentinel instead of
+// string-matching the status.
 var errHTTPNotImplemented = errors.New("http: not implemented")
+
+// errNotImplementedBody wraps errHTTPNotImplemented with the 501 response's
+// error message, so callers that need cause-specific detail — e.g.
+// SearchContent's "index is building: N% complete" or "index is stale ...
+// --full-rebuild" remediation — can recover it instead of seeing only the
+// bare sentinel. errors.Is(err, errHTTPNotImplemented) still holds for every
+// caller that only cares about the status.
+type errNotImplementedBody struct {
+	message string
+}
+
+func (e *errNotImplementedBody) Error() string { return errHTTPNotImplemented.Error() }
+func (e *errNotImplementedBody) Unwrap() error { return errHTTPNotImplemented }
+
+// notImplementedMessage extracts the {"error": "..."} message huma's error
+// responses carry, falling back to the raw (trimmed) body when it isn't in
+// that shape.
+func notImplementedMessage(body []byte) string {
+	var apiErr struct {
+		Error string `json:"error"`
+	}
+	if json.Unmarshal(body, &apiErr) == nil && apiErr.Error != "" {
+		return apiErr.Error
+	}
+	return strings.TrimSpace(string(body))
+}
 
 type httpBackend struct {
 	baseURL           string
@@ -173,6 +200,18 @@ func (b *httpBackend) Messages(
 	if f.Direction != "" {
 		q.Set("direction", f.Direction)
 	}
+	if f.Around != nil {
+		q.Set("around", strconv.Itoa(*f.Around))
+	}
+	if f.Before != nil {
+		q.Set("before", strconv.Itoa(*f.Before))
+	}
+	if f.After != nil {
+		q.Set("after", strconv.Itoa(*f.After))
+	}
+	if len(f.Roles) > 0 {
+		q.Set("roles", strings.Join(f.Roles, ","))
+	}
 	path := "/api/v1/sessions/" + url.PathEscape(id) +
 		"/messages?" + q.Encode()
 	var out MessageList
@@ -309,6 +348,14 @@ func (b *httpBackend) Stats(
 	setIfNotEmpty("until", f.Until)
 	setIfNotEmpty("agent", f.Agent)
 	setIfNotEmpty("timezone", f.Timezone)
+	includeOneShot := f.IncludeOneShot
+	includeAutomated := f.IncludeAutomated
+	if !f.ApplyDefaultVisibility {
+		includeOneShot = true
+		includeAutomated = true
+	}
+	q.Set("include_one_shot", strconv.FormatBool(includeOneShot))
+	q.Set("include_automated", strconv.FormatBool(includeAutomated))
 	for _, p := range f.IncludeProjects {
 		q.Add("include_project", p)
 	}
@@ -395,6 +442,7 @@ func (b *httpBackend) SearchContent(
 		"date_from":       req.DateFrom,
 		"date_to":         req.DateTo,
 		"active_since":    req.ActiveSince,
+		"scope":           req.Scope,
 	} {
 		if v != "" {
 			q.Set(k, v)
@@ -415,11 +463,51 @@ func (b *httpBackend) SearchContent(
 	if req.Cursor > 0 {
 		q.Set("cursor", strconv.Itoa(req.Cursor))
 	}
+	if req.Context > 0 {
+		q.Set("context", strconv.Itoa(req.Context))
+	}
 	var out ContentSearchResult
-	if err := b.getJSON(ctx, "/api/v1/search/content?"+q.Encode(), &out); err != nil {
+	var opts []func(*http.Request)
+	if req.Mode == "semantic" || req.Mode == "hybrid" {
+		opts = append(opts, func(r *http.Request) {
+			r.Header.Set(SemanticSearchIntentHeader, SemanticSearchIntentValue)
+		})
+	}
+	if err := b.getJSONLong(ctx, "/api/v1/search/content?"+q.Encode(), &out, opts...); err != nil {
+		var notImpl *errNotImplementedBody
+		if errors.As(err, &notImpl) {
+			return nil, wrapSemanticUnavailable(notImpl.message)
+		}
 		return nil, err
 	}
 	return &out, nil
+}
+
+// wrapSemanticUnavailable turns a search/content 501 response's error
+// message into an error wrapping ErrSemanticUnavailable, preserving
+// whatever cause-specific remediation text the server attached (e.g. "index
+// is building: N% complete" or "... run 'agentsview embeddings build
+// --full-rebuild'") instead of discarding it for the bare sentinel.
+// errors.Is(result, ErrSemanticUnavailable) always holds. When message is
+// empty or is exactly the sentinel's own text (no extra cause), the bare
+// sentinel is returned rather than duplicating it.
+func wrapSemanticUnavailable(message string) error {
+	sentinel := ErrSemanticUnavailable.Error()
+	if message == "" || message == sentinel {
+		return ErrSemanticUnavailable
+	}
+	if cause, ok := strings.CutPrefix(message, sentinel); ok {
+		return fmt.Errorf("%w%s", ErrSemanticUnavailable, cause)
+	}
+	if reason, ok := strings.CutPrefix(
+		message, "semantic search not available: ",
+	); ok {
+		return db.NewSemanticUnavailableError(reason)
+	}
+	// An unexpected body shape (e.g. a differently worded 501) is still a
+	// reasoned semantic-unavailable error: errors.Is holds without injecting
+	// the sentinel's local-only setup guidance into the server's text.
+	return db.NewSemanticUnavailableError(message)
 }
 
 func (b *httpBackend) UsageSummary(
@@ -427,19 +515,20 @@ func (b *httpBackend) UsageSummary(
 ) (*UsageSummaryResult, error) {
 	q := url.Values{}
 	for k, v := range map[string]string{
-		"from":            req.From,
-		"to":              req.To,
-		"timezone":        req.Timezone,
-		"agent":           req.Agent,
-		"project":         req.Project,
-		"machine":         req.Machine,
-		"git_branch":      req.GitBranch,
-		"exclude_project": req.ExcludeProject,
-		"exclude_agent":   req.ExcludeAgent,
-		"exclude_model":   req.ExcludeModel,
-		"model":           req.Model,
-		"active_since":    req.ActiveSince,
-		"termination":     req.Termination,
+		"from":                req.From,
+		"to":                  req.To,
+		"timezone":            req.Timezone,
+		"agent":               req.Agent,
+		"project":             req.Project,
+		"machine":             req.Machine,
+		"git_branch":          req.GitBranch,
+		"exclude_project":     req.ExcludeProject,
+		"exclude_project_key": req.ExcludeProjectKey,
+		"exclude_agent":       req.ExcludeAgent,
+		"exclude_model":       req.ExcludeModel,
+		"model":               req.Model,
+		"active_since":        req.ActiveSince,
+		"termination":         req.Termination,
 	} {
 		if v != "" {
 			q.Set(k, v)
@@ -484,18 +573,19 @@ func (b *httpBackend) UsagePairwiseComparison(
 ) (*UsagePairwiseComparisonResponse, error) {
 	q := url.Values{}
 	for k, v := range map[string]string{
-		"from":            req.From,
-		"to":              req.To,
-		"timezone":        req.Timezone,
-		"agent":           req.Agent,
-		"project":         req.Project,
-		"machine":         req.Machine,
-		"git_branch":      req.GitBranch,
-		"exclude_project": req.ExcludeProject,
-		"exclude_agent":   req.ExcludeAgent,
-		"exclude_model":   req.ExcludeModel,
-		"active_since":    req.ActiveSince,
-		"termination":     req.Termination,
+		"from":                req.From,
+		"to":                  req.To,
+		"timezone":            req.Timezone,
+		"agent":               req.Agent,
+		"project":             req.Project,
+		"machine":             req.Machine,
+		"git_branch":          req.GitBranch,
+		"exclude_project":     req.ExcludeProject,
+		"exclude_project_key": req.ExcludeProjectKey,
+		"exclude_agent":       req.ExcludeAgent,
+		"exclude_model":       req.ExcludeModel,
+		"active_since":        req.ActiveSince,
+		"termination":         req.Termination,
 	} {
 		if v != "" {
 			q.Set(k, v)
@@ -541,6 +631,170 @@ func (b *httpBackend) UsagePairwiseComparison(
 		return nil, err
 	}
 	return &out, nil
+}
+
+func (b *httpBackend) ListRecallEntries(
+	ctx context.Context, f RecallFilter,
+) (*RecallList, error) {
+	if err := ValidateRecallEntryLimit(f.Limit); err != nil {
+		return nil, err
+	}
+	q := recallFilterToQuery(f)
+	var out RecallList
+	if err := b.getJSON(ctx, "/api/v1/recall/entries?"+q.Encode(), &out); err != nil {
+		if errors.Is(err, errHTTPNotImplemented) {
+			return nil, fmt.Errorf(
+				"recall list: daemon at %s: %w", b.baseURL, db.ErrReadOnly,
+			)
+		}
+		return nil, err
+	}
+	if out.RecallEntries == nil {
+		out.RecallEntries = []db.RecallResult{}
+	}
+	if f.TrustedOnly {
+		out.TrustedOnly = true
+	}
+	return &out, nil
+}
+
+func (b *httpBackend) GetRecallEntry(
+	ctx context.Context, id string,
+) (*db.RecallEntry, error) {
+	var out db.RecallEntry
+	path := "/api/v1/recall/entries/" + url.PathEscape(id)
+	err := b.getJSON(ctx, path, &out)
+	if errors.Is(err, errHTTPNotFound) {
+		return nil, nil
+	}
+	if errors.Is(err, errHTTPNotImplemented) {
+		return nil, fmt.Errorf(
+			"recall get: daemon at %s: %w", b.baseURL, db.ErrReadOnly,
+		)
+	}
+	if err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+
+func (b *httpBackend) QueryRecallEntries(
+	ctx context.Context, req RecallQuery,
+) (*RecallQueryResult, error) {
+	if err := ValidateRecallEntryLimit(req.Limit); err != nil {
+		return nil, err
+	}
+	if req.IncludeContext {
+		if _, err := NormalizeRecallContextMaxBytes(req.ContextMaxBytes); err != nil {
+			return nil, err
+		}
+	}
+	if _, err := NormalizeRecallQuerySurface(req.Surface); err != nil {
+		return nil, err
+	}
+	if req.StrictRecording {
+		return nil, fmt.Errorf("strict recall recording requires a direct backend")
+	}
+	var out RecallQueryResult
+	if err := b.postJSON(ctx, "/api/v1/recall/query", req, &out); err != nil {
+		if errors.Is(err, errHTTPNotImplemented) {
+			return nil, fmt.Errorf(
+				"recall query: daemon at %s: %w", b.baseURL, db.ErrReadOnly,
+			)
+		}
+		return nil, err
+	}
+	if out.RecallEntries == nil {
+		out.RecallEntries = []db.RecallResult{}
+	}
+	if req.TrustedOnly {
+		out.TrustedOnly = true
+	}
+	if out.Summary == nil {
+		out.Summary = BuildRecallQuerySummary(out.RecallEntries)
+	}
+	if out.ContextEntries == nil && out.ContextMeta != nil {
+		out.ContextEntries = RecallContextResults(
+			out.RecallEntries, out.ContextMeta,
+		)
+	}
+	if err := ValidateRecallContextEntries(
+		out.ContextEntries, out.ContextMeta,
+	); err != nil {
+		return nil, err
+	}
+	if out.ContextSummary == nil && out.ContextMeta != nil {
+		out.ContextSummary = BuildRecallContextSummary(
+			out.RecallEntries, out.ContextMeta,
+		)
+	}
+	return &out, nil
+}
+
+func (b *httpBackend) ImportRecallEntries(
+	ctx context.Context, r io.Reader, opts db.RecallImportOptions,
+) (*db.RecallImportResult, error) {
+	if b.readOnly {
+		// Surface the shared sentinel so callers can errors.Is it,
+		// matching Sync/ScanSecrets instead of posting to a read-only
+		// daemon and returning a bare endpoint error.
+		return nil, fmt.Errorf(
+			"import: daemon at %s is read-only: %w",
+			b.baseURL, db.ErrReadOnly,
+		)
+	}
+	var out db.RecallImportResult
+	path := "/api/v1/recall/import"
+	q := url.Values{}
+	if opts.DryRun {
+		q.Set("dry_run", "true")
+	}
+	if opts.RequireExistingSessions {
+		q.Set("require_existing_sessions", "true")
+	} else {
+		q.Set("allow_placeholder_sessions", "true")
+	}
+	if opts.AllowProductionImport {
+		q.Set("allow_production_import", "true")
+	}
+	if encoded := q.Encode(); encoded != "" {
+		path += "?" + encoded
+	}
+	if err := b.postRaw(ctx, path, r, &out); err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+
+func recallFilterToQuery(f RecallFilter) url.Values {
+	q := url.Values{}
+	for k, v := range map[string]string{
+		"q":                      f.Query,
+		"project":                f.Project,
+		"cwd":                    f.CWD,
+		"git_branch":             f.GitBranch,
+		"agent":                  f.Agent,
+		"type":                   f.Type,
+		"scope":                  f.Scope,
+		"status":                 f.Status,
+		"extractor_method":       f.ExtractorMethod,
+		"source_session_id":      f.SourceSessionID,
+		"source_episode_id":      f.SourceEpisodeID,
+		"source_run_id":          f.SourceRunID,
+		"supersedes_entry_id":    f.SupersedesEntryID,
+		"superseded_by_entry_id": f.SupersededByEntryID,
+	} {
+		if v != "" {
+			q.Set(k, v)
+		}
+	}
+	if f.Limit > 0 {
+		q.Set("limit", strconv.Itoa(f.Limit))
+	}
+	if f.TrustedOnly {
+		q.Set("trusted_only", "true")
+	}
+	return q
 }
 
 func (b *httpBackend) ListSecrets(
@@ -700,7 +954,23 @@ func (b *httpBackend) addAuth(req *http.Request) {
 }
 
 func (b *httpBackend) getJSON(
-	ctx context.Context, path string, out any,
+	ctx context.Context, path string, out any, opts ...func(*http.Request),
+) error {
+	return b.getJSONWithClient(ctx, b.client, path, out, opts...)
+}
+
+func (b *httpBackend) getJSONLong(
+	ctx context.Context, path string, out any, opts ...func(*http.Request),
+) error {
+	return b.getJSONWithClient(ctx, b.longRunningClient, path, out, opts...)
+}
+
+func (b *httpBackend) getJSONWithClient(
+	ctx context.Context,
+	client *http.Client,
+	path string,
+	out any,
+	opts ...func(*http.Request),
 ) error {
 	req, err := http.NewRequestWithContext(
 		ctx, http.MethodGet, b.baseURL+path, nil,
@@ -708,6 +978,46 @@ func (b *httpBackend) getJSON(
 	if err != nil {
 		return err
 	}
+	b.addAuth(req)
+	for _, opt := range opts {
+		opt(req)
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusNotFound {
+		return errHTTPNotFound
+	}
+	if resp.StatusCode == http.StatusNotImplemented {
+		body, _ := io.ReadAll(resp.Body)
+		return &errNotImplementedBody{message: notImplementedMessage(body)}
+	}
+	if resp.StatusCode != http.StatusOK {
+		msg, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf(
+			"GET %s: HTTP %d: %s", path, resp.StatusCode, msg,
+		)
+	}
+	return json.NewDecoder(resp.Body).Decode(out)
+}
+
+func (b *httpBackend) postJSON(
+	ctx context.Context, path string, in any, out any,
+) error {
+	body, err := json.Marshal(in)
+	if err != nil {
+		return err
+	}
+	req, err := http.NewRequestWithContext(
+		ctx, http.MethodPost, b.baseURL+path, bytes.NewReader(body),
+	)
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Origin", b.baseURL)
 	b.addAuth(req)
 	resp, err := b.client.Do(req)
 	if err != nil {
@@ -718,12 +1028,50 @@ func (b *httpBackend) getJSON(
 		return errHTTPNotFound
 	}
 	if resp.StatusCode == http.StatusNotImplemented {
-		return errHTTPNotImplemented
+		body, _ := io.ReadAll(resp.Body)
+		return &errNotImplementedBody{message: notImplementedMessage(body)}
 	}
 	if resp.StatusCode != http.StatusOK {
 		msg, _ := io.ReadAll(resp.Body)
 		return fmt.Errorf(
-			"GET %s: HTTP %d: %s", path, resp.StatusCode, msg,
+			"POST %s: HTTP %d: %s", path, resp.StatusCode, msg,
+		)
+	}
+	return json.NewDecoder(resp.Body).Decode(out)
+}
+
+func (b *httpBackend) postRaw(
+	ctx context.Context, path string, in io.Reader, out any,
+) error {
+	req, err := http.NewRequestWithContext(
+		ctx, http.MethodPost, b.baseURL+path, in,
+	)
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/x-ndjson")
+	req.Header.Set("Origin", b.baseURL)
+	b.addAuth(req)
+	resp, err := b.client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusNotFound {
+		return errHTTPNotFound
+	}
+	if resp.StatusCode == http.StatusNotImplemented {
+		// A read-only (pg serve) daemon returns 501 for write endpoints.
+		// Surface the shared sentinel so callers can errors.Is it, matching
+		// Sync and ScanSecrets.
+		return fmt.Errorf(
+			"daemon at %s is read-only: %w", b.baseURL, db.ErrReadOnly,
+		)
+	}
+	if resp.StatusCode != http.StatusOK {
+		msg, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf(
+			"POST %s: HTTP %d: %s", path, resp.StatusCode, msg,
 		)
 	}
 	return json.NewDecoder(resp.Body).Decode(out)

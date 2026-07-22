@@ -44,6 +44,8 @@ type doctorDBInspection struct {
 	AntigravityCLISummary    int
 	AntigravityUnknownSchema int
 	AntigravityCountsErr     error
+	MissingSecretScans       int
+	MissingSecretScansErr    error
 }
 
 type doctorSyncReport struct {
@@ -181,15 +183,37 @@ func inspectDoctorDB(path string) doctorDBInspection {
 	insp.AntigravityCLITotal = total
 	insp.AntigravityCLISummary = summary
 	insp.AntigravityUnknownSchema = unknownSchema
+
+	// Sessions with current quality signals but no persisted secret
+	// scan: the signature of a findings write that failed mid-sequence
+	// under a binary predating the findings-before-signals write
+	// ordering. The filtered signals backfill deliberately does not
+	// revisit them (see db.BackfillSignals), so surface them here.
+	if err := conn.QueryRow(
+		`SELECT COUNT(*) FROM sessions
+		 WHERE quality_signal_version >= ?
+		   AND secrets_rules_version = ''
+		   AND message_count > 0
+		   AND deleted_at IS NULL`,
+		db.CurrentQualitySignalVersion,
+	).Scan(&insp.MissingSecretScans); err != nil {
+		insp.MissingSecretScansErr = err
+		return insp
+	}
 	return insp
 }
 
+// doctorReadOnlyDSN builds a read-only sqlite3 DSN. The file: scheme is
+// required for mattn/go-sqlite3 to honor mode=ro (a bare path silently opens
+// read-write), and the path is percent-encoded so `%`, `?`, or `#` in a real
+// path cannot be misparsed as URI syntax.
 func doctorReadOnlyDSN(path string) string {
 	params := url.Values{}
 	params.Set("mode", "ro")
 	params.Set("_busy_timeout", "5000")
 	params.Set("_foreign_keys", "ON")
-	return path + "?" + params.Encode()
+	escaped := (&url.URL{Path: path}).EscapedPath()
+	return "file:" + escaped + "?" + params.Encode()
 }
 
 func listDoctorResyncTempFiles(dbPath string) []string {
@@ -308,6 +332,7 @@ func writeDoctorSyncReport(w io.Writer, report doctorSyncReport) {
 	writeDoctorSessionCounts(w, report)
 	writeDoctorSummaryMode(w, report)
 	writeDoctorUnknownSchema(w, report)
+	writeDoctorMissingSecretScans(w, report)
 	writeDoctorTempFiles(w, report.TempFiles)
 	writeDoctorAgentRoots(w, report.AgentRoots)
 	writeDoctorDebugEvidence(w, report)
@@ -382,6 +407,25 @@ func writeDoctorUnknownSchema(w io.Writer, report doctorSyncReport) {
 		report.AntigravityUnknownSchema)
 }
 
+// writeDoctorMissingSecretScans surfaces sessions whose quality
+// signals are current but whose secret findings were never persisted.
+// It stays silent on a clean archive or when the count query failed.
+// Detection is partial by design: a session whose earlier findings
+// write succeeded before a later one failed keeps a stale non-empty
+// rules version and is indistinguishable from a legitimately old scan.
+func writeDoctorMissingSecretScans(w io.Writer, report doctorSyncReport) {
+	if report.MissingSecretScansErr != nil ||
+		report.MissingSecretScans == 0 {
+		return
+	}
+	fmt.Fprintf(w,
+		"%d session(s) have current quality signals but no persisted "+
+			"secret scan\n"+
+			"  -> a findings write likely failed under an older version; "+
+			"run \"agentsview secrets scan\" to rescan and persist findings\n",
+		report.MissingSecretScans)
+}
+
 func writeDoctorTempFiles(w io.Writer, files []string) {
 	fmt.Fprintln(w, "Resync temp files:")
 	if len(files) == 0 {
@@ -454,7 +498,10 @@ func doctorLikelyCause(
 		return "SQLite user_version is stale; inspect debug.log for resync aborts or failures"
 	}
 	if *report.UserVersion > currentVersion {
-		return "SQLite user_version is newer than this binary. Run \"agentsview update\" or install the latest AgentsView release before serving or syncing"
+		return fmt.Sprintf(
+			"SQLite user_version is newer than this binary. Use an AgentsView build with data version %d or newer, or restore an archive backup compatible with data version %d",
+			*report.UserVersion, currentVersion,
+		)
 	}
 	return "data-version resync is not expected; Running initial sync... is normal incremental startup work"
 }

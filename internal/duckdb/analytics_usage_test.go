@@ -11,6 +11,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.kenn.io/agentsview/internal/db"
+	"go.kenn.io/agentsview/internal/export"
 )
 
 // TestDuckBuildAnalyticsWhereSubagents verifies that the DuckDB
@@ -165,6 +166,22 @@ func TestDuckUsageTerminationPredicate(t *testing.T) {
 	assert.True(t, ok, "termination cutoff should be bound as a timestamp string")
 }
 
+func TestDuckUsageProjectLabelsPreserveCommas(t *testing.T) {
+	where, args := appendDuckUsageSessionFilterClauses(
+		"WHERE true",
+		nil,
+		db.UsageFilter{
+			ProjectLabels:        []string{"team,core"},
+			ExcludeProjectLabels: []string{"other,group"},
+		},
+		"",
+	)
+
+	assert.Contains(t, where, "s.project = ?")
+	assert.Contains(t, where, "s.project != ?")
+	assert.Equal(t, []any{"team,core", "other,group"}, args)
+}
+
 func TestDuckUsageAutomatedScopePredicates(t *testing.T) {
 	tests := []struct {
 		name    string
@@ -207,6 +224,118 @@ func TestDuckUsageAutomatedScopePredicates(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestDuckUsageAggregateCostRecordsMixedReportedAndComputed(t *testing.T) {
+	resolver := export.NewPricingResolver([]export.EffectivePricingRow{{
+		ModelPattern: "mixed-model",
+		Rates: export.ModelRates{
+			InputPerMTok:      1,
+			OutputPerMTok:     2,
+			CacheWritePerMTok: 3,
+			CacheReadPerMTok:  4,
+			Source:            export.PricingRowSourceFetched,
+		},
+	}})
+
+	cost, _, priced, contributes := duckUsageAggregateCost(
+		"mixed-model",
+		1000, 2000, 3000, 4000,
+		100, 200, 300, 400, 500,
+		0.25,
+		true,
+		resolver,
+	)
+	require.True(t, priced)
+	require.True(t, contributes)
+	assert.InDelta(t, 0.25+(100*1+200*2+400*3+500*4)/1_000_000.0, cost, 1e-12)
+
+	block, err := resolver.BuildBlock()
+	require.NoError(t, err)
+	assert.Equal(t, export.CostSourceMixed, block.CostSource)
+	assert.Equal(t, export.CostSourceMixed, block.Models["mixed-model"].CostSource)
+}
+
+func TestDuckUsageAggregateCostKeepsMixedUnpricedComputedTokensUnpriced(t *testing.T) {
+	resolver := export.NewPricingResolver(nil)
+
+	cost, _, priced, contributes := duckUsageAggregateCost(
+		"unknown-model",
+		1000, 2000, 0, 0,
+		1000, 2000, 0, 0, 0,
+		0.25,
+		true,
+		resolver,
+	)
+
+	require.True(t, contributes)
+	assert.False(t, priced)
+	assert.Equal(t, 0.25, cost)
+
+	block, err := resolver.BuildBlock()
+	require.NoError(t, err)
+	assert.Equal(t, export.CostSourceMixed, block.CostSource)
+	require.Contains(t, block.Models, "unknown-model")
+	assert.Equal(t, export.CostSourceMixed, block.Models["unknown-model"].CostSource)
+	assert.Nil(t, block.Models["unknown-model"].MatchedPattern)
+	assert.Empty(t, block.Fallback.Models)
+}
+
+func TestDuckUsageAggregateCostIncludesReasoningOnlyRows(t *testing.T) {
+	resolver := export.NewPricingResolver([]export.EffectivePricingRow{{
+		ModelPattern: "reasoning-model",
+		Rates: export.ModelRates{
+			OutputPerMTok: 2,
+			Source:        export.PricingRowSourceFetched,
+		},
+	}})
+
+	cost, _, priced, contributes := duckUsageAggregateCost(
+		"reasoning-model",
+		0, 0, 0, 0,
+		0, 0, 300, 0, 0,
+		0,
+		false,
+		resolver,
+	)
+
+	require.True(t, contributes)
+	assert.True(t, priced)
+	assert.InDelta(t, 0.0006, cost, 1e-12)
+
+	block, err := resolver.BuildBlock()
+	require.NoError(t, err)
+	require.Contains(t, block.Models, "reasoning-model")
+	assert.Equal(t, export.CostSourceComputed,
+		block.Models["reasoning-model"].CostSource)
+}
+
+func TestDuckUsageAggregateCostRecordsZeroTokenModelProvenance(t *testing.T) {
+	resolver := export.NewPricingResolver([]export.EffectivePricingRow{{
+		ModelPattern: "zero-model",
+		Rates: export.ModelRates{
+			InputPerMTok: 1,
+			Source:       export.PricingRowSourceFetched,
+		},
+	}})
+
+	cost, _, priced, contributes := duckUsageAggregateCost(
+		"zero-model",
+		0, 0, 0, 0,
+		0, 0, 0, 0, 0,
+		0,
+		false,
+		resolver,
+	)
+
+	assert.True(t, priced)
+	assert.False(t, contributes)
+	assert.Zero(t, cost)
+	block, err := resolver.BuildBlock()
+	require.NoError(t, err)
+	require.Contains(t, block.Models, "zero-model")
+	assert.Equal(t, export.CostSourceComputed,
+		block.Models["zero-model"].CostSource)
 }
 
 func TestDuckUsageAutomatedScopeOneShotExemption(t *testing.T) {
@@ -853,6 +982,14 @@ func assertDuckAnalyticsToolsModelFilterCountsOnlyMatchingToolCalls(
 	assert.Equal(t, 1, byCategory["Read"], "Read")
 	assert.Equal(t, 1, byCategory["Skill"], "Skill")
 	assert.Zero(t, byCategory["Grep"], "Grep")
+
+	byTool := map[string]int{}
+	for _, row := range resp.ByTool {
+		byTool[row.ToolName] = row.CallCount
+	}
+	assert.Equal(t, 1, byTool["Read"], "Read tool")
+	assert.Equal(t, 1, byTool["Skill"], "Skill tool")
+	assert.Zero(t, byTool["Grep"], "Grep tool")
 }
 
 func TestDuckAnalyticsToolsModelAndHourFilterCountsOnlyMatchingHourToolCalls(
@@ -893,6 +1030,10 @@ func TestDuckAnalyticsToolsModelAndHourFilterCountsOnlyMatchingHourToolCalls(
 	require.Len(t, resp.ByCategory, 1, "len(ByCategory)")
 	assert.Equal(t, "Grep", resp.ByCategory[0].Category, "Category")
 	assert.Equal(t, 1, resp.ByCategory[0].Count, "Count")
+	require.Len(t, resp.ByTool, 1, "len(ByTool)")
+	assert.Equal(t, "Grep", resp.ByTool[0].ToolName, "ToolName")
+	assert.Equal(t, 1, resp.ByTool[0].CallCount, "CallCount")
+	assert.Equal(t, 1, resp.ByTool[0].SessionCount, "SessionCount")
 }
 
 func assertDuckAnalyticsSkillsModelFilterCountsOnlyMatchingSkillCalls(
@@ -905,7 +1046,7 @@ func assertDuckAnalyticsSkillsModelFilterCountsOnlyMatchingSkillCalls(
 	resp, err := store.GetAnalyticsSkills(ctx, db.AnalyticsFilter{
 		From: "2024-06-01", To: "2024-06-01", Timezone: "UTC",
 		Model: "gpt-4o",
-	})
+	}, "week")
 	require.NoError(t, err, "GetAnalyticsSkills")
 	assert.Equal(t, 1, resp.TotalSkillCalls, "TotalSkillCalls")
 	assert.Equal(t, 1, resp.DistinctSkills, "DistinctSkills")
@@ -1470,7 +1611,8 @@ func newDuckAnalyticsStore(
 	_, err := local.WriteSessionBatchAtomic(writes)
 	require.NoError(t, err)
 	syncer := newInMemoryTestSync(t, local, SyncOptions{})
-	_, err = syncer.Push(ctx, true, nil)
+	require.NoError(t, createSchema(ctx, syncer.DB()))
+	_, err = syncer.pushEverything(ctx, nil)
 	require.NoError(t, err)
 	return NewStoreFromDB(syncer.DB())
 }

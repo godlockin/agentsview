@@ -6,7 +6,7 @@ import {
   todayStr,
   type DateRange,
 } from "./dateRangeSelector.js";
-import { formatDateTime, m } from "../../i18n/index.js";
+import { m } from "../../i18n/index.js";
 
 /**
  * The three ways a user can pick a range with the unified RangePicker. Every
@@ -58,15 +58,18 @@ export const RELATIVE_PRESETS: RelativePreset[] = [
   { label: m.shared_range_preset_all, longLabel: m.shared_range_preset_all_time, days: 0 },
 ];
 
-export const CALENDAR_UNITS: { unit: CalendarUnit; label: () => string }[] = [
-  { unit: "day", label: m.shared_range_calendar_day },
-  { unit: "week", label: m.shared_range_calendar_week },
-  { unit: "month", label: m.shared_range_calendar_month },
-];
-
 /** Parse a YYYY-MM-DD date string as local midnight. */
 function parseLocal(date: string): Date {
   return new Date(date + "T00:00:00");
+}
+
+function isValidLocalDate(date: string): boolean {
+  // RangeSelection uses app-internal canonical date-only strings, not
+  // localized display/input formats. Keep this strict so lexicographic range
+  // comparisons and local calendar math stay unambiguous.
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) return false;
+  const d = parseLocal(date);
+  return !Number.isNaN(d.getTime()) && localDateStr(d) === date;
 }
 
 /**
@@ -93,33 +96,28 @@ export function periodBounds(unit: CalendarUnit, anchor: string): DateRange {
   return { from: localDateStr(first), to: localDateStr(last) };
 }
 
-/**
- * Move a calendar anchor one period in `dir`: one day, seven days, or one
- * calendar month (clamping the day so Jan 31 -> Feb 28 rather than overflowing
- * into March). Mirrors the activity store's step() so period navigation is
- * unchanged.
- */
-export function stepAnchor(
-  unit: CalendarUnit,
-  anchor: string,
-  dir: -1 | 1,
-): string {
-  const d = parseLocal(anchor);
-  if (unit === "day") {
-    d.setDate(d.getDate() + dir);
-  } else if (unit === "week") {
-    d.setDate(d.getDate() + 7 * dir);
-  } else {
-    const target = new Date(d.getFullYear(), d.getMonth() + dir, 1);
-    const lastDay = new Date(
-      target.getFullYear(),
-      target.getMonth() + 1,
-      0,
-    ).getDate();
-    target.setDate(Math.min(d.getDate(), lastDay));
-    d.setTime(target.getTime());
+function selectionFromCalendarRange(
+  from: string,
+  to: string,
+): CalendarSelection | null {
+  if (from > to || !isValidLocalDate(from) || !isValidLocalDate(to)) {
+    return null;
   }
-  return localDateStr(d);
+  if (from === to) {
+    return { mode: "calendar", unit: "day", anchor: from };
+  }
+
+  const week = periodBounds("week", from);
+  if (week.from === from && week.to === to) {
+    return { mode: "calendar", unit: "week", anchor: from };
+  }
+
+  const month = periodBounds("month", from);
+  if (month.from === from && month.to === to) {
+    return { mode: "calendar", unit: "month", anchor: from };
+  }
+
+  return null;
 }
 
 /** Turn any selection into the concrete {from, to} the stores consume. */
@@ -137,88 +135,12 @@ export function resolveRange(
   }
 }
 
-/** Human label for the period a calendar selection currently points at. */
-export function calendarLabel(unit: CalendarUnit, anchor: string): string {
-  const d = parseLocal(anchor);
-  if (unit === "day") {
-    return formatDateTime(d, {
-      year: "numeric",
-      month: "short",
-      day: "numeric",
-    });
-  }
-  if (unit === "month") {
-    return formatDateTime(d, {
-      year: "numeric",
-      month: "long",
-    });
-  }
-  const start = parseLocal(periodBounds("week", anchor).from);
-  return m.shared_range_week_of({
-    date: formatDateTime(start, {
-      month: "short",
-      day: "numeric",
-    }),
-  });
-}
-
-/** Short label for the trigger button reflecting the current selection. */
-export function rangeLabel(sel: RangeSelection): string {
-  if (sel.mode === "relative") {
-    const preset = RELATIVE_PRESETS.find((p) => p.days === sel.days);
-    return preset ? preset.longLabel() : m.shared_range_last_days({ count: sel.days });
-  }
-  if (sel.mode === "calendar") {
-    return calendarLabel(sel.unit, sel.anchor);
-  }
-  if (!sel.from || !sel.to) return m.shared_range_custom_range();
-  const from = parseLocal(sel.from);
-  const to = parseLocal(sel.to);
-  if (sel.from === sel.to) {
-    return formatDateTime(from, {
-      month: "short",
-      day: "numeric",
-    });
-  }
-  return (
-    `${formatDateTime(from, { month: "short", day: "numeric" })} - ` +
-    `${formatDateTime(to, { month: "short", day: "numeric" })}`
-  );
-}
-
-/**
- * Build the default selection for a tab the user just switched to, seeded from
- * the current selection so switching tabs never jumps the visible range
- * unexpectedly. `current` supplies a sensible anchor/range; `earliestSession`
- * feeds the "All" fallback.
- */
-export function defaultForMode(
-  mode: RangeMode,
-  current: RangeSelection,
-  earliestSession?: string | null,
-): RangeSelection {
-  if (mode === "relative") {
-    return { mode: "relative", days: 30 };
-  }
-  if (mode === "calendar") {
-    const anchor =
-      current.mode === "custom" && current.to
-        ? current.to
-        : current.mode === "calendar"
-          ? current.anchor
-          : todayStr();
-    const unit = current.mode === "calendar" ? current.unit : "week";
-    return { mode: "calendar", unit, anchor };
-  }
-  const resolved = resolveRange(current, earliestSession);
-  return { mode: "custom", from: resolved.from, to: resolved.to };
-}
-
 /**
  * Reconstruct the picker selection for stores that track a rolling-vs-pinned
  * window (analytics, usage). A non-pinned window is the rolling preset; a
  * pinned range that exactly matches the all-time bounds shows as the "All"
- * preset; anything else is a custom range.
+ * preset; exact calendar periods show as calendar selections; anything else
+ * is a custom range.
  */
 export function selectionFromWindow(opts: {
   isPinned: boolean;
@@ -234,14 +156,16 @@ export function selectionFromWindow(opts: {
   if (opts.from === all.from && opts.to === all.to) {
     return { mode: "relative", days: 0 };
   }
+  const calendar = selectionFromCalendarRange(opts.from, opts.to);
+  if (calendar) return calendar;
   return { mode: "custom", from: opts.from, to: opts.to };
 }
 
 /**
  * Reconstruct a selection for stores that only persist a from/to span (trends,
  * insights). If the span exactly matches a relative preset's current bounds it
- * shows as that preset (so a default 1y range reads "Last year"); otherwise it
- * is a custom range.
+ * shows as that preset (so a default 1y range reads "Last year"). Exact
+ * calendar periods show as calendar selections; otherwise it is a custom range.
  */
 export function selectionFromRange(
   from: string,
@@ -254,6 +178,8 @@ export function selectionFromRange(
       return { mode: "relative", days: preset.days };
     }
   }
+  const calendar = selectionFromCalendarRange(from, to);
+  if (calendar) return calendar;
   return { mode: "custom", from, to };
 }
 

@@ -18,8 +18,8 @@ type ParseDiffOptions struct {
 	// agent whose registered factory can Discover() and re-parse a source.
 	// That includes shared-SQLite DB-backed providers that fan a database
 	// out to one virtual source per session (Kiro, OpenCode, Forge,
-	// Piebald, Warp). Only import-only agents, which have no source to
-	// re-parse, are rejected with an error.
+	// Devin, Piebald, Warp). Only import-only agents, which have no
+	// source to re-parse, are rejected with an error.
 	Agents []parser.AgentType
 	// Limit caps the number of source files parsed, newest mtime first
 	// across all agents. 0 means no limit.
@@ -108,7 +108,9 @@ func (e *Engine) ParseDiff(ctx context.Context, opts ParseDiffOptions) (*ParseDi
 		s := &storedSessions[i]
 		storedByID[s.ID] = s
 		if s.FilePath != nil && *s.FilePath != "" {
-			base := parseDiffSourceKey(*s.FilePath)
+			base := parseDiffSourceKey(
+				parser.AgentType(s.Agent), *s.FilePath,
+			)
 			storedByPath[base] = append(storedByPath[base], s)
 		}
 	}
@@ -180,13 +182,14 @@ func (e *Engine) ParseDiff(ctx context.Context, opts ParseDiffOptions) (*ParseDi
 		report, storedSessions, resolvedSet,
 		len(opts.Agents) == 0, cutPaths, visited,
 	)
-	// Raced sessions were compared against a fresh parse just like the
-	// others, so they count toward Examined; they are simply not counted
-	// as drift. Keeping them in Examined also keeps VacuousResync honest:
-	// a run with comparable (raced) sessions is not "all pending resync".
+	// Raced and incremental-skew sessions were compared against a fresh
+	// parse just like the others, so they count toward Examined; they are
+	// simply not counted as drift. Keeping them in Examined also keeps
+	// VacuousResync honest: a run with comparable (raced or skew) sessions
+	// is not "all pending resync".
 	report.Totals.Examined = report.Totals.Identical +
 		report.Totals.Changed + report.Totals.PendingResync +
-		report.Totals.Raced
+		report.Totals.Raced + report.Totals.IncrementalSkew
 
 	sort.Slice(report.Sessions, func(i, j int) bool {
 		a, b := report.Sessions[i], report.Sessions[j]
@@ -204,8 +207,8 @@ func (e *Engine) ParseDiff(ctx context.Context, opts ParseDiffOptions) (*ParseDi
 	return report, nil
 }
 
-// parseDiffProviderSources discovers an agent's on-disk sources through
-// the provider facade. It is scoped to a single agent type so parse-diff
+// parseDiffProviderSources discovers an agent's sources through the provider
+// facade. It is scoped to a single agent type so parse-diff
 // respects the requested agent set.
 func (e *Engine) parseDiffProviderSources(
 	ctx context.Context,
@@ -271,12 +274,13 @@ func (e *Engine) parseDiffAgentDiscoverable(def parser.AgentDef) bool {
 	// A provider-authoritative agent with a registered factory exposes a
 	// working Discover()/Parse() the report-only run can re-parse, whether it
 	// reads literal per-session files (Claude, Codex) or a shared SQLite store
-	// its provider fans out to one virtual source per session (Kiro, OpenCode,
-	// and the DB-backed Forge/Piebald/Warp providers). FileBased is not
-	// consulted here: it distinguishes literal-file agents from DB-backed ones
-	// for the watcher and sync paths, but both kinds satisfy the same provider
-	// Discover() contract parse-diff needs. Import-only agents are not
-	// provider-authoritative, so the switch still rejects them.
+	// its provider fans out to one virtual source per session (Kiro,
+	// OpenCode, and the DB-backed Forge/Devin/Piebald/Warp providers).
+	// FileBased is not consulted here: it distinguishes literal-file agents
+	// from DB-backed ones for the watcher and sync paths, but both kinds
+	// satisfy the same provider Discover() contract parse-diff needs.
+	// Import-only agents are not provider-authoritative, so the switch still
+	// rejects them.
 	switch e.providerMigrationModes[def.Type] {
 	case parser.ProviderMigrationProviderAuthoritative:
 		factory, ok := e.providerFactories[def.Type]
@@ -288,7 +292,7 @@ func (e *Engine) parseDiffAgentDiscoverable(def parser.AgentDef) bool {
 
 // resolveParseDiffAgents validates the requested agent set against
 // the registry and returns the matching defs in registry order. Only
-// file-based agents with an on-disk source can be re-parsed.
+// agents with parse-diff support can be re-parsed.
 func (e *Engine) resolveParseDiffAgents(
 	requested []parser.AgentType,
 ) ([]parser.AgentDef, error) {
@@ -315,7 +319,7 @@ func (e *Engine) resolveParseDiffAgents(
 		}
 		if _, known := parser.AgentByType(t); known {
 			return nil, fmt.Errorf(
-				"agent %q has no on-disk source to re-parse; "+
+				"agent %q is not supported by parse-diff; "+
 					"supported agents: %s", t, supported,
 			)
 		}
@@ -364,7 +368,7 @@ func sortAndLimitParseDiffFiles(
 	if limit > 0 && len(files) > limit {
 		limited = true
 		for _, f := range files[limit:] {
-			cutPaths[parseDiffSourceKey(f.Path)] = true
+			cutPaths[parseDiffSourceKey(f.Agent, f.Path)] = true
 		}
 		files = files[:limit]
 	}
@@ -389,8 +393,8 @@ func parseDiffDiscoveryMtime(f parser.DiscoveredFile) (int64, bool) {
 	return f.ProviderSource.DiscoveryMTimeNS, true
 }
 
-func parseDiffSourceKey(path string) string {
-	if isPerSessionDBVirtualSource(path) {
+func parseDiffSourceKey(agent parser.AgentType, path string) string {
+	if isPerSessionDBVirtualSource(agent, path) {
 		return path
 	}
 	return stripVirtualSourceSuffix(path)
@@ -398,17 +402,23 @@ func parseDiffSourceKey(path string) string {
 
 // perSessionDBVirtualSourceBases lists the shared-SQLite database filenames
 // whose providers discover one virtual source per session (opencode.db#id,
-// warp.sqlite#id, ...). parse-diff keys these by their full virtual path, so a
+// sessions.db#id, warp.sqlite#id, ...). parse-diff keys these by their full
+// virtual path, so a
 // --limit sample or a per-session parse failure stays scoped to the single
 // session it names instead of fanning out across every sibling row in the same
 // physical database. Contrast Kiro/Zed/Shelley, whose providers discover the
 // database as one source; those key by the stripped database path.
 var perSessionDBVirtualSourceBases = []string{
-	"opencode.db", "kilo.db", "mimocode.db",
+	"opencode.db", "kilo.db", "mimocode.db", "sessions.db",
 	parser.WarpDBFilename, parser.ForgeDBFilename, parser.PiebaldDBFilename,
 }
 
-func isPerSessionDBVirtualSource(path string) bool {
+func isPerSessionDBVirtualSource(agent parser.AgentType, path string) bool {
+	if _, _, ok := parser.ParseVirtualSourcePathForBase(
+		path, parser.WindsurfStateDBName,
+	); ok {
+		return agent == parser.AgentWindsurf
+	}
 	for _, base := range perSessionDBVirtualSourceBases {
 		if _, _, ok := parser.ParseVirtualSourcePathForBase(path, base); ok {
 			return true
@@ -424,6 +434,9 @@ func isPerSessionDBVirtualSource(path string) bool {
 // Copilot appends to its shared trace file, and the "#runIdx" suffix aider
 // appends to its shared history file.
 func stripVirtualSourceSuffix(path string) string {
+	if dbPath, _, ok := parser.ParseVirtualSourcePath(path); ok {
+		return dbPath
+	}
 	if tracePath, _, ok := parser.SplitVisualStudioCopilotVirtualPath(path); ok {
 		return tracePath
 	}
@@ -434,6 +447,11 @@ func stripVirtualSourceSuffix(path string) string {
 		return dbPath
 	}
 	if dbPath, _, ok := parser.ParseVirtualSourcePathForBase(path, "threads.db"); ok {
+		return dbPath
+	}
+	if dbPath, _, ok := parser.ParseVirtualSourcePathForBase(
+		path, parser.WindsurfStateDBName,
+	); ok {
 		return dbPath
 	}
 	for _, base := range perSessionDBVirtualSourceBases {
@@ -467,10 +485,12 @@ func stripVirtualSourceSuffix(path string) string {
 // it fails CLOSED rather than risk masking genuine parser drift:
 //
 //   - Virtual-path sources (Aider "#runIdx", Kiro/Zed/OpenCode/Kilo/MiMoCode
-//     "#rawID", Shelley, Forge/Piebald/Warp "#sessionID", Visual Studio Copilot
-//     "#conversationID"). Many sessions fan out of ONE physical source, so the
-//     source mtime is NOT a per-session signal. A shared DB's rows can carry
-//     advanced updated_at values, and Aider's File.Mtime is the whole
+//     "#rawID", Shelley, Forge/Devin/Piebald/Warp "#sessionID", Visual
+//     Studio Copilot "#conversationID"). Many sessions fan out of ONE
+//     physical source, so the source mtime is NOT a per-session signal. A
+//     shared DB's rows can carry advanced updated_at values, Devin's
+//     authoritative mtime is a provider-composite across DB metadata and
+//     transcript state, and Aider's File.Mtime is the whole
 //     .aider.chat.history.md file's mtime shared by every run in it --
 //     appending a new run bumps it for all runs -- so a newer mtime does not
 //     mean THIS session's parsed content was torn. Including them would mask
@@ -604,7 +624,7 @@ func (e *Engine) parseDiffCollectFile(
 	resolver worktreeProjectResolver,
 	presencePaths *[]string,
 ) error {
-	base := parseDiffSourceKey(job.path)
+	base := parseDiffSourceKey(fileAgents[job.path], job.path)
 
 	if job.err != nil {
 		storedHere := storedByPath[base]
@@ -652,9 +672,9 @@ func (e *Engine) parseDiffCollectFile(
 			usageEvents: pr.UsageEvents,
 			needsRetry:  job.needsRetryForSession(pr.Session.ID),
 		}
-		prepared, msgs, ok := e.prepareSessionWrite(pw, resolver)
+		prepared, msgs, verdict := e.prepareSessionWrite(pw, resolver)
 		id := prepared.ID
-		if !ok {
+		if verdict != sessionWriteOK {
 			// prepareSessionWrite returns a zero session on veto;
 			// reconstruct the final ID the way applyRemoteRewrites
 			// would have.
@@ -666,7 +686,7 @@ func (e *Engine) parseDiffCollectFile(
 		}
 
 		var fields []FieldDiff
-		compare := ok && !pw.needsRetry &&
+		compare := verdict == sessionWriteOK && !pw.needsRetry &&
 			stored != nil && stored.DeletedAt == nil
 		if compare {
 			events, _ := toDBUsageEvents(id, pw.usageEvents)
@@ -735,14 +755,40 @@ func (e *Engine) parseDiffCollectFile(
 			}
 		}
 
+		// Incremental-append skew: the stored row was last written by the
+		// incremental-append path (last_write_incremental), so a full
+		// re-parse legitimately differs on the ordinal-shape / per-message
+		// metadata surface. Only meaningful when there is a real change to
+		// reclassify, and only when the session was actually compared (a nil
+		// stored row cannot carry the flag). Ranked below raced -- if the
+		// source also demonstrably moved past its snapshot, the mtime race
+		// is the stronger, directly provable diagnosis -- so this is gated
+		// on !raced. Unlike the raced guard this needs no agent/source
+		// reliability check: the flag is per-session ground truth recorded
+		// by the exact write path being diagnosed, so it generalizes to
+		// whatever provider took the incremental path rather than a
+		// hardcoded agent list.
+		//
+		// The reclassification is confined to the incremental-artifact
+		// fields (diffsConfinedToIncrementalArtifacts): a marker alone is
+		// not enough, because it is session-level while a regression is
+		// field-level. A non-informational diff outside that allow-list
+		// (first_message, message_content, usage totals, tool_calls, ...) is
+		// genuine parser drift that must stay DiffChanged even on an
+		// incrementally written row, so the marker cannot mask it.
+		incrementalSkew := realDiffs > 0 && compare && !raced &&
+			stored != nil && stored.LastWriteIncremental &&
+			diffsConfinedToIncrementalArtifacts(fields)
+
 		class, reason := classifyParseDiffSession(
 			pw.needsRetry,
-			ok,
+			verdict == sessionWriteOK,
 			stored != nil,
 			stored != nil && stored.DeletedAt != nil,
 			stored != nil && stored.DataVersion < db.CurrentDataVersion(),
 			realDiffs,
 			raced,
+			incrementalSkew,
 		)
 
 		entry := SessionDiff{
@@ -786,6 +832,13 @@ func (e *Engine) parseDiffCollectFile(
 			// FieldCounts and from HasFailures so --fail-on-change stays
 			// trustworthy.
 			report.Totals.Raced++
+			report.Sessions = append(report.Sessions, entry)
+		case DiffIncrementalSkew:
+			// Inconclusive (incremental-vs-full skew): listed for
+			// visibility with its field diffs attached for drill-down, but
+			// excluded from FieldCounts and from HasFailures so
+			// --fail-on-change stays trustworthy, exactly like DiffRaced.
+			report.Totals.IncrementalSkew++
 			report.Sessions = append(report.Sessions, entry)
 		case DiffSkipped:
 			// A re-parsed but trashed session: counted with the rest
@@ -944,20 +997,23 @@ func (e *Engine) parseDiffSweepStored(
 			reason = "remote session"
 		case s.DeletedAt != nil:
 			reason = "trashed"
-		case defOK && !def.FileBased &&
+		case defOK && !eParseDiffAgentHasProviderSource(def) &&
 			def.EnvVar == "" && def.ConfigKey == "":
 			reason = "import-only agent"
 		case defOK && !def.FileBased && !e.parseDiffAgentDiscoverable(def):
 			// A DB-backed agent parse-diff cannot re-parse (no provider
 			// factory). Provider-authoritative DB-backed agents
-			// (Forge/Piebald/Warp) are discoverable, so they fall through
-			// to the source-based reasons below (not sampled / source
-			// missing / not discovered) just like literal-file agents.
+			// (Forge/Devin/Piebald/Warp) are discoverable, so they fall
+			// through to the source-based reasons below (not sampled /
+			// source missing / not discovered) just like literal-file
+			// agents.
 			reason = "database-backed agent"
 		case s.FilePath == nil || *s.FilePath == "":
 			reason = "source missing"
 		default:
-			sourceKey := parseDiffSourceKey(*s.FilePath)
+			sourceKey := parseDiffSourceKey(
+				parser.AgentType(s.Agent), *s.FilePath,
+			)
 			sourcePath := stripVirtualSourceSuffix(*s.FilePath)
 			switch {
 			case cutPaths[sourceKey]:
@@ -978,6 +1034,16 @@ func (e *Engine) parseDiffSweepStored(
 			StoredDataVersion: s.DataVersion,
 		})
 		report.Totals.Skipped++
+	}
+}
+
+func eParseDiffAgentHasProviderSource(def parser.AgentDef) bool {
+	switch parser.ProviderMigrationModes()[def.Type] {
+	case parser.ProviderMigrationProviderAuthoritative:
+		_, ok := parser.ProviderFactoryByType(def.Type)
+		return ok
+	default:
+		return false
 	}
 }
 

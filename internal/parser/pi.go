@@ -1,6 +1,7 @@
 package parser
 
 import (
+	"bufio"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -36,11 +37,15 @@ func parsePiLikeSession(
 	defer f.Close()
 
 	lr := newLineReader(f, maxLineSize)
+	defer releaseLineReader(lr)
 
 	// --- Parse session header (first non-whitespace line) ---
 	// Skip whitespace-only lines to stay consistent with
-	// IsPiSessionFile in discovery.go which uses TrimSpace.
-	var headerLine string
+	// IsPiSessionFile in discovery.go which uses TrimSpace. OMP (Oh My Pi)
+	// v16.3+ prefixes the header with a fixed-width rewritable
+	// {"type":"title",...} slot line holding the current session title;
+	// skip it too (matching IsPiSessionFile) and keep its title.
+	var headerLine, slotTitle string
 	for {
 		line, ok := lr.next()
 		if !ok {
@@ -48,10 +53,15 @@ func parsePiLikeSession(
 				"not a pi session: missing session header in %s", path,
 			)
 		}
-		if strings.TrimSpace(line) != "" {
-			headerLine = line
-			break
+		if strings.TrimSpace(line) == "" {
+			continue
 		}
+		if gjson.Get(line, "type").Str == "title" {
+			slotTitle = gjson.Get(line, "title").Str
+			continue
+		}
+		headerLine = line
+		break
 	}
 
 	if !gjson.Valid(headerLine) {
@@ -68,6 +78,7 @@ func parsePiLikeSession(
 
 	sessionID := gjson.Get(headerLine, "id").Str
 	cwd := gjson.Get(headerLine, "cwd").Str
+	headerTitle := gjson.Get(headerLine, "title").Str
 	headerTimestamp := parseTimestamp(gjson.Get(headerLine, "timestamp").Str)
 
 	// If project was not passed in, derive from cwd.
@@ -75,12 +86,35 @@ func parsePiLikeSession(
 		project = ExtractProjectFromCwd(cwd)
 	}
 
-	// branchedFrom handling: store basename without extension.
+	// Branch lineage. Upstream pi records the parent as branchedFrom, a
+	// file path whose basename without extension is the parent's session
+	// ID. OMP (Oh My Pi) v3 headers instead record parentSession, the
+	// parent's session ID directly. branchedFrom wins when present so
+	// upstream pi is unchanged; parentSession is the OMP-only fallback.
+	// Both paths reuse this session's own idPrefix, so the mapped value
+	// matches the parent's stored ID (idPrefix + its session id) and
+	// lineage resolves.
 	var parentSessionID string
-	branchedFrom := gjson.Get(headerLine, "branchedFrom").Str
-	if branchedFrom != "" {
+	if branchedFrom := gjson.Get(headerLine, "branchedFrom").Str; branchedFrom != "" {
 		base := filepath.Base(branchedFrom)
 		parentSessionID = idPrefix + strings.TrimSuffix(base, filepath.Ext(base))
+	} else if agent == AgentOMP {
+		if parentSession := gjson.Get(headerLine, "parentSession").Str; parentSession != "" {
+			parentSessionID = idPrefix + parentSession
+		}
+	}
+
+	// OMP writes subagent transcripts inside a directory named after the
+	// parent's transcript file: <project>/<parent>.jsonl sits alongside
+	// <project>/<parent>/<agent>.jsonl. A subagent header carries neither
+	// branchedFrom nor parentSession, so lineage is recovered from the
+	// sibling parent transcript. This nests to arbitrary depth.
+	var isOMPSubagent bool
+	if agent == AgentOMP && parentSessionID == "" {
+		if parentID := ompParentHeaderSessionID(path); parentID != "" {
+			parentSessionID = idPrefix + parentID
+			isOMPSubagent = true
+		}
 	}
 
 	// V1 detection: if header has no id, we may need to derive from filename.
@@ -241,6 +275,21 @@ func parsePiLikeSession(
 		return nil, nil, fmt.Errorf("reading pi %s: %w", path, err)
 	}
 
+	// Session name precedence: the OMP title slot is rewritten in place
+	// and always holds the current title, so it outranks session_info
+	// renames; the header title is the initial auto-generated fallback.
+	if slotTitle != "" {
+		sessionName = slotTitle
+	} else if sessionName == "" {
+		sessionName = headerTitle
+	}
+
+	// OMP subagent transcripts have an empty title slot and header title; the
+	// meaningful label is the agent name, which is the transcript's filename.
+	if isOMPSubagent && sessionName == "" {
+		sessionName = strings.TrimSuffix(filepath.Base(path), ".jsonl")
+	}
+
 	// V1 fallback: derive session ID from filename.
 	if isV1 || sessionID == "" {
 		sessionID = strings.TrimSuffix(filepath.Base(path), ".jsonl")
@@ -279,6 +328,9 @@ func parsePiLikeSession(
 			Size:  info.Size(),
 			Mtime: info.ModTime().UnixNano(),
 		},
+	}
+	if isOMPSubagent {
+		sess.RelationshipType = RelSubagent
 	}
 
 	accumulateMessageTokenUsage(sess, messages)
@@ -588,4 +640,50 @@ func piTimestamp(line string) time.Time {
 		return time.UnixMilli(ms).UTC()
 	}
 	return time.Time{}
+}
+
+// ompParentHeaderSessionID returns the parent OMP session's stored raw ID for a
+// nested subagent transcript, or "" when childPath is not a nested subagent.
+// OMP stores subagents in a directory named after the parent transcript (minus
+// the .jsonl extension), so the parent transcript is the containing directory
+// plus ".jsonl". The ID resolution mirrors parent parsing: prefer the header
+// id, but support V1 parent transcripts by falling back to the parent filename.
+func ompParentHeaderSessionID(childPath string) string {
+	parent := filepath.Dir(childPath) + ".jsonl"
+	parentID, ok := ompSessionHeaderID(parent)
+	if !ok {
+		return ""
+	}
+	if parentID != "" {
+		return parentID
+	}
+	return strings.TrimSuffix(filepath.Base(parent), ".jsonl")
+}
+
+// ompSessionHeaderID reads path's session header id, skipping a leading OMP
+// title slot line. The boolean reports whether the file has a valid pi session
+// header. os.Open intentionally follows symlinks to supported parent
+// transcripts.
+func ompSessionHeaderID(path string) (string, bool) {
+	f, err := os.Open(path)
+	if err != nil {
+		return "", false
+	}
+	defer f.Close()
+	s := bufio.NewScanner(f)
+	s.Buffer(make([]byte, 0, 64*1024), 64*1024*1024)
+	for s.Scan() {
+		line := strings.TrimSpace(s.Text())
+		if line == "" {
+			continue
+		}
+		if gjson.Get(line, "type").Str == "title" {
+			continue
+		}
+		if gjson.Get(line, "type").Str != "session" {
+			return "", false
+		}
+		return gjson.Get(line, "id").Str, true
+	}
+	return "", false
 }

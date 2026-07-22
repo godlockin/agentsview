@@ -36,17 +36,25 @@ docker run --rm -p 127.0.0.1:8080:8080 \
 ## Quick Start
 
 ```bash
-agentsview serve               # start foreground server
-agentsview serve --background  # start server and return to the shell
-agentsview serve status        # show whether a server is running
-agentsview serve stop          # stop the running server
-agentsview session list        # read from the daemon if warm, otherwise SQLite
-agentsview usage daily         # print daily cost summary
+agentsview serve           # start the server in the foreground
+agentsview daemon start    # start the writable SQLite daemon
+agentsview daemon status   # show daemon status
+agentsview daemon restart  # restart from current configuration
+agentsview daemon stop     # stop the writable daemon
+agentsview session list    # read from the daemon if warm, otherwise SQLite
+agentsview usage daily     # print daily cost summary
 ```
 
 On first run, agentsview discovers sessions from every supported agent on your
 machine, syncs them into a local SQLite database, and serves a web UI at
 `http://127.0.0.1:8080`.
+
+For Devin CLI, point `DEVIN_DIR` or `devin_dirs` at the local root that contains
+`cli/` — for example `~/Library/Application Support/devin` on macOS,
+`~/.local/share/devin` on Linux, or a redacted path like
+`.../Application Support/devin`. AgentsView reads session data under
+`<root>/cli/...` and intentionally ignores copied config or OAuth paths. Do not
+paste tokens, OAuth files, or other secrets into bug reports.
 
 Claude and Codex sources can also be configured as `s3://` roots, so a central
 AgentsView instance can read sessions that other machines push to S3-compatible
@@ -61,11 +69,16 @@ back to direct read-only SQLite on a cold archive so one-off scripts stay fast.
 Commands that need fresh data or need to write, such as `sync`, `usage`,
 `token-use`, `pg push`, and `duckdb push`, auto-start the daemon when needed.
 
-Use `agentsview serve --background` when you want to start the daemon
-explicitly. The command prints the server URL, process ID, and log path
-(`~/.agentsview/serve.log`). Check on it with `agentsview serve status` and shut
-it down with `agentsview serve stop`. Background daemons self-exit after an idle
-period unless a client request or daemon-owned job is active.
+Use `agentsview daemon start` when you want to start the writable SQLite daemon
+explicitly. It loads the normal effective configuration from `config.toml` and
+supported environment variables; `daemon start` and `daemon restart` accept no
+serve-specific flags. Background daemons self-exit after an idle period unless a
+client request or daemon-owned job is active.
+
+The existing `agentsview serve --background`, `agentsview serve status`, and
+`agentsview serve stop` commands remain available. Use `serve --background` when
+a one-off daemon needs a serve-only flag, such as `--no-sync` or an
+unauthenticated non-loopback `--host` override.
 
 ## Remote / forwarded access
 
@@ -155,10 +168,13 @@ docker run --rm -p 127.0.0.1:9494:9494 \
     --allow-insecure
 
 # Serve the web UI from a remote Quack endpoint.
+# The client url uses the native quack:HOST:PORT form; the Quack extension
+# does not accept quack:http:// or quack:https:// urls. A non-loopback host
+# needs --allow-insecure.
 docker run --rm -p 127.0.0.1:8080:8080 \
-  -e AGENTSVIEW_DUCKDB_URL='quack:https://duckdb.example.com' \
+  -e AGENTSVIEW_DUCKDB_URL='quack:duckdb.example.com:9494' \
   -e AGENTSVIEW_DUCKDB_TOKEN="$QUACK_TOKEN" \
-  ghcr.io/kenn-io/agentsview:latest duckdb serve
+  ghcr.io/kenn-io/agentsview:latest duckdb serve --allow-insecure
 ```
 
 Keep Quack on loopback or behind TLS. Plain HTTP Quack on a non-loopback bind
@@ -191,6 +207,7 @@ agentsview usage statusline
 Features:
 
 - Automatic pricing via LiteLLM rates (with offline fallback)
+- Authoritative Copilot CLI billing totals when session logs provide them
 - Prompt-caching-aware cost calculation (cache creation / read tokens)
 - Per-model breakdown with `--breakdown`
 - Date filtering (`--since`, `--until`, `--all`), agent filtering (`--agent`)
@@ -270,6 +287,11 @@ agentsview stats --include-git-outcomes
 | ![Search](https://agentsview.io/assets/generated/screenshots/search-results.png) | ![Heatmap](https://agentsview.io/assets/generated/screenshots/heatmap.png) |
 
 - **Full-text search** across all message content (FTS5)
+- **Semantic search** (opt-in) -- index session content with any
+  OpenAI-compatible embeddings endpoint and search by meaning with
+  `agentsview session search --semantic` or `--hybrid`; every content-search
+  match cites the conversation unit it came from
+  ([docs](https://agentsview.io/semantic-search/))
 - **Token usage and cost dashboard** -- per-session and per-model cost
   breakdowns, daily spend charts, all in the web UI
 - **Analytics dashboard** -- activity heatmaps, tool usage, velocity metrics,
@@ -301,12 +323,14 @@ thread JSON files.
 | Claude Cowork         | `~/Library/Application Support/Claude/local-agent-mode-sessions/` (macOS)                                                                                               |
 | Codex                 | `~/.codex/sessions/`                                                                                                                                                    |
 | Copilot CLI           | `~/.copilot/`                                                                                                                                                           |
+| Devin CLI             | `~/.local/share/devin/` (Linux), `~/Library/Application Support/devin/` (macOS); point `DEVIN_DIR` / `devin_dirs` at the root that contains `cli/`                      |
 | Cortex Code           | `~/.snowflake/cortex/conversations/`                                                                                                                                    |
 | Cursor                | `~/.cursor/projects/`                                                                                                                                                   |
 | DeepSeek TUI          | `~/.codewhale/sessions/`, `~/.deepseek/sessions/`                                                                                                                       |
 | Forge                 | `~/.forge/`                                                                                                                                                             |
 | Gemini CLI            | `~/.gemini/`                                                                                                                                                            |
 | gptme                 | `~/.local/share/gptme/logs/`                                                                                                                                            |
+| Grok                  | `~/.grok/sessions/`                                                                                                                                                     |
 | Hermes Agent          | `~/.hermes/sessions/`                                                                                                                                                   |
 | iFlow                 | `~/.iflow/projects/`                                                                                                                                                    |
 | Kilo                  | `~/.local/share/kilo/`                                                                                                                                                  |
@@ -321,17 +345,29 @@ thread JSON files.
 | OhMyPi                | `~/.omp/agent/sessions/`                                                                                                                                                |
 | Pi                    | `~/.pi/agent/sessions/`                                                                                                                                                 |
 | Piebald               | `~/.local/share/piebald/`                                                                                                                                               |
+| Posit Assistant       | `~/.posit/assistant/workspaces/`                                                                                                                                        |
 | Positron Assistant    | `~/Library/Application Support/Positron/User/` (macOS)                                                                                                                  |
 | QClaw                 | `~/.qclaw/agents/`                                                                                                                                                      |
+| Qoder                 | `~/.qoder/projects/`, `~/.qoderwork/projects/`                                                                                                                          |
 | Qwen Code             | `~/.qwen/projects/`                                                                                                                                                     |
 | QwenPaw               | `~/.copaw/workspaces/`, `~/.qwenpaw/workspaces/`                                                                                                                        |
 | Reasonix              | `~/.reasonix/`, `%APPDATA%\\reasonix\\` (Windows)                                                                                                                       |
+| RooCode               | `~/Library/Application Support/Code/User/globalStorage/rooveterinaryinc.roo-cline/` (macOS), `~/.config/Code/User/globalStorage/rooveterinaryinc.roo-cline/` (Linux), `%APPDATA%\\Code\\User\\globalStorage\\rooveterinaryinc.roo-cline\\` (Windows) |
 | VSCode Copilot        | `~/Library/Application Support/Code/User/` (macOS)                                                                                                                      |
 | Visual Studio Copilot | `%LOCALAPPDATA%\\Temp\\VSGitHubCopilotLogs\\traces\\` (Windows), `~/Library/Caches/VSGitHubCopilotLogs/traces/` (macOS), `~/.cache/VSGitHubCopilotLogs/traces/` (Linux) |
+| Windsurf              | `~/Library/Application Support/Windsurf/User/` (macOS), `~/.config/Windsurf/User/` (Linux), `%APPDATA%\\Windsurf\\User\\` (Windows)                                     |
 | Warp                  | `~/.warp/` (platform-dependent)                                                                                                                                         |
 | WorkBuddy             | `~/.workbuddy/projects/`                                                                                                                                                |
+| ZCode                 | `~/.zcode/cli/db/`, `~/.zcode/cli/`                                                                                                                                     |
 | Zed                   | `~/Library/Application Support/Zed/` (macOS)                                                                                                                            |
 | Zencoder              | `~/.zencoder/sessions/`                                                                                                                                                 |
+
+Grok sessions are read from `summary.json` (title, timestamps, project),
+optional `signals.json` (token counters), and `chat_history.jsonl` when present
+for the full transcript (user turns, assistant replies, thinking, and tool
+calls). If `chat_history.jsonl` is missing, AgentsView falls back to
+summary-only mode. Set `GROK_DIR` or `grok_dirs` to override the default
+directory.
 
 Each directory can be overridden with an environment variable. See the
 [configuration docs](https://agentsview.io/configuration/) for details. Cursor

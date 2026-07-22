@@ -60,7 +60,7 @@ func TestParseDiff_UnknownAgentListsSupported(t *testing.T) {
 	}
 	// The DB-backed provider-authoritative agents are re-parseable through
 	// their providers, so they appear in the supported list too.
-	for _, want := range []string{"forge", "piebald", "warp"} {
+	for _, want := range []string{"forge", "devin", "piebald", "warp"} {
 		assert.Contains(t, err.Error(), want,
 			"error should list supported DB-backed agent %q", want)
 	}
@@ -90,8 +90,7 @@ func TestParseDiff_RejectsAgentsWithoutOnDiskSource(t *testing.T) {
 				"parse-diff", "--agent", tc.agent)
 			require.Error(t, err)
 			assert.Contains(t, err.Error(), fmt.Sprintf(
-				"agent %q is not supported by parse-diff "+
-					"(no on-disk source to re-parse)", tc.agent))
+				"agent %q is not supported by parse-diff", tc.agent))
 		})
 	}
 }
@@ -130,8 +129,8 @@ func TestParseDiffAgentTypes(t *testing.T) {
 		},
 		{
 			name: "db-backed provider-authoritative agents",
-			in:   []string{"forge", "piebald", "warp"},
-			want: []string{"forge", "piebald", "warp"},
+			in:   []string{"forge", "devin", "piebald", "warp"},
+			want: []string{"forge", "devin", "piebald", "warp"},
 		},
 		{
 			name: "trims and lowercases",
@@ -151,7 +150,7 @@ func TestParseDiffAgentTypes(t *testing.T) {
 		{
 			name:    "import-only agent",
 			in:      []string{"claude-ai"},
-			wantErr: "no on-disk source to re-parse",
+			wantErr: "is not supported by parse-diff",
 		},
 	}
 	for _, tc := range tests {
@@ -183,15 +182,22 @@ func TestParseDiffSupportedAgentsIncludesProviderAuthoritativeAgents(t *testing.
 	// current provider-authoritative agent and stays correct as the migration
 	// manifest changes, rather than a hand-maintained subset. FileBased is not
 	// part of the gate: DB-backed provider-authoritative agents
-	// (Forge/Piebald/Warp) are re-parseable through their providers too.
+	// (Forge/Devin/Piebald/Warp) are re-parseable through their providers too.
 	checked := 0
 	for _, def := range parser.Registry {
 		if modes[def.Type] != parser.ProviderMigrationProviderAuthoritative {
 			continue
 		}
+		if _, ok := parser.ProviderFactoryByType(def.Type); !ok {
+			assert.False(t, parseDiffAgentSupported(def),
+				"parse-diff must exclude %s without a provider factory", def.Type)
+			assert.NotContains(t, supported, string(def.Type),
+				"parse-diff supported list must exclude %s without a provider factory", def.Type)
+			continue
+		}
 		checked++
 		assert.True(t, parseDiffAgentSupported(def),
-			"parse-diff support must include provider-authoritative %s", def.Type)
+			"parse-diff support must include %s", def.Type)
 		assert.Contains(t, supported, string(def.Type),
 			"parse-diff supported list must include %s", def.Type)
 	}
@@ -202,7 +208,8 @@ func TestParseDiffSupportedAgentsIncludesProviderAuthoritativeAgents(t *testing.
 	// regression that re-adds a FileBased gate to the parse-diff support
 	// check is caught by name, not just by the registry-wide sweep above.
 	for _, agent := range []parser.AgentType{
-		parser.AgentForge, parser.AgentPiebald, parser.AgentWarp,
+		parser.AgentForge, parser.AgentDevin,
+		parser.AgentPiebald, parser.AgentWarp,
 	} {
 		def, ok := parser.AgentByType(agent)
 		require.True(t, ok, "agent %s", agent)
@@ -362,6 +369,18 @@ func changedSession(
 	}
 }
 
+// skewSession builds a DiffIncrementalSkew SessionDiff fixture.
+func skewSession(
+	agent, id string, fields ...sync.FieldDiff,
+) sync.SessionDiff {
+	return sync.SessionDiff{
+		SessionID: id,
+		Agent:     agent,
+		Class:     sync.DiffIncrementalSkew,
+		Fields:    fields,
+	}
+}
+
 func TestRenderParseDiffReport_ChangedSessions(t *testing.T) {
 	r := &sync.ParseDiffReport{
 		GeneratedAt:   "2026-06-12T00:00:00Z",
@@ -512,6 +531,112 @@ func TestRenderParseDiffReport_CapAndVerbose(t *testing.T) {
 			"first_message: old -> new (lengths 3 vs 3)")
 		assert.Contains(t, out,
 			"termination_status: completed -> (null) [informational]")
+	})
+}
+
+func TestRenderParseDiffReport_IncrementalSkewCapAndVerbose(t *testing.T) {
+	var sessions []sync.SessionDiff
+	for i := range parseDiffChangedCap + 5 {
+		sessions = append(sessions, skewSession(
+			"claude",
+			fmt.Sprintf("skew-%02d", i),
+			sync.FieldDiff{
+				Field:  sync.FieldFirstMessage,
+				Stored: "old",
+				Parsed: "new",
+			},
+		))
+	}
+	r := &sync.ParseDiffReport{
+		Totals: sync.ParseDiffTotals{
+			Examined:        len(sessions),
+			IncrementalSkew: len(sessions),
+		},
+		Sessions: sessions,
+	}
+
+	t.Run("capped", func(t *testing.T) {
+		var buf bytes.Buffer
+		renderParseDiffReport(&buf, r, "db", "all agents", false)
+		out := buf.String()
+
+		assert.Contains(t, out, "Incremental-skew sessions",
+			"the skew drill-down section must be present")
+		assert.Contains(t, out,
+			"... (5 more; use --verbose or --json)")
+		assert.Contains(t, out, "skew-00")
+		assert.Contains(t, out,
+			fmt.Sprintf("skew-%02d", parseDiffChangedCap-1))
+		assert.NotContains(t, out,
+			fmt.Sprintf("skew-%02d", parseDiffChangedCap),
+			"sessions past the cap must be elided")
+		assert.Contains(t, out, "Incremental skew",
+			"the summary must include the incremental-skew line")
+	})
+
+	t.Run("verbose", func(t *testing.T) {
+		var buf bytes.Buffer
+		renderParseDiffReport(&buf, r, "db", "all agents", true)
+		out := buf.String()
+
+		assert.NotContains(t, out, "more; use --verbose",
+			"verbose output is never capped")
+		assert.Contains(t, out,
+			fmt.Sprintf("skew-%02d", parseDiffChangedCap+4),
+			"verbose lists every skew session")
+		assert.Contains(t, out, "first_message: old -> new")
+	})
+}
+
+// TestRenderParseDiffReport_ResyncNote pins the resync-baseline
+// recommendation: the note appears only when the report carries
+// incremental-skew sessions, and is absent otherwise.
+func TestRenderParseDiffReport_ResyncNote(t *testing.T) {
+	t.Run("note present when incremental skew > 0", func(t *testing.T) {
+		r := &sync.ParseDiffReport{
+			Totals: sync.ParseDiffTotals{
+				Examined:        2,
+				Identical:       1,
+				IncrementalSkew: 1,
+			},
+			Sessions: []sync.SessionDiff{
+				skewSession("claude", "skew-1", sync.FieldDiff{
+					Field:  sync.FieldFirstMessage,
+					Stored: "a", Parsed: "b",
+				}),
+			},
+		}
+		var buf bytes.Buffer
+		renderParseDiffReport(&buf, r, "db", "all agents", false)
+		out := buf.String()
+		assert.Contains(t, out,
+			"1 session(s) were last written through the "+
+				"incremental-append path",
+			"the resync note must report the skew count")
+		assert.Contains(t, out, "Run a full resync",
+			"the resync note must recommend a resync")
+	})
+
+	t.Run("note absent without incremental skew", func(t *testing.T) {
+		r := &sync.ParseDiffReport{
+			Totals: sync.ParseDiffTotals{
+				Examined:  2,
+				Identical: 1,
+				Changed:   1,
+			},
+			FieldCounts: map[string]int{sync.FieldFirstMessage: 1},
+			Sessions: []sync.SessionDiff{
+				changedSession("claude", "chg-1", sync.FieldDiff{
+					Field:  sync.FieldFirstMessage,
+					Stored: "a", Parsed: "b",
+				}),
+			},
+		}
+		var buf bytes.Buffer
+		renderParseDiffReport(&buf, r, "db", "all agents", false)
+		out := buf.String()
+		assert.NotContains(t, out, "incremental-append path",
+			"the resync note must not appear without skew sessions")
 	})
 }
 

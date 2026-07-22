@@ -249,6 +249,266 @@ func TestParseHermesArchive_FallsBackToTranscriptsWhenStateDBUnreadable(
 	assert.Empty(t, res.UsageEvents)
 }
 
+func TestWriteHermesSessionJSONL_UsesMatchingProfileStateDB(t *testing.T) {
+	defaultRoot := t.TempDir()
+	defaultSessions := filepath.Join(defaultRoot, "sessions")
+	require.NoError(t, os.MkdirAll(defaultSessions, 0o755))
+	createHermesStateDB(t, defaultRoot)
+
+	defaultDB, err := sql.Open("sqlite3", filepath.Join(defaultRoot, "state.db"))
+	require.NoError(t, err)
+	defer func() { _ = defaultDB.Close() }()
+	_, err = defaultDB.Exec(`
+		DELETE FROM messages;
+		DELETE FROM sessions;
+		INSERT INTO sessions (
+			id, source, model, started_at, ended_at, message_count, title
+		) VALUES (
+			'default-only', 'default', 'gpt-default',
+			1778767200.0, 1778767800.0, 1, 'Default Session'
+		);
+		INSERT INTO messages (
+			session_id, role, content, timestamp
+		) VALUES (
+			'default-only', 'user', 'wrong root message', 1778767210.0
+		);
+	`)
+	require.NoError(t, err)
+
+	profileRoot := t.TempDir()
+	profileSessions := filepath.Join(profileRoot, "sessions")
+	require.NoError(t, os.MkdirAll(profileSessions, 0o755))
+	createHermesStateDB(t, profileRoot)
+
+	profileDB, err := sql.Open("sqlite3", filepath.Join(profileRoot, "state.db"))
+	require.NoError(t, err)
+	defer func() { _ = profileDB.Close() }()
+	_, err = profileDB.Exec(`
+		INSERT INTO sessions (
+			id, source, model, started_at, ended_at, message_count, title
+		) VALUES (
+			'sibling', 'profile', 'gpt-sibling',
+			1778767200.0, 1778767800.0, 1, 'Sibling Session'
+		);
+		INSERT INTO messages (
+			session_id, role, content, timestamp
+		) VALUES (
+			'sibling', 'user', 'sibling message', 1778767211.0
+		);
+	`)
+	require.NoError(t, err)
+
+	var buf strings.Builder
+	require.NoError(t, WriteHermesSessionJSONL(
+		&buf,
+		filepath.Join(profileRoot, "state.db"),
+		[]string{defaultSessions, profileSessions},
+		"child",
+	))
+
+	out := buf.String()
+	assert.NotContains(t, out, "SQLite format 3")
+	assert.Contains(t, out, `"role":"session_meta"`)
+	assert.Contains(t, out, "state db only has one message")
+	assert.NotContains(t, out, "wrong root message")
+	assert.NotContains(t, out, "sibling message")
+
+	for line := range strings.SplitSeq(strings.TrimSpace(out), "\n") {
+		assert.JSONEq(t, line, line)
+	}
+}
+
+func TestWriteHermesSessionJSONL_TranscriptSourceCopiesFile(t *testing.T) {
+	root := t.TempDir()
+	sessionsDir := filepath.Join(root, "sessions")
+	require.NoError(t, os.MkdirAll(sessionsDir, 0o755))
+	body := strings.Join([]string{
+		`{"role":"session_meta","model":"gpt-4","timestamp":"2026-04-03T15:27:00Z"}`,
+		`{"role":"user","content":"hello from transcript","timestamp":"2026-04-03T15:28:00Z"}`,
+		"",
+	}, "\n")
+	require.NoError(t, os.WriteFile(
+		filepath.Join(sessionsDir, "child.jsonl"),
+		[]byte(body),
+		0o644,
+	))
+
+	var buf strings.Builder
+	require.NoError(t, WriteHermesSessionJSONL(
+		&buf, filepath.Join(root, "state.db"), []string{sessionsDir}, "child",
+	))
+	assert.Equal(t, body, buf.String())
+}
+
+func TestWriteHermesSessionJSONL_FallsBackWhenStoredStateDBMissesSession(t *testing.T) {
+	defaultRoot := t.TempDir()
+	defaultSessions := filepath.Join(defaultRoot, "sessions")
+	require.NoError(t, os.MkdirAll(defaultSessions, 0o755))
+	createHermesStateDB(t, defaultRoot)
+
+	profileRoot := t.TempDir()
+	profileSessions := filepath.Join(profileRoot, "sessions")
+	require.NoError(t, os.MkdirAll(profileSessions, 0o755))
+	createHermesStateDB(t, profileRoot)
+
+	var buf strings.Builder
+	require.NoError(t, WriteHermesSessionJSONL(
+		&buf,
+		filepath.Join(defaultRoot, "state.db"),
+		[]string{defaultSessions, profileSessions},
+		"child",
+	))
+	assert.Contains(t, buf.String(), "state db only has one message")
+}
+
+func TestWriteHermesSessionJSONL_FallsBackToTranscriptWhenStateDBMissesSessionInSameRoot(t *testing.T) {
+	root := t.TempDir()
+	sessionsDir := filepath.Join(root, "sessions")
+	require.NoError(t, os.MkdirAll(sessionsDir, 0o755))
+	createHermesStateDB(t, root)
+	dbPath := filepath.Join(root, "state.db")
+
+	conn, err := sql.Open("sqlite3", dbPath)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = conn.Close() })
+	_, err = conn.Exec(`DELETE FROM messages WHERE session_id = 'child'`)
+	require.NoError(t, err)
+	_, err = conn.Exec(`DELETE FROM sessions WHERE id = 'child'`)
+	require.NoError(t, err)
+
+	body := strings.Join([]string{
+		`{"role":"session_meta","model":"gpt-4","timestamp":"2026-05-14T10:00:00Z"}`,
+		`{"role":"user","content":"fallback transcript prompt","timestamp":"2026-05-14T10:01:00Z"}`,
+		"",
+	}, "\n")
+	require.NoError(t, os.WriteFile(
+		filepath.Join(sessionsDir, "child.jsonl"),
+		[]byte(body),
+		0o644,
+	))
+
+	var buf strings.Builder
+	require.NoError(t, WriteHermesSessionJSONL(
+		&buf,
+		dbPath,
+		[]string{sessionsDir},
+		"child",
+	))
+	assert.Equal(t, body, buf.String())
+}
+
+func TestWriteHermesSessionJSONL_FallsBackWhenStoredStateDBUnreadable(t *testing.T) {
+	root := t.TempDir()
+	sessionsDir := filepath.Join(root, "sessions")
+	require.NoError(t, os.MkdirAll(sessionsDir, 0o755))
+	require.NoError(t, os.WriteFile(
+		filepath.Join(root, "state.db"),
+		[]byte("not a sqlite database"),
+		0o644,
+	))
+	body := strings.Join([]string{
+		`{"role":"session_meta","model":"gpt-4","timestamp":"2026-05-14T10:00:00Z"}`,
+		`{"role":"user","content":"fallback unreadable transcript","timestamp":"2026-05-14T10:01:00Z"}`,
+		"",
+	}, "\n")
+	require.NoError(t, os.WriteFile(
+		filepath.Join(sessionsDir, "child.jsonl"),
+		[]byte(body),
+		0o644,
+	))
+
+	var buf strings.Builder
+	require.NoError(t, WriteHermesSessionJSONL(
+		&buf,
+		filepath.Join(root, "state.db"),
+		[]string{sessionsDir},
+		"child",
+	))
+	assert.Equal(t, body, buf.String())
+}
+
+func TestWriteHermesSessionJSONL_PrioritizesAdjacentTranscriptBeforeRoots(t *testing.T) {
+	for _, tt := range []struct {
+		name        string
+		prepareRoot func(t *testing.T, root string)
+	}{
+		{
+			name: "missing stored state db",
+		},
+		{
+			name: "unreadable stored state db",
+			prepareRoot: func(t *testing.T, root string) {
+				t.Helper()
+				require.NoError(t, os.WriteFile(
+					filepath.Join(root, "state.db"),
+					[]byte("not a sqlite database"),
+					0o644,
+				))
+			},
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			storedRoot := t.TempDir()
+			storedSessions := filepath.Join(storedRoot, "sessions")
+			require.NoError(t, os.MkdirAll(storedSessions, 0o755))
+			if tt.prepareRoot != nil {
+				tt.prepareRoot(t, storedRoot)
+			}
+			body := strings.Join([]string{
+				`{"role":"session_meta","model":"gpt-4","timestamp":"2026-05-14T10:00:00Z"}`,
+				`{"role":"user","content":"adjacent stored transcript","timestamp":"2026-05-14T10:01:00Z"}`,
+				"",
+			}, "\n")
+			require.NoError(t, os.WriteFile(
+				filepath.Join(storedSessions, "child.jsonl"),
+				[]byte(body),
+				0o644,
+			))
+
+			otherRoot := t.TempDir()
+			otherSessions := filepath.Join(otherRoot, "sessions")
+			require.NoError(t, os.MkdirAll(otherSessions, 0o755))
+			createHermesStateDB(t, otherRoot)
+
+			var buf strings.Builder
+			require.NoError(t, WriteHermesSessionJSONL(
+				&buf,
+				filepath.Join(storedRoot, "state.db"),
+				[]string{otherSessions, storedSessions},
+				"child",
+			))
+			assert.Equal(t, body, buf.String())
+		})
+	}
+}
+
+func TestWriteHermesSessionJSONL_PrefersTranscriptWhenQualityWins(t *testing.T) {
+	root := t.TempDir()
+	sessionsDir := filepath.Join(root, "sessions")
+	require.NoError(t, os.MkdirAll(sessionsDir, 0o755))
+	createHermesStateDB(t, root)
+	body := strings.Join([]string{
+		`{"role":"session_meta","model":"gpt-4","timestamp":"2026-05-14T10:00:00Z"}`,
+		`{"role":"user","content":"transcript prompt","timestamp":"2026-05-14T10:01:00Z"}`,
+		`{"role":"assistant","content":"transcript answer","timestamp":"2026-05-14T10:02:00Z"}`,
+		"",
+	}, "\n")
+	require.NoError(t, os.WriteFile(
+		filepath.Join(sessionsDir, "child.jsonl"),
+		[]byte(body),
+		0o644,
+	))
+
+	var buf strings.Builder
+	require.NoError(t, WriteHermesSessionJSONL(
+		&buf,
+		filepath.Join(root, "state.db"),
+		[]string{sessionsDir},
+		"child",
+	))
+	assert.Equal(t, body, buf.String())
+}
+
 func TestParseHermesArchive_UsesStateMessagesWhenJSONLIsLowerQuality(
 	t *testing.T,
 ) {
@@ -547,6 +807,110 @@ func TestParseHermesSession_JSONL_ToolCalls(t *testing.T) {
 		"package main\n",
 		DecodeContent(msgs[2].ToolResults[0].ContentRaw),
 	)
+}
+
+func TestParseHermesSkillViewSetsSkillName(t *testing.T) {
+	const skillName = "debugging"
+	const skillToolCall = `{"id":"skill-1","function":{"name":"skill_view","arguments":"{\"name\":\"debugging\"}"}}`
+
+	t.Run("JSONL transcript", func(t *testing.T) {
+		content := strings.Join([]string{
+			`{"role":"session_meta","timestamp":"2026-04-03T15:00:00.000000"}`,
+			`{"role":"user","content":"Debug this","timestamp":"2026-04-03T15:00:01.000000"}`,
+			`{"role":"assistant","content":"","tool_calls":[` + skillToolCall + `],"timestamp":"2026-04-03T15:00:02.000000"}`,
+		}, "\n")
+
+		_, msgs := runHermesJSONLTest(t, "", content)
+		require.Len(t, msgs, 2)
+		require.Len(t, msgs[1].ToolCalls, 1)
+		assert.Equal(t, skillName, msgs[1].ToolCalls[0].SkillName)
+	})
+
+	t.Run("JSON transcript", func(t *testing.T) {
+		content := `{
+			"messages": [
+				{"role":"user","content":"Debug this","timestamp":"2026-04-03T15:00:01.000000"},
+				{"role":"assistant","content":"","tool_calls":[` + skillToolCall + `],"timestamp":"2026-04-03T15:00:02.000000"}
+			]
+		}`
+
+		_, msgs := runHermesJSONTest(t, "", content)
+		require.Len(t, msgs, 2)
+		require.Len(t, msgs[1].ToolCalls, 1)
+		assert.Equal(t, skillName, msgs[1].ToolCalls[0].SkillName)
+	})
+
+	t.Run("state database", func(t *testing.T) {
+		root := t.TempDir()
+		require.NoError(t, os.MkdirAll(filepath.Join(root, "sessions"), 0o755))
+		createHermesStateDB(t, root)
+
+		db, err := sql.Open("sqlite3", filepath.Join(root, "state.db"))
+		require.NoError(t, err)
+		_, err = db.Exec(`
+			INSERT INTO messages (
+				session_id, role, content, tool_calls, timestamp
+			) VALUES (
+				'child', 'assistant', '', ?, 1778767211.0
+			)`, `[`+skillToolCall+`]`)
+		require.NoError(t, err)
+		require.NoError(t, db.Close())
+
+		results, err := parseHermesTestArchive(t, root, "", "local")
+		require.NoError(t, err)
+		require.Len(t, results, 1)
+		require.Len(t, results[0].Messages, 2)
+		require.Len(t, results[0].Messages[1].ToolCalls, 1)
+		assert.Equal(t, skillName, results[0].Messages[1].ToolCalls[0].SkillName)
+	})
+}
+
+func TestParseHermesSkillViewInputEncodings(t *testing.T) {
+	testCases := []struct {
+		name     string
+		toolCall string
+	}{
+		{
+			name:     "nested string arguments",
+			toolCall: `{"id":"skill-1","function":{"name":"skill_view","arguments":"{\"name\":\"debugging\"}"}}`,
+		},
+		{
+			name:     "nested object arguments",
+			toolCall: `{"id":"skill-1","function":{"name":"skill_view","arguments":{"name":"debugging"}}}`,
+		},
+		{
+			name:     "top-level string arguments",
+			toolCall: `{"id":"skill-1","name":"skill_view","arguments":"{\"name\":\"debugging\"}"}`,
+		},
+		{
+			name:     "top-level object arguments",
+			toolCall: `{"id":"skill-1","name":"skill_view","arguments":{"name":"debugging"}}`,
+		},
+		{
+			name:     "top-level string input",
+			toolCall: `{"id":"skill-1","name":"skill_view","input":"{\"name\":\"debugging\"}"}`,
+		},
+		{
+			name:     "top-level object input",
+			toolCall: `{"id":"skill-1","name":"skill_view","input":{"name":"debugging"}}`,
+		},
+	}
+
+	for _, testCase := range testCases {
+		t.Run(testCase.name, func(t *testing.T) {
+			content := strings.Join([]string{
+				`{"role":"session_meta","timestamp":"2026-04-03T15:00:00.000000"}`,
+				`{"role":"user","content":"Debug this","timestamp":"2026-04-03T15:00:01.000000"}`,
+				`{"role":"assistant","content":"","tool_calls":[` + testCase.toolCall + `],"timestamp":"2026-04-03T15:00:02.000000"}`,
+			}, "\n")
+
+			_, msgs := runHermesJSONLTest(t, "", content)
+			require.Len(t, msgs, 2)
+			require.Len(t, msgs[1].ToolCalls, 1)
+			assert.JSONEq(t, `{"name":"debugging"}`, msgs[1].ToolCalls[0].InputJSON)
+			assert.Equal(t, "debugging", msgs[1].ToolCalls[0].SkillName)
+		})
+	}
 }
 
 func TestParseHermesSession_JSONL_MultipleToolCalls(t *testing.T) {

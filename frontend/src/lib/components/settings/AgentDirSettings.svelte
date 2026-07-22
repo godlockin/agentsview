@@ -23,6 +23,7 @@
     zed: "Zed",
     kimi: "Kimi",
     workbuddy: "WorkBuddy",
+    qoder: "Qoder",
     piebald: "Piebald",
     antigravity: "Antigravity",
     "antigravity-cli": "Antigravity CLI",
@@ -56,7 +57,7 @@
   .dir-list {
     display: flex;
     flex-direction: column;
-    gap: 10px;
+    gap: var(--space-5);
   }
 
   .dir-row {

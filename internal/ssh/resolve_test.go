@@ -3,6 +3,7 @@ package ssh
 import (
 	"os"
 	"os/exec"
+	"path"
 	"path/filepath"
 	"runtime"
 	"strings"
@@ -20,59 +21,93 @@ func TestBuildResolveScript(t *testing.T) {
 	assert.Contains(t, script, "CLAUDE_PROJECTS_DIR")
 	assert.Contains(t, script, "CLAUDE_CONFIG_DIR")
 
-	// Non-file-based agents must not appear.
+	// Only file-backed provider-authoritative agents belong in the resolver.
 	for _, def := range parser.Registry {
-		if def.FileBased {
+		want := def.FileBased &&
+			parser.ProviderMigrationModes()[def.Type] ==
+				parser.ProviderMigrationProviderAuthoritative
+		if def.Type == parser.AgentTrae {
+			want = false
+		}
+		if want {
+			assert.True(t, resolveScriptMentionsAgent(script, def.Type),
+				"file-backed provider-authoritative agent %s missing from script", def.Type)
 			continue
 		}
-		marker := "\"" + string(def.Type) + ":"
-		assert.NotContains(t, script, marker,
-			"non-file-based agent %s in script", def.Type)
+		assert.False(t, resolveScriptMentionsAgent(script, def.Type),
+			"unsupported agent %s must stay out of the SSH resolver", def.Type)
 	}
+}
 
-	// Every file-based, provider-authoritative agent has on-disk source
-	// roots that SSH sync must transfer, so it must appear in the script.
-	for _, def := range parser.Registry {
-		if !def.FileBased ||
-			parser.ProviderMigrationModes()[def.Type] !=
-				parser.ProviderMigrationProviderAuthoritative {
-			continue
-		}
-		marker := "\"" + string(def.Type) + ":"
-		assert.Contains(t, script, marker,
-			"provider-authoritative agent %s missing from script", def.Type)
-	}
+func resolveScriptMentionsAgent(script string, agent parser.AgentType) bool {
+	name := string(agent)
+	return strings.Contains(script, "\""+name+":") ||
+		strings.Contains(script, " "+name+"\n")
+}
+
+func TestResolveScriptExcludesDevinProviderRoot(t *testing.T) {
+	home := t.TempDir()
+	devinRoot := filepath.Join(home, ".local", "share", "devin")
+	require.NoError(t, os.MkdirAll(devinRoot, 0o755))
+
+	out := runResolveScriptForTest(t, "HOME="+home, "DEVIN_DIR="+devinRoot)
+
+	dirs, _ := parseResolvedDirs(string(out))
+	assert.NotContains(t, dirs, parser.AgentDevin)
+}
+
+func TestResolveScriptExcludesTraeProfile(t *testing.T) {
+	home := t.TempDir()
+	traeRoot := filepath.Join(home, "AppData", "Roaming", "TRAE", "User")
+	claudeRoot := filepath.Join(home, ".claude", "projects")
+	require.NoError(t, os.MkdirAll(traeRoot, 0o755))
+	require.NoError(t, os.MkdirAll(claudeRoot, 0o755))
+
+	out := runResolveScriptForTest(t, "HOME="+home, "TRAE_DIR="+traeRoot)
+	dirs, _ := parseResolvedDirs(string(out))
+	assert.NotContains(t, dirs, parser.AgentTrae)
 }
 
 func TestResolveScriptHonorsClaudeConfigDirRoot(t *testing.T) {
 	home := t.TempDir()
-	root := filepath.Join(home, ".claude-personal")
+	root := filepath.Join(home, "claude personal")
 	projectsDir := filepath.Join(root, "projects")
 	require.NoError(t, os.MkdirAll(projectsDir, 0o755), "mkdir projects")
 
-	script := buildResolveScript()
-	cmd := exec.Command("sh", "-c", script)
-	cmd.Env = []string{
-		"HOME=" + home,
-		"CLAUDE_CONFIG_DIR=" + root,
-	}
-	out, err := cmd.CombinedOutput()
-	require.NoError(t, err, "resolve script failed: output: %s", out)
+	out := runResolveScriptForTest(t,
+		"HOME="+home,
+		"CLAUDE_CONFIG_DIR="+root,
+	)
 
 	dirs, _ := parseResolvedDirs(string(out))
 	assert.Contains(t, dirs[parser.AgentClaude], root+"/projects")
 	assert.NotContains(t, dirs[parser.AgentClaude], home+"/.claude/projects")
 }
 
+func TestResolveScriptTreatsEnvValuesAsData(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("resolve script runs on POSIX remote hosts; local Windows filepaths and MSYS shell parsing are not representative")
+	}
+	home := t.TempDir()
+	projectsDir := filepath.Join(home, "config root", "projects")
+	require.NoError(t, os.MkdirAll(projectsDir, 0o755), "mkdir projects")
+
+	script := buildResolveScript()
+	require.NotContains(t, script, "eval")
+	out := runResolveScriptForTest(t,
+		"HOME="+home,
+		"CLAUDE_PROJECTS_DIR="+projectsDir,
+	)
+
+	dirs, _ := parseResolvedDirs(string(out))
+	assert.Contains(t, dirs[parser.AgentClaude], projectsDir)
+}
+
 func TestResolveScriptExitsZero(t *testing.T) {
 	// The resolve script must exit 0 even when no agent
 	// dirs exist. Verify by running it against an empty
 	// HOME so no default dirs are found.
-	script := buildResolveScript()
-	cmd := exec.Command("sh", "-c", script)
-	cmd.Env = []string{"HOME=/nonexistent"}
-	out, err := cmd.CombinedOutput()
-	require.NoError(t, err, "resolve script failed: output: %s", out)
+	out := runResolveScriptForTest(t, "HOME=/nonexistent")
 	// No dirs should be found.
 	assert.Empty(t, strings.TrimSpace(string(out)))
 }
@@ -88,11 +123,7 @@ func TestResolveScriptIncludesCodexIndex(t *testing.T) {
 	indexPath := filepath.Join(home, ".codex", "session_index.jsonl")
 	require.NoError(t, os.WriteFile(indexPath, []byte("{}\n"), 0o644), "write index")
 
-	script := buildResolveScript()
-	cmd := exec.Command("sh", "-c", script)
-	cmd.Env = []string{"HOME=" + home}
-	out, err := cmd.CombinedOutput()
-	require.NoError(t, err, "resolve script failed: output: %s", out)
+	out := runResolveScriptForTest(t, "HOME="+home)
 
 	// The script runs in a POSIX shell (MSYS on Windows), so it emits
 	// forward-slash paths that differ from native filepath.Join output.
@@ -115,6 +146,207 @@ func hasSuffix(paths []string, suffix string) bool {
 	return false
 }
 
+// TestResolveScriptIncludesHermesNamedProfiles verifies the remote resolve
+// script discovers Hermes named-profile session dirs and database files, not
+// just the default profile.
+func TestResolveScriptIncludesHermesNamedProfiles(t *testing.T) {
+	home := t.TempDir()
+	require.NoError(t, os.MkdirAll(filepath.Join(home, ".hermes", "sessions"), 0o755))
+	require.NoError(t, os.WriteFile(
+		filepath.Join(home, ".hermes", "state.db"), []byte("sqlite"), 0o644,
+	))
+	orchestratorRoot := filepath.Join(home, ".hermes", "profiles", "orchestrator")
+	researchRoot := filepath.Join(home, ".hermes", "profiles", "research")
+	require.NoError(t, os.MkdirAll(filepath.Join(orchestratorRoot, "sessions"), 0o755))
+	require.NoError(t, os.MkdirAll(filepath.Join(researchRoot, "sessions"), 0o755))
+	for _, path := range []string{
+		filepath.Join(orchestratorRoot, "state.db"),
+		filepath.Join(orchestratorRoot, "state.db-wal"),
+		filepath.Join(orchestratorRoot, "state.db-shm"),
+		filepath.Join(orchestratorRoot, "state.db-journal"),
+		filepath.Join(researchRoot, "state.db"),
+	} {
+		require.NoError(t, os.WriteFile(path, []byte("sqlite"), 0o644))
+	}
+
+	out := runResolveScriptForTest(t, "HOME="+home)
+	dirs, extraFiles := parseResolvedDirs(string(out))
+
+	assert.Truef(t, hasSuffix(dirs[parser.AgentHermes], ".hermes/sessions"),
+		"default profile sessions dir should resolve, got %v", dirs[parser.AgentHermes])
+	assert.Truef(t, hasSuffix(dirs[parser.AgentHermes], ".hermes/profiles/orchestrator/sessions"),
+		"orchestrator profile sessions dir should resolve, got %v", dirs[parser.AgentHermes])
+	assert.Truef(t, hasSuffix(dirs[parser.AgentHermes], ".hermes/profiles/research/sessions"),
+		"research profile sessions dir should resolve, got %v", dirs[parser.AgentHermes])
+	assert.True(t, hasSuffix(extraFiles, ".hermes/profiles/orchestrator/state.db"))
+	assert.True(t, hasSuffix(extraFiles, ".hermes/profiles/orchestrator/state.db-wal"))
+	assert.True(t, hasSuffix(extraFiles, ".hermes/profiles/orchestrator/state.db-shm"))
+	assert.True(t, hasSuffix(extraFiles, ".hermes/profiles/orchestrator/state.db-journal"))
+	assert.True(t, hasSuffix(extraFiles, ".hermes/profiles/research/state.db"))
+	assert.True(t, hasSuffix(extraFiles, ".hermes/state.db"))
+}
+
+func TestResolveScriptHermesOverrideReplacesNamedProfiles(t *testing.T) {
+	home := filepath.ToSlash(t.TempDir())
+	profileSessions := path.Join(
+		home, ".hermes", "profiles", "research", "sessions",
+	)
+	customRoot := path.Join(home, "custom-hermes")
+	customSessions := path.Join(customRoot, "sessions")
+	require.NoError(t, os.MkdirAll(profileSessions, 0o755))
+	require.NoError(t, os.MkdirAll(customSessions, 0o755))
+	require.NoError(t, os.WriteFile(
+		path.Join(customRoot, "state.db"), []byte("sqlite"), 0o644,
+	))
+
+	out := runResolveScriptForTest(t,
+		"HOME="+home,
+		"HERMES_SESSIONS_DIR="+customSessions,
+	)
+	dirs, extraFiles := parseResolvedDirs(string(out))
+
+	assert.Equal(t, []string{customSessions}, dirs[parser.AgentHermes])
+	assert.Equal(t, []string{path.Join(customRoot, "state.db")}, extraFiles)
+}
+
+func TestResolveScriptHermesProfilesContainerOverrideEnumeratesProfiles(t *testing.T) {
+	home := filepath.ToSlash(t.TempDir())
+	profilesRoot := path.Join(home, ".hermes", "profiles")
+	researchRoot := path.Join(profilesRoot, "research")
+	researchSessions := path.Join(researchRoot, "sessions")
+	researchStateDB := path.Join(researchRoot, "state.db")
+	databaseOnlyRoot := path.Join(profilesRoot, "database-only")
+	databaseOnlyStateDB := path.Join(databaseOnlyRoot, "state.db")
+	require.NoError(t, os.MkdirAll(researchSessions, 0o755))
+	require.NoError(t, os.MkdirAll(databaseOnlyRoot, 0o755))
+	require.NoError(t, os.WriteFile(researchStateDB, []byte("sqlite"), 0o644))
+	require.NoError(t, os.WriteFile(databaseOnlyStateDB, []byte("sqlite"), 0o644))
+
+	outsideRoot := filepath.ToSlash(path.Join(t.TempDir(), "outside-profile"))
+	require.NoError(t, os.MkdirAll(path.Join(outsideRoot, "sessions"), 0o755))
+	require.NoError(t, os.Symlink(outsideRoot, path.Join(profilesRoot, "linked")))
+
+	out := runResolveScriptForTest(t,
+		"HOME="+home,
+		"HERMES_SESSIONS_DIR="+profilesRoot,
+	)
+	dirs, extraFiles := parseResolvedDirs(string(out))
+
+	assert.ElementsMatch(t, []string{researchSessions, databaseOnlyStateDB},
+		dirs[parser.AgentHermes])
+	assert.Equal(t, []string{researchStateDB}, extraFiles)
+}
+
+func TestResolveScriptHermesTrailingSlashOverrideIncludesStateDB(t *testing.T) {
+	home := filepath.ToSlash(t.TempDir())
+	customRoot := path.Join(home, "custom-hermes")
+	customSessions := path.Join(customRoot, "sessions")
+	require.NoError(t, os.MkdirAll(filepath.FromSlash(customSessions), 0o755))
+	stateDB := path.Join(customRoot, "state.db")
+	require.NoError(t, os.WriteFile(filepath.FromSlash(stateDB), []byte("sqlite"), 0o644))
+
+	out := runResolveScriptForTest(t,
+		"HOME="+home,
+		"HERMES_SESSIONS_DIR="+customSessions+"/",
+	)
+	dirs, extraFiles := parseResolvedDirs(string(out))
+
+	assert.Equal(t, []string{customSessions}, dirs[parser.AgentHermes])
+	assert.Equal(t, []string{stateDB}, extraFiles)
+}
+
+func TestResolveScriptIncludesFlatCustomHermesRoot(t *testing.T) {
+	home := t.TempDir()
+	customRoot := filepath.Join(home, "custom", "hermes-archive")
+	require.NoError(t, os.MkdirAll(customRoot, 0o755))
+	require.NoError(t, os.WriteFile(
+		filepath.Join(customRoot, "child.jsonl"), []byte("{}\n"), 0o644,
+	))
+
+	out := runResolveScriptForTest(t,
+		"HOME="+home,
+		"HERMES_SESSIONS_DIR="+customRoot,
+	)
+	dirs, extraFiles := parseResolvedDirs(string(out))
+
+	assert.Equal(t, []string{customRoot}, dirs[parser.AgentHermes])
+	assert.Empty(t, extraFiles)
+}
+
+func TestResolveScriptIncludesHermesDatabaseOnlyProfile(t *testing.T) {
+	home := filepath.ToSlash(t.TempDir())
+	profileRoot := path.Join(home, ".hermes", "profiles", "database-only")
+	require.NoError(t, os.MkdirAll(profileRoot, 0o755))
+	stateDB := path.Join(profileRoot, "state.db")
+	require.NoError(t, os.WriteFile(stateDB, []byte("sqlite"), 0o644))
+
+	out := runResolveScriptForTest(t, "HOME="+home)
+	dirs, _ := parseResolvedDirs(string(out))
+
+	assert.Truef(t, hasSuffix(
+		dirs[parser.AgentHermes], ".hermes/profiles/database-only/state.db",
+	), "database-only profile should resolve, got %v", dirs[parser.AgentHermes])
+}
+
+func TestResolveScriptSkipsSessionlessHermesProfileCredentials(t *testing.T) {
+	home := t.TempDir()
+	profileRoot := filepath.Join(home, ".hermes", "profiles", "sessions")
+	require.NoError(t, os.MkdirAll(profileRoot, 0o755))
+	require.NoError(t, os.WriteFile(
+		filepath.Join(profileRoot, ".env"), []byte("TOKEN=secret\n"), 0o600,
+	))
+	require.NoError(t, os.WriteFile(
+		filepath.Join(profileRoot, "auth.json"), []byte(`{"token":"secret"}`), 0o600,
+	))
+	require.NoError(t, os.WriteFile(
+		filepath.Join(profileRoot, "debug.jsonl"), []byte("not a session\n"), 0o600,
+	))
+
+	out := runResolveScriptForTest(t, "HOME="+home)
+	dirs, extraFiles := parseResolvedDirs(string(out))
+
+	assert.NotContains(t, dirs[parser.AgentHermes], profileRoot)
+	assert.NotContains(t, extraFiles, filepath.Join(profileRoot, ".env"))
+	assert.NotContains(t, extraFiles, filepath.Join(profileRoot, "auth.json"))
+}
+
+func TestResolveScriptSkipsSymlinkedHermesProfile(t *testing.T) {
+	home := t.TempDir()
+	profilesRoot := filepath.Join(home, ".hermes", "profiles")
+	require.NoError(t, os.MkdirAll(profilesRoot, 0o755))
+	outsideRoot := filepath.Join(t.TempDir(), "outside-profile")
+	outsideSessions := filepath.Join(outsideRoot, "sessions")
+	require.NoError(t, os.MkdirAll(outsideSessions, 0o755))
+	require.NoError(t, os.WriteFile(
+		filepath.Join(outsideSessions, "credential.jsonl"), []byte("secret\n"), 0o600,
+	))
+	profileLink := filepath.Join(profilesRoot, "linked")
+	require.NoError(t, os.Symlink(outsideRoot, profileLink))
+
+	out := runResolveScriptForTest(t, "HOME="+home)
+	dirs, extraFiles := parseResolvedDirs(string(out))
+
+	assert.NotContains(t, dirs[parser.AgentHermes], filepath.Join(profileLink, "sessions"))
+	assert.Empty(t, extraFiles)
+}
+
+// TestResolveScriptSkipsMissingHermesProfiles verifies that when no profiles/
+// dir exists, the glob expands to nothing emittable (av_emit_target's [ -d ]
+// guard drops the non-existent path) — so only the default profile resolves.
+func TestResolveScriptSkipsMissingHermesProfiles(t *testing.T) {
+	home := t.TempDir()
+	require.NoError(t, os.MkdirAll(filepath.Join(home, ".hermes", "sessions"), 0o755))
+
+	out := runResolveScriptForTest(t, "HOME="+home)
+	dirs, _ := parseResolvedDirs(string(out))
+
+	assert.Truef(t, hasSuffix(dirs[parser.AgentHermes], ".hermes/sessions"),
+		"default profile sessions dir should resolve, got %v", dirs[parser.AgentHermes])
+	// The unexpanded glob must never leak through as a literal path.
+	assert.Falsef(t, hasSuffix(dirs[parser.AgentHermes], "profiles/*/sessions"),
+		"unexpanded glob must not be emitted, got %v", dirs[parser.AgentHermes])
+}
+
 // TestResolveScriptSkipsMissingCodexIndex verifies that a missing index
 // produces no extra-file entry, so the transfer's tar command never names a
 // nonexistent path (which would be a fatal, non-benign error).
@@ -124,11 +356,7 @@ func TestResolveScriptSkipsMissingCodexIndex(t *testing.T) {
 		os.MkdirAll(filepath.Join(home, ".codex", "sessions"), 0o755),
 		"mkdir sessions")
 
-	script := buildResolveScript()
-	cmd := exec.Command("sh", "-c", script)
-	cmd.Env = []string{"HOME=" + home}
-	out, err := cmd.CombinedOutput()
-	require.NoError(t, err, "resolve script failed: output: %s", out)
+	out := runResolveScriptForTest(t, "HOME="+home)
 
 	_, extraFiles := parseResolvedDirs(string(out))
 	assert.Empty(t, extraFiles,
@@ -147,11 +375,7 @@ func TestResolveScriptSkipsAiderHomeDefault(t *testing.T) {
 		0o644,
 	), "write history")
 
-	script := buildResolveScript()
-	cmd := exec.Command("sh", "-c", script)
-	cmd.Env = []string{"HOME=" + home}
-	out, err := cmd.CombinedOutput()
-	require.NoError(t, err, "resolve script failed: output: %s", out)
+	out := runResolveScriptForTest(t, "HOME="+home)
 
 	dirs, _ := parseResolvedDirs(string(out))
 	assert.Empty(t, dirs[parser.AgentAider],
@@ -189,11 +413,7 @@ func TestResolveScriptAiderScopedByEnvFindsHistoryFiles(t *testing.T) {
 	deepHistory := filepath.Join(deepDir, parser.AiderHistoryFileName())
 	require.NoError(t, os.WriteFile(deepHistory, []byte("# aider\n"), 0o644))
 
-	script := buildResolveScript()
-	cmd := exec.Command("sh", "-c", script)
-	cmd.Env = []string{"HOME=" + home, "AIDER_DIR=" + codeRoot}
-	out, err := cmd.CombinedOutput()
-	require.NoError(t, err, "resolve script failed: output: %s", out)
+	out := runResolveScriptForTest(t, "HOME="+home, "AIDER_DIR="+codeRoot)
 
 	dirs, _ := parseResolvedDirs(string(out))
 	aiderTargets := slashPaths(dirs[parser.AgentAider])
@@ -219,11 +439,7 @@ func TestResolveScriptAiderNewlinePathCannotInjectTarget(t *testing.T) {
 	maliciousHistory := filepath.Join(maliciousDir, parser.AiderHistoryFileName())
 	require.NoError(t, os.WriteFile(maliciousHistory, []byte("# aider\n"), 0o644))
 
-	script := buildResolveScript()
-	cmd := exec.Command("sh", "-c", script)
-	cmd.Env = []string{"HOME=" + home, "AIDER_DIR=" + codeRoot}
-	out, err := cmd.CombinedOutput()
-	require.NoError(t, err, "resolve script failed: output: %s", out)
+	out := runResolveScriptForTest(t, "HOME="+home, "AIDER_DIR="+codeRoot)
 
 	dirs, _ := parseResolvedDirs(string(out))
 	assert.NotContains(t, dirs[parser.AgentAider], injected,
@@ -248,18 +464,71 @@ func slashPaths(paths []string) []string {
 func TestResolveScriptAiderRejectsHomeOverride(t *testing.T) {
 	home := t.TempDir()
 
-	script := buildResolveScript()
 	for _, override := range []string{home, home + "/"} {
-		cmd := exec.Command("sh", "-c", script)
-		cmd.Env = []string{"HOME=" + home, "AIDER_DIR=" + override}
-		out, err := cmd.CombinedOutput()
-		require.NoError(t, err, "resolve script failed: output: %s", out)
+		out := runResolveScriptForTest(t, "HOME="+home, "AIDER_DIR="+override)
 
 		dirs, _ := parseResolvedDirs(string(out))
 		assert.Empty(t, dirs[parser.AgentAider],
 			"AIDER_DIR=%q (== $HOME) must not resolve to a whole-home tar, got %v",
 			override, dirs[parser.AgentAider])
 	}
+}
+
+func TestResolveScriptWindsurfTargetsOnlySessionFiles(t *testing.T) {
+	home := t.TempDir()
+	userRoot := filepath.Join(home, "AppData", "Roaming", "Windsurf", "User")
+	workspaceRoot := filepath.Join(userRoot, "workspaceStorage")
+	workspaceDir := filepath.Join(workspaceRoot, "workspace-a")
+	stateDB := filepath.Join(workspaceDir, parser.WindsurfStateDBName)
+	stateWAL := stateDB + "-wal"
+	stateSHM := stateDB + "-shm"
+	workspaceJSON := filepath.Join(workspaceDir, "workspace.json")
+	secretPath := filepath.Join(workspaceDir, "extension-secret.json")
+	require.NoError(t, os.MkdirAll(workspaceDir, 0o755))
+	require.NoError(t, os.WriteFile(stateDB, []byte("state"), 0o644))
+	require.NoError(t, os.WriteFile(stateWAL, []byte("wal"), 0o644))
+	require.NoError(t, os.WriteFile(stateSHM, []byte("shm"), 0o644))
+	require.NoError(t, os.WriteFile(workspaceJSON, []byte("{}\n"), 0o644))
+	require.NoError(t, os.WriteFile(secretPath, []byte("secret"), 0o644))
+
+	out := runResolveScriptForTest(t, "HOME="+home)
+
+	records := resolveOutputRecords(string(out))
+	userRootSuffix := filepath.ToSlash(filepath.Join("AppData", "Roaming", "Windsurf", "User"))
+	workspaceRootSuffix := filepath.ToSlash(filepath.Join(userRootSuffix, "workspaceStorage"))
+	workspaceSuffix := filepath.ToSlash(filepath.Join(workspaceRootSuffix, "workspace-a"))
+	agentFilePrefix := resolveAgentFilePrefix + ":" + string(parser.AgentWindsurf)
+	assert.True(t, hasRecordWithPathSuffix(records, string(parser.AgentWindsurf), userRootSuffix))
+	assert.True(t, hasRecordWithPathSuffix(records, agentFilePrefix,
+		filepath.ToSlash(filepath.Join(workspaceSuffix, parser.WindsurfStateDBName))))
+	assert.True(t, hasRecordWithPathSuffix(records, agentFilePrefix,
+		filepath.ToSlash(filepath.Join(workspaceSuffix, parser.WindsurfStateDBName+"-wal"))))
+	assert.False(t, hasRecordWithPathSuffix(records, agentFilePrefix,
+		filepath.ToSlash(filepath.Join(workspaceSuffix, parser.WindsurfStateDBName+"-shm"))))
+	assert.True(t, hasRecordWithPathSuffix(records, agentFilePrefix,
+		filepath.ToSlash(filepath.Join(workspaceSuffix, "workspace.json"))))
+	assert.False(t, hasRecordWithPathSuffix(records, string(parser.AgentWindsurf), workspaceRootSuffix))
+	assert.False(t, hasRecordWithPathSuffix(records, agentFilePrefix,
+		filepath.ToSlash(filepath.Join(workspaceSuffix, filepath.Base(secretPath)))))
+}
+
+func hasRecordWithPathSuffix(records []string, prefix, suffix string) bool {
+	for _, record := range records {
+		if strings.HasPrefix(record, prefix+":") && strings.HasSuffix(record, suffix) {
+			return true
+		}
+	}
+	return false
+}
+
+func runResolveScriptForTest(t *testing.T, env ...string) []byte {
+	t.Helper()
+	cmd := exec.Command("sh")
+	cmd.Stdin = strings.NewReader(buildResolveScript())
+	cmd.Env = env
+	out, err := cmd.CombinedOutput()
+	require.NoError(t, err, "resolve script failed: output: %s", out)
+	return out
 }
 
 func TestParseResolvedDirs(t *testing.T) {
@@ -300,4 +569,94 @@ func TestParseResolvedDirsNULRecords(t *testing.T) {
 		dirs[parser.AgentAider])
 	assert.Equal(t,
 		[]string{"/home/wes/.codex/session_index.jsonl"}, extraFiles)
+}
+
+func TestParseResolvedTargetsIncludesAgentFiles(t *testing.T) {
+	input := "windsurf:/home/wes/Windsurf/User\x00" +
+		"@agentfile:windsurf:/home/wes/Windsurf/User/workspaceStorage/a/state.vscdb\x00" +
+		"@agentfile:windsurf:/home/wes/Windsurf/User/workspaceStorage/a/state.vscdb\x00" +
+		"@agentfile:windsurf:/home/wes/Windsurf/User/workspaceStorage/a/workspace.json\x00" +
+		"@file:/home/wes/.codex/session_index.jsonl\x00"
+
+	dirs, files, extraFiles := parseResolvedTargets(input)
+
+	assert.Equal(t, []string{"/home/wes/Windsurf/User"}, dirs[parser.AgentWindsurf])
+	assert.Equal(t, []string{
+		"/home/wes/Windsurf/User/workspaceStorage/a/state.vscdb",
+		"/home/wes/Windsurf/User/workspaceStorage/a/workspace.json",
+	}, files[parser.AgentWindsurf])
+	assert.Equal(t,
+		[]string{"/home/wes/.codex/session_index.jsonl"}, extraFiles)
+}
+
+func TestResolveScriptRooCodeTargetsOnlySessionFiles(t *testing.T) {
+	home := t.TempDir()
+	rooRoot := filepath.Join(home, ".config", "Code", "User",
+		"globalStorage", "rooveterinaryinc.roo-cline")
+	task1 := filepath.Join(rooRoot, "tasks", "task-1")
+	task2 := filepath.Join(rooRoot, "tasks", "task-2")
+	metaDir := filepath.Join(rooRoot, "tasks", "_meta")
+	settingsDir := filepath.Join(rooRoot, "settings")
+	checkpoints := filepath.Join(task1, "checkpoints")
+	require.NoError(t, os.MkdirAll(task1, 0o755))
+	require.NoError(t, os.MkdirAll(task2, 0o755))
+	require.NoError(t, os.MkdirAll(metaDir, 0o755))
+	require.NoError(t, os.MkdirAll(settingsDir, 0o755))
+	require.NoError(t, os.MkdirAll(checkpoints, 0o755))
+	require.NoError(t, os.WriteFile(
+		filepath.Join(task1, "history_item.json"), []byte(`{"id":"task-1"}`), 0o644))
+	require.NoError(t, os.WriteFile(
+		filepath.Join(task1, "ui_messages.json"), []byte(`[]`), 0o644))
+	require.NoError(t, os.WriteFile(
+		filepath.Join(task2, "history_item.json"), []byte(`{"id":"task-2"}`), 0o644))
+	require.NoError(t, os.WriteFile(
+		filepath.Join(settingsDir, "mcp_settings.json"),
+		[]byte(`{"mcpServers":{"s":{"env":{"API_KEY":"sk-secret"}}}}`), 0o644))
+	require.NoError(t, os.WriteFile(
+		filepath.Join(checkpoints, "checkpoint.bin"), []byte("checkpoint"), 0o644))
+
+	out := runResolveScriptForTest(t, "HOME="+home)
+
+	records := resolveOutputRecords(string(out))
+	rootSuffix := filepath.ToSlash(filepath.Join(".config", "Code", "User",
+		"globalStorage", "rooveterinaryinc.roo-cline"))
+	agentFilePrefix := resolveAgentFilePrefix + ":" + string(parser.AgentRooCode)
+	assert.True(t, hasRecordWithPathSuffix(records,
+		string(parser.AgentRooCode), rootSuffix),
+		"root must be emitted once as the agent target")
+	assert.True(t, hasRecordWithPathSuffix(records, agentFilePrefix,
+		"tasks/task-1/history_item.json"))
+	assert.True(t, hasRecordWithPathSuffix(records, agentFilePrefix,
+		"tasks/task-1/ui_messages.json"))
+	assert.True(t, hasRecordWithPathSuffix(records, agentFilePrefix,
+		"tasks/task-2/history_item.json"))
+	// task-2 has no ui_messages.json; av_emit_agent_file skips it.
+	assert.False(t, hasRecordWithPathSuffix(records, agentFilePrefix,
+		"tasks/task-2/ui_messages.json"))
+	for _, record := range records {
+		assert.NotContains(t, record, "mcp_settings.json",
+			"settings must never be emitted")
+		assert.NotContains(t, record, "checkpoint",
+			"checkpoint data must never be emitted")
+		assert.NotContains(t, record, "_meta",
+			"underscore-prefixed task dirs must be skipped")
+	}
+}
+
+func TestResolveScriptRooCodeSkipsRootWithoutSessions(t *testing.T) {
+	home := t.TempDir()
+	rooRoot := filepath.Join(home, ".config", "Code", "User",
+		"globalStorage", "rooveterinaryinc.roo-cline")
+	settingsDir := filepath.Join(rooRoot, "settings")
+	require.NoError(t, os.MkdirAll(settingsDir, 0o755))
+	require.NoError(t, os.WriteFile(
+		filepath.Join(settingsDir, "mcp_settings.json"),
+		[]byte(`{"mcpServers":{}}`), 0o644))
+
+	out := runResolveScriptForTest(t, "HOME="+home)
+
+	for _, record := range resolveOutputRecords(string(out)) {
+		assert.NotContains(t, record, "roo-cline",
+			"a session-less RooCode root must emit nothing")
+	}
 }

@@ -13,7 +13,7 @@
   import { liveTick } from "../../stores/liveTick.svelte.js";
   import ToolBlock from "./ToolBlock.svelte";
   import ParallelGroup from "./ParallelGroup.svelte";
-  import CopyButton from "../shared/CopyButton.svelte";
+  import { CopyButton } from "@kenn-io/kit-ui";
   import { displayToolName } from "../../utils/toolDisplay.js";
   import { SettingsIcon } from "../../icons.js";
   import { m } from "../../i18n/index.js";
@@ -23,6 +23,8 @@
     timestamp: string;
     highlightQuery?: string;
     isCurrentHighlight?: boolean;
+    sortNewestFirst?: boolean;
+    divider?: { ordinal: number; label: string };
   }
 
   let {
@@ -30,6 +32,8 @@
     timestamp,
     highlightQuery = "",
     isCurrentHighlight = false,
+    sortNewestFirst = false,
+    divider,
   }: Props = $props();
 
   let copied = $state(false);
@@ -52,6 +56,10 @@
   );
 
   let label = $derived(m.tool_call_group_call_count({ count: totalCalls }));
+
+  let displayMessages = $derived(
+    sortNewestFirst ? [...messages].reverse() : messages,
+  );
 
   /** Index turn timings by message id for O(1) lookup. */
   let turnByMessage = $derived.by(() => {
@@ -128,6 +136,7 @@
     </span>
     <span class="group-label">{label}</span>
     <CopyButton
+      revealOnHover
       {copied}
       ariaLabel={m.tool_call_group_copy_tool_calls()}
       copiedAriaLabel={m.tool_call_group_copied_tool_calls()}
@@ -141,47 +150,54 @@
   </div>
 
   <div class="tool-group-body">
-    {#each messages as message (message.ordinal)}
+    {#each displayMessages as message (message.ordinal)}
+      {#if divider?.ordinal === message.ordinal}
+        <div class="read-progress-divider" role="separator" aria-label={m.read_progress_boundary()}>
+          {divider.label}
+        </div>
+      {/if}
       {@const calls = message.tool_calls ?? []}
       {@const turn = turnByMessage.get(message.id)}
-      {#if calls.length === 1}
-        {@const soloCall = calls[0]!}
-        <ToolBlock
-          toolCall={soloCall}
-          content=""
-          label={displayToolName(soloCall)}
-          durationLabel={soloDurationLabel(
-            callByToolUseID.get(soloCall.tool_use_id ?? ""),
-            turn,
-            message,
-          )}
-          isRunning={isRunningTurn(message)}
-          {highlightQuery}
-          {isCurrentHighlight}
-        />
-      {:else if calls.length >= 2}
-        <ParallelGroup
-          toolCalls={calls}
-          callTimingByID={callByToolUseID}
-          turnDurationMs={turn?.duration_ms ?? null}
-          isRunning={isRunningTurn(message)}
-          {highlightQuery}
-          {isCurrentHighlight}
-        />
-      {:else}
-        <!-- Fallback for messages with `has_tool_use` but no
-             structured tool_calls — parse the content for tool
-             markers (legacy/synthetic transcripts). -->
-        {#each enrichSegments(parseContent(message.content, message.has_tool_use, message.id, message.content_length), message.tool_calls).filter((s) => s.type === "tool") as seg, segIdx (`${message.id}-${segIdx}`)}
+      <div data-message-ordinal={message.ordinal}>
+        {#if calls.length === 1}
+          {@const soloCall = calls[0]!}
           <ToolBlock
-            content={seg.content}
-            label={seg.label}
-            toolCall={seg.toolCall}
+            toolCall={soloCall}
+            content=""
+            label={displayToolName(soloCall)}
+            durationLabel={soloDurationLabel(
+              callByToolUseID.get(soloCall.tool_use_id ?? ""),
+              turn,
+              message,
+            )}
+            isRunning={isRunningTurn(message)}
             {highlightQuery}
             {isCurrentHighlight}
           />
-        {/each}
-      {/if}
+        {:else if calls.length >= 2}
+          <ParallelGroup
+            toolCalls={calls}
+            callTimingByID={callByToolUseID}
+            turnDurationMs={turn?.duration_ms ?? null}
+            isRunning={isRunningTurn(message)}
+            {highlightQuery}
+            {isCurrentHighlight}
+          />
+        {:else}
+          <!-- Fallback for messages with `has_tool_use` but no
+               structured tool_calls — parse the content for tool
+               markers (legacy/synthetic transcripts). -->
+          {#each enrichSegments(parseContent(message.content, message.has_tool_use, message.id, message.content_length), message.tool_calls).filter((s) => s.type === "tool") as seg, segIdx (`${message.id}-${segIdx}`)}
+            <ToolBlock
+              content={seg.content}
+              label={seg.label}
+              toolCall={seg.toolCall}
+              {highlightQuery}
+              {isCurrentHighlight}
+            />
+          {/each}
+        {/if}
+      </div>
     {/each}
   </div>
 </div>
@@ -220,7 +236,7 @@
     margin-left: auto;
   }
 
-  .tool-group:hover :global(.copy-btn) {
+  .tool-group:hover :global(.kit-copy-btn) {
     opacity: 1;
   }
 
@@ -228,6 +244,28 @@
     display: flex;
     flex-direction: column;
     gap: 2px;
+  }
+
+  .read-progress-divider {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin: 4px 0 6px;
+    color: var(--accent-blue);
+    font-size: 11px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+  }
+
+  .read-progress-divider::before,
+  .read-progress-divider::after {
+    content: "";
+    height: 1px;
+    flex: 1;
+    background: color-mix(
+      in srgb, var(--accent-blue) 35%, transparent
+    );
   }
 
   .tool-group-body :global(.tool-block) {

@@ -5,6 +5,8 @@ import (
 	"database/sql"
 	"fmt"
 	"time"
+
+	"go.kenn.io/agentsview/internal/export"
 )
 
 // DefaultRollupRecomputeDays is how many trailing days
@@ -117,7 +119,7 @@ func (db *DB) aggregateRollupBuckets(
 	defer rows.Close()
 
 	// No pricing needed: the rollup stores tokens only.
-	rateResolver := newModelRateResolver(nil)
+	rateResolver := export.NewPricingResolver(nil)
 
 	buckets := make(map[rollupKey]*rollupBucket)
 	seen := make(map[usageDedupToken]struct{})

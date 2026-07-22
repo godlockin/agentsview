@@ -1,9 +1,11 @@
 package main
 
 import (
+	"bytes"
 	"context"
+	"database/sql"
+	"encoding/base64"
 	"encoding/json"
-	"errors"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -18,10 +20,24 @@ import (
 	"go.kenn.io/agentsview/internal/cursorusage"
 	"go.kenn.io/agentsview/internal/db"
 	"go.kenn.io/agentsview/internal/dbtest"
+	"go.kenn.io/agentsview/internal/export"
 	"go.kenn.io/agentsview/internal/parser"
 	"go.kenn.io/agentsview/internal/parsertest"
-	"go.kenn.io/agentsview/internal/pricing"
+	"go.kenn.io/agentsview/internal/pricingrefresh"
 )
+
+var goldenFixtureNow = time.Date(2026, 7, 3, 12, 0, 0, 0, time.UTC)
+
+const (
+	goldenDatabaseID       = "00000000-0000-4000-8000-000000000001"
+	goldenArchiveID        = "00000000-0000-4000-8000-000000000002"
+	goldenArchiveSalt      = "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f"
+	goldenPricingUpdatedAt = "2026-07-03T12:00:00Z"
+	goldenComputedModel    = "fixture-model-computed"
+	goldenReportedModel    = "fixture-model-reported"
+)
+
+var goldenCursorSecret = []byte("agentsview-export-golden-secret-v1")
 
 func TestFmtCost(t *testing.T) {
 	tests := []struct {
@@ -44,6 +60,311 @@ func TestFmtCost(t *testing.T) {
 			assert.Equal(t, tc.want, fmtCost(tc.in),
 				"fmtCost(%v)", tc.in)
 		})
+	}
+}
+
+func TestUsageDailyGolden(t *testing.T) {
+	setupExportGoldenDataDir(t)
+
+	cmd := newRootCommand()
+	cmd.SetArgs([]string{
+		"usage", "daily",
+		"--json",
+		"--since", "2026-07-01",
+		"--until", "2026-07-03",
+		"--timezone", "UTC",
+		"--offline",
+		"--no-sync",
+	})
+	var err error
+	stdout := captureStdout(t, func() {
+		_, err = cmd.ExecuteC()
+	})
+	require.NoError(t, err, "usage daily json golden command")
+	var report db.DailyUsageResult
+	require.NoError(t, json.Unmarshal([]byte(stdout), &report))
+	assert.Equal(t, 2, report.SchemaVersion)
+
+	assertGoldenBytes(t, "usage_daily_v2.json", []byte(stdout))
+}
+
+func TestUsageDailyBreakdownGolden(t *testing.T) {
+	setupExportGoldenDataDir(t)
+
+	cmd := newRootCommand()
+	cmd.SetArgs([]string{
+		"usage", "daily",
+		"--json",
+		"--breakdown",
+		"--since", "2026-07-01",
+		"--until", "2026-07-03",
+		"--timezone", "UTC",
+		"--offline",
+		"--no-sync",
+	})
+	var err error
+	stdout := captureStdout(t, func() {
+		_, err = cmd.ExecuteC()
+	})
+	require.NoError(t, err, "usage daily json breakdown golden command")
+	var report db.DailyUsageResult
+	require.NoError(t, json.Unmarshal([]byte(stdout), &report))
+	require.NotEmpty(t, report.Daily)
+	for _, daily := range report.Daily {
+		require.Len(t, daily.MachineBreakdowns, 1)
+		assert.Equal(t, "golden-host", daily.MachineBreakdowns[0].MachineName)
+	}
+
+	assertGoldenBytes(t, "usage_daily_breakdown_v2.json", []byte(stdout))
+}
+
+func setupExportGoldenDataDir(t *testing.T) string {
+	t.Helper()
+	dataDir := testDataDir(t)
+	t.Setenv("TZ", "UTC")
+	t.Setenv("AGENTSVIEW_CURSOR_ATTRIBUTION_DB",
+		filepath.Join(dataDir, "missing-cursor-attribution.db"))
+	writeGoldenCursorSecretConfig(t, dataDir)
+
+	dbPath := sessionsDBPath(dataDir)
+	database := dbtest.OpenTestDBAt(t, dbPath)
+	seedExportGoldenArchive(t, database)
+	require.NoError(t, database.Close(), "close golden database")
+	setGoldenPricingUpdatedAt(t, dbPath)
+	return dataDir
+}
+
+func writeGoldenCursorSecretConfig(t *testing.T, dataDir string) {
+	t.Helper()
+	encoded := base64.StdEncoding.EncodeToString(goldenCursorSecret)
+	require.NoError(t, os.WriteFile(
+		filepath.Join(dataDir, "config.toml"),
+		[]byte("cursor_secret = \""+encoded+"\"\n"),
+		0o600,
+	), "write golden config")
+}
+
+func seedExportGoldenArchive(t *testing.T, database *db.DB) {
+	t.Helper()
+	ctx := context.Background()
+	database.SetCursorSecret(goldenCursorSecret)
+	require.NoError(t, database.SetDatabaseIDForTest(ctx, goldenDatabaseID))
+	require.NoError(t, database.SetArchiveIdentityForTest(
+		ctx, goldenArchiveID, goldenArchiveSalt,
+	))
+	require.NoError(t, database.UpsertModelPricing([]db.ModelPricing{
+		{
+			ModelPattern:         goldenComputedModel,
+			InputPerMTok:         2,
+			OutputPerMTok:        8,
+			CacheCreationPerMTok: 3,
+			CacheReadPerMTok:     0.5,
+		},
+		{
+			ModelPattern:         goldenReportedModel,
+			InputPerMTok:         1,
+			OutputPerMTok:        4,
+			CacheCreationPerMTok: 2,
+			CacheReadPerMTok:     0.25,
+		},
+	}), "seed golden pricing")
+	seedGoldenExportSession(t, database, goldenExportSessionSpec{
+		id: "path-current", project: "path-project", agent: "claude",
+		startedAt: "2026-07-03T11:00:00Z",
+		endedAt:   "2026-07-03T11:10:00Z",
+		model:     goldenReportedModel,
+		costUSD:   dbtest.Ptr(0.0125),
+		cwd:       "/fixtures/path-project/pkg",
+	})
+	seedGoldenExportSession(t, database, goldenExportSessionSpec{
+		id: "remote-current", project: "remote-project", agent: "codex",
+		startedAt: "2026-07-03T10:00:00Z",
+		endedAt:   "2026-07-03T10:30:00Z",
+		model:     goldenComputedModel,
+		tokenJSON: json.RawMessage(`{"input_tokens":1200,"output_tokens":240,` +
+			`"cache_creation_input_tokens":80,"cache_read_input_tokens":400}`),
+		outputTokens: 240,
+		cwd:          "/fixtures/remote-project/worktrees/feature/app",
+		gitBranch:    "feature/golden",
+	})
+	seedGoldenExportSession(t, database, goldenExportSessionSpec{
+		id: "remote-yesterday", project: "remote-project", agent: "codex",
+		startedAt:    "2026-07-02T09:00:00Z",
+		endedAt:      "2026-07-02T09:20:00Z",
+		model:        goldenComputedModel,
+		tokenJSON:    json.RawMessage(`{"input_tokens":800,"output_tokens":160}`),
+		outputTokens: 160,
+		cwd:          "/fixtures/remote-project/worktrees/feature/cli",
+		gitBranch:    "feature/golden",
+	})
+	seedGoldenExportSession(t, database, goldenExportSessionSpec{
+		id: "unknown-older", project: "unknown-project", agent: "cursor",
+		startedAt: "2026-07-01T08:00:00Z",
+		endedAt:   "2026-07-01T08:05:00Z",
+		model:     goldenReportedModel,
+		costUSD:   dbtest.Ptr(0.0042),
+	})
+	seedGoldenProjectIdentities(t, database)
+}
+
+func seedGoldenProjectIdentities(t *testing.T, database *db.DB) {
+	t.Helper()
+	ctx := context.Background()
+	for _, sessionID := range []string{"remote-current", "remote-yesterday"} {
+		require.NoError(t, database.UpsertProjectIdentityObservation(ctx,
+			export.ProjectIdentityObservation{
+				SessionID:            sessionID,
+				Project:              "remote-project",
+				Machine:              "golden-host",
+				RootPath:             "/fixtures/remote-project/worktrees/feature",
+				GitRemote:            "https://github.com/acme/remote-project.git",
+				GitRemoteName:        "origin",
+				RepositoryPath:       "/fixtures/remote-project",
+				WorktreeName:         "feature",
+				WorktreeRootPath:     "/fixtures/remote-project/worktrees/feature",
+				WorktreeRelationship: export.WorktreeLinked,
+				CheckoutState:        export.CheckoutBranch,
+				GitBranch:            "feature/golden",
+				ObservedAt:           goldenFixtureNow,
+			}), "seed remote project identity")
+	}
+	require.NoError(t, database.UpsertProjectIdentityObservation(ctx,
+		export.ProjectIdentityObservation{
+			SessionID:            "path-current",
+			Project:              "path-project",
+			Machine:              "golden-host",
+			RootPath:             "/fixtures/path-project",
+			RepositoryPath:       "/fixtures/path-project",
+			WorktreeRootPath:     "/fixtures/path-project",
+			WorktreeRelationship: export.WorktreeMain,
+			CheckoutState:        export.CheckoutUnknown,
+			ObservedAt:           goldenFixtureNow,
+		}), "seed path project identity")
+	require.NoError(t, database.UpsertProjectIdentityObservation(ctx,
+		export.ProjectIdentityObservation{
+			SessionID:  "unknown-older",
+			Project:    "unknown-project",
+			Machine:    "golden-host",
+			ObservedAt: goldenFixtureNow,
+		}), "seed unknown project identity")
+}
+
+type goldenExportSessionSpec struct {
+	id           string
+	project      string
+	agent        string
+	startedAt    string
+	endedAt      string
+	model        string
+	tokenJSON    json.RawMessage
+	outputTokens int
+	costUSD      *float64
+	cwd          string
+	gitBranch    string
+}
+
+func seedGoldenExportSession(
+	t *testing.T, database *db.DB, spec goldenExportSessionSpec,
+) {
+	t.Helper()
+	session := db.Session{
+		ID:               spec.id,
+		Project:          spec.project,
+		Machine:          "golden-host",
+		Agent:            spec.agent,
+		StartedAt:        &spec.startedAt,
+		EndedAt:          &spec.endedAt,
+		CreatedAt:        spec.startedAt,
+		MessageCount:     4,
+		UserMessageCount: 2,
+		RelationshipType: "root",
+		DataVersion:      db.CurrentDataVersion(),
+		Cwd:              spec.cwd,
+		GitBranch:        spec.gitBranch,
+	}
+	if spec.outputTokens > 0 {
+		session.TotalOutputTokens = spec.outputTokens
+		session.HasTotalOutputTokens = true
+	}
+	require.NoError(t, database.UpsertSession(session),
+		"upsert golden session %s", spec.id)
+
+	msgs := []db.Message{
+		{
+			SessionID: spec.id, Ordinal: 0, Role: "user",
+			Content: "golden request", ContentLength: len("golden request"),
+			Timestamp: spec.startedAt,
+		},
+		{
+			SessionID: spec.id, Ordinal: 1, Role: "assistant",
+			Content: "golden response", ContentLength: len("golden response"),
+			Timestamp: addSeconds(spec.startedAt, 30), Model: spec.model,
+		},
+		{
+			SessionID: spec.id, Ordinal: 2, Role: "user",
+			Content: "follow up", ContentLength: len("follow up"),
+			Timestamp: addMinutes(spec.startedAt, 2),
+		},
+		{
+			SessionID: spec.id, Ordinal: 3, Role: "assistant",
+			Content: "done", ContentLength: len("done"),
+			Timestamp: addMinutes(spec.startedAt, 3), Model: spec.model,
+		},
+	}
+	if len(spec.tokenJSON) > 0 {
+		msgs[1].TokenUsage = spec.tokenJSON
+		msgs[1].OutputTokens = spec.outputTokens
+		msgs[1].HasOutputTokens = true
+	}
+	require.NoError(t, database.InsertMessages(msgs),
+		"insert golden messages %s", spec.id)
+
+	if spec.costUSD != nil {
+		ordinal := 1
+		require.NoError(t, database.ReplaceSessionUsageEvents(
+			spec.id, []db.UsageEvent{{
+				SessionID:      spec.id,
+				MessageOrdinal: &ordinal,
+				Source:         "provider",
+				Model:          spec.model,
+				InputTokens:    300,
+				OutputTokens:   60,
+				CostUSD:        spec.costUSD,
+				OccurredAt:     addMinutes(spec.startedAt, 1),
+				DedupKey:       spec.id + ":provider-usage",
+			}},
+		), "seed golden usage event %s", spec.id)
+	}
+}
+
+func setGoldenPricingUpdatedAt(t *testing.T, dbPath string) {
+	t.Helper()
+	conn, err := sql.Open("sqlite3", dbPath)
+	require.NoError(t, err, "open golden db for pricing timestamp")
+	defer func() {
+		require.NoError(t, conn.Close(), "close pricing timestamp db")
+	}()
+	_, err = conn.Exec(`UPDATE model_pricing SET updated_at = ?`,
+		goldenPricingUpdatedAt)
+	require.NoError(t, err, "set deterministic pricing updated_at")
+}
+
+func assertGoldenBytes(t *testing.T, name string, got []byte) {
+	t.Helper()
+	path := filepath.Join("..", "..", "testdata", "golden", name)
+	if *updateGolden {
+		require.NoError(t, os.MkdirAll(filepath.Dir(path), 0o755),
+			"mkdir golden dir")
+		require.NoError(t, os.WriteFile(path, got, 0o644),
+			"write golden %s", name)
+		t.Logf("rewrote %s (%d bytes)", path, len(got))
+		return
+	}
+	want, err := os.ReadFile(path)
+	require.NoError(t, err, "read golden (run with -update to generate)")
+	if !bytes.Equal(want, got) {
+		assert.Equal(t, string(want), string(got),
+			"golden mismatch for %s", name)
 	}
 }
 
@@ -130,9 +451,43 @@ func TestFetchHTTPDailyUsage(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, got.Daily, 1)
 	assert.Equal(t, "Bearer secret-token", gotAuth)
+	assert.Equal(t, export.UsageDailySchemaVersion, got.SchemaVersion)
+	require.NotNil(t, got.Pricing)
+	assert.Contains(t, got.Pricing.Models, "gpt-5.1")
+	require.Len(t, got.Projects, 1)
+	for key, project := range got.Projects {
+		assert.NotContains(t, key, "proj")
+		assert.Equal(t, "proj", project.DisplayLabel)
+		assert.Equal(t, export.ProjectResolutionUnknown, project.Resolution)
+	}
 	assert.Equal(t, 10, got.Totals.InputTokens)
 	assert.Equal(t, 20, got.Daily[0].OutputTokens)
 	assert.Equal(t, 1, got.SessionCounts.Total)
+}
+
+func TestFetchHTTPDailyUsageMissingProjectsDefaultsEmptyMap(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(
+		w http.ResponseWriter,
+		r *http.Request,
+	) {
+		writeJSONResponse(w, `{
+			"schema_version": 1,
+			"totals": {},
+			"daily": [],
+			"sessionCounts": {}
+		}`)
+	}))
+	defer ts.Close()
+
+	got, err := fetchHTTPDailyUsage(
+		context.Background(),
+		transport{Mode: transportHTTP, URL: ts.URL},
+		"",
+		dailyUsageQuery{NoDefaultRange: true},
+	)
+	require.NoError(t, err)
+	assert.NotNil(t, got.Projects)
+	assert.Empty(t, got.Projects)
 }
 
 func TestFetchHTTPDailyUsagePreservesExcludedSessionFilters(t *testing.T) {
@@ -633,6 +988,91 @@ func TestLocalArchiveQueryDailyUsageAppliesDefaultRange(t *testing.T) {
 	assert.NotEmpty(t, withBreakdowns.Daily[0].AgentBreakdowns)
 }
 
+func TestUsageDailyJSONIncludesExportMetadata(t *testing.T) {
+	dataDir := testDataDir(t)
+	database := dbtest.OpenTestDBAt(t, filepath.Join(dataDir, "sessions.db"))
+	fallbackModel := fallbackPricedModel(t)
+	require.NoError(t, pricingrefresh.SeedFallback(database))
+	seedUsageDailyExportMetadataFixture(t, database, fallbackModel)
+	require.NoError(t, database.Close())
+
+	out := captureStdout(t, func() {
+		runUsageDaily(UsageDailyConfig{
+			JSON: true, Since: "2026-06-01", Until: "2026-06-01",
+			Timezone: "UTC", Offline: true, NoSync: true,
+		})
+	})
+
+	var got db.DailyUsageResult
+	require.NoError(t, json.Unmarshal([]byte(out), &got))
+	assert.Equal(t, export.UsageDailySchemaVersion, got.SchemaVersion)
+	require.NotNil(t, got.Pricing)
+	require.Contains(t, got.Pricing.Models, "gpt-5.1")
+	require.Contains(t, got.Pricing.Models, fallbackModel)
+	assert.Equal(t, export.CostSourceReported,
+		got.Pricing.Models["gpt-5.1"].CostSource)
+	assert.Equal(t, export.CostSourceComputed,
+		got.Pricing.Models[fallbackModel].CostSource)
+	assert.True(t, got.Pricing.Fallback.Used)
+	assert.Contains(t, got.Pricing.Fallback.Models, fallbackModel)
+	require.Len(t, got.Projects, 1)
+	var projectKey string
+	for key, project := range got.Projects {
+		projectKey = key
+		assert.NotContains(t, key, "shared-project")
+		assert.Equal(t, "shared-project", project.DisplayLabel)
+		assert.Equal(t, export.ProjectResolutionUnknown, project.Resolution)
+	}
+
+	require.Len(t, got.Daily, 1)
+	assert.Equal(t, "2026-06-01", got.Daily[0].Date)
+	assert.ElementsMatch(t, []string{"gpt-5.1", fallbackModel},
+		got.Daily[0].ModelsUsed)
+	assert.Equal(t, 300, got.Totals.InputTokens)
+	assert.Equal(t, 150, got.Totals.OutputTokens)
+	assert.Equal(t, 2, got.SessionCounts.Total)
+	assert.Equal(t, map[string]int{projectKey: 2},
+		got.SessionCounts.ByProject)
+}
+
+func seedUsageDailyExportMetadataFixture(
+	t *testing.T, database *db.DB, fallbackModel string,
+) {
+	t.Helper()
+	started := "2026-06-01T10:00:00Z"
+	ended := "2026-06-01T10:05:00Z"
+	for _, id := range []string{"reported-cost", "fallback-cost"} {
+		require.NoError(t, database.UpsertSession(db.Session{
+			ID: "usage-meta-" + id, Project: "shared-project",
+			Machine: "test", Agent: "codex", StartedAt: &started,
+			EndedAt: &ended, CreatedAt: started, MessageCount: 2,
+			UserMessageCount: 1, RelationshipType: "root", DataVersion: 1,
+		}))
+	}
+	require.NoError(t, database.InsertMessages([]db.Message{
+		{
+			SessionID: "usage-meta-reported-cost", Ordinal: 0,
+			Role: "assistant", Timestamp: started, Model: "gpt-5.1",
+		},
+		{
+			SessionID: "usage-meta-fallback-cost", Ordinal: 0,
+			Role: "assistant", Timestamp: started, Model: fallbackModel,
+			TokenUsage: json.RawMessage(`{"input_tokens":200,"output_tokens":100}`),
+		},
+	}))
+	cost := 0.25
+	ordinal := 1
+	require.NoError(t, database.ReplaceSessionUsageEvents(
+		"usage-meta-reported-cost", []db.UsageEvent{{
+			SessionID: "usage-meta-reported-cost", MessageOrdinal: &ordinal,
+			Source: "session", Model: "gpt-5.1", InputTokens: 100,
+			OutputTokens: 50, CostUSD: &cost,
+			OccurredAt: "2026-06-01T10:01:00Z",
+			DedupKey:   "usage-meta-reported-cost:event",
+		}},
+	))
+}
+
 func TestFormatDailyUsageJSON(t *testing.T) {
 	result := db.DailyUsageResult{
 		Daily: []db.DailyUsageEntry{
@@ -686,6 +1126,7 @@ func TestFormatDailyUsageJSON(t *testing.T) {
 		"date", "inputTokens", "outputTokens",
 		"cacheCreationTokens", "cacheReadTokens",
 		"totalCost", "modelsUsed", "modelBreakdowns",
+		"machineBreakdowns",
 	}
 	for _, f := range wantFields {
 		assert.Contains(t, daily[0], f,
@@ -973,116 +1414,6 @@ func TestNewUsageCursorCommandExplicitMemberFilterDoesNotReuseConfigSibling(t *t
 	}
 }
 
-func TestRefreshPricingIfStale_FreshAttemptSkipsFetch(t *testing.T) {
-	d := newTestDB(t)
-	now := pricingTestNow()
-
-	// Last attempt 10 minutes ago, cooldown 1 hour: skip.
-	prev := seedPricingAttempt(t, d, now, 10*time.Minute)
-
-	fetcher := &pricingFetchRecorder{}
-	refreshed, err := refreshPricingIfStale(
-		d, fetcher.fetch, pricingTestCooldown, now,
-	)
-	require.NoError(t, err)
-	assert.False(t, refreshed, "refreshed = true, want false within cooldown")
-	assert.Zero(t, fetcher.calls, "fetch should not run within cooldown")
-
-	// Meta value preserved (we did not overwrite it).
-	assertPricingAttemptMeta(t, d, prev)
-}
-
-func TestRefreshPricingIfStale_StaleTriggersFetch(t *testing.T) {
-	d := newTestDB(t)
-	now := pricingTestNow()
-
-	// Last attempt 2 hours ago, cooldown 1 hour: refresh.
-	seedPricingAttempt(t, d, now, 2*time.Hour)
-
-	fetcher := &pricingFetchRecorder{rows: []pricing.ModelPricing{{
-		ModelPattern:  "gpt-5.5",
-		InputPerMTok:  1.25,
-		OutputPerMTok: 10.0,
-	}}}
-	refreshed, err := refreshPricingIfStale(
-		d, fetcher.fetch, pricingTestCooldown, now,
-	)
-	require.NoError(t, err)
-	require.True(t, refreshed, "refreshed = false, want true after cooldown")
-
-	// Pricing row written.
-	p, err := d.GetModelPricing("gpt-5.5")
-	require.NoError(t, err)
-	require.NotNil(t, p, "gpt-5.5 row missing")
-	assert.Equal(t, 10.0, p.OutputPerMTok)
-
-	// Meta updated to now.
-	assertPricingAttemptMeta(t, d, now.Format(time.RFC3339))
-}
-
-func TestRefreshPricingIfStale_NeverAttemptedTriggersFetch(t *testing.T) {
-	d := newTestDB(t)
-	now := pricingTestNow()
-
-	fetcher := &pricingFetchRecorder{}
-	refreshed, err := refreshPricingIfStale(
-		d, fetcher.fetch, pricingTestCooldown, now,
-	)
-	require.NoError(t, err)
-	assert.Equal(t, 1, fetcher.calls, "fetch should run when meta empty")
-	assert.True(t, refreshed, "refreshed = false, want true on first attempt")
-}
-
-func TestRefreshPricingIfStale_FetchFailureRecordsAttempt(t *testing.T) {
-	d := newTestDB(t)
-	now := pricingTestNow()
-
-	wantErr := errors.New("network down")
-	fetcher := &pricingFetchRecorder{err: wantErr}
-	refreshed, err := refreshPricingIfStale(
-		d, fetcher.fetch, pricingTestCooldown, now,
-	)
-	assert.ErrorIs(t, err, wantErr)
-	assert.False(t, refreshed, "refreshed = true, want false on fetch failure")
-
-	// Cooldown still recorded so a persistent failure doesn't
-	// retry on every CLI call.
-	assertPricingAttemptMeta(t, d, now.Format(time.RFC3339))
-
-	// A second call within cooldown skips the fetch entirely.
-	second := &pricingFetchRecorder{}
-	_, err = refreshPricingIfStale(
-		d, second.fetch, pricingTestCooldown, now.Add(time.Minute),
-	)
-	require.NoError(t, err)
-	assert.Zero(t, second.calls, "second call should be suppressed by cooldown")
-}
-
-func TestEnsurePricingWithFetcherSkipsFetchWithinCooldown(t *testing.T) {
-	d := newTestDB(t)
-	now := pricingTestNow()
-
-	seedPricingAttempt(t, d, now, 10*time.Minute)
-
-	fetcher := &pricingFetchRecorder{rows: []pricing.ModelPricing{{
-		ModelPattern:  "network-only-model",
-		InputPerMTok:  1,
-		OutputPerMTok: 1,
-	}}}
-	refreshed, err := ensurePricingWithFetcher(d, false, fetcher.fetch, now)
-	require.NoError(t, err)
-	assert.False(t, refreshed)
-	assert.Zero(t, fetcher.calls, "fetch should not run within cooldown")
-
-	fallback, err := d.GetModelPricing("gpt-5.5")
-	require.NoError(t, err)
-	require.NotNil(t, fallback, "fallback pricing should be seeded")
-
-	networkOnly, err := d.GetModelPricing("network-only-model")
-	require.NoError(t, err)
-	assert.Nil(t, networkOnly, "cooldown should prevent network upsert")
-}
-
 // TestPeriodicPricingRefresh_ZeroIntervalReturnsImmediately guards
 // against a bad config value (interval <= 0) turning into a hot
 // spin loop.
@@ -1120,8 +1451,35 @@ func TestPeriodicPricingRefresh_StopsOnContextCancel(t *testing.T) {
 // sampleDailyUsageJSON is a full usage summary body with a single day and
 // non-zero totals, shared by the HTTP and daemon usage tests.
 const sampleDailyUsageJSON = `{
+	"schema_version": 2,
 	"from": "2026-06-01",
 	"to": "2026-06-02",
+	"pricing": {
+		"source": "embedded",
+		"table_version": "test",
+		"latest_row_updated_at": null,
+		"custom_override_count": 0,
+		"effective_row_count": 1,
+		"digest": "test-digest",
+		"cost_source": "reported",
+		"fallback": {"used": false, "models": []},
+		"models": {
+			"gpt-5.1": {
+				"matched_pattern": "gpt-5.1",
+				"input_cost_per_mtok": 1,
+				"output_cost_per_mtok": 2,
+				"cache_write_cost_per_mtok": 3,
+				"cache_read_cost_per_mtok": 4,
+				"cost_source": "reported"
+			}
+		}
+	},
+	"projects": {
+		"pl1:fixture": {
+			"display_label": "proj",
+			"resolution": "unknown"
+		}
+	},
 	"totals": {
 		"inputTokens": 10,
 		"outputTokens": 20,
@@ -1148,9 +1506,6 @@ const emptyDailyUsageJSON = `{"totals":{},"daily":[]}`
 // totalCostOnlyUsageJSON carries a non-zero total cost but no daily rows.
 const totalCostOnlyUsageJSON = `{"totals":{"totalCost":0.42},"daily":[]}`
 
-// pricingTestCooldown is the cooldown used by the pricing refresh tests.
-const pricingTestCooldown = time.Hour
-
 // newAgentDataDir creates a temp data dir and points AGENTSVIEW_DATA_DIR at it.
 func newAgentDataDir(t *testing.T) string {
 	t.Helper()
@@ -1174,43 +1529,6 @@ func assertNoLocalSessionsDB(t *testing.T, dataDir string) {
 func writeJSONResponse(w http.ResponseWriter, body string) {
 	w.Header().Set("Content-Type", "application/json")
 	_, _ = w.Write([]byte(body))
-}
-
-// pricingTestNow is the fixed clock used by the pricing refresh tests.
-func pricingTestNow() time.Time {
-	return time.Date(2026, 5, 25, 12, 0, 0, 0, time.UTC)
-}
-
-// seedPricingAttempt records a pricing refresh attempt aged `age` before now
-// and returns the RFC3339 timestamp written.
-func seedPricingAttempt(
-	t *testing.T, d *db.DB, now time.Time, age time.Duration,
-) string {
-	t.Helper()
-	ts := now.Add(-age).Format(time.RFC3339)
-	require.NoError(t, d.SetPricingMeta(pricingRefreshMetaKey, ts))
-	return ts
-}
-
-// assertPricingAttemptMeta asserts the stored refresh attempt timestamp.
-func assertPricingAttemptMeta(t *testing.T, d *db.DB, want string) {
-	t.Helper()
-	got, err := d.GetPricingMeta(pricingRefreshMetaKey)
-	require.NoError(t, err)
-	assert.Equal(t, want, got)
-}
-
-// pricingFetchRecorder is a fake pricing fetcher that records call counts and
-// returns canned rows or an error.
-type pricingFetchRecorder struct {
-	calls int
-	rows  []pricing.ModelPricing
-	err   error
-}
-
-func (f *pricingFetchRecorder) fetch() ([]pricing.ModelPricing, error) {
-	f.calls++
-	return f.rows, f.err
 }
 
 // zeroTotalsCopilotUsageJSON is a daily-usage summary with sessions present

@@ -13,6 +13,7 @@ import type { OpenSessionResponse } from '../models/OpenSessionResponse';
 import type { OrdinalsResponse } from '../models/OrdinalsResponse';
 import type { PublishResponse } from '../models/PublishResponse';
 import type { RenameRequest } from '../models/RenameRequest';
+import type { ResolveSessionIDsResponse } from '../models/ResolveSessionIDsResponse';
 import type { ResumeRequest } from '../models/ResumeRequest';
 import type { ResumeResponse } from '../models/ResumeResponse';
 import type { ServiceMessageList } from '../models/ServiceMessageList';
@@ -42,6 +43,46 @@ export class SessionsService {
         403: `Forbidden`,
         404: `Not Found`,
         409: `Conflict`,
+        500: `Internal Server Error`,
+        501: `Not Implemented`,
+        502: `Bad Gateway`,
+        503: `Service Unavailable`,
+        504: `Gateway Timeout`,
+      },
+    });
+  }
+  /**
+   * Resolve session IDs
+   * @returns ResolveSessionIDsResponse OK
+   * @throws ApiError
+   */
+  public static getApiV1SessionIdsResolve({
+    partial,
+    limit,
+  }: {
+    /**
+     * Session ID substring
+     */
+    partial: string,
+    /**
+     * Maximum number of matching IDs
+     */
+    limit?: number,
+  }): CancelablePromise<ResolveSessionIDsResponse> {
+    return __request(OpenAPI, {
+      method: 'GET',
+      url: '/api/v1/session-ids/resolve',
+      query: {
+        'partial': partial,
+        'limit': limit,
+      },
+      errors: {
+        400: `Bad Request`,
+        401: `Unauthorized`,
+        403: `Forbidden`,
+        404: `Not Found`,
+        409: `Conflict`,
+        422: `Unprocessable Entity`,
         500: `Internal Server Error`,
         501: `Not Implemented`,
         502: `Bad Gateway`,
@@ -103,15 +144,15 @@ export class SessionsService {
      */
     agent?: string,
     /**
-     * Filter to a single YYYY-MM-DD date
+     * Filter sessions active on this YYYY-MM-DD date
      */
     date?: string,
     /**
-     * Filter start date
+     * Filter sessions active on or after this date
      */
     dateFrom?: string,
     /**
-     * Filter end date
+     * Filter sessions active on or before this date
      */
     dateTo?: string,
     /**
@@ -229,6 +270,36 @@ export class SessionsService {
     });
   }
   /**
+   * Batch delete sessions
+   * @returns void
+   * @throws ApiError
+   */
+  public static postApiV1SessionsBatchDelete({
+    requestBody,
+  }: {
+    requestBody: BatchDeleteInputBody,
+  }): CancelablePromise<void> {
+    return __request(OpenAPI, {
+      method: 'POST',
+      url: '/api/v1/sessions/batch-delete',
+      body: requestBody,
+      mediaType: 'application/json',
+      errors: {
+        400: `Bad Request`,
+        401: `Unauthorized`,
+        403: `Forbidden`,
+        404: `Not Found`,
+        409: `Conflict`,
+        422: `Unprocessable Entity`,
+        500: `Internal Server Error`,
+        501: `Not Implemented`,
+        502: `Bad Gateway`,
+        503: `Service Unavailable`,
+        504: `Gateway Timeout`,
+      },
+    });
+  }
+  /**
    * List sidebar sessions
    * @returns DbSidebarSessionIndex OK
    * @throws ApiError
@@ -281,15 +352,15 @@ export class SessionsService {
      */
     agent?: string,
     /**
-     * Filter to a single YYYY-MM-DD date
+     * Filter sessions active on this YYYY-MM-DD date
      */
     date?: string,
     /**
-     * Filter start date
+     * Filter sessions active on or after this date
      */
     dateFrom?: string,
     /**
-     * Filter end date
+     * Filter sessions active on or before this date
      */
     dateTo?: string,
     /**
@@ -708,6 +779,10 @@ export class SessionsService {
     limit,
     direction,
     from,
+    around,
+    before,
+    after,
+    roles,
   }: {
     /**
      * Session ID
@@ -725,6 +800,22 @@ export class SessionsService {
      * Starting message ordinal
      */
     from?: number,
+    /**
+     * Center a symmetric window on this ordinal (mutually exclusive with from/direction)
+     */
+    around?: number,
+    /**
+     * Messages before the around anchor (default 5)
+     */
+    before?: number,
+    /**
+     * Messages after the around anchor (default 5)
+     */
+    after?: number,
+    /**
+     * Comma-separated roles to include, e.g. user,assistant
+     */
+    roles?: string,
   }): CancelablePromise<ServiceMessageList> {
     return __request(OpenAPI, {
       method: 'GET',
@@ -736,6 +827,10 @@ export class SessionsService {
         'limit': limit,
         'direction': direction,
         'from': from,
+        'around': around,
+        'before': before,
+        'after': after,
+        'roles': roles,
       },
       errors: {
         400: `Bad Request`,
@@ -1093,17 +1188,31 @@ export class SessionsService {
    */
   public static getApiV1SessionsIdUsage({
     id,
+    breakdown,
+    rollup,
   }: {
     /**
      * Session ID
      */
     id: string,
+    /**
+     * Include per-step breakdown rows
+     */
+    breakdown?: boolean,
+    /**
+     * Include explicit subagent descendant costs
+     */
+    rollup?: boolean,
   }): CancelablePromise<SessionUsageResponse> {
     return __request(OpenAPI, {
       method: 'GET',
       url: '/api/v1/sessions/{id}/usage',
       path: {
         'id': id,
+      },
+      query: {
+        'breakdown': breakdown,
+        'rollup': rollup,
       },
       errors: {
         400: `Bad Request`,
@@ -1192,36 +1301,6 @@ export class SessionsService {
         403: `Forbidden`,
         404: `Not Found`,
         409: `Conflict`,
-        500: `Internal Server Error`,
-        501: `Not Implemented`,
-        502: `Bad Gateway`,
-        503: `Service Unavailable`,
-        504: `Gateway Timeout`,
-      },
-    });
-  }
-  /**
-   * Batch delete sessions
-   * @returns void
-   * @throws ApiError
-   */
-  public static postApiV1SessionsBatchDelete({
-    requestBody,
-  }: {
-    requestBody: BatchDeleteInputBody,
-  }): CancelablePromise<void> {
-    return __request(OpenAPI, {
-      method: 'POST',
-      url: '/api/v1/sessions/batch-delete',
-      body: requestBody,
-      mediaType: 'application/json',
-      errors: {
-        400: `Bad Request`,
-        401: `Unauthorized`,
-        403: `Forbidden`,
-        404: `Not Found`,
-        409: `Conflict`,
-        422: `Unprocessable Entity`,
         500: `Internal Server Error`,
         501: `Not Implemented`,
         502: `Bad Gateway`,

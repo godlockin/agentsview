@@ -1,4 +1,5 @@
 import { test, expect } from "@playwright/test";
+import { clickNavTab, expectActiveNavTab } from "./helpers/nav";
 
 test.describe("Usage page", () => {
   test.beforeEach(async ({ page }) => {
@@ -64,16 +65,16 @@ test.describe("Usage page", () => {
 
     // Click the first filter dropdown (Project).
     const trigger = page
-      .locator(".filter-dropdown .filter-trigger")
+      .locator(".usage-toolbar .kit-filter-dropdown__btn")
       .first();
     await trigger.click();
 
     // Dropdown panel should appear with rows.
     await expect(
-      page.locator(".dropdown-panel").first(),
+      page.locator(".usage-toolbar .kit-filter-dropdown__panel").first(),
     ).toBeVisible();
     await expect(
-      page.locator(".dropdown-row").first(),
+      page.locator(".usage-toolbar .kit-filter-dropdown__item").first(),
     ).toBeVisible();
   });
 
@@ -92,11 +93,11 @@ test.describe("Usage page", () => {
 
     // Open the project filter and exclude the first item.
     const trigger = page
-      .locator(".filter-dropdown .filter-trigger")
+      .locator(".usage-toolbar .kit-filter-dropdown__btn")
       .first();
     await trigger.click();
     await page
-      .locator(".dropdown-row")
+      .locator(".usage-toolbar .kit-filter-dropdown__item")
       .filter({ hasText: "project-delta" })
       .first()
       .click();
@@ -123,13 +124,13 @@ test.describe("Usage page", () => {
 
     // Open the project filter.
     const trigger = page
-      .locator(".filter-dropdown .filter-trigger")
+      .locator(".usage-toolbar .kit-filter-dropdown__btn")
       .first();
     await trigger.click();
 
     // Click "Deselect all".
     await page
-      .locator(".bulk-btn")
+      .locator(".usage-toolbar .kit-filter-dropdown__bulk-btn")
       .filter({ hasText: "Deselect all" })
       .first()
       .click();
@@ -139,7 +140,7 @@ test.describe("Usage page", () => {
 
     // Click "Select all".
     await page
-      .locator(".bulk-btn")
+      .locator(".usage-toolbar .kit-filter-dropdown__bulk-btn")
       .filter({ hasText: "Select all" })
       .first()
       .click();
@@ -148,14 +149,10 @@ test.describe("Usage page", () => {
     await expect(trigger).toContainText("All");
   });
 
-  test("top nav shows Usage button as active", async ({
+  test("top nav shows Usage as the active destination", async ({
     page,
   }) => {
-    const usageBtn = page.locator(
-      '.nav-btn[aria-label="Usage"]',
-    );
-    await expect(usageBtn).toBeVisible();
-    await expect(usageBtn).toHaveClass(/active/);
+    await expectActiveNavTab(page, "Usage");
   });
 
   test("URL updates when filter changes", async ({ page }) => {
@@ -166,11 +163,11 @@ test.describe("Usage page", () => {
 
     // Exclude a project.
     const trigger = page
-      .locator(".filter-dropdown .filter-trigger")
+      .locator(".usage-toolbar .kit-filter-dropdown__btn")
       .first();
     await trigger.click();
     await page
-      .locator(".dropdown-row")
+      .locator(".usage-toolbar .kit-filter-dropdown__item")
       .filter({ hasText: "project-delta" })
       .first()
       .click();
@@ -178,5 +175,53 @@ test.describe("Usage page", () => {
 
     // URL should contain the exclude_project param.
     await expect(page).toHaveURL(/exclude_project=/);
+  });
+
+  test("returning bare refreshes rolling bounds after midnight", async ({
+    page,
+  }) => {
+    await page.clock.setFixedTime(new Date("2026-07-09T23:59:00"));
+    await page.goto("/usage?window_days=30");
+    await expect(page.locator(".usage-page")).toBeVisible();
+    await expect(
+      page.locator(".kit-date-range-picker__trigger"),
+    ).toContainText("Last 30 days");
+
+    await clickNavTab(page, "Sessions");
+    await page.clock.setFixedTime(new Date("2026-07-10T00:01:00"));
+    const requestPromise = page.waitForRequest((request) =>
+      new URL(request.url()).pathname.endsWith("/api/v1/usage/summary")
+    );
+    await clickNavTab(page, "Usage");
+    const requestUrl = new URL((await requestPromise).url());
+
+    expect(requestUrl.searchParams.get("from")).toBe("2026-06-11");
+    expect(requestUrl.searchParams.get("to")).toBe("2026-07-10");
+    await expect(
+      page.locator(".kit-date-range-picker__trigger"),
+    ).toContainText("Last 30 days");
+  });
+
+  test("adopts a retained Insights range after linking is enabled", async ({
+    page,
+  }) => {
+    await page.goto("/insights");
+    await expect(page.locator(".insights-page")).toBeVisible();
+
+    await page.locator(".kit-date-range-picker__trigger").click();
+    await page.getByRole("button", { name: "90d", exact: true }).click();
+    await expect(page).toHaveURL(/window_days=90/);
+
+    await page.getByRole("button", { name: "Settings" }).click();
+    await page
+      .getByRole("switch", { name: "Link date ranges across pages" })
+      .check();
+
+    await clickNavTab(page, "Usage");
+
+    await expect(page.locator(".usage-page")).toBeVisible();
+    await expect(
+      page.locator(".kit-date-range-picker__trigger"),
+    ).toContainText("Last 90 days");
   });
 });

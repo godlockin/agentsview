@@ -24,7 +24,7 @@ jobs:
         with:
           persist-credentials: false
 
-      - uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c  # v6.4.0
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16  # v6.5.0
         with:
           go-version-file: go.mod
 
@@ -53,6 +53,13 @@ jobs:
 
       - name: Type-check (svelte-check)
         run: npm run check
+        working-directory: frontend
+
+      - name: Design-system conformance (kit-ui-check)
+        # Full rule set over all of src; legitimate exceptions carry inline
+        # kit-ui-check-ignore markers with reasons (e.g. the app token
+        # definitions in app.css).
+        run: npm run check:kit-ui
         working-directory: frontend
 
       - name: Run frontend tests
@@ -85,7 +92,7 @@ jobs:
         with:
           persist-credentials: false
 
-      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405  # v6.2.0
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1  # v6.3.0
         with:
           python-version: "3.14"
 
@@ -110,6 +117,7 @@ jobs:
       - name: Run shell script tests
         run: |
           bash scripts/install_test.sh
+          bash scripts/retry_test.sh
           bash scripts/check_desktop_release_health_test.sh
           bash scripts/check_desktop_release_health_from_event_test.sh
           bash desktop/scripts/test-repair-appimage-diricon.sh
@@ -127,7 +135,7 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
 
-      - uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c  # v6.4.0
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16  # v6.5.0
         with:
           go-version-file: go.mod
 
@@ -158,6 +166,10 @@ jobs:
         run: go test -tags "fts5" ./... -v -count=1 -timeout=20m
         env:
           CGO_ENABLED: "1"
+
+      - name: Run eval-ingest build-tag tests
+        if: runner.os == 'Linux'
+        run: make test-evalingest
 
       - name: Run Go tests (race detector)
         if: runner.os == 'Linux'
@@ -210,7 +222,7 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
 
-      - uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c  # v6.4.0
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16  # v6.5.0
         with:
           go-version-file: go.mod
 
@@ -237,7 +249,7 @@ jobs:
     runs-on: ubuntu-latest
     services:
       postgres:
-        image: postgres:18-alpine
+        image: pgvector/pgvector:pg18
         env:
           POSTGRES_USER: agentsview_test
           POSTGRES_PASSWORD: agentsview_test_password
@@ -255,7 +267,7 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
 
-      - uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c  # v6.4.0
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16  # v6.5.0
         with:
           go-version-file: go.mod
 
@@ -269,7 +281,7 @@ jobs:
           TEST_PG_URL: postgres://agentsview_test:agentsview_test_password@localhost:5433/agentsview_test?sslmode=disable
 
       - name: Build SSH test container
-        run: docker build -t agentsview-sshd -f testdata/ssh/Dockerfile .
+        run: bash scripts/retry.sh 3 10 docker build -t agentsview-sshd -f testdata/ssh/Dockerfile .
 
       - name: Start SSH test container
         run: |
@@ -307,7 +319,7 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
 
-      - uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c  # v6.4.0
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16  # v6.5.0
         with:
           go-version-file: go.mod
 

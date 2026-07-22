@@ -1,12 +1,17 @@
 <script lang="ts">
   import { m } from "../../i18n/index.js";
   import {
+    getSessionStatus,
     sessions,
     type SessionGroupInput,
   } from "../../stores/sessions.svelte.js";
+  import {
+    buildReadProgressToken,
+    readProgress,
+  } from "../../stores/read-progress.svelte.js";
   import { starred } from "../../stores/starred.svelte.js";
   import { formatRelativeTime, truncate } from "../../utils/format.js";
-  import { agentColor as getAgentColor, agentLabel } from "../../utils/agents.js";
+  import { agentColor as getAgentColor, agentLabel, entrypointBadge } from "../../utils/agents.js";
   import {
     normalizeMessagePreview,
     previewMessage,
@@ -18,7 +23,8 @@
     UserRoundIcon,
     UsersRoundIcon,
   } from "../../icons.js";
-  import StatusDot from "../common/StatusDot.svelte";
+  import { StatusDot } from "@kenn-io/kit-ui";
+  import { sessionStatusLabel } from "../../utils/sessionStatus.js";
   import { router } from "../../stores/router.svelte.js";
 
   interface Props {
@@ -73,6 +79,8 @@
     selected = false,
   }: Props = $props();
 
+  let sessionStatus = $derived(getSessionStatus(session, groupSessions));
+
   let isActive = $derived.by(() => {
     const aid = sessions.activeSessionId;
     if (!aid) return false;
@@ -95,6 +103,17 @@
     !!session.machine &&
     session.machine !== "local",
   );
+
+  let hasUnread = $derived.by(() => {
+    const candidates = groupSessions && !expanded
+      ? groupSessions
+      : [session];
+    return candidates.some((candidate) => {
+      const token = buildReadProgressToken(candidate);
+      return token !== null &&
+        readProgress.hasUnread(candidate.id, token);
+    });
+  });
 
   /** Whether this session is a team member (received a <teammate-message>). */
   let isTeamSession = $derived(
@@ -375,7 +394,7 @@
     </button>
   {/if}
 
-  <StatusDot {session} {groupSessions} size={6} />
+  <StatusDot status={sessionStatus} label={sessionStatusLabel(sessionStatus)} size={6} />
 
 
   <div class="session-info">
@@ -421,6 +440,14 @@
             <span class="session-project">{session.project}</span>
           {/if}
           <span class="session-time">{timeStr}</span>
+          {#if hasUnread}
+            <span
+              class="session-unread-indicator"
+              role="status"
+              aria-label={m.read_progress_unread_messages()}
+              title={m.read_progress_unread_messages()}
+            ></span>
+          {/if}
           <span class="session-count">{session.user_message_count}</span>
           {#if hasSubagents}
             <UserRoundIcon class="group-hint-icon" size="9" strokeWidth="2" aria-hidden="true" />
@@ -454,7 +481,10 @@
   {#if !compact && (!hideAgent || showMachine)}
     <div class="side-meta">
       {#if !hideAgent}
-        <span class="agent-tag" style:color={agentColor}>{agentLabel(session.agent)}</span>
+        <span class="agent-tag" style:color={agentColor}>{agentLabel(session.agent, session.agent_label)}</span>
+        {#if entrypointBadge(session.entrypoint)}
+          <span class="entrypoint-tag">{entrypointBadge(session.entrypoint)}</span>
+        {/if}
       {/if}
       {#if showMachine}
         <span class="machine-tag" title={session.machine}>
@@ -493,7 +523,7 @@
   .session-item {
     display: flex;
     align-items: center;
-    gap: 5px;
+    gap: var(--space-2);
     width: 100%;
     height: 42px;
     padding: 0 10px;
@@ -588,7 +618,7 @@
     display: flex;
     flex-direction: column;
     align-items: flex-end;
-    gap: 3px;
+    gap: var(--space-1);
     min-width: 0;
     flex-shrink: 0;
     margin-left: 4px;
@@ -606,6 +636,11 @@
     max-width: 52px;
     overflow: hidden;
     text-overflow: ellipsis;
+  }
+
+  .entrypoint-tag {
+    opacity: 0.75;
+    font-size: 0.9em;
   }
 
   .machine-tag {
@@ -707,6 +742,17 @@
     flex-shrink: 0;
   }
 
+  .session-unread-indicator {
+    width: 7px;
+    height: 7px;
+    border-radius: 999px;
+    background: var(--accent-blue);
+    box-shadow: 0 0 0 1px color-mix(
+      in srgb, var(--accent-blue) 24%, transparent
+    );
+    flex-shrink: 0;
+  }
+
   .session-count::before {
     content: "\2022 ";
   }
@@ -755,11 +801,11 @@
 
   :global(.context-menu) {
     position: fixed;
-    z-index: 9999;
+    z-index: var(--z-popover);
     background: var(--bg-surface);
     border: 1px solid var(--border-default);
     border-radius: 6px;
-    box-shadow: 0 4px 16px rgba(0, 0, 0, 0.25);
+    box-shadow: var(--shadow-lg);
     padding: 4px 0;
     min-width: 120px;
   }

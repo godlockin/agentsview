@@ -45,6 +45,7 @@ type bytesOutput struct {
 
 type apiErrorResponse struct {
 	Status  int    `json:"-"`
+	Code    string `json:"code,omitempty"`
 	Message string `json:"error"`
 }
 
@@ -58,6 +59,10 @@ func (e *apiErrorResponse) GetStatus() int {
 
 func apiError(status int, message string) error {
 	return &apiErrorResponse{Status: status, Message: message}
+}
+
+func apiErrorWithCode(status int, code, message string) error {
+	return &apiErrorResponse{Status: status, Code: code, Message: message}
 }
 
 var configureHumaErrorsOnce stdsync.Once
@@ -218,6 +223,13 @@ func get[I, O any](
 	handler func(context.Context, *I) (*O, error),
 ) {
 	registerRoute(group, http.MethodGet, path, summary, handler, s.humaTimeout())
+}
+
+func getLong[I, O any](
+	_ *Server, group routeGroup, path, summary string,
+	handler func(context.Context, *I) (*O, error),
+) {
+	registerRoute(group, http.MethodGet, path, summary, handler)
 }
 
 func post[I, O any](
@@ -381,7 +393,10 @@ func (s *Server) humaTimeout() func(*huma.Operation) {
 					next(huma.WithContext(humago.NewContext(ctx.Operation(), r, w), r.Context()))
 				}),
 				s.cfg.WriteTimeout,
-				`{"error":"request timed out"}`,
+				timeoutErrorBody(
+					req.Method+" "+req.URL.Path,
+					s.cfg.WriteTimeout,
+				),
 			)
 			tw := &contentTypeWrapper{
 				ResponseWriter: writer,

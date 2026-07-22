@@ -47,13 +47,18 @@
   interface Panel {
     title: string;
     rows: ActivityKeyMinutes[];
+	projectRows: boolean;
   }
 
   const panels = $derived.by((): Panel[] => [
-    { title: m.activity_project(), rows: byProject },
-    { title: m.activity_model(), rows: byModel },
-    { title: m.activity_agent(), rows: byAgent },
+    { title: m.activity_project(), rows: byProject, projectRows: true },
+    { title: m.activity_model(), rows: byModel, projectRows: false },
+    { title: m.activity_agent(), rows: byAgent, projectRows: false },
   ]);
+
+  function rowIdentity(row: ActivityKeyMinutes, projectRows: boolean): string {
+	return projectRows ? (row.project_key || row.key) : row.key;
+  }
 
   function maxValue(rows: ActivityKeyMinutes[]): number {
     if (rows.length === 0) return 1;
@@ -116,7 +121,7 @@
 <div class="breakdowns">
   <div class="breakdowns-header">
     <h3 class="breakdowns-title">{m.activity_breakdown()}</h3>
-    <div class="header-right">
+    <div class="panel-actions">
       <div class="legend" aria-hidden="true">
         <span class="legend-item">
           <span class="swatch interactive"></span>{m.activity_interactive()}
@@ -156,7 +161,7 @@
         <h4 class="panel-title">{panel.title}</h4>
         {#if panel.rows.length > 0}
           <div class="bar-list">
-            {#each panel.rows as row (row.key)}
+            {#each panel.rows as row (rowIdentity(row, panel.projectRows))}
               <!-- svelte-ignore a11y_no_static_element_interactions -->
               <div
                 class="bar-row"
@@ -215,7 +220,7 @@
     color: var(--text-primary);
   }
 
-  .header-right {
+  .panel-actions {
     display: flex;
     align-items: center;
     gap: 12px;
@@ -224,7 +229,7 @@
   .legend {
     display: flex;
     align-items: center;
-    gap: 10px;
+    gap: var(--space-5);
   }
 
   .legend-item {
@@ -302,7 +307,7 @@
   .bar-list {
     display: flex;
     flex-direction: column;
-    gap: 3px;
+    gap: var(--space-2);
   }
 
   .bar-row {
@@ -367,6 +372,6 @@
     border-radius: var(--radius-sm);
     white-space: nowrap;
     pointer-events: none;
-    z-index: 100;
+    z-index: var(--z-tooltip);
   }
 </style>

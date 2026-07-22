@@ -1,16 +1,23 @@
 <script lang="ts">
+  import { EmptyState } from "@kenn-io/kit-ui";
   import { m } from "../../i18n/index.js";
   import { TrashIcon } from "../../icons.js";
-  import { onMount } from "svelte";
+  import { onDestroy, onMount } from "svelte";
   import type { Session } from "../../api/types.js";
   import { SessionsService } from "../../api/generated/index";
-  import { configureGeneratedClient } from "../../api/runtime.js";
+  import {
+    callGenerated,
+    configureGeneratedClient,
+    isAbortError,
+  } from "../../api/runtime.js";
   import { sessions } from "../../stores/sessions.svelte.js";
   import { formatRelativeTime, truncate } from "../../utils/format.js";
   import { normalizeMessagePreview } from "../../utils/messages.js";
+  import { LatestRead } from "../../utils/latest-read.js";
   let trashedSessions: Session[] = $state([]);
   let loading = $state(true);
   let emptying = $state(false);
+  const trashRead = new LatestRead();
 
   interface TrashResponse {
     sessions: Session[];
@@ -21,18 +28,25 @@
   });
 
   async function loadTrash() {
+    const signal = trashRead.begin();
     loading = true;
     try {
       configureGeneratedClient();
-      const res =
-        await SessionsService.getApiV1Trash() as unknown as TrashResponse;
+      const res = await callGenerated(
+        () => SessionsService.getApiV1Trash(),
+        signal,
+      ) as unknown as TrashResponse;
+      if (!trashRead.isCurrent(signal)) return;
       trashedSessions = res.sessions ?? [];
-    } catch {
+    } catch (e) {
+      if (isAbortError(e) || !trashRead.isCurrent(signal)) return;
       // Silently ignore — page will show empty state.
     } finally {
-      loading = false;
+      if (trashRead.finish(signal)) loading = false;
     }
   }
+
+  onDestroy(() => trashRead.cancel());
 
   async function restoreSession(id: string) {
     try {
@@ -84,11 +98,11 @@
   {#if loading}
     <div class="loading-state">{m.trash_loading()}</div>
   {:else if trashedSessions.length === 0}
-    <div class="empty-state">
-      <TrashIcon size="40" strokeWidth="1.6" class="empty-icon" aria-hidden="true" />
-      <p class="empty-title">{m.trash_empty()}</p>
-      <p class="empty-desc-text">{m.trash_empty_desc()}</p>
-    </div>
+    <EmptyState title={m.trash_empty()} description={m.trash_empty_desc()}>
+      {#snippet icon()}
+        <TrashIcon size="40" strokeWidth="1.6" aria-hidden="true" />
+      {/snippet}
+    </EmptyState>
   {:else}
     <div class="trash-header">
       <TrashIcon size="18" strokeWidth="2" class="trash-icon" aria-hidden="true" />
@@ -152,7 +166,7 @@
   .trash-header {
     display: flex;
     align-items: center;
-    gap: 10px;
+    gap: var(--space-4);
     margin-bottom: 8px;
   }
 
@@ -198,29 +212,6 @@
     color: var(--text-muted);
     padding: 40px 0;
     font-size: 13px;
-  }
-
-  .empty-state {
-    text-align: center;
-    padding: 60px 20px;
-    color: var(--text-muted);
-  }
-
-  :global(.empty-icon) {
-    opacity: 0.15;
-    margin-bottom: 16px;
-  }
-
-  .empty-title {
-    font-size: 16px;
-    font-weight: 500;
-    color: var(--text-secondary);
-    margin: 0 0 6px;
-  }
-
-  .empty-desc-text {
-    font-size: 13px;
-    margin: 0;
   }
 
   .trash-list {

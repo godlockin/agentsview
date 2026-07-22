@@ -361,12 +361,21 @@ type IncrementalRequest struct {
 	// appended tail forks away from the stored tip and must trigger a
 	// full reparse instead of a naive append.
 	LastEntryUUID string
+	// StoredAgentLabel and StoredEntrypoint are the session identity
+	// values already persisted for this session. Claude identity is
+	// first-non-empty-wins across the file, and real CLI transcripts
+	// carry a top-level entrypoint on most lines, so the incremental
+	// parser escalates to a full parse only when an appended non-empty
+	// value could fill a still-empty stored field.
+	StoredAgentLabel string
+	StoredEntrypoint string
 }
 
 // IncrementalOutcome is the append-only parse output.
 type IncrementalOutcome struct {
 	SessionID            string
 	Messages             []ParsedMessage
+	SubagentLinks        []ClaudeSubagentLink
 	EndedAt              time.Time
 	ConsumedBytes        int64
 	MessageCount         int
@@ -375,6 +384,7 @@ type IncrementalOutcome struct {
 	PeakContextTokens    int
 	HasTotalOutputTokens bool
 	HasPeakContextTokens bool
+	TerminationStatus    *TerminationStatus
 	ForceReplace         bool
 }
 
@@ -432,8 +442,12 @@ func providerFactoryForDef(def AgentDef) ProviderFactory {
 		return newDeepSeekTUIProviderFactory(def)
 	case AgentForge:
 		return newForgeProviderFactory(def)
+	case AgentDevin:
+		return newDevinProviderFactory(def)
 	case AgentHermes:
 		return newHermesProviderFactory(def)
+	case AgentGrok:
+		return newGrokProviderFactory(def)
 	case AgentIflow:
 		return newIflowProviderFactory(def)
 	case AgentGptme:
@@ -466,12 +480,16 @@ func providerFactoryForDef(def AgentDef) ProviderFactory {
 		return newPiProviderFactory(def)
 	case AgentPositron:
 		return newPositronProviderFactory(def)
+	case AgentPositAssistant:
+		return newPositAssistantProviderFactory(def)
 	case AgentQClaw:
 		return newQClawProviderFactory(def)
 	case AgentQwen:
 		return newQwenProviderFactory(def)
 	case AgentQwenPaw:
 		return newQwenPawProviderFactory(def)
+	case AgentQoder:
+		return newQoderProviderFactory(def)
 	case AgentReasonix:
 		return newReasonixProviderFactory(def)
 	case AgentShelley:
@@ -480,8 +498,14 @@ func providerFactoryForDef(def AgentDef) ProviderFactory {
 		return newVisualStudioCopilotProviderFactory(def)
 	case AgentVSCodeCopilot:
 		return newVSCodeCopilotProviderFactory(def)
+	case AgentWindsurf:
+		return newWindsurfProviderFactory(def)
+	case AgentTrae:
+		return newTraeProviderFactory(def)
 	case AgentVibe:
 		return newVibeProviderFactory(def)
+	case AgentZCode:
+		return newZcodeProviderFactory(def)
 	case AgentWarp:
 		return newWarpProviderFactory(def)
 	case AgentWorkBuddy:
@@ -490,6 +514,8 @@ func providerFactoryForDef(def AgentDef) ProviderFactory {
 		return newZencoderProviderFactory(def)
 	case AgentZed:
 		return newZedProviderFactory(def)
+	case AgentRooCode:
+		return newRooCodeProviderFactory(def)
 	default:
 		panic("missing provider factory for " + string(def.Type))
 	}

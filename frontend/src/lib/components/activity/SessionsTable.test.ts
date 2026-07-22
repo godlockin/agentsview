@@ -14,6 +14,7 @@ function makeRow(
     session_id: "sess",
     title: "Session",
     project: "proj",
+	project_key: "pl1:sha256:proj",
     agent: "claude",
     primary_model: "opus",
     models: ["opus"],
@@ -145,7 +146,7 @@ describe("SessionsTable", () => {
     await tick();
 
     const costHeader = document.querySelector(
-      '[data-sort-key="cost"]',
+      "th.sort-cost button",
     ) as HTMLElement | null;
     expect(costHeader).toBeTruthy();
     costHeader!.dispatchEvent(new MouseEvent("click", { bubbles: true }));

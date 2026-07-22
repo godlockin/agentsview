@@ -1,8 +1,11 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"path/filepath"
+	"strings"
+	stdsync "sync"
 	"testing"
 	"time"
 
@@ -11,8 +14,76 @@ import (
 	"go.kenn.io/agentsview/internal/config"
 	"go.kenn.io/agentsview/internal/db"
 	"go.kenn.io/agentsview/internal/dbtest"
+	"go.kenn.io/agentsview/internal/postgres"
 	syncpkg "go.kenn.io/agentsview/internal/sync"
 )
+
+// TestDaemonPushHeartbeat pins the daemon-delegated push's client-side
+// output: an immediate delegation announcement, elapsed-time heartbeats
+// while the blocking POST is in flight, and silence after stop.
+func TestDaemonPushHeartbeat(t *testing.T) {
+	orig := daemonPushHeartbeatInterval
+	daemonPushHeartbeatInterval = 5 * time.Millisecond
+	t.Cleanup(func() { daemonPushHeartbeatInterval = orig })
+
+	var out syncBuffer
+	stop := startDaemonPushHeartbeatTo(&out, "PostgreSQL")
+	assert.Contains(t, out.String(),
+		"Pushing to PostgreSQL via the local daemon")
+
+	require.Eventually(t, func() bool {
+		return strings.Contains(out.String(),
+			"still pushing to PostgreSQL via the daemon")
+	}, time.Second, time.Millisecond, "heartbeat line must appear")
+
+	stop()
+	settled := out.String()
+	time.Sleep(20 * time.Millisecond)
+	assert.Equal(t, settled, out.String(), "no output after stop")
+}
+
+// TestDaemonPushProgressSilencesHeartbeat pins that the first streamed
+// progress event stops the elapsed-time heartbeat for good: once the daemon
+// starts reporting real progress, heartbeat lines must not interleave with
+// the in-place progress line.
+func TestDaemonPushProgressSilencesHeartbeat(t *testing.T) {
+	orig := daemonPushHeartbeatInterval
+	daemonPushHeartbeatInterval = 50 * time.Millisecond
+	t.Cleanup(func() { daemonPushHeartbeatInterval = orig })
+
+	out := captureStdout(t, func() {
+		onProgress, finish := daemonPushProgress(
+			"PostgreSQL", newPGPushProgressPrinter(),
+		)
+		onProgress(postgres.PushProgress{SessionsDone: 1, SessionsTotal: 2})
+		time.Sleep(150 * time.Millisecond)
+		finish()
+	})
+
+	assert.Contains(t, out, "Pushing to PostgreSQL via the local daemon")
+	assert.Contains(t, out, "Pushing... 1/2 sessions")
+	assert.NotContains(t, out, "still pushing",
+		"heartbeat must stay silent after the first progress event")
+}
+
+// syncBuffer is a mutex-guarded bytes.Buffer: the heartbeat goroutine writes
+// while the test reads.
+type syncBuffer struct {
+	mu  stdsync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *syncBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *syncBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
+}
 
 func TestLocalArchiveWriteBackendPGPushStopsAfterCanceledLocalSync(t *testing.T) {
 	testLocalArchivePushStopsAfterCanceledSync(t,
@@ -22,6 +93,51 @@ func TestLocalArchiveWriteBackendPGPushStopsAfterCanceledLocalSync(t *testing.T)
 			)
 			return err
 		})
+}
+
+func TestLocalPGPushEnsuresPricingBeforeConnecting(t *testing.T) {
+	backend := testLocalArchiveWriteBackend(t)
+	backend.ensurePricing = func(_ context.Context, database *db.DB) error {
+		require.NoError(t, database.UpsertModelPricing([]db.ModelPricing{{
+			ModelPattern:  "new-model",
+			InputPerMTok:  2,
+			OutputPerMTok: 8,
+		}}))
+		return nil
+	}
+
+	_, err := backend.PGPush(
+		context.Background(),
+		pgTargetSelection{PG: config.PGConfig{URL: unreachablePGURL}},
+		PGPushConfig{}, nil, nil,
+	)
+
+	require.Error(t, err)
+	rate, err := backend.database.GetModelPricing("new-model")
+	require.NoError(t, err)
+	require.NotNil(t, rate)
+	assert.Equal(t, 8.0, rate.OutputPerMTok)
+}
+
+func TestLocalPGWatchPusherUsesBackendPricingEnsure(t *testing.T) {
+	backend := testLocalArchiveWriteBackend(t)
+	ensureCalls := 0
+	backend.ensurePricing = func(_ context.Context, database *db.DB) error {
+		require.Same(t, backend.database, database)
+		ensureCalls++
+		return nil
+	}
+	target := &fakeTarget{}
+	pusher := backend.newPGPusher(
+		func(context.Context) error { return nil },
+		func() (pgTarget, error) { return target, nil },
+	)
+
+	require.NoError(t, pusher.push(
+		context.Background(), reasonChange, false,
+	))
+	assert.Equal(t, 1, ensureCalls)
+	assert.Equal(t, 1, target.pushes)
 }
 
 func TestLocalArchiveWriteBackendDuckDBPushStopsAfterCanceledLocalSync(t *testing.T) {
@@ -34,6 +150,9 @@ func TestLocalArchiveWriteBackendDuckDBPushStopsAfterCanceledLocalSync(t *testin
 		})
 }
 
+// TestLocalArchiveWriteBackendDuckDBPushUsesConfiguredRemoteURL verifies that
+// a configured remote Quack URL now fails the push outright: push writes the
+// local mirror only, so a remote target is rejected rather than attempted.
 func TestLocalArchiveWriteBackendDuckDBPushUsesConfiguredRemoteURL(t *testing.T) {
 	backend := testLocalArchiveWriteBackend(t)
 
@@ -49,7 +168,8 @@ func TestLocalArchiveWriteBackendDuckDBPushUsesConfiguredRemoteURL(t *testing.T)
 			nil,
 		)
 		require.Error(t, err)
-		assert.Contains(t, err.Error(), "duckdb quack token is required")
+		assert.Contains(t, err.Error(), "duckdb push writes the local mirror")
+		assert.Contains(t, err.Error(), "quack serve")
 	})
 }
 
@@ -71,7 +191,7 @@ func TestLocalArchiveWriteBackendDuckDBPushValidatesRemoteBeforeLocalSync(t *tes
 	})
 
 	require.Error(t, err)
-	assert.Contains(t, err.Error(), "duckdb quack token is required")
+	assert.Contains(t, err.Error(), "duckdb push writes the local mirror")
 	assert.NotContains(t, out, "Database:")
 	assert.NotContains(t, out, "Opening DuckDB mirror")
 }

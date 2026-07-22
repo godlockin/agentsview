@@ -1,6 +1,7 @@
 package pricing
 
 import (
+	"context"
 	"fmt"
 	"time"
 
@@ -16,6 +17,14 @@ type ModelPricing = catalog.ModelPricing
 // and parses it into ModelPricing entries.
 func FetchLiteLLMPricing() ([]ModelPricing, error) {
 	return catalog.FetchLiteLLMPricing()
+}
+
+// FetchLiteLLMPricingContext downloads the LiteLLM pricing JSON and binds the
+// request lifetime to ctx.
+func FetchLiteLLMPricingContext(
+	ctx context.Context,
+) ([]ModelPricing, error) {
+	return catalog.FetchLiteLLMPricingContext(ctx)
 }
 
 // ParseLiteLLMPricing parses the LiteLLM JSON map into

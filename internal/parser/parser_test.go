@@ -203,6 +203,11 @@ func TestExtractTextContent(t *testing.T) {
 			`[]`,
 			"", false, false, nil,
 		},
+		{
+			"unknown and empty blocks ignored",
+			`[{"type":"unknown","value":"x"},{"type":"text","text":""},{"type":"thinking","thinking":""}]`,
+			"", false, false, nil,
+		},
 	}
 
 	for _, tt := range tests {
@@ -827,6 +832,12 @@ func TestIsClaudeSystemMessage(t *testing.T) {
 		{"task-notification",
 			"<task-notification>some data</task-notification>",
 			true},
+		{"system-reminder",
+			"<system-reminder>some data</system-reminder>", true},
+		{"system-reminder plus prompt",
+			"<system-reminder>some data</system-reminder>\n\nreal prompt", false},
+		{"task-notification-status",
+			"<task-notification-status>some data", false},
 		{"command-message is not system",
 			"<command-message>foo</command-message>", false},
 		{"command-name is not system",
@@ -951,6 +962,39 @@ func TestExtractCommandText(t *testing.T) {
 				"extractCommandText(%q) ok", tt.content)
 			assert.Equalf(t, tt.want, got,
 				"extractCommandText(%q)", tt.content)
+		})
+	}
+}
+
+func TestPreprocessClaudeUserText(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name string
+		in   string
+		want string
+		skip bool
+	}{
+		{
+			name: "ordinary content preserves whitespace",
+			in:   "  ordinary prompt",
+			want: "  ordinary prompt",
+		},
+		{
+			name: "reminder precedes command envelope",
+			in:   "<system-reminder>context</system-reminder>\n<command-name>/clear</command-name>",
+			want: "/clear",
+		},
+		{
+			name: "malformed reminder stays content",
+			in:   "<system-reminder>context",
+			want: "<system-reminder>context",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, skip := preprocessClaudeUserText(tt.in)
+			assert.Equal(t, tt.want, got)
+			assert.Equal(t, tt.skip, skip)
 		})
 	}
 }

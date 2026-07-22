@@ -447,15 +447,7 @@ func (s dbBackedSource) virtualPath() string {
 }
 
 func parseDBBackedVirtualPath(path string) (string, string, bool) {
-	idx := strings.LastIndex(path, "#")
-	if idx < 0 {
-		return "", "", false
-	}
-	dbPath, sessionID := path[:idx], path[idx+1:]
-	if dbPath == "" || sessionID == "" {
-		return "", "", false
-	}
-	return dbPath, sessionID, true
+	return ParseVirtualSourcePath(path)
 }
 
 func newForgeProviderFactory(def AgentDef) ProviderFactory {
@@ -553,6 +545,7 @@ func warpProviderSpec() dbBackedProviderSpec {
 
 func dbBackedSourceCapabilities(multiSession CapabilitySupport) SourceCapabilities {
 	source := jsonlFileProviderSourceCapabilities()
+	source.StoredSourceHints = CapabilitySupported
 	source.MultiSessionSource = multiSession
 	source.ForceReplaceOnParse = CapabilitySupported
 	return source

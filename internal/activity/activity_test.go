@@ -1,11 +1,14 @@
 package activity
 
 import (
+	"encoding/json"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"go.kenn.io/agentsview/internal/export"
 )
 
 func mustLoad(t *testing.T, name string) *time.Location {
@@ -43,6 +46,40 @@ func paramsFromQuery(q Query) Params {
 		GapCapSeconds: q.GapCapSeconds,
 		Bucket:        q.Bucket,
 	}
+}
+
+func TestReportOmitsUnsetPricingMetadata(t *testing.T) {
+	b, err := json.Marshal(Report{})
+	require.NoError(t, err)
+
+	assert.NotContains(t, string(b), `"pricing"`)
+}
+
+func TestReportEmitsEmptyProjectsMap(t *testing.T) {
+	b, err := json.Marshal(Report{
+		SchemaVersion: export.ActivityReportSchemaVersion,
+		Projects:      map[string]export.ProjectMapEntry{},
+	})
+	require.NoError(t, err)
+
+	assert.Contains(t, string(b), `"projects":{}`)
+}
+
+func TestAllocateUsageCostsDistributesSessionTotalByEstimatedCost(t *testing.T) {
+	total := 0.03
+	usage := []UsageRow{
+		{SessionID: "s1", Model: "model-a", Cost: 10, Priced: true, Contributes: true},
+		{SessionID: "s1", Model: "model-b", Cost: 20, SessionCost: &total, Priced: true, Contributes: true},
+	}
+
+	allocated := AllocateUsageCosts(usage)
+
+	require.Len(t, allocated, 2)
+	assert.InDelta(t, 0.01, allocated[0].Cost, 1e-12)
+	assert.InDelta(t, 0.02, allocated[1].Cost, 1e-12)
+	assert.Equal(t, export.CostSourceReported, allocated[0].CostSource)
+	assert.Equal(t, export.CostSourceReported, allocated[1].CostSource)
+	assert.Equal(t, total, allocated[0].Cost+allocated[1].Cost)
 }
 
 func TestAggregate_DayWindowUTC(t *testing.T) {

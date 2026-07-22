@@ -4,8 +4,10 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"log"
-	"path/filepath"
+	"os"
+	stdsync "sync"
 	"time"
 
 	"go.kenn.io/agentsview/internal/config"
@@ -13,6 +15,7 @@ import (
 	duckdbsync "go.kenn.io/agentsview/internal/duckdb"
 	"go.kenn.io/agentsview/internal/parser"
 	"go.kenn.io/agentsview/internal/postgres"
+	"go.kenn.io/agentsview/internal/pricingrefresh"
 	syncpkg "go.kenn.io/agentsview/internal/sync"
 )
 
@@ -94,6 +97,72 @@ type daemonArchiveWriteBackend struct {
 	tr     transport
 }
 
+// daemonPushHeartbeatInterval bounds how often the daemon-delegated push
+// prints an elapsed-time line while waiting. A package var so tests can
+// shrink it.
+var daemonPushHeartbeatInterval = 30 * time.Second
+
+// startDaemonPushHeartbeat announces that the push runs inside the daemon
+// and then prints an elapsed-time line every interval until the returned
+// stop func is called. The daemon streams per-session progress once its
+// push loop starts, but the phases before it — the daemon-side local sync
+// and the remote schema migration — produce no progress events, so without
+// a heartbeat a long first push would look hung until the first session
+// lands. The caller stops the heartbeat on the first streamed progress
+// event; stop is idempotent-unsafe, so wrap it (see daemonPushProgress).
+func startDaemonPushHeartbeat(label string) func() {
+	return startDaemonPushHeartbeatTo(os.Stdout, label)
+}
+
+func startDaemonPushHeartbeatTo(w io.Writer, label string) func() {
+	fmt.Fprintf(w, "Pushing to %s via the local daemon...\n", label)
+	start := time.Now()
+	done := make(chan struct{})
+	finished := make(chan struct{})
+	go func() {
+		defer close(finished)
+		ticker := time.NewTicker(daemonPushHeartbeatInterval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-done:
+				return
+			case <-ticker.C:
+				fmt.Fprintf(w,
+					"still pushing to %s via the daemon (%s elapsed)\n",
+					label, time.Since(start).Round(time.Second),
+				)
+			}
+		}
+	}()
+	return func() {
+		close(done)
+		<-finished
+	}
+}
+
+// daemonPushProgress pairs a running heartbeat with a streamed-progress
+// renderer: the heartbeat covers the daemon-side phases that emit no
+// progress events (local sync, schema migration), and the first streamed
+// event silences it for good so heartbeat lines never interleave with the
+// in-place progress line. The returned finish func stops the heartbeat (if
+// no event ever arrived) and clears the in-place line.
+func daemonPushProgress[P any](
+	label string, render func(P),
+) (onProgress func(P), finish func()) {
+	stop := startDaemonPushHeartbeat(label)
+	var once stdsync.Once
+	stopHeartbeat := func() { once.Do(stop) }
+	onProgress = func(p P) {
+		stopHeartbeat()
+		render(p)
+	}
+	return onProgress, func() {
+		stopHeartbeat()
+		fmt.Print("\r\033[K")
+	}
+}
+
 func (b daemonArchiveWriteBackend) PGPush(
 	ctx context.Context,
 	target pgTargetSelection,
@@ -101,6 +170,10 @@ func (b daemonArchiveWriteBackend) PGPush(
 	projects []string,
 	excludeProjects []string,
 ) (postgres.PushResult, error) {
+	onProgress, finish := daemonPushProgress(
+		"PostgreSQL", newPGPushProgressPrinter(),
+	)
+	defer finish()
 	return postDaemonPush[postgres.PushResult](
 		ctx, b.tr, b.appCfg.AuthToken, "/api/v1/push/pg",
 		daemonPushRequest{
@@ -110,7 +183,9 @@ func (b daemonArchiveWriteBackend) PGPush(
 			PG:                     &target.PG,
 			SyncStateTarget:        target.SyncStateTarget,
 			MigrateLegacySyncState: target.MigrateLegacySyncState,
+			NoVectors:              cfg.NoVectors,
 		},
+		onProgress,
 	)
 }
 
@@ -121,7 +196,7 @@ func (b daemonArchiveWriteBackend) DuckDBPush(
 	projects []string,
 	excludeProjects []string,
 ) (duckdbsync.PushResult, error) {
-	return b.duckDBPush(ctx, duckCfg, cfg, projects, excludeProjects, "")
+	return b.duckDBPush(ctx, duckCfg, cfg, projects, excludeProjects)
 }
 
 func (b daemonArchiveWriteBackend) DuckDBPushWatch(
@@ -142,6 +217,11 @@ func (b daemonArchiveWriteBackend) DuckDBPushWatch(
 	push := func(pctx context.Context, reason pushReason, full bool) error {
 		pushCfg := cfg
 		pushCfg.Full = full
+		// Watch pushes are automatic: a mirror held by a live serve
+		// process defers instead of rebuilding the whole archive on
+		// every changed batch, and archive-scale diagnostics are
+		// skipped. Push ignores the defer behavior when full is set.
+		pushCfg.Automatic = true
 		backend := archiveWriteBackend(b)
 		cleanup := func() {}
 		if reason != reasonStartup {
@@ -176,7 +256,7 @@ func (b daemonArchiveWriteBackend) DuckDBPushWatch(
 	defer ticker.Stop()
 
 	stopWatcher, unwatchedDirs := startFileWatcher(b.appCfg, nil,
-		func(_ []string) {
+		func(_ syncpkg.WatchBatch) {
 			loop.NotifyDirty()
 		},
 	)
@@ -198,18 +278,26 @@ func (b daemonArchiveWriteBackend) duckDBPush(
 	cfg DuckDBPushConfig,
 	projects []string,
 	excludeProjects []string,
-	syncStateTarget string,
 ) (duckdbsync.PushResult, error) {
 	if err := duckdbsync.ValidatePushTarget(duckCfg); err != nil {
 		return duckdbsync.PushResult{}, err
 	}
-	duckCfg, err := absolutizeDuckDBPath(duckCfg)
-	if err != nil {
-		return duckdbsync.PushResult{}, err
-	}
-	if syncStateTarget == "" {
-		syncStateTarget = duckdbsync.SyncStateTargetForConfig(duckCfg)
-	}
+	// Never send a mirror path to the daemon: the daemon pins pushes to its
+	// own resolved path and rejects any request naming a different one, and
+	// a configured RELATIVE path absolutizes against each process's cwd, so
+	// the CLI and daemon can disagree on the absolute form of the same
+	// configured path. An empty path defers to the server's pinned path;
+	// non-path fields (machine name, filters) still apply.
+	duckCfg.Path = ""
+	onProgress, finish := daemonPushProgress(
+		"DuckDB", func(p duckdbsync.PushProgress) {
+			fmt.Printf(
+				"\rPushing... %d/%d sessions, %d messages\x1b[K",
+				p.SessionsDone, p.SessionsTotal, p.MessagesDone,
+			)
+		},
+	)
+	defer finish()
 	return postDaemonPush[duckdbsync.PushResult](
 		ctx, b.tr, b.appCfg.AuthToken, "/api/v1/push/duckdb",
 		daemonPushRequest{
@@ -217,23 +305,10 @@ func (b daemonArchiveWriteBackend) duckDBPush(
 			Projects:        projects,
 			ExcludeProjects: excludeProjects,
 			DuckDB:          &duckCfg,
-			SyncStateTarget: syncStateTarget,
+			Automatic:       cfg.Automatic,
 		},
+		onProgress,
 	)
-}
-
-func absolutizeDuckDBPath(
-	duckCfg config.DuckDBConfig,
-) (config.DuckDBConfig, error) {
-	if duckCfg.Path == "" || filepath.IsAbs(duckCfg.Path) {
-		return duckCfg, nil
-	}
-	abs, err := filepath.Abs(duckCfg.Path)
-	if err != nil {
-		return duckCfg, fmt.Errorf("resolving duckdb path: %w", err)
-	}
-	duckCfg.Path = abs
-	return duckCfg, nil
 }
 
 func (b daemonArchiveWriteBackend) PGPushWatch(
@@ -287,7 +362,7 @@ func (b daemonArchiveWriteBackend) PGPushWatch(
 	defer ticker.Stop()
 
 	stopWatcher, unwatchedDirs := startFileWatcher(b.appCfg, nil,
-		func(_ []string) {
+		func(_ syncpkg.WatchBatch) {
 			loop.NotifyDirty()
 		},
 	)
@@ -304,8 +379,29 @@ func (b daemonArchiveWriteBackend) PGPushWatch(
 }
 
 type localArchiveWriteBackend struct {
-	appCfg   config.Config
-	database *db.DB
+	appCfg        config.Config
+	database      *db.DB
+	ensurePricing func(context.Context, *db.DB) error
+}
+
+func (b *localArchiveWriteBackend) ensureCurrentPricing(
+	ctx context.Context,
+) error {
+	if b.ensurePricing != nil {
+		return b.ensurePricing(ctx, b.database)
+	}
+	return pricingrefresh.EnsureCurrent(ctx, b.database)
+}
+
+func (b *localArchiveWriteBackend) newPGPusher(
+	localSync func(context.Context) error,
+	connect func() (pgTarget, error),
+) *pgPusher {
+	return &pgPusher{
+		localSync:     localSync,
+		ensurePricing: b.ensureCurrentPricing,
+		connect:       connect,
+	}
 }
 
 func (b *localArchiveWriteBackend) PGPush(
@@ -319,15 +415,26 @@ func (b *localArchiveWriteBackend) PGPush(
 	if err := ctx.Err(); err != nil {
 		return postgres.PushResult{}, err
 	}
+	if err := b.ensureCurrentPricing(ctx); err != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return postgres.PushResult{}, ctxErr
+		}
+		log.Printf("warning: pricing refresh failed: %v", err)
+	}
+	if err := ctx.Err(); err != nil {
+		return postgres.PushResult{}, err
+	}
 	forceFull := cfg.Full || didResync
 
 	fmt.Println("Connecting to PostgreSQL...")
 	connectStart := time.Now()
 	applyClassifierConfig(b.appCfg)
+	vectorSource := pgVectorPushSource(b.appCfg, target, cfg)
+	defer closeVectorPushSource(vectorSource)
 	ps, err := postgres.New(
 		target.PG.URL, target.PG.Schema, b.database,
 		target.PG.MachineName, target.PG.AllowInsecure,
-		target.syncOptions(projects, excludeProjects),
+		target.syncOptions(projects, excludeProjects, vectorSource),
 	)
 	if err != nil {
 		return postgres.PushResult{}, err
@@ -348,11 +455,7 @@ func (b *localArchiveWriteBackend) PGPush(
 		time.Since(schemaStart).Round(time.Millisecond),
 	)
 	fmt.Println("Starting PostgreSQL push...")
-	result, err := ps.Push(ctx, forceFull,
-		func(p postgres.PushProgress) {
-			printPGPushProgress(p)
-		},
-	)
+	result, err := ps.Push(ctx, forceFull, newPGPushProgressPrinter())
 	fmt.Print("\r\033[K")
 	if err != nil {
 		return postgres.PushResult{}, err
@@ -367,9 +470,7 @@ func (b *localArchiveWriteBackend) DuckDBPush(
 	projects []string,
 	excludeProjects []string,
 ) (duckdbsync.PushResult, error) {
-	return b.duckDBPush(
-		ctx, duckCfg, cfg, projects, excludeProjects, "",
-	)
+	return b.duckDBPush(ctx, duckCfg, cfg, projects, excludeProjects)
 }
 
 func (b *localArchiveWriteBackend) duckDBPush(
@@ -378,7 +479,6 @@ func (b *localArchiveWriteBackend) duckDBPush(
 	cfg DuckDBPushConfig,
 	projects []string,
 	excludeProjects []string,
-	syncStateTarget string,
 ) (duckdbsync.PushResult, error) {
 	if err := duckdbsync.ValidatePushTarget(duckCfg); err != nil {
 		return duckdbsync.PushResult{}, err
@@ -388,51 +488,18 @@ func (b *localArchiveWriteBackend) duckDBPush(
 		return duckdbsync.PushResult{}, err
 	}
 	forceFull := cfg.Full || didResync
-	if syncStateTarget == "" {
-		syncStateTarget = duckdbsync.SyncStateTargetForConfig(duckCfg)
-	}
 
-	fmt.Println("Opening DuckDB mirror...")
-	connectStart := time.Now()
+	fmt.Println("Starting DuckDB push...")
 	opts := duckdbsync.SyncOptions{
 		Projects:        projects,
 		ExcludeProjects: excludeProjects,
-		SyncStateTarget: syncStateTarget,
+		Automatic:       cfg.Automatic,
 	}
-	var syncer *duckdbsync.Sync
-	var err error
-	if duckCfg.URL != "" {
-		syncer, err = duckdbsync.NewFromConfig(
-			duckCfg, b.database, opts,
-		)
-	} else {
-		syncer, err = duckdbsync.New(
-			duckCfg.Path, b.database, duckCfg.MachineName, opts,
-		)
-	}
-	if err != nil {
-		return duckdbsync.PushResult{}, err
-	}
-	defer syncer.Close()
-	fmt.Printf(
-		"Opened DuckDB mirror in %s\n",
-		time.Since(connectStart).Round(time.Millisecond),
-	)
-
-	fmt.Println("Preparing DuckDB schema...")
-	schemaStart := time.Now()
-	if err := syncer.EnsureSchema(ctx); err != nil {
-		return duckdbsync.PushResult{}, fmt.Errorf("schema: %w", err)
-	}
-	fmt.Printf(
-		"DuckDB schema ready in %s\n",
-		time.Since(schemaStart).Round(time.Millisecond),
-	)
-	fmt.Println("Starting DuckDB push...")
-	result, err := syncer.Push(ctx, forceFull,
+	result, err := duckdbsync.Push(
+		ctx, duckCfg.Path, b.database, duckCfg.MachineName, opts, forceFull,
 		func(p duckdbsync.PushProgress) {
 			fmt.Printf(
-				"\rPushing... %d/%d sessions, %d messages",
+				"\rPushing... %d/%d sessions, %d messages\x1b[K",
 				p.SessionsDone, p.SessionsTotal, p.MessagesDone,
 			)
 		},
@@ -462,6 +529,11 @@ func (b *localArchiveWriteBackend) DuckDBPushWatch(
 	push := func(pctx context.Context, reason pushReason, full bool) error {
 		pushCfg := cfg
 		pushCfg.Full = full
+		// Watch pushes are automatic: a mirror held by a live serve
+		// process defers instead of rebuilding the whole archive on
+		// every changed batch, and archive-scale diagnostics are
+		// skipped. Push ignores the defer behavior when full is set.
+		pushCfg.Automatic = true
 		res, err := b.DuckDBPush(pctx, duckCfg, pushCfg, projects, exclude)
 		if err != nil {
 			return err
@@ -482,7 +554,7 @@ func (b *localArchiveWriteBackend) DuckDBPushWatch(
 	defer ticker.Stop()
 
 	stopWatcher, unwatchedDirs := startFileWatcher(b.appCfg, nil,
-		func(_ []string) {
+		func(_ syncpkg.WatchBatch) {
 			loop.NotifyDirty()
 		},
 	)
@@ -499,13 +571,17 @@ func (b *localArchiveWriteBackend) DuckDBPushWatch(
 }
 
 func logDuckDBWatchPushResult(res duckdbsync.PushResult, reason pushReason) {
+	if res.Diagnostics.Deferred {
+		log.Printf(
+			"duckdb watch: push deferred: %s (%s)",
+			res.Diagnostics.DeferredReason, reason,
+		)
+		return
+	}
 	if res.Diagnostics.Cutoff != "" {
 		log.Printf(
-			"duckdb watch: source local %s; candidates %s; skipped unchanged %s; stale deleted %d; wrote sessions %s, messages %d (%s)",
-			formatDuckDBPushSessionCounts(res.Diagnostics.LocalSessions),
-			formatDuckDBPushSessionCounts(res.Diagnostics.CandidateSessions),
-			formatDuckDBPushSessionCounts(res.Diagnostics.SkippedUnchangedSessions),
-			res.Diagnostics.DeletedStaleSessions,
+			"duckdb watch: source %s; wrote sessions %s, messages %d (%s)",
+			formatDuckDBPushSource(res.Diagnostics),
 			formatDuckDBPushSessionCounts(res.Diagnostics.PushedSessions),
 			res.MessagesPushed,
 			reason,
@@ -549,7 +625,8 @@ func (b *localArchiveWriteBackend) PGPushWatch(
 
 	engine := syncpkg.NewEngine(b.database, syncpkg.EngineConfig{
 		AgentDirs:               b.appCfg.AgentDirs,
-		Machine:                 "local",
+		IncludeCwdPrefixes:      b.appCfg.SyncIncludeCwdPrefixes,
+		Machine:                 b.appCfg.LocalMachineName,
 		BlockedResultCategories: b.appCfg.ResultContentBlockedCategories,
 	})
 	defer engine.Close()
@@ -562,8 +639,16 @@ func (b *localArchiveWriteBackend) PGPushWatch(
 		return err
 	}
 
-	pusher := &pgPusher{
-		localSync: func(c context.Context) error {
+	// One vectors.db adapter for the watch loop's lifetime: connect runs on
+	// every reconnect, and a fresh source per reconnect would leak the
+	// previous one's memoized read-only handle (postgres.Sync never closes
+	// its source). The adapter is designed for reuse — it reopens lazily
+	// after transient failures.
+	vectorSource := pgVectorPushSource(b.appCfg, target, cfg)
+	defer closeVectorPushSource(vectorSource)
+
+	pusher := b.newPGPusher(
+		func(c context.Context) error {
 			engine.SyncAll(c, nil)
 			// The push scans SQLite rows right after this returns;
 			// flush deferred signal recomputes so pushed sessions
@@ -571,19 +656,19 @@ func (b *localArchiveWriteBackend) PGPushWatch(
 			engine.FlushSignals()
 			return nil
 		},
-		connect: func() (pgTarget, error) {
+		func() (pgTarget, error) {
 			applyClassifierConfig(b.appCfg)
 			s, cErr := postgres.New(
 				target.PG.URL, target.PG.Schema, b.database,
 				target.PG.MachineName, target.PG.AllowInsecure,
-				target.syncOptions(projects, exclude),
+				target.syncOptions(projects, exclude, vectorSource),
 			)
 			if cErr != nil {
 				return nil, cErr
 			}
 			return s, nil
 		},
-	}
+	)
 	defer pusher.reset()
 
 	fmt.Printf(
@@ -604,8 +689,8 @@ func (b *localArchiveWriteBackend) PGPushWatch(
 	defer ticker.Stop()
 
 	stopWatcher, unwatchedDirs := startFileWatcher(b.appCfg, engine,
-		func(paths []string) {
-			engine.SyncPaths(paths)
+		func(batch syncpkg.WatchBatch) {
+			syncWatchBatch(ctx, engine, batch)
 			loop.NotifyDirty()
 		},
 	)

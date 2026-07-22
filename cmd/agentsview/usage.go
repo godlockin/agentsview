@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"io"
 	"log"
-	"maps"
 	"net/http"
 	"net/url"
 	"os"
@@ -17,8 +16,10 @@ import (
 
 	"go.kenn.io/agentsview/internal/config"
 	"go.kenn.io/agentsview/internal/db"
+	"go.kenn.io/agentsview/internal/export"
 	"go.kenn.io/agentsview/internal/parser"
 	"go.kenn.io/agentsview/internal/pricing"
+	"go.kenn.io/agentsview/internal/pricingrefresh"
 	"go.kenn.io/agentsview/internal/service"
 	"go.kenn.io/agentsview/internal/sync"
 )
@@ -309,8 +310,9 @@ func ensureFreshData(
 
 	if database.NeedsResync() {
 		engine := sync.NewEngine(database, sync.EngineConfig{
-			AgentDirs: appCfg.AgentDirs,
-			Machine:   "local",
+			AgentDirs:          appCfg.AgentDirs,
+			IncludeCwdPrefixes: appCfg.SyncIncludeCwdPrefixes,
+			Machine:            appCfg.LocalMachineName,
 		})
 		defer engine.Close()
 		fmt.Fprintln(os.Stderr,
@@ -332,8 +334,9 @@ func ensureFreshData(
 	}
 
 	engine := sync.NewEngine(database, sync.EngineConfig{
-		AgentDirs: appCfg.AgentDirs,
-		Machine:   "local",
+		AgentDirs:          appCfg.AgentDirs,
+		IncludeCwdPrefixes: appCfg.SyncIncludeCwdPrefixes,
+		Machine:            appCfg.LocalMachineName,
 	})
 	defer engine.Close()
 
@@ -381,7 +384,7 @@ func printSyncSummaryStderr(stats sync.SyncStats, t time.Time) {
 // every restart while still propagating corrected fallback
 // rates when the binary is upgraded.
 func seedPricing(database *db.DB) {
-	if err := seedFallbackPricing(database); err != nil {
+	if err := pricingrefresh.SeedFallback(database); err != nil {
 		log.Printf("pricing seed: %v", err)
 	}
 	go refreshPricingFromSources(database)
@@ -418,23 +421,6 @@ func periodicPricingRefresh(
 			}
 		}
 	}
-}
-
-func seedFallbackPricing(database *db.DB) error {
-	const metaKey = "_fallback_version"
-	stored, err := database.GetPricingMeta(metaKey)
-	if err != nil {
-		return err
-	}
-	if stored == pricing.FallbackVersion {
-		return nil
-	}
-	if err := upsertPricing(
-		database, pricing.FallbackPricing(),
-	); err != nil {
-		return err
-	}
-	return database.SetPricingMeta(metaKey, pricing.FallbackVersion)
 }
 
 // refreshPricingFromSources walks the default pricing source
@@ -486,82 +472,40 @@ func refreshPricingFromSources(database *db.DB) {
 	}
 }
 
-// refreshPricingFromLiteLLM is the single-source refresh
-// helper used by the CLI's statusline path. It does not
-// fan out to OpenRouter so the CLI stays cheap. Kept as a
-// thin wrapper around refreshPricingFromSources with only
-// the LiteLLM entry for callers that want the old
-// single-source behaviour.
+// refreshPricingFromLiteLLM fetches the upstream LiteLLM
+// catalog and upserts it over whatever is in the table. Called
+// from a goroutine after the synchronous fallback seed so a
+// slow or failing fetch never blocks server startup.
 func refreshPricingFromLiteLLM(database *db.DB) {
-	prices, err := pricing.FetchLiteLLMPricing()
-	if err != nil {
-		log.Printf(
-			"pricing refresh: litellm fetch failed: %v", err,
-		)
-		return
-	}
-	if err := upsertPricing(database, prices); err != nil {
-		log.Printf("pricing refresh: upsert failed: %v", err)
+	if err := pricingrefresh.Refresh(
+		database, pricing.FetchLiteLLMPricing,
+	); err != nil {
+		log.Printf("pricing refresh: %v", err)
 	}
 }
 
-// pricingRefreshMetaKey marks the last time the CLI tried to
-// refresh model_pricing from LiteLLM. Cooldown is enforced
-// against this value, win or fail, so a repeatedly-failing
-// fetch (offline, DNS broken) does not block every CLI call.
-const pricingRefreshMetaKey = "_litellm_last_attempt"
-
-// pricingRefreshCooldown is the minimum interval between
-// CLI-triggered LiteLLM fetches. Short enough that a newly
-// released model gets priced within hours of the user noticing,
-// long enough that statusline-style repeated CLI invocations
-// don't hammer LiteLLM when a session uses a truly unpriced
-// model (e.g. a local Ollama model).
-const pricingRefreshCooldown = time.Hour
-
-// refreshPricingIfStale fetches the LiteLLM pricing catalog
-// and upserts it when the last attempt is older than cooldown
-// (or has never run). The fetcher is injectable for tests so
-// the cooldown logic can be exercised without network. Returns
-// true when an upsert succeeded; callers can re-query pricing
-// after a true result. Errors from the fetch are returned so
-// the caller can emit a warning; cooldown is recorded before
-// the fetch so a persistent failure won't retry every call.
-func refreshPricingIfStale(
-	database *db.DB,
-	fetch func() ([]pricing.ModelPricing, error),
-	cooldown time.Duration,
-	now time.Time,
-) (bool, error) {
-	stored, err := database.GetPricingMeta(pricingRefreshMetaKey)
-	if err != nil {
-		return false, fmt.Errorf(
-			"reading pricing refresh meta: %w", err)
-	}
-	if stored != "" {
-		last, perr := time.Parse(time.RFC3339, stored)
-		if perr == nil && now.Sub(last) < cooldown {
-			return false, nil
+// upsertPricing converts merged catalog rates to db.ModelPricing
+// rows and upserts them. Used by refreshPricingFromSources, which
+// fans out to multiple upstream catalogs and merges before writing
+// a single batch.
+func upsertPricing(
+	database *db.DB, prices []pricing.ModelPricing,
+) error {
+	dbPrices := make([]db.ModelPricing, len(prices))
+	for i, p := range prices {
+		dbPrices[i] = db.ModelPricing{
+			ModelPattern:         p.ModelPattern,
+			InputPerMTok:         p.InputPerMTok,
+			OutputPerMTok:        p.OutputPerMTok,
+			CacheCreationPerMTok: p.CacheCreationPerMTok,
+			CacheReadPerMTok:     p.CacheReadPerMTok,
 		}
 	}
-	if err := database.SetPricingMeta(
-		pricingRefreshMetaKey, now.UTC().Format(time.RFC3339),
-	); err != nil {
-		return false, fmt.Errorf(
-			"recording pricing refresh attempt: %w", err)
-	}
-	prices, err := fetch()
-	if err != nil {
-		return false, err
-	}
-	if err := upsertPricing(database, prices); err != nil {
-		return false, err
-	}
-	return true, nil
+	return database.UpsertModelPricing(dbPrices)
 }
 
 func ensurePricing(database *db.DB, offline bool) {
-	if _, err := ensurePricingWithFetcher(
+	if _, err := pricingrefresh.Ensure(
 		database, offline, pricing.FetchLiteLLMPricing, time.Now(),
 	); err != nil {
 		fmt.Fprintf(os.Stderr,
@@ -584,6 +528,7 @@ func applyFallbackPricing(
 	database *db.DB, custom map[string]config.CustomModelRate,
 ) {
 	rates := make(map[string]config.CustomModelRate)
+	sources := make(map[string]export.PricingRowSource)
 	for _, p := range pricing.FallbackPricing() {
 		// These keys are the same concrete model-pattern keys that the
 		// model_pricing table stores. SQLite usage lookups run the merged map
@@ -595,27 +540,13 @@ func applyFallbackPricing(
 			CacheCreation: p.CacheCreationPerMTok,
 			CacheRead:     p.CacheReadPerMTok,
 		}
+		sources[p.ModelPattern] = export.PricingRowSourceEmbedded
 	}
-	maps.Copy(rates, custom)
-	database.SetCustomPricing(rates)
-}
-
-func ensurePricingWithFetcher(
-	database *db.DB, offline bool,
-	fetch func() ([]pricing.ModelPricing, error),
-	now time.Time,
-) (bool, error) {
-	if offline {
-		return false, upsertPricing(database, pricing.FallbackPricing())
+	for model, rate := range custom {
+		rates[model] = rate
+		sources[model] = export.PricingRowSourceCustom
 	}
-
-	if err := seedFallbackPricing(database); err != nil {
-		return false, err
-	}
-
-	return refreshPricingIfStale(
-		database, fetch, pricingRefreshCooldown, now,
-	)
+	database.SetEffectivePricing(rates, sources)
 }
 
 func fetchHTTPDailyUsage(
@@ -674,38 +605,27 @@ func fetchHTTPDailyUsage(
 		)
 	}
 	var out struct {
-		Totals        db.UsageTotals        `json:"totals"`
-		Daily         []db.DailyUsageEntry  `json:"daily"`
-		SessionCounts db.UsageSessionCounts `json:"sessionCounts"`
+		SchemaVersion int                               `json:"schema_version,omitempty"`
+		Pricing       *export.PricingBlock              `json:"pricing,omitempty"`
+		Projects      map[string]export.ProjectMapEntry `json:"projects,omitempty"`
+		Totals        db.UsageTotals                    `json:"totals"`
+		Daily         []db.DailyUsageEntry              `json:"daily"`
+		SessionCounts db.UsageSessionCounts             `json:"sessionCounts"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
 		return db.DailyUsageResult{}, err
 	}
+	if out.Projects == nil {
+		out.Projects = map[string]export.ProjectMapEntry{}
+	}
 	return db.DailyUsageResult{
+		SchemaVersion: out.SchemaVersion,
+		Pricing:       out.Pricing,
+		Projects:      out.Projects,
 		Daily:         out.Daily,
 		Totals:        out.Totals,
 		SessionCounts: out.SessionCounts,
 	}, nil
-}
-
-// upsertPricing copies pricing rows into the db.ModelPricing
-// shape and upserts them. Shared by ensurePricing (CLI),
-// seedPricing (startup fallback), and
-// refreshPricingFromLiteLLM (async refresh).
-func upsertPricing(
-	database *db.DB, prices []pricing.ModelPricing,
-) error {
-	dbPrices := make([]db.ModelPricing, len(prices))
-	for i, p := range prices {
-		dbPrices[i] = db.ModelPricing{
-			ModelPattern:         p.ModelPattern,
-			InputPerMTok:         p.InputPerMTok,
-			OutputPerMTok:        p.OutputPerMTok,
-			CacheCreationPerMTok: p.CacheCreationPerMTok,
-			CacheReadPerMTok:     p.CacheReadPerMTok,
-		}
-	}
-	return database.UpsertModelPricing(dbPrices)
 }
 
 func printDailyTable(

@@ -25,8 +25,24 @@ LDFLAGS_RELEASE += -s -w
 endif
 DESKTOP_DIST_DIR := dist/desktop
 GOLANGCI_LINT_VERSION ?= v2.11.4
+# Isolate each checkout from stale sibling-worktree fixes and issue positions.
+GOLANGCI_LINT_CACHE ?= $(CURDIR)/.golangci-cache
+export GOLANGCI_LINT_CACHE
 CUSTOM_GCL := ./custom-gcl
 PRICING_SNAPSHOT_FILE := internal/pricing/snapshot/litellm_snapshot.json.gz
+
+# sqlite-vec's cgo bindings #include "sqlite3.h". Without an override the
+# compiler falls back to the system header (the macOS SDK one marks
+# sqlite3_auto_extension deprecated, warning on every build) which can also
+# drift from the amalgamation mattn/go-sqlite3 statically links. Compile
+# against the bundled amalgamation's own header instead, mirroring the
+# Linux release workflow in .github/workflows/release.yml.
+# Setting CGO_CFLAGS replaces Go's built-in default of "-O2 -g", so restate
+# it explicitly or the SQLite amalgamation compiles unoptimized (2-3x slower
+# queries, caught by the bench gate). Caller-provided flags stay last so
+# they can still override.
+SQLITE_INCLUDE_DIR := .sqlite-include
+export CGO_CFLAGS := -O2 -g -I$(CURDIR)/$(SQLITE_INCLUDE_DIR) $(CGO_CFLAGS)
 
 GOPATH_FIRST := $(shell go env GOPATH | cut -d: -f1)
 AIR_BIN := $(shell if command -v air >/dev/null 2>&1; then command -v air; \
@@ -34,7 +50,7 @@ AIR_BIN := $(shell if command -v air >/dev/null 2>&1; then command -v air; \
 	elif [ -x "$(GOPATH_FIRST)/bin/air" ]; then printf "%s" "$(GOPATH_FIRST)/bin/air"; \
 	fi)
 
-.PHONY: build build-release build-release-profiled install frontend frontend-dev dev check-air air-install desktop-dev desktop-build desktop-macos-app desktop-macos-dmg desktop-windows-installer desktop-linux-appimage desktop-app docs-install docs-build docs-serve docs-check docs-screenshots docs-assets-branch docs-generated-assets-branch docs-deploy-staging docs-deploy test test-short bench-backends test-postgres test-postgres-ci test-s3 postgres-up postgres-down test-ssh test-ssh-ci ssh-up ssh-down e2e e2e-duckdb vet lint lint-ci lint-golangci lint-golangci-ci nilaway nilaway-golangci-build lint-tools tidy clean release release-darwin-arm64 release-darwin-amd64 release-universal-apple build-local-apple-silicon run-offline run-offline-universal release-linux-amd64 install-hooks ensure-embed-dir pricing-snapshot dev-snapshot help
+.PHONY: build build-release build-release-profiled install frontend frontend-dev dev check-air air-install desktop-dev desktop-build desktop-macos-app desktop-macos-dmg desktop-windows-installer desktop-linux-appimage desktop-app docs-install docs-build docs-serve docs-check docs-screenshots docs-assets-branch docs-generated-assets-branch docs-deploy-staging docs-deploy test test-short test-evalingest bench-backends bench-gate bench-gate-config test-postgres test-postgres-ci test-s3 postgres-up postgres-down test-ssh test-ssh-ci ssh-up ssh-down e2e e2e-duckdb vet lint lint-ci lint-golangci lint-golangci-ci nilaway nilaway-golangci-build lint-tools tidy clean release release-darwin-arm64 release-darwin-amd64 release-universal-apple build-local-apple-silicon run-offline run-offline-universal release-linux-amd64 install-hooks ensure-embed-dir pricing-snapshot sqlite-vec-header dev-snapshot help
 
 # Ensure go:embed has at least one file (no-op if frontend is built)
 ensure-embed-dir:
@@ -44,9 +60,19 @@ ensure-embed-dir:
 			'keep embed dir for generated frontend assets' \
 			> internal/web/dist/.keep
 
+# Copy the go-sqlite3 amalgamation header where CGO_CFLAGS points.
+# Chained from pricing-snapshot so every Go-compiling target stages it
+# without lengthening each prerequisite list.
+sqlite-vec-header:
+	@go mod download github.com/mattn/go-sqlite3
+	@mkdir -p $(SQLITE_INCLUDE_DIR)
+	@install -m 0644 \
+		"$$(go list -m -f '{{.Dir}}' github.com/mattn/go-sqlite3)/sqlite3-binding.h" \
+		$(SQLITE_INCLUDE_DIR)/sqlite3.h
+
 # Restore the generated LiteLLM fallback snapshot from its artifact branch.
 # Pinned ref, SHA256, and branch are compiled into the snapshot tool.
-pricing-snapshot:
+pricing-snapshot: sqlite-vec-header
 	go run ./internal/pricing/cmd/litellm-snapshot -restore
 
 # Build the binary (debug, with embedded pricing snapshot and frontend)
@@ -281,6 +307,11 @@ test: pricing-snapshot ensure-embed-dir
 test-short: pricing-snapshot ensure-embed-dir
 	go test -tags "fts5" ./... -short -count=1
 
+# Run the quarantined eval-ingest endpoint tests under their build tag.
+test-evalingest: pricing-snapshot ensure-embed-dir
+	CGO_ENABLED=1 go test -tags "fts5,evalingest" \
+		./internal/db ./internal/server -v -count=1
+
 # Compare db.Store read-query performance across SQLite, DuckDB, and PostgreSQL.
 # Requires Docker because the PostgreSQL backend is started with testcontainers.
 BENCH_BACKENDS_FLAGS ?= -bench . -run '^$$' -benchmem
@@ -290,6 +321,35 @@ bench-backends: pricing-snapshot ensure-embed-dir
 	AGENTSVIEW_BENCH_SESSIONS=$(BENCH_BACKENDS_SESSIONS) \
 		AGENTSVIEW_BENCH_MESSAGES_PER_SESSION=$(BENCH_BACKENDS_MESSAGES_PER_SESSION) \
 		CGO_ENABLED=1 go test -tags "fts5,benchdb" ./internal/backendbench $(BENCH_BACKENDS_FLAGS)
+
+# Hot-path benchmark gate. Runs every benchmark in the gated packages
+# (sync engine warm/cold/append, message write paths, usage
+# aggregation, secret scanning). This target is the single source of
+# truth for the gate configuration: CI's bench.yml runs it on both
+# the PR head and the merge base, then compares the outputs with
+# `go run ./cmd/benchgate -old old.txt -new new.txt`. Run it before
+# and after touching a sync or DB hot path.
+BENCH_GATE_PACKAGES ?= ./internal/sync ./internal/db ./internal/secrets
+# Count must stay >= 5: benchgate's time gate needs at least 5
+# candidate samples for its significance test.
+BENCH_GATE_COUNT ?= 6
+# Fixed iterations, not a duration: some gated benchmarks grow their
+# fixture as they iterate, so baseline and candidate must run the
+# same iteration count to measure identical workloads.
+BENCH_GATE_TIME ?= 20x
+bench-gate: pricing-snapshot ensure-embed-dir
+	CGO_ENABLED=1 go test -tags "fts5" -run '^$$' \
+		-bench . -benchmem \
+		-count $(BENCH_GATE_COUNT) -benchtime $(BENCH_GATE_TIME) \
+		-timeout 25m $(BENCH_GATE_PACKAGES)
+
+# Prints the gate's sample/iteration configuration in shell-evalable
+# form. CI evaluates this on the PR head and passes the values into
+# the merge-base `make bench-gate` invocation, so both sides measure
+# identical workloads even when a PR changes the defaults above (the
+# package list intentionally stays per-side).
+bench-gate-config:
+	@echo "BENCH_GATE_COUNT=$(BENCH_GATE_COUNT) BENCH_GATE_TIME=$(BENCH_GATE_TIME)"
 
 # Start test PostgreSQL container
 postgres-up:
@@ -417,7 +477,7 @@ tidy: pricing-snapshot
 clean:
 	rm -f agentsview agentsv
 	rm -f $(PRICING_SNAPSHOT_FILE)
-	rm -rf internal/web/dist dist/ tmp/
+	rm -rf internal/web/dist dist/ tmp/ $(SQLITE_INCLUDE_DIR)
 	mkdir -p internal/web/dist
 	printf '%s\n' \
 		'keep embed dir for generated frontend assets' \
@@ -584,6 +644,7 @@ help:
 	@echo "  test           - Run all tests"
 	@echo "  test-short     - Run fast tests only"
 	@echo "  bench-backends - Benchmark SQLite, DuckDB, and PostgreSQL stores"
+	@echo "  bench-gate     - Run the hot-path benchmarks CI gates PRs on"
 	@echo "  test-postgres  - Run PostgreSQL integration tests"
 	@echo "  test-s3        - Run S3 discovery integration tests (Docker)"
 	@echo "  postgres-up    - Start test PostgreSQL container"

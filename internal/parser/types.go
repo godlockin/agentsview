@@ -25,6 +25,8 @@ const (
 	AgentAmp            AgentType = "amp"
 	AgentZencoder       AgentType = "zencoder"
 	AgentVSCodeCopilot  AgentType = "vscode-copilot"
+	AgentWindsurf       AgentType = "windsurf"
+	AgentTrae           AgentType = "trae"
 	AgentVSCopilot      AgentType = "visualstudio-copilot"
 	AgentPi             AgentType = "pi"
 	AgentOMP            AgentType = "omp"
@@ -40,21 +42,27 @@ const (
 	AgentKiroIDE        AgentType = "kiro-ide"
 	AgentCortex         AgentType = "cortex"
 	AgentHermes         AgentType = "hermes"
+	AgentGrok           AgentType = "grok"
 	AgentWorkBuddy      AgentType = "workbuddy"
 	AgentForge          AgentType = "forge"
+	AgentDevin          AgentType = "devin"
 	AgentPiebald        AgentType = "piebald"
 	AgentWarp           AgentType = "warp"
 	AgentPositron       AgentType = "positron"
+	AgentPositAssistant AgentType = "posit-assistant"
+	AgentZCode          AgentType = "zcode"
 	AgentAntigravity    AgentType = "antigravity"
 	AgentAntigravityCLI AgentType = "antigravity-cli"
 	AgentVibe           AgentType = "vibe"
 	AgentZed            AgentType = "zed"
 	AgentQwenPaw        AgentType = "qwenpaw"
 	AgentGptme          AgentType = "gptme"
+	AgentQoder          AgentType = "qoder"
 	AgentShelley        AgentType = "shelley"
 	AgentAider          AgentType = "aider"
 	AgentReasonix       AgentType = "reasonix"
 	AgentIcodemate      AgentType = "icodemate"
+	AgentRooCode        AgentType = "roocode"
 )
 
 // AgentDef describes a supported coding agent's filesystem
@@ -284,6 +292,56 @@ var Registry = []AgentDef{
 		},
 	},
 	{
+		Type:        AgentWindsurf,
+		DisplayName: "Windsurf",
+		EnvVar:      "WINDSURF_DIR",
+		ConfigKey:   "windsurf_dirs",
+		DefaultDirs: []string{
+			// Windows
+			"AppData/Roaming/Windsurf/User",
+			"AppData/Roaming/Windsurf - Next/User",
+			// macOS
+			"Library/Application Support/Windsurf/User",
+			"Library/Application Support/Windsurf - Next/User",
+			// Linux
+			".config/Windsurf/User",
+			".config/Windsurf - Next/User",
+		},
+		IDPrefix: "windsurf:",
+		WatchSubdirs: []string{
+			"workspaceStorage",
+		},
+		FileBased: true,
+		Usage: UsageCapabilities{
+			NoPerMessageTokenData: true,
+			AICreditsDenominated:  true,
+		},
+	},
+	{
+		Type:        AgentTrae,
+		DisplayName: "Trae",
+		EnvVar:      "TRAE_DIR",
+		ConfigKey:   "trae_dirs",
+		DefaultDirs: []string{
+			// Windows
+			"AppData/Roaming/Trae/User",
+			"AppData/Roaming/Trae CN/User",
+			"AppData/Roaming/TRAE SOLO CN/User",
+			// macOS
+			"Library/Application Support/Trae/User",
+			"Library/Application Support/Trae CN/User",
+			"Library/Application Support/TRAE SOLO CN/User",
+			// Linux
+			".config/Trae/User",
+			".config/Trae CN/User",
+			".config/TRAE SOLO CN/User",
+		},
+		IDPrefix:     "trae:",
+		WatchSubdirs: []string{"workspaceStorage", "globalStorage"},
+		FileBased:    true,
+		Usage:        UsageCapabilities{NoPerMessageTokenData: true},
+	},
+	{
 		Type:        AgentVSCopilot,
 		DisplayName: "Visual Studio Copilot",
 		EnvVar:      "VISUALSTUDIO_COPILOT_DIR",
@@ -443,6 +501,15 @@ var Registry = []AgentDef{
 		ShallowWatchRootsFunc: ResolveHermesShallowWatchRoots,
 	},
 	{
+		Type:        AgentGrok,
+		DisplayName: "Grok",
+		EnvVar:      "GROK_DIR",
+		ConfigKey:   "grok_dirs",
+		DefaultDirs: []string{".grok/sessions"},
+		IDPrefix:    "grok:",
+		FileBased:   true,
+	},
+	{
 		Type:        AgentWorkBuddy,
 		DisplayName: "WorkBuddy",
 		EnvVar:      "WORKBUDDY_PROJECTS_DIR",
@@ -459,6 +526,18 @@ var Registry = []AgentDef{
 		DefaultDirs: []string{".forge"},
 		IDPrefix:    "forge:",
 		FileBased:   false,
+	},
+	{
+		Type:        AgentDevin,
+		DisplayName: "Devin",
+		EnvVar:      "DEVIN_DIR",
+		ConfigKey:   "devin_dirs",
+		DefaultDirs: []string{
+			"Library/Application Support/devin",
+			".local/share/devin",
+		},
+		IDPrefix:  "devin:",
+		FileBased: false,
 	},
 	{
 		Type:        AgentPiebald,
@@ -496,6 +575,35 @@ var Registry = []AgentDef{
 		IDPrefix:     "positron:",
 		WatchSubdirs: []string{"workspaceStorage"},
 		FileBased:    true,
+	},
+	{
+		// Posit Assistant (posit-dev/assistant) stores one directory per
+		// conversation under workspaces/<workspaceId>/<conversationId>/,
+		// holding a conversation.json message tree plus an append-only
+		// lm-messages.jsonl transcript. Distinct from the Positron IDE's
+		// built-in Assistant above, which uses VS Code chatSessions files.
+		Type:        AgentPositAssistant,
+		DisplayName: "Posit Assistant",
+		EnvVar:      "POSIT_ASSISTANT_DIR",
+		ConfigKey:   "posit_assistant_dirs",
+		DefaultDirs: []string{".posit/assistant/workspaces"},
+		IDPrefix:    "posit-assistant:",
+		FileBased:   true,
+	},
+	{
+		Type:        AgentZCode,
+		DisplayName: "ZCode",
+		EnvVar:      "ZCODE_DIR",
+		ConfigKey:   "zcode_dirs",
+		DefaultDirs: []string{
+			".zcode/cli/db",
+			".zcode/cli",
+		},
+		IDPrefix:  "zcode:",
+		FileBased: false,
+		Usage: UsageCapabilities{
+			NoPerMessageTokenData: true,
+		},
 	},
 	{
 		Type:         AgentZed,
@@ -552,6 +660,18 @@ var Registry = []AgentDef{
 		DefaultDirs: []string{".local/share/gptme/logs"},
 		IDPrefix:    "gptme:",
 		FileBased:   true,
+	},
+	{
+		Type:        AgentQoder,
+		DisplayName: "Qoder",
+		EnvVar:      "QODER_PROJECTS_DIR",
+		ConfigKey:   "qoder_project_dirs",
+		DefaultDirs: []string{
+			".qoder/projects",
+			".qoderwork/projects",
+		},
+		IDPrefix:  "qoder:",
+		FileBased: true,
 	},
 	{
 		// Shelley (exe.dev) stores all conversations in a single
@@ -617,6 +737,30 @@ var Registry = []AgentDef{
 		WatchSubdirs:   []string{"storage/session_diff"},
 		FileBased:      true,
 		WatchRootsFunc: ResolveIcodemateWatchRoots,
+	},
+	{
+		// RooCode (rooveterinaryinc.roo-cline) is a VSCode extension that
+		// stores sessions in VSCode's globalStorage directory under
+		// tasks/<taskId>/. Each task directory holds history_item.json
+		// (metadata) and ui_messages.json (transcript). VSCode
+		// canonicalizes globalStorage directory names to lowercase, so
+		// the default paths must use the lowercase extension ID to be
+		// discoverable on case-sensitive Linux filesystems. RooCode was
+		// shut down on May 15, 2026; ZooCode is the active community fork.
+		Type:        AgentRooCode,
+		DisplayName: "RooCode",
+		EnvVar:      "ROOCODE_DIR",
+		ConfigKey:   "roocode_dirs",
+		DefaultDirs: []string{
+			// macOS
+			"Library/Application Support/Code/User/globalStorage/rooveterinaryinc.roo-cline",
+			// Linux
+			".config/Code/User/globalStorage/rooveterinaryinc.roo-cline",
+			// Windows
+			"AppData/Roaming/Code/User/globalStorage/rooveterinaryinc.roo-cline",
+		},
+		IDPrefix:  "roocode:",
+		FileBased: true,
 	},
 }
 
@@ -790,6 +934,8 @@ type ParsedSession struct {
 	Project          string
 	Machine          string
 	Agent            AgentType
+	AgentLabel       string
+	Entrypoint       string
 	ParentSessionID  string
 	RelationshipType RelationshipType
 	Cwd              string
@@ -802,15 +948,21 @@ type ParsedSession struct {
 	// decode. Empty means full (parser did not classify). Currently set
 	// only by the Antigravity CLI parser.
 	TranscriptFidelity string
-	MalformedLines     int
-	IsTruncated        bool
-	FirstMessage       string
-	SessionName        string
-	StartedAt          time.Time
-	EndedAt            time.Time
-	MessageCount       int
-	UserMessageCount   int
-	File               FileInfo
+	// GenMetadataWithoutUsage reports whether this Antigravity session's steps
+	// table carried gen_metadata rows but none decoded into a usage event --
+	// an early warning that a newer agy build changed the gen_metadata wire
+	// format the token-block heuristic depends on. Set by both Antigravity
+	// parsers; false for every other agent.
+	GenMetadataWithoutUsage bool
+	MalformedLines          int
+	IsTruncated             bool
+	FirstMessage            string
+	SessionName             string
+	StartedAt               time.Time
+	EndedAt                 time.Time
+	MessageCount            int
+	UserMessageCount        int
+	File                    FileInfo
 
 	// TerminationStatus describes how the session appears to have
 	// ended. Empty string = unknown (parser did not classify, or
@@ -827,6 +979,10 @@ type ParsedSession struct {
 	// (e.g. VSCode Copilot). The sync engine forwards these into
 	// the usage_events table for catalog-based cost pricing.
 	UsageEvents []ParsedUsageEvent
+
+	// CountsAuthoritative marks parsers that own MessageCount and
+	// UserMessageCount even when they intentionally emit no transcript rows.
+	CountsAuthoritative bool
 
 	// aggregateTokenPresenceKnown marks session aggregate token
 	// coverage as parser-owned and authoritative.

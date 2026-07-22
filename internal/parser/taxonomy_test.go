@@ -26,6 +26,7 @@ func TestNormalizeToolCategory(t *testing.T) {
 		// Codex tools
 		{"shell_command", "Bash"},
 		{"exec_command", "Bash"},
+		{"list_files", "Read"},
 		{"apply_patch", "Edit"},
 		{"write_stdin", "Bash"},
 		{"shell", "Bash"},
@@ -100,6 +101,21 @@ func TestNormalizeToolCategory(t *testing.T) {
 		{"todo_write", "Tool"},
 		{"todo_read", "Tool"},
 		{"parallel", "Task"},
+
+		// RooCode tools
+		{"readFile", "Read"},
+		{"writeToFile", "Write"},
+		{"insertContent", "Write"},
+		{"searchAndReplace", "Edit"},
+		{"appliedDiff", "Edit"},
+		{"listFiles", "Read"},
+		{"listFilesTopLevel", "Read"},
+		{"listFilesRecursive", "Read"},
+		{"listCodeDefinitionNames", "Read"},
+		{"searchFiles", "Grep"},
+		{"newTask", "Task"},
+		{"skill", "Tool"},
+		{"search", "Tool"},
 
 		// Unknown
 		{"view_image", "Other"},

@@ -2,11 +2,13 @@ package db
 
 import (
 	"context"
+	"database/sql"
 	"fmt"
 	"sort"
 	"time"
 
 	"go.kenn.io/agentsview/internal/activity"
+	"go.kenn.io/agentsview/internal/export"
 )
 
 // activityReportRangeBoundsUTC returns the exact [start, end) UTC bounds
@@ -37,10 +39,18 @@ func activityReportRangeBoundsUTC(q activity.Query) (string, string) {
 //
 // The filter `f` is honored as-is: callers that want one-shot or
 // automated sessions included must pass them through with the
-// corresponding exclusions disabled.
+// corresponding exclusions disabled. Subagent and fork sessions are
+// always counted so the cost totals match GetDailyUsage, which never
+// filters by relationship_type. Fork sessions hold only their own
+// rewound-branch messages (the parsers partition entries across
+// branches), so counting them adds no duplicate activity; any usage
+// rows that do recur across sessions collapse in the aggregator's
+// dedup, the same guarantee GetDailyUsage relies on.
 func (db *DB) GetActivityReport(
 	ctx context.Context, f AnalyticsFilter, q activity.Query,
 ) (activity.Report, error) {
+	f.IncludeSubagents = true
+	f.IncludeForks = true
 	rangeStartUTC, rangeEndUTC := activityReportRangeBoundsUTC(q)
 	lowerBound := paddedUTCBound(q.RangeStart.UTC().Format(time.RFC3339), -14)
 	upperBound := paddedUTCBound(q.RangeEnd.UTC().Format(time.RFC3339), 14)
@@ -56,12 +66,12 @@ func (db *DB) GetActivityReport(
 		return activity.Report{}, err
 	}
 
-	usage, err := db.activityReportUsage(ctx, ids, lowerBound, upperBound)
+	usage, pricing, err := db.activityReportUsage(ctx, ids, lowerBound, upperBound, q)
 	if err != nil {
 		return activity.Report{}, err
 	}
 
-	return activity.Aggregate(activity.Params{
+	report := activity.Aggregate(activity.Params{
 		RangeStart:    q.RangeStart,
 		RangeEnd:      q.RangeEnd,
 		Loc:           q.Loc,
@@ -69,7 +79,177 @@ func (db *DB) GetActivityReport(
 		Partial:       q.Partial,
 		GapCapSeconds: q.GapCapSeconds,
 		Bucket:        q.Bucket,
-	}, sessions, acts, usage), nil
+	}, sessions, acts, usage)
+	report.SchemaVersion = export.ActivityReportSchemaVersion
+	report.Pricing = pricing
+	projects, err := db.BuildProjectIdentityMap(ctx,
+		activityReportProjectLabels(sessions))
+	if err != nil {
+		return activity.Report{}, err
+	}
+	activity.SanitizeProjectLabels(&report, projects)
+	report.Projects = export.ProjectMapForWire(projects)
+	return report, nil
+}
+
+// GetSessionUsageRows returns the backend-priced usage rows for the supplied
+// sessions, with the same cross-session deduplication as activity reports.
+type sqliteSessionUsageOrderedRow struct {
+	scan    usageScanRow
+	ts      time.Time
+	validTS bool
+	ordinal int64
+}
+
+func (db *DB) GetSessionUsageRows(
+	ctx context.Context, ids []string,
+) ([]activity.UsageRow, error) {
+	if len(ids) == 0 {
+		return nil, nil
+	}
+	pricing, err := db.loadPricingMap(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("loading pricing: %w", err)
+	}
+	rateResolver := export.NewPricingResolver(pricing)
+	sessionOrder := make(map[string]int, len(ids))
+	for i, id := range ids {
+		sessionOrder[id] = i
+	}
+	var rowsAcc []sqliteSessionUsageOrderedRow
+	err = queryChunked(ids, func(chunk []string) error {
+		ph, args := inPlaceholders(chunk)
+		query := usageRowSelect() + ` AND u.session_id IN ` + ph
+		rows, queryErr := db.getReader().QueryContext(ctx, query, args...)
+		if queryErr != nil {
+			return fmt.Errorf("querying session usage rows: %w", queryErr)
+		}
+		defer rows.Close()
+		for rows.Next() {
+			r, scanErr := scanUsageRow(rows)
+			if scanErr != nil {
+				return fmt.Errorf("scanning session usage rows: %w", scanErr)
+			}
+			ordinal := int64(-1)
+			if r.messageOrdinal.Valid {
+				ordinal = r.messageOrdinal.Int64
+			}
+			parsedTS, tsErr := parseTimestamp(r.ts)
+			rowsAcc = append(rowsAcc, sqliteSessionUsageOrderedRow{
+				scan:    r,
+				ts:      parsedTS,
+				validTS: tsErr == nil,
+				ordinal: ordinal,
+			})
+		}
+		return rows.Err()
+	})
+	if err != nil {
+		return nil, err
+	}
+	sort.SliceStable(rowsAcc, func(i, j int) bool {
+		return sqliteSessionUsageRowLess(rowsAcc[i], rowsAcc[j], sessionOrder)
+	})
+	seen := make(map[usageDedupToken]struct{})
+	out := make([]activity.UsageRow, 0, len(rowsAcc))
+	for _, o := range rowsAcc {
+		r := o.scan
+		if key, ok := usageDedupTokenForRow(
+			r.usageSource, r.agent, r.claudeMessageID,
+			r.claudeRequestID, r.sourceUUID, r.usageDedupKey,
+		); ok {
+			if _, dup := seen[key]; dup {
+				continue
+			}
+			seen[key] = struct{}{}
+		}
+		_, outputTok, _, _, _ := sqliteSessionUsageRowTokens(r)
+		costRow := r
+		var sessionCost *float64
+		if r.costSource == CopilotReportedCostSource && r.costUSD.Valid {
+			v := r.costUSD.Float64
+			sessionCost = &v
+			costRow.costUSD = sql.NullFloat64{}
+			rateResolver.RecordUnattributedReported()
+		}
+		cost, priced, contributes := sessionRowCost(costRow, rateResolver)
+		costSource := export.CostSourceComputed
+		if costRow.costUSD.Valid {
+			costSource = export.CostSourceReported
+		}
+		out = append(out, activity.UsageRow{
+			SessionID:       r.sessionID,
+			Model:           r.model,
+			Timestamp:       r.ts,
+			OutputTokens:    outputTok,
+			Cost:            cost,
+			CostSource:      costSource,
+			SessionCost:     sessionCost,
+			Priced:          priced,
+			Contributes:     contributes,
+			Agent:           r.agent,
+			ClaudeMessageID: r.claudeMessageID,
+			ClaudeRequestID: r.claudeRequestID,
+			SourceUUID:      r.sourceUUID,
+			UsageDedupKey:   r.usageDedupKey,
+		})
+	}
+	return out, nil
+}
+
+func sqliteSessionUsageRowTokens(
+	r usageScanRow,
+) (inputTok, outputTok, cacheCrTok, cacheRdTok, reasoningTok int) {
+	if r.usageSource == "message" {
+		return clampedUsageTokenCountersWithReasoning(r.tokenJSON)
+	}
+	inputTok, outputTok, cacheCrTok, cacheRdTok = usageEventRowTokens(
+		r.usageSource,
+		r.inputTokens, r.outputTokens,
+		r.cacheCreationInputTokens, r.cacheReadInputTokens,
+	)
+	return inputTok, outputTok, cacheCrTok, cacheRdTok, r.reasoningTokens
+}
+
+func sqliteSessionUsageRowLess(
+	a, b sqliteSessionUsageOrderedRow,
+	sessionOrder map[string]int,
+) bool {
+	if a.validTS && b.validTS {
+		if !a.ts.Equal(b.ts) {
+			return a.ts.Before(b.ts)
+		}
+	} else if a.validTS != b.validTS {
+		return a.validTS
+	}
+	if a.scan.ts != b.scan.ts {
+		return a.scan.ts < b.scan.ts
+	}
+	if ai, ok := sessionOrder[a.scan.sessionID]; ok {
+		if bi, ok := sessionOrder[b.scan.sessionID]; ok && ai != bi {
+			return ai < bi
+		}
+	}
+	if a.scan.sessionID != b.scan.sessionID {
+		return a.scan.sessionID < b.scan.sessionID
+	}
+	if a.ordinal != b.ordinal {
+		return a.ordinal < b.ordinal
+	}
+	if a.scan.usageSource != b.scan.usageSource {
+		return a.scan.usageSource < b.scan.usageSource
+	}
+	return a.scan.usageDedupKey < b.scan.usageDedupKey
+}
+
+func activityReportProjectLabels(
+	sessions []activity.SessionMeta,
+) []string {
+	set := make(map[string]struct{}, len(sessions))
+	for _, session := range sessions {
+		set[session.Project] = struct{}{}
+	}
+	return sortedSetKeys(set)
 }
 
 // activityReportSessions returns the candidate sessions whose window
@@ -96,7 +276,7 @@ func (db *DB) activityReportSessions(
 	query := `SELECT
 		s.id,
 		COALESCE(NULLIF(s.display_name, ''), NULLIF(s.session_name, ''),
-			NULLIF(s.first_message, ''), NULLIF(s.project, ''), s.id),
+			NULLIF(s.project, ''), s.id),
 		s.project,
 		s.agent,
 		s.machine,
@@ -195,18 +375,22 @@ func (db *DB) activityReportActivity(
 // chronologically (matching PostgreSQL/DuckDB); lexically '.' < 'Z' would
 // otherwise invert them and let SQLite keep a different duplicate row.
 func (db *DB) activityReportUsage(
-	ctx context.Context, ids []string, lowerBound, upperBound string,
-) ([]activity.UsageRow, error) {
-	var out []activity.UsageRow
-	if len(ids) == 0 {
-		return out, nil
-	}
+	ctx context.Context, ids []string, lowerBound, upperBound string, q activity.Query,
+) ([]activity.UsageRow, *export.PricingBlock, error) {
+	out := []activity.UsageRow{}
 
 	pricing, err := db.loadPricingMap(ctx)
 	if err != nil {
-		return nil, fmt.Errorf("loading pricing: %w", err)
+		return nil, nil, fmt.Errorf("loading pricing: %w", err)
 	}
-	rateResolver := newModelRateResolver(pricing)
+	rateResolver := export.NewPricingResolver(pricing)
+	if len(ids) == 0 {
+		block, err := rateResolver.BuildBlock()
+		if err != nil {
+			return nil, nil, fmt.Errorf("building pricing block: %w", err)
+		}
+		return out, &block, nil
+	}
 
 	// Accumulate the parsed ts and dedup ordinal alongside each mapped row so
 	// we can impose one global (ts, session_id, ordinal) order across all
@@ -215,6 +399,7 @@ func (db *DB) activityReportUsage(
 	// per-chunk ordering is not enough for the aggregator's first-seen dedup.
 	type ordered struct {
 		row     activity.UsageRow
+		scan    dailyUsageScanRow
 		ts      time.Time
 		ordinal int64
 	}
@@ -253,7 +438,6 @@ func (db *DB) activityReportUsage(
 				return fmt.Errorf(
 					"scanning activity report usage: %w", scanErr)
 			}
-			_, outputTok, _, _, cost, _ := dailyUsageAmounts(r, rateResolver)
 			ord := int64(-1)
 			if r.messageOrdinal.Valid {
 				ord = r.messageOrdinal.Int64
@@ -262,12 +446,11 @@ func (db *DB) activityReportUsage(
 			rowsAcc = append(rowsAcc, ordered{
 				ts:      parsedTS,
 				ordinal: ord,
+				scan:    r,
 				row: activity.UsageRow{
 					SessionID:       r.sessionID,
 					Model:           r.model,
 					Timestamp:       r.ts,
-					OutputTokens:    outputTok,
-					Cost:            cost,
 					Agent:           r.agent,
 					ClaudeMessageID: r.claudeMessageID,
 					ClaudeRequestID: r.claudeRequestID,
@@ -279,7 +462,7 @@ func (db *DB) activityReportUsage(
 		return rows.Err()
 	})
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
 	sort.SliceStable(rowsAcc, func(i, j int) bool {
@@ -292,9 +475,76 @@ func (db *DB) activityReportUsage(
 		}
 		return a.ordinal < b.ordinal
 	})
-	out = make([]activity.UsageRow, len(rowsAcc))
+	baseRows := make([]activity.UsageRow, len(rowsAcc))
 	for i, o := range rowsAcc {
-		out[i] = o.row
+		baseRows[i] = o.row
 	}
-	return out, nil
+	mask := activity.UsageSurvivorMask(q.RangeStart, q.RangeEnd, q.EffectiveEnd, baseRows)
+	out = make([]activity.UsageRow, 0, len(rowsAcc))
+	for i, o := range rowsAcc {
+		if !mask[i] {
+			continue
+		}
+		_, outputTok, _, _, _, _ := dailyUsageAmounts(o.scan, rateResolver)
+		costRow := o.scan
+		var sessionCost *float64
+		if o.scan.costSource == CopilotReportedCostSource && o.scan.costUSD.Valid {
+			v := o.scan.costUSD.Float64
+			sessionCost = &v
+			costRow.costUSD = sql.NullFloat64{}
+			rateResolver.RecordUnattributedReported()
+		}
+		cost, priced, contributes := sqliteActivityReportRowStatus(costRow, rateResolver)
+		costSource := export.CostSourceComputed
+		if costRow.costUSD.Valid {
+			costSource = export.CostSourceReported
+		}
+		row := o.row
+		row.OutputTokens = outputTok
+		row.Cost = cost
+		row.CostSource = costSource
+		row.SessionCost = sessionCost
+		row.Priced = priced
+		row.Contributes = contributes
+		out = append(out, row)
+	}
+	block, err := rateResolver.BuildBlock()
+	if err != nil {
+		return nil, nil, fmt.Errorf("building pricing block: %w", err)
+	}
+	return out, &block, nil
+}
+
+func sqliteActivityReportRowStatus(
+	r dailyUsageScanRow, pricing *export.PricingResolver,
+) (cost float64, priced, contributes bool) {
+	var inTok, outTok, crTok, rdTok int
+	reasoningTok := r.reasoningTokens
+	if r.usageSource == "message" {
+		inTok, outTok, crTok, rdTok, reasoningTok =
+			clampedUsageTokenCountersWithReasoning(r.tokenJSON)
+	} else {
+		inTok, outTok, crTok, rdTok = usageEventRowTokens(
+			r.usageSource,
+			r.inputTokens, r.outputTokens,
+			r.cacheCreationInputTokens, r.cacheReadInputTokens)
+	}
+
+	if r.costUSD.Valid {
+		pricing.RecordReported(r.model, pricing.Lookup(r.model))
+		return r.costUSD.Float64, true, true
+	}
+	if inTok == 0 && outTok == 0 && reasoningTok == 0 &&
+		crTok == 0 && rdTok == 0 {
+		return 0, true, false
+	}
+	lookup := pricing.Lookup(r.model)
+	if !lookup.OK {
+		pricing.RecordComputed(r.model, lookup)
+		return 0, false, true
+	}
+	cost = lookup.Rates.CostForTokens(
+		inTok, outTok, reasoningTok, crTok, rdTok)
+	pricing.RecordComputed(r.model, lookup)
+	return cost, true, true
 }

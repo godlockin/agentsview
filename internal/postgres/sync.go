@@ -143,12 +143,23 @@ func isUndefinedColumn(err error) bool {
 	return strings.Contains(err.Error(), "42703")
 }
 
+// isInsufficientPrivilege returns true when the role lacks a required
+// privilege (PG SQLSTATE 42501) — e.g. a restricted push role that cannot
+// create vector tables in a schema provisioned by a privileged role.
+func isInsufficientPrivilege(err error) bool {
+	if err == nil {
+		return false
+	}
+	return strings.Contains(err.Error(), "42501")
+}
+
 // Sync manages push-only sync from local SQLite to a remote
 // PostgreSQL database.
 type Sync struct {
 	pg                     *sql.DB
 	local                  *db.DB
 	syncState              syncStateStore
+	aliasBackfillState     syncStateStore
 	machine                string
 	schema                 string
 	targetFingerprint      string
@@ -158,6 +169,10 @@ type Sync struct {
 	// Project filtering for push scope.
 	projects        []string
 	excludeProjects []string
+
+	// vectorSource, when set, supplies the local vectors.db active generation
+	// pushed as a phase at the end of Push. Nil disables the phase.
+	vectorSource VectorPushSource
 
 	closeOnce sync.Once
 	closeErr  error
@@ -173,6 +188,13 @@ func (s *Sync) effectiveSyncState() syncStateStore {
 	return s.local
 }
 
+func (s *Sync) aliasBackfillSyncStateOrDefault() syncStateStore {
+	if s.aliasBackfillState != nil {
+		return s.aliasBackfillState
+	}
+	return s.effectiveSyncState()
+}
+
 // SyncOptions holds optional configuration for a Sync instance.
 type SyncOptions struct {
 	// Projects limits push scope to these project names.
@@ -186,6 +208,9 @@ type SyncOptions struct {
 	// MigrateLegacySyncState moves unsuffixed legacy sync-state keys into the
 	// named default target the first time that target runs.
 	MigrateLegacySyncState bool
+	// VectorSource, when non-nil, enables the vector push phase, replicating
+	// the local vectors.db active generation into PG. Nil skips the phase.
+	VectorSource VectorPushSource
 }
 
 // New creates a Sync instance and verifies the PG connection.
@@ -239,6 +264,7 @@ func New(
 		opts.Projects,
 		opts.ExcludeProjects,
 	)
+	aliasBackfillStateScope := opts.SyncStateTarget
 	migrateLegacySyncState := opts.MigrateLegacySyncState &&
 		!hasProjectFilter(opts.Projects, opts.ExcludeProjects)
 
@@ -250,6 +276,11 @@ func New(
 			syncStateScope,
 			migrateLegacySyncState,
 		),
+		aliasBackfillState: newScopedSyncStateStore(
+			local,
+			aliasBackfillStateScope,
+			false,
+		),
 		machine:                machine,
 		schema:                 schema,
 		targetFingerprint:      targetFingerprint,
@@ -257,6 +288,7 @@ func New(
 		migrateLegacySyncState: migrateLegacySyncState,
 		projects:               opts.Projects,
 		excludeProjects:        opts.ExcludeProjects,
+		vectorSource:           opts.VectorSource,
 	}, nil
 }
 
@@ -375,6 +407,15 @@ func (s *Sync) ensureSchemaLocked(ctx context.Context) error {
 		// existing rows.
 		if err := runSchemaDataRepairsPG(ctx, s.pg); err != nil {
 			return err
+		}
+		// pushSchemaCurrent predates the vector tables, so a schema
+		// created before this feature is "current" yet lacks them; a
+		// plain post-upgrade pg push would never create them. Run the
+		// same best-effort vector setup the full EnsureSchema path does
+		// (schema.go), once per Sync via the schemaDone memo. Failure
+		// leaves semantic search unavailable but must not fail the push.
+		if _, err := ensureVectorBaseSchemaPG(ctx, s.pg); err != nil {
+			log.Printf("pg schema: vector schema setup failed: %v", err)
 		}
 		s.schemaDone = true
 		return nil

@@ -268,6 +268,13 @@ func contractMessagesOrderingAndToolResults(
 	require.NoError(t, err)
 	require.Equal(t, []int{0, 1, 2, 3, 4}, messageOrdinals(all))
 
+	modelCounts, err := store.GetResumeModelCounts(ctx, fixture.alphaID)
+	require.NoError(t, err)
+	require.Equal(t, []ModelCount{{
+		Model: "claude-sonnet-contract",
+		Count: 2,
+	}}, modelCounts)
+
 	activity, err := store.GetSessionActivity(ctx, fixture.alphaID)
 	require.NoError(t, err)
 	require.NotNil(t, activity)
@@ -512,7 +519,7 @@ func contractAnalyticsTrendsAndUsage(
 	skills, err := store.GetAnalyticsSkills(ctx, AnalyticsFilter{
 		From: "2026-01-10",
 		To:   "2026-01-10",
-	})
+	}, "week")
 	require.NoError(t, err)
 	require.Equal(t, 1, skills.TotalSkillCalls)
 	require.Equal(t, 1, skills.DistinctSkills)
@@ -561,7 +568,7 @@ func contractAnalyticsTrendsAndUsage(
 	require.Equal(t, 3, counts.Total)
 	require.Equal(t, 2, counts.ByProject["alpha"])
 
-	usage, err := store.GetSessionUsage(ctx, fixture.alphaID)
+	usage, err := store.GetSessionUsage(ctx, fixture.alphaID, true)
 	require.NoError(t, err)
 	require.NotNil(t, usage)
 	require.True(t, usage.HasTokenData)
@@ -593,6 +600,10 @@ func contractLocalOnlyMethods(
 		_, err = store.InsertInsight(Insight{})
 		requireReadOnly(t, err)
 		requireReadOnly(t, store.DeleteInsight(1))
+		_, err = store.RecordRecallQueryEvent(ctx, RecallQueryEvent{
+			Surface: RecallQuerySurfaceQuery,
+		})
+		requireReadOnly(t, err)
 		return
 	}
 
@@ -642,6 +653,12 @@ func contractLocalOnlyMethods(
 	require.NoError(t, err)
 	require.Len(t, list, 1)
 	require.NoError(t, store.DeleteInsight(insightID))
+	queryID, err := store.RecordRecallQueryEvent(ctx, RecallQueryEvent{
+		Query:   "store contract recall query",
+		Surface: RecallQuerySurfaceQuery,
+	})
+	require.NoError(t, err)
+	require.NotEmpty(t, queryID)
 }
 
 func TestStoreContractGetUsageMatchingSessionCountCountsCopilotSessionsWithoutUsageRows(

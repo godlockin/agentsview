@@ -5,7 +5,9 @@ import (
 	"crypto/sha256"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -41,6 +43,8 @@ type testEnv struct {
 	ompDir            string
 	kiroDir           string
 	shelleyDir        string
+	traeDir           string
+	windsurfDir       string
 	antigravityCLIDir string
 	db                *db.DB
 	engine            *sync.Engine
@@ -277,11 +281,1054 @@ func assignFocusedAgentDir(
 		env.kiroDir = dir
 	case parser.AgentShelley:
 		env.shelleyDir = dir
+	case parser.AgentTrae:
+		env.traeDir = dir
+	case parser.AgentWindsurf:
+		env.windsurfDir = dir
 	case parser.AgentAntigravityCLI:
 		env.antigravityCLIDir = dir
 	default:
 		t.Fatalf("unsupported focused test fixture for %s", agent)
 	}
+}
+
+func TestGrokSummaryCountsSurviveSync(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test")
+	}
+	root := t.TempDir()
+	summaryPath := filepath.Join(
+		root,
+		"cwd-key",
+		"sess-1",
+		"summary.json",
+	)
+	require.NoError(t, os.MkdirAll(filepath.Dir(summaryPath), 0o755))
+	require.NoError(t, os.WriteFile(summaryPath, []byte(`{
+		"summary":"Preserve Grok counts",
+		"firstPrompt":"resume the build",
+		"modelId":"grok-code-fast",
+		"createdAt":"2026-07-08T10:00:00Z",
+		"updatedAt":"2026-07-08T10:30:00Z",
+		"lastActiveAt":"2026-07-08T10:31:00Z",
+		"numMessages":6,
+		"worktreeLabel":"agentsview"
+	}`), 0o644))
+	require.NoError(t, os.WriteFile(filepath.Join(
+		root, "cwd-key", "sess-1", "signals.json",
+	), []byte(`{
+		"tokenUsage": {
+			"peakContextTokens": 4096
+		}
+	}`), 0o644))
+	require.NoError(t, os.WriteFile(filepath.Join(
+		root, "cwd-key", "sess-1", "updates.jsonl",
+	), []byte(`{"params":{"update":{"usage":{"inputTokens":131966,"outputTokens":326,"totalTokens":132292,"cachedReadTokens":131456,"reasoningTokens":122,"modelCalls":1,"apiDurationMs":7493,"costUsdTicks":424128000,"modelUsage":{"grok-4.5-build":{"inputTokens":131966,"outputTokens":326,"totalTokens":132292,"cachedReadTokens":131456,"reasoningTokens":122,"modelCalls":1,"apiDurationMs":7493,"costUsdTicks":424128000}},"numTurns":1}}}}`+"\n"), 0o644))
+
+	database := dbtest.OpenTestDB(t)
+	engine := sync.NewEngine(database, sync.EngineConfig{
+		AgentDirs: map[parser.AgentType][]string{
+			parser.AgentGrok: {root},
+		},
+		Machine: "local",
+	})
+
+	stats := engine.SyncAll(context.Background(), nil)
+	require.GreaterOrEqual(t, stats.Synced, 1)
+
+	sess, err := database.GetSession(context.Background(), "grok:sess-1")
+	require.NoError(t, err)
+	require.NotNil(t, sess)
+	assert.Equal(t, 6, sess.MessageCount)
+	assert.Equal(t, 1, sess.UserMessageCount)
+	assert.True(t, sess.HasPeakContextTokens)
+	assert.Equal(t, 4096, sess.PeakContextTokens)
+
+	promptSearch, err := database.Search(context.Background(), db.SearchFilter{
+		Query: "resume the build",
+		Limit: 5,
+	})
+	require.NoError(t, err)
+	require.Len(t, promptSearch.Results, 1)
+	assert.Equal(t, "grok:sess-1", promptSearch.Results[0].SessionID)
+
+	nameSearch, err := database.Search(context.Background(), db.SearchFilter{
+		Query: "Preserve Grok counts",
+		Limit: 5,
+	})
+	require.NoError(t, err)
+	require.Len(t, nameSearch.Results, 1)
+	assert.Equal(t, "grok:sess-1", nameSearch.Results[0].SessionID)
+
+	daily, err := database.GetDailyUsage(context.Background(), db.UsageFilter{
+		From: "2026-07-08", To: "2026-07-08", Agent: "grok",
+	})
+	require.NoError(t, err)
+	assert.Equal(t, 510, daily.Totals.InputTokens)
+	assert.Equal(t, 131456, daily.Totals.CacheReadTokens)
+	assert.Equal(t, 326, daily.Totals.OutputTokens)
+	assert.InDelta(t, 0.0424128, daily.Totals.TotalCost, 1e-9)
+
+	usage, err := database.GetSessionUsage(
+		context.Background(), "grok:sess-1", true,
+	)
+	require.NoError(t, err)
+	require.NotNil(t, usage)
+	assert.Contains(t, usage.Models, "grok-4.5-build")
+	assert.True(t, usage.HasCost)
+	assert.InDelta(t, 0.0424128, usage.CostUSD, 1e-9)
+	require.Len(t, usage.Breakdown, 1)
+	assert.Equal(t, 510, usage.Breakdown[0].InputTokens)
+	assert.Equal(t, 131456, usage.Breakdown[0].CacheReadInputTokens)
+	assert.Equal(t, 326, usage.Breakdown[0].OutputTokens)
+	assert.True(t, usage.Breakdown[0].HasCost)
+	assert.InDelta(t, 0.0424128, usage.Breakdown[0].CostUSD, 1e-9)
+
+	events, err := database.GetUsageEvents(
+		context.Background(), "grok:sess-1",
+	)
+	require.NoError(t, err)
+	require.Len(t, events, 1)
+	assert.Equal(t, 122, events[0].ReasoningTokens)
+	require.NotNil(t, events[0].CostUSD)
+	assert.InDelta(t, 0.0424128, *events[0].CostUSD, 1e-9)
+
+	exported, err := database.ExportSessionSummaries(
+		context.Background(),
+		db.SessionExportOptions{
+			Filter: db.SessionFilter{Agent: "grok"},
+			Limit:  10,
+			Format: "json",
+		},
+	)
+	require.NoError(t, err)
+	require.Len(t, exported.Rows, 1)
+	require.NotNil(t, exported.Rows[0].ModelUsage)
+	assert.Equal(t, 122, exported.Rows[0].ModelUsage.ReasoningTokens)
+	require.Contains(t,
+		exported.Rows[0].ModelUsage.ByModel, "grok-4.5-build",
+	)
+	assert.Equal(t, 122,
+		exported.Rows[0].ModelUsage.ByModel["grok-4.5-build"].ReasoningTokens,
+	)
+}
+
+type openCodeFamilySQLiteCase struct {
+	name   string
+	agent  parser.AgentType
+	dbName string
+	prefix string
+}
+
+func openCodeFamilySQLiteCases() []openCodeFamilySQLiteCase {
+	return []openCodeFamilySQLiteCase{
+		{
+			name: "opencode", agent: parser.AgentOpenCode,
+			dbName: "opencode.db", prefix: "opencode:",
+		},
+		{
+			name: "kilo", agent: parser.AgentKilo,
+			dbName: "kilo.db", prefix: "kilo:",
+		},
+		{
+			name: "mimocode", agent: parser.AgentMiMoCode,
+			dbName: "mimocode.db", prefix: "mimocode:",
+		},
+		{
+			name: "icodemate", agent: parser.AgentIcodemate,
+			dbName: "icodemate.db", prefix: "icodemate:",
+		},
+	}
+}
+
+func newOpenCodeFamilySQLiteTestEngine(
+	t *testing.T,
+	agent parser.AgentType,
+	root string,
+	database *db.DB,
+) *sync.Engine {
+	t.Helper()
+	return sync.NewEngine(database, sync.EngineConfig{
+		AgentDirs: map[parser.AgentType][]string{
+			agent: {root},
+		},
+		Machine: "local",
+	})
+}
+
+func seedOpenCodeSQLiteTextSession(
+	t *testing.T,
+	oc *openCodeTestDB,
+	projectID, sessionID string,
+	timeCreated, timeUpdated int64,
+	userContent, assistantContent string,
+) {
+	t.Helper()
+	oc.addSession(t, sessionID, projectID, timeCreated, timeUpdated)
+	userMessageID := sessionID + "-msg-user"
+	assistantMessageID := sessionID + "-msg-assistant"
+	oc.addMessage(t, userMessageID, sessionID, "user", timeCreated)
+	oc.addMessage(
+		t, assistantMessageID, sessionID, "assistant", timeCreated+1,
+	)
+	oc.addTextPart(
+		t, userMessageID+"-part", sessionID, userMessageID,
+		userContent, timeCreated,
+	)
+	oc.addTextPart(
+		t, assistantMessageID+"-part", sessionID,
+		assistantMessageID, assistantContent, timeCreated+1,
+	)
+}
+
+func openCodeLocalModifiedSnapshot(
+	t *testing.T,
+	database *db.DB,
+	sessionIDs ...string,
+) map[string]string {
+	t.Helper()
+	out := make(map[string]string, len(sessionIDs))
+	for _, sessionID := range sessionIDs {
+		sess, err := database.GetSessionFull(context.Background(), sessionID)
+		require.NoError(t, err, "GetSessionFull(%q)", sessionID)
+		require.NotNil(t, sess, "session %q not found", sessionID)
+		require.NotNil(t, sess.LocalModifiedAt,
+			"local_modified_at for %q", sessionID)
+		out[sessionID] = *sess.LocalModifiedAt
+	}
+	return out
+}
+
+func openCodeStoredSession(
+	t *testing.T,
+	database *db.DB,
+	sessionID string,
+) *db.Session {
+	t.Helper()
+	sess, err := database.GetSessionFull(context.Background(), sessionID)
+	require.NoError(t, err, "GetSessionFull(%q)", sessionID)
+	require.NotNil(t, sess, "session %q not found", sessionID)
+	return sess
+}
+
+func setFileMtime(t *testing.T, path string, mtimeNS int64) {
+	t.Helper()
+	ts := time.Unix(0, mtimeNS)
+	require.NoError(t, os.Chtimes(path, ts, ts), "chtimes %s", path)
+}
+
+// TestSyncPathsContextCancelledAbortsWithoutWriting pins shutdown
+// responsiveness for watcher-driven syncs: SyncPathsContext must honor its
+// context and abort before writing, instead of running the sync to
+// completion while Watcher.Stop (and therefore SIGTERM shutdown) waits on
+// it. The same paths sync fine once the context is live again.
+func TestSyncPathsContextCancelledAbortsWithoutWriting(t *testing.T) {
+	env := setupSingleAgentTestEnv(t, parser.AgentOpenCode)
+	storage := createOpenCodeStorageFixture(t, env.opencodeDir)
+	const sessionID = "oc-cancelled-sync"
+	sessionPath := storage.addSession(
+		t, "global", sessionID,
+		"/home/user/code/oc-app", "Cancelled Sync",
+		1704067200000, 1704067205000,
+	)
+	storage.addMessage(
+		t, sessionID, "msg-a1", "assistant",
+		1704067201000, nil,
+	)
+	storage.addTextPart(
+		t, sessionID, "msg-a1", "part-a1",
+		"cancelled sync reply", 1704067201000,
+	)
+
+	cancelled, cancel := context.WithCancel(context.Background())
+	cancel()
+	env.engine.SyncPathsContext(cancelled, []string{sessionPath})
+
+	sess, err := env.db.GetSessionFull(
+		context.Background(), "opencode:"+sessionID,
+	)
+	require.NoError(t, err, "GetSessionFull after cancelled sync")
+	assert.Nil(t, sess,
+		"a cancelled watcher sync must not write the session")
+
+	env.engine.SyncPathsContext(
+		context.Background(), []string{sessionPath},
+	)
+	assertMessageContent(
+		t, env.db, "opencode:"+sessionID, "cancelled sync reply",
+	)
+}
+
+func TestSyncEngineOpenCodeFamilySQLiteDropsUnchangedContainerSessions(
+	t *testing.T,
+) {
+	for _, tt := range openCodeFamilySQLiteCases() {
+		t.Run(tt.name, func(t *testing.T) {
+			root := t.TempDir()
+			database := dbtest.OpenTestDB(t)
+			engine := newOpenCodeFamilySQLiteTestEngine(
+				t, tt.agent, root, database,
+			)
+			oc := createOpenCodeLikeDB(
+				t, filepath.Join(root, tt.dbName), tt.name,
+			)
+			oc.addProject(t, "proj", "/home/user/code/opencode-app")
+			seedOpenCodeSQLiteTextSession(
+				t, oc, "proj", "stable-one",
+				1779012000000, 1779012030000,
+				"first prompt", "first answer",
+			)
+			seedOpenCodeSQLiteTextSession(
+				t, oc, "proj", "stable-two",
+				1779012100000, 1779012130000,
+				"second prompt", "second answer",
+			)
+
+			stats := engine.SyncAll(context.Background(), nil)
+			require.False(t, stats.Aborted, "first sync aborted: %+v", stats)
+			assert.Equal(t, 2, stats.Synced, "first sync writes both sessions")
+
+			sessionIDs := []string{
+				tt.prefix + "stable-one",
+				tt.prefix + "stable-two",
+			}
+			before := openCodeLocalModifiedSnapshot(
+				t, database, sessionIDs...,
+			)
+
+			time.Sleep(20 * time.Millisecond)
+			stats = engine.SyncAll(context.Background(), nil)
+			require.False(t, stats.Aborted, "second sync aborted: %+v", stats)
+			assert.Equal(t, 0, stats.Synced,
+				"unchanged %s SQLite container sessions must be dropped", tt.name)
+
+			after := openCodeLocalModifiedSnapshot(
+				t, database, sessionIDs...,
+			)
+			assert.Equal(t, before, after,
+				"unchanged %s rows must not be rewritten", tt.name)
+		})
+	}
+}
+
+func TestSyncEngineOpenCodeSQLiteDropsOnlyUnchangedContainerRows(
+	t *testing.T,
+) {
+	env := setupSingleAgentTestEnv(t, parser.AgentOpenCode)
+	oc := createOpenCodeDB(t, env.opencodeDir)
+	oc.addProject(t, "proj", "/home/user/code/opencode-app")
+	seedOpenCodeSQLiteTextSession(
+		t, oc, "proj", "changed-session",
+		1779012000000, 1779012030000,
+		"original prompt", "original answer",
+	)
+	seedOpenCodeSQLiteTextSession(
+		t, oc, "proj", "stable-session",
+		1779012100000, 1779012130000,
+		"stable prompt", "stable answer",
+	)
+
+	stats := env.engine.SyncAll(context.Background(), nil)
+	require.False(t, stats.Aborted, "first sync aborted: %+v", stats)
+	assert.Equal(t, 2, stats.Synced, "first sync writes both sessions")
+
+	changedID := "opencode:changed-session"
+	stableID := "opencode:stable-session"
+	before := openCodeLocalModifiedSnapshot(
+		t, env.db, changedID, stableID,
+	)
+
+	time.Sleep(20 * time.Millisecond)
+	oc.updateSessionTime(t, "changed-session", 1779015630000)
+	oc.replaceTextContent(
+		t, "changed-session",
+		"changed prompt", "changed answer",
+		1779015600000,
+	)
+
+	stats = env.engine.SyncAll(context.Background(), nil)
+	require.False(t, stats.Aborted, "second sync aborted: %+v", stats)
+	assert.Equal(t, 1, stats.Synced,
+		"only the changed OpenCode SQLite row should be rewritten")
+	assertMessageContent(
+		t, env.db, changedID, "changed prompt", "changed answer",
+	)
+
+	after := openCodeLocalModifiedSnapshot(
+		t, env.db, changedID, stableID,
+	)
+	assert.NotEqual(t, before[changedID], after[changedID],
+		"changed row must be rewritten")
+	assert.Equal(t, before[stableID], after[stableID],
+		"unchanged sibling row must not be rewritten")
+	assertMessageContent(
+		t, env.db, stableID, "stable prompt", "stable answer",
+	)
+}
+
+func TestSyncEngineOpenCodeSQLiteSameMtimeContentChangeUsesFingerprint(
+	t *testing.T,
+) {
+	env := setupSingleAgentTestEnv(t, parser.AgentOpenCode)
+	oc := createOpenCodeDB(t, env.opencodeDir)
+	oc.addProject(t, "proj", "/home/user/code/opencode-app")
+	seedOpenCodeSQLiteTextSession(
+		t, oc, "proj", "same-mtime-sqlite",
+		1779012000000, 1779012030000,
+		"original prompt", "original answer",
+	)
+
+	stats := env.engine.SyncAll(context.Background(), nil)
+	require.False(t, stats.Aborted, "first sync aborted: %+v", stats)
+	assert.Equal(t, 1, stats.Synced, "first sync writes the SQLite session")
+	sessionID := "opencode:same-mtime-sqlite"
+	assertMessageContent(
+		t, env.db, sessionID, "original prompt", "original answer",
+	)
+	before := openCodeStoredSession(t, env.db, sessionID)
+	require.NotNil(t, before.FileMtime, "file_mtime before rewrite")
+	require.NotNil(t, before.FileHash, "file_hash before rewrite")
+	require.NotNil(t, before.LocalModifiedAt,
+		"local_modified_at before rewrite")
+
+	time.Sleep(20 * time.Millisecond)
+	oc.replaceTextContent(
+		t, "same-mtime-sqlite",
+		"changed prompt with same session mtime",
+		"changed answer with same session mtime",
+		1779012000000,
+	)
+
+	stats = env.engine.SyncAll(context.Background(), nil)
+	require.False(t, stats.Aborted, "second sync aborted: %+v", stats)
+	assert.Equal(t, 1, stats.Synced,
+		"same-mtime SQLite fingerprint changes must be rewritten")
+	assertMessageContent(
+		t, env.db, sessionID,
+		"changed prompt with same session mtime",
+		"changed answer with same session mtime",
+	)
+	after := openCodeStoredSession(t, env.db, sessionID)
+	require.NotNil(t, after.FileMtime, "file_mtime after rewrite")
+	require.NotNil(t, after.FileHash, "file_hash after rewrite")
+	require.NotNil(t, after.LocalModifiedAt,
+		"local_modified_at after rewrite")
+	assert.Equal(t, *before.FileMtime, *after.FileMtime,
+		"same-mtime rewrite keeps the OpenCode SQLite session mtime")
+	assert.NotEqual(t, *before.FileHash, *after.FileHash,
+		"changed SQLite child content must change the storage fingerprint")
+	assert.Greater(t, *after.LocalModifiedAt, *before.LocalModifiedAt,
+		"successful rewrite must bump local_modified_at for push windows")
+}
+
+// TestSyncEngineOpenCodeSQLiteUntouchedContainerSkipsReparse pins the
+// container-level freshness gate: when the shared opencode.db file is
+// completely untouched since the last verified sync, its sessions must be
+// counted as skipped (no per-session fingerprint, no parse) instead of
+// being re-parsed and dropped as unchanged after the fact.
+func TestSyncEngineOpenCodeSQLiteUntouchedContainerSkipsReparse(
+	t *testing.T,
+) {
+	env := setupSingleAgentTestEnv(t, parser.AgentOpenCode)
+	oc := createOpenCodeDB(t, env.opencodeDir)
+	oc.addProject(t, "proj", "/home/user/code/opencode-app")
+	seedOpenCodeSQLiteTextSession(
+		t, oc, "proj", "gated-one",
+		1779012000000, 1779012030000,
+		"first prompt", "first answer",
+	)
+	seedOpenCodeSQLiteTextSession(
+		t, oc, "proj", "gated-two",
+		1779012100000, 1779012130000,
+		"second prompt", "second answer",
+	)
+
+	stats := env.engine.SyncAll(context.Background(), nil)
+	require.False(t, stats.Aborted, "first sync aborted: %+v", stats)
+	assert.Equal(t, 2, stats.Synced, "first sync writes both sessions")
+
+	stats = env.engine.SyncAll(context.Background(), nil)
+	require.False(t, stats.Aborted, "second sync aborted: %+v", stats)
+	assert.Equal(t, 0, stats.Synced,
+		"untouched container must not re-emit sessions")
+	assert.Equal(t, 2, stats.Skipped,
+		"untouched container sessions must skip before parse")
+	assertMessageContent(
+		t, env.db, "opencode:gated-one",
+		"first prompt", "first answer",
+	)
+	assertMessageContent(
+		t, env.db, "opencode:gated-two",
+		"second prompt", "second answer",
+	)
+}
+
+// TestSyncEngineOpenCodeSQLiteStatIdenticalContentChangeStillReemits pins
+// the gate's safety boundary: file size and mtime equality alone must never
+// be trusted (mtime granularity differs across filesystems, and a rewrite
+// can land within one granularity unit). A content change that leaves the
+// container stat-identical — same size, mtime restored — still changes
+// SQLite's own write counters, so the sessions must be re-parsed and the
+// changed content re-emitted.
+func TestSyncEngineOpenCodeSQLiteStatIdenticalContentChangeStillReemits(
+	t *testing.T,
+) {
+	env := setupSingleAgentTestEnv(t, parser.AgentOpenCode)
+	oc := createOpenCodeDB(t, env.opencodeDir)
+	oc.addProject(t, "proj", "/home/user/code/opencode-app")
+	seedOpenCodeSQLiteTextSession(
+		t, oc, "proj", "stat-twin",
+		1779012000000, 1779012030000,
+		"original prompt", "original answer",
+	)
+
+	stats := env.engine.SyncAll(context.Background(), nil)
+	require.False(t, stats.Aborted, "first sync aborted: %+v", stats)
+	assert.Equal(t, 1, stats.Synced, "first sync writes the session")
+
+	dbPath := filepath.Join(env.opencodeDir, "opencode.db")
+	before, err := os.Stat(dbPath)
+	require.NoError(t, err, "stat opencode.db")
+
+	time.Sleep(20 * time.Millisecond)
+	// Same-length replacement content keeps the SQLite file size stable, and
+	// the mtime is restored below, so only SQLite's internal change counter
+	// betrays the rewrite.
+	oc.replaceTextContent(
+		t, "stat-twin",
+		"replaced prompt", "replaced answer",
+		1779012000000,
+	)
+	after, err := os.Stat(dbPath)
+	require.NoError(t, err, "stat opencode.db after rewrite")
+	require.Equal(t, before.Size(), after.Size(),
+		"fixture must keep the container size stable for this test")
+	setFileMtime(t, dbPath, before.ModTime().UnixNano())
+
+	stats = env.engine.SyncAll(context.Background(), nil)
+	require.False(t, stats.Aborted, "second sync aborted: %+v", stats)
+	assert.Equal(t, 1, stats.Synced,
+		"stat-identical content change must still be re-emitted")
+	assertMessageContent(
+		t, env.db, "opencode:stat-twin",
+		"replaced prompt", "replaced answer",
+	)
+}
+
+// TestSyncEngineOpenCodeSQLiteWALOnlyChangeStillReemits pins the gate's WAL
+// awareness: OpenCode runs its database in WAL mode, where a committed write
+// only appends frames to opencode.db-wal and leaves the main file's size,
+// mtime, and header change counter untouched until a checkpoint. A change
+// that lands only in the WAL must still be re-parsed and re-emitted.
+func TestSyncEngineOpenCodeSQLiteWALOnlyChangeStillReemits(t *testing.T) {
+	env := setupSingleAgentTestEnv(t, parser.AgentOpenCode)
+	oc := createOpenCodeDB(t, env.opencodeDir)
+	oc.mustExec(t, "enable WAL", "PRAGMA journal_mode=WAL")
+	oc.addProject(t, "proj", "/home/user/code/opencode-app")
+	seedOpenCodeSQLiteTextSession(
+		t, oc, "proj", "wal-session",
+		1779012000000, 1779012030000,
+		"original prompt", "original answer",
+	)
+
+	stats := env.engine.SyncAll(context.Background(), nil)
+	require.False(t, stats.Aborted, "first sync aborted: %+v", stats)
+	assert.Equal(t, 1, stats.Synced, "first sync writes the session")
+
+	dbPath := filepath.Join(env.opencodeDir, "opencode.db")
+	before, err := os.Stat(dbPath)
+	require.NoError(t, err, "stat opencode.db")
+
+	time.Sleep(20 * time.Millisecond)
+	oc.updateSessionTime(t, "wal-session", 1779015630000)
+	oc.replaceTextContent(
+		t, "wal-session",
+		"changed prompt", "changed answer",
+		1779015600000,
+	)
+	// The commit must have landed in the WAL only; a main-file change would
+	// mean this test no longer exercises the WAL-awareness of the gate.
+	after, err := os.Stat(dbPath)
+	require.NoError(t, err, "stat opencode.db after WAL write")
+	require.Equal(t, before.Size(), after.Size(),
+		"main DB file size must stay untouched by a WAL-mode commit")
+	require.Equal(t, before.ModTime(), after.ModTime(),
+		"main DB file mtime must stay untouched by a WAL-mode commit")
+
+	stats = env.engine.SyncAll(context.Background(), nil)
+	require.False(t, stats.Aborted, "second sync aborted: %+v", stats)
+	assert.Equal(t, 1, stats.Synced,
+		"a WAL-only container change must still be re-emitted")
+	assertMessageContent(
+		t, env.db, "opencode:wal-session",
+		"changed prompt", "changed answer",
+	)
+}
+
+// TestSyncEngineOpenCodeSQLiteCwdFilteredContainerStaysUntrusted pins the
+// promotion invariant against the cwd allow-list: a session that parses but
+// is vetoed by the filter was deliberately not persisted, so its container
+// was not fully verified and must never be trusted. A later sync must
+// re-verify the container (no gate skips) instead of hiding the vetoed
+// session behind the trusted state.
+func TestSyncEngineOpenCodeSQLiteCwdFilteredContainerStaysUntrusted(
+	t *testing.T,
+) {
+	if testing.Short() {
+		t.Skip("skipping integration test")
+	}
+	root := t.TempDir()
+	database := dbtest.OpenTestDB(t)
+	engine := sync.NewEngine(database, sync.EngineConfig{
+		AgentDirs: map[parser.AgentType][]string{
+			parser.AgentOpenCode: {root},
+		},
+		Machine:            "local",
+		IncludeCwdPrefixes: []string{"/home/user/code/keep-app"},
+	})
+	oc := createOpenCodeDB(t, root)
+	oc.addProject(t, "proj-keep", "/home/user/code/keep-app")
+	oc.addProject(t, "proj-drop", "/home/user/code/drop-app")
+	seedOpenCodeSQLiteTextSession(
+		t, oc, "proj-keep", "keep-session",
+		1779012000000, 1779012030000,
+		"keep prompt", "keep answer",
+	)
+	seedOpenCodeSQLiteTextSession(
+		t, oc, "proj-drop", "drop-session",
+		1779012100000, 1779012130000,
+		"drop prompt", "drop answer",
+	)
+
+	stats := engine.SyncAll(context.Background(), nil)
+	require.False(t, stats.Aborted, "first sync aborted: %+v", stats)
+	assert.Equal(t, 1, stats.Synced, "only the allowed session is written")
+
+	stats = engine.SyncAll(context.Background(), nil)
+	require.False(t, stats.Aborted, "second sync aborted: %+v", stats)
+	assert.Equal(t, 0, stats.Skipped,
+		"a container with cwd-vetoed sessions must not be gate-skipped")
+
+	kept, err := database.GetSessionFull(
+		context.Background(), "opencode:keep-session",
+	)
+	require.NoError(t, err)
+	assert.NotNil(t, kept, "allowed session must be archived")
+	dropped, err := database.GetSessionFull(
+		context.Background(), "opencode:drop-session",
+	)
+	require.NoError(t, err)
+	assert.Nil(t, dropped, "vetoed session must stay out of the archive")
+}
+
+// TestSyncEngineOpenCodeSQLiteCutoffPassMustNotTrustContainer guards the
+// gate's promotion rule: a cutoff-filtered pass discovers the container but
+// processes none of its sessions, so it has verified nothing and a later
+// full sync must still parse and write them.
+func TestSyncEngineOpenCodeSQLiteCutoffPassMustNotTrustContainer(
+	t *testing.T,
+) {
+	env := setupSingleAgentTestEnv(t, parser.AgentOpenCode)
+	oc := createOpenCodeDB(t, env.opencodeDir)
+	oc.addProject(t, "proj", "/home/user/code/opencode-app")
+	seedOpenCodeSQLiteTextSession(
+		t, oc, "proj", "filtered-session",
+		1779012000000, 1779012030000,
+		"first prompt", "first answer",
+	)
+
+	future := time.Now().Add(24 * time.Hour)
+	stats := env.engine.SyncAllSince(context.Background(), future, nil)
+	require.False(t, stats.Aborted, "cutoff sync aborted: %+v", stats)
+	assert.Equal(t, 0, stats.Synced, "future cutoff filters every source")
+
+	stats = env.engine.SyncAll(context.Background(), nil)
+	require.False(t, stats.Aborted, "full sync aborted: %+v", stats)
+	assert.Equal(t, 1, stats.Synced,
+		"a cutoff-filtered pass must not mark the container verified")
+	assertMessageContent(
+		t, env.db, "opencode:filtered-session",
+		"first prompt", "first answer",
+	)
+}
+
+// TestSyncEngineOpenCodeStorageUntouchedSessionSkipsReparse pins the
+// per-session freshness gate for file-backed storage sessions: once a pass
+// has written (or verified) a session, an untouched session must skip
+// before fingerprinting and parsing on every later pass — including the
+// very next one after the write. The part file is made unreadable for the
+// gated pass, so any attempt to re-read the tree would surface as a
+// failure instead of a skip.
+func TestSyncEngineOpenCodeStorageUntouchedSessionSkipsReparse(
+	t *testing.T,
+) {
+	env := setupSingleAgentTestEnv(t, parser.AgentOpenCode)
+	storage := createOpenCodeStorageFixture(t, env.opencodeDir)
+	const sessionID = "oc-storage-gated"
+	storage.addSession(
+		t, "global", sessionID,
+		"/home/user/code/oc-app", "Storage Gated",
+		1704067200000, 1704067205000,
+	)
+	storage.addMessage(
+		t, sessionID, "msg-a1", "assistant",
+		1704067201000, nil,
+	)
+	partPath := storage.addTextPart(
+		t, sessionID, "msg-a1", "part-a1",
+		"gated storage reply", 1704067201000,
+	)
+
+	stats := env.engine.SyncAll(context.Background(), nil)
+	require.False(t, stats.Aborted, "first sync aborted: %+v", stats)
+	assert.Equal(t, 1, stats.Synced, "first sync writes the session")
+
+	// The write pass itself promotes the session's stat signature, so
+	// the very next pass must already gate-skip it.
+	require.NoError(t, os.Chmod(partPath, 0o000), "make part unreadable")
+	t.Cleanup(func() {
+		_ = os.Chmod(partPath, 0o644)
+	})
+
+	stats = env.engine.SyncAll(context.Background(), nil)
+	require.False(t, stats.Aborted, "gated sync aborted: %+v", stats)
+	assert.Equal(t, 0, stats.Failed,
+		"gated pass must not re-read message or part files")
+	assert.Equal(t, 1, stats.Skipped,
+		"verified-unchanged session must skip before parse")
+	assertMessageContent(
+		t, env.db, "opencode:"+sessionID, "gated storage reply",
+	)
+}
+
+// TestSyncEngineOpenCodeStorageAppendedMessageReemitsSession covers the
+// streaming case through the gate: a new message/part appended after the
+// session was trusted changes its stat signature, so the session re-parses
+// and re-emits exactly once, then settles back to skipping.
+func TestSyncEngineOpenCodeStorageAppendedMessageReemitsSession(
+	t *testing.T,
+) {
+	env := setupSingleAgentTestEnv(t, parser.AgentOpenCode)
+	storage := createOpenCodeStorageFixture(t, env.opencodeDir)
+	const sessionID = "oc-storage-append"
+	storage.addSession(
+		t, "global", sessionID,
+		"/home/user/code/oc-app", "Storage Append",
+		1704067200000, 1704067205000,
+	)
+	storage.addMessage(
+		t, sessionID, "msg-a1", "assistant",
+		1704067201000, nil,
+	)
+	storage.addTextPart(
+		t, sessionID, "msg-a1", "part-a1",
+		"first storage reply", 1704067201000,
+	)
+
+	stats := env.engine.SyncAll(context.Background(), nil)
+	require.False(t, stats.Aborted, "first sync aborted: %+v", stats)
+	assert.Equal(t, 1, stats.Synced, "first sync writes the session")
+	stats = env.engine.SyncAll(context.Background(), nil)
+	require.False(t, stats.Aborted, "second sync aborted: %+v", stats)
+	assert.Equal(t, 0, stats.Synced, "verification pass drops the unchanged session")
+
+	storage.addMessage(
+		t, sessionID, "msg-b1", "assistant",
+		1704067202000, nil,
+	)
+	storage.addTextPart(
+		t, sessionID, "msg-b1", "part-b1",
+		"second storage reply", 1704067202000,
+	)
+
+	stats = env.engine.SyncAll(context.Background(), nil)
+	require.False(t, stats.Aborted, "append sync aborted: %+v", stats)
+	assert.Equal(t, 1, stats.Synced,
+		"appended message must re-emit the session")
+	assertMessageContent(
+		t, env.db, "opencode:"+sessionID,
+		"first storage reply", "second storage reply",
+	)
+}
+
+// TestSyncEngineOpenCodeStorageWatcherEventDoesNotRewriteUnchanged pins the
+// watcher path for file-backed storage sessions: a changed-path event that
+// resolves to a session whose parse output is already stored must not
+// rewrite it. Message/part events used to force-parse, which bypassed
+// dropUnchangedSharedSQLiteResults and rewrote the whole session (bumping
+// local_modified_at and amplifying remote pushes) on every streamed append
+// or spurious event re-fire.
+func TestSyncEngineOpenCodeStorageWatcherEventDoesNotRewriteUnchanged(
+	t *testing.T,
+) {
+	env := setupSingleAgentTestEnv(t, parser.AgentOpenCode)
+	storage := createOpenCodeStorageFixture(t, env.opencodeDir)
+	const sessionID = "oc-storage-watch-unchanged"
+	storage.addSession(
+		t, "global", sessionID,
+		"/home/user/code/oc-app", "Storage Watch",
+		1704067200000, 1704067205000,
+	)
+	storage.addMessage(
+		t, sessionID, "msg-a1", "assistant",
+		1704067201000, nil,
+	)
+	partPath := storage.addTextPart(
+		t, sessionID, "msg-a1", "part-a1",
+		"steady storage reply", 1704067201000,
+	)
+
+	stats := env.engine.SyncAll(context.Background(), nil)
+	require.False(t, stats.Aborted, "first sync aborted: %+v", stats)
+	assert.Equal(t, 1, stats.Synced, "first sync writes the session")
+	fullID := "opencode:" + sessionID
+	before := openCodeLocalModifiedSnapshot(t, env.db, fullID)
+
+	env.engine.SyncPaths([]string{partPath})
+
+	after := openCodeLocalModifiedSnapshot(t, env.db, fullID)
+	assert.Equal(t, before[fullID], after[fullID],
+		"an event on an unchanged session must not rewrite it")
+	assertMessageContent(
+		t, env.db, fullID, "steady storage reply",
+	)
+
+	storage.addTextPart(
+		t, sessionID, "msg-a1", "part-a1",
+		"updated storage reply", 1704067203000,
+	)
+	env.engine.SyncPaths([]string{partPath})
+
+	assertMessageContent(
+		t, env.db, fullID, "updated storage reply",
+	)
+	final := openCodeLocalModifiedSnapshot(t, env.db, fullID)
+	assert.NotEqual(t, after[fullID], final[fullID],
+		"a real content change must rewrite the session")
+}
+
+// TestSyncEngineOpenCodeStorageStatIdenticalEventStillReemits pins the
+// gate's safety boundary on the watcher path: a child rewritten in place
+// with the same size and a restored mtime is invisible to the stat
+// signature, but the event names the change, so classification must
+// invalidate the session's trust and the next parse must re-emit the new
+// content.
+func TestSyncEngineOpenCodeStorageStatIdenticalEventStillReemits(
+	t *testing.T,
+) {
+	env := setupSingleAgentTestEnv(t, parser.AgentOpenCode)
+	storage := createOpenCodeStorageFixture(t, env.opencodeDir)
+	const sessionID = "oc-storage-stat-twin"
+	storage.addSession(
+		t, "global", sessionID,
+		"/home/user/code/oc-app", "Storage Stat Twin",
+		1704067200000, 1704067205000,
+	)
+	storage.addMessage(
+		t, sessionID, "msg-a1", "assistant",
+		1704067201000, nil,
+	)
+	partPath := storage.addTextPart(
+		t, sessionID, "msg-a1", "part-a1",
+		"stat twin reply AAAA", 1704067201000,
+	)
+
+	stats := env.engine.SyncAll(context.Background(), nil)
+	require.False(t, stats.Aborted, "first sync aborted: %+v", stats)
+	assert.Equal(t, 1, stats.Synced, "first sync writes the session")
+	stats = env.engine.SyncAll(context.Background(), nil)
+	require.False(t, stats.Aborted, "second sync aborted: %+v", stats)
+	assert.Equal(t, 0, stats.Synced, "verification pass drops the unchanged session")
+
+	beforeInfo, err := os.Stat(partPath)
+	require.NoError(t, err, "stat part before rewrite")
+	// Same-length replacement text keeps the part file size stable, and the
+	// mtime is restored below, so only the event says anything changed.
+	storage.addTextPart(
+		t, sessionID, "msg-a1", "part-a1",
+		"stat twin reply BBBB", 1704067201000,
+	)
+	afterInfo, err := os.Stat(partPath)
+	require.NoError(t, err, "stat part after rewrite")
+	require.Equal(t, beforeInfo.Size(), afterInfo.Size(),
+		"fixture must keep the part size stable for this test")
+	setFileMtime(t, partPath, beforeInfo.ModTime().UnixNano())
+
+	env.engine.SyncPaths([]string{partPath})
+
+	assertMessageContent(
+		t, env.db, "opencode:"+sessionID, "stat twin reply BBBB",
+	)
+}
+
+func TestSyncEngineOpenCodeSQLiteSameMtimeMetadataChangeUsesFingerprint(
+	t *testing.T,
+) {
+	env := setupSingleAgentTestEnv(t, parser.AgentOpenCode)
+	oc := createOpenCodeDB(t, env.opencodeDir)
+	oc.addProject(t, "proj", "/home/user/code/original-app")
+	seedOpenCodeSQLiteTextSession(
+		t, oc, "proj", "same-mtime-metadata",
+		1779012000000, 1779012030000,
+		"stable prompt", "stable answer",
+	)
+
+	stats := env.engine.SyncAll(context.Background(), nil)
+	require.False(t, stats.Aborted, "first sync aborted: %+v", stats)
+	assert.Equal(t, 1, stats.Synced, "first sync writes the SQLite session")
+	sessionID := "opencode:same-mtime-metadata"
+	before := openCodeStoredSession(t, env.db, sessionID)
+	require.NotNil(t, before.FileMtime, "file_mtime before rewrite")
+	require.NotNil(t, before.FileHash, "file_hash before rewrite")
+	require.NotNil(t, before.LocalModifiedAt,
+		"local_modified_at before rewrite")
+	assert.Equal(t, "/home/user/code/original-app", before.Cwd)
+	assert.Equal(t, "original_app", before.Project)
+
+	time.Sleep(20 * time.Millisecond)
+	oc.mustExec(t, "update project worktree",
+		"UPDATE project SET worktree = ? WHERE id = ?",
+		"/home/user/code/renamed-app", "proj",
+	)
+
+	stats = env.engine.SyncAll(context.Background(), nil)
+	require.False(t, stats.Aborted, "second sync aborted: %+v", stats)
+	assert.Equal(t, 1, stats.Synced,
+		"same-mtime SQLite metadata changes must be rewritten")
+	assertMessageContent(
+		t, env.db, sessionID, "stable prompt", "stable answer",
+	)
+	after := openCodeStoredSession(t, env.db, sessionID)
+	require.NotNil(t, after.FileMtime, "file_mtime after rewrite")
+	require.NotNil(t, after.FileHash, "file_hash after rewrite")
+	require.NotNil(t, after.LocalModifiedAt,
+		"local_modified_at after rewrite")
+	assert.Equal(t, *before.FileMtime, *after.FileMtime,
+		"metadata-only rewrite keeps the OpenCode SQLite session mtime")
+	assert.NotEqual(t, *before.FileHash, *after.FileHash,
+		"changed SQLite metadata must change the storage fingerprint")
+	assert.Greater(t, *after.LocalModifiedAt, *before.LocalModifiedAt,
+		"successful rewrite must bump local_modified_at for push windows")
+	assert.Equal(t, "/home/user/code/renamed-app", after.Cwd)
+	assert.Equal(t, "renamed_app", after.Project)
+}
+
+func TestSyncEngineOpenCodeStorageSameMtimeContentChangeUsesFingerprint(
+	t *testing.T,
+) {
+	env := setupSingleAgentTestEnv(t, parser.AgentOpenCode)
+	storage := createOpenCodeStorageFixture(t, env.opencodeDir)
+	sessionPath := storage.addSession(
+		t, "proj", "same-mtime-hash",
+		"/home/user/code/opencode-app", "Hash Guard",
+		1779012000000, 1779012030000,
+	)
+	storage.addMessage(
+		t, "same-mtime-hash", "msg-user", "user",
+		1779012000000, nil,
+	)
+	userPartPath := storage.addTextPart(
+		t, "same-mtime-hash", "msg-user", "part-user",
+		"original prompt", 1779012000000,
+	)
+	storage.addMessage(
+		t, "same-mtime-hash", "msg-assistant", "assistant",
+		1779012000001, nil,
+	)
+	storage.addTextPart(
+		t, "same-mtime-hash", "msg-assistant", "part-assistant",
+		"original answer", 1779012000001,
+	)
+
+	stats := env.engine.SyncAll(context.Background(), nil)
+	require.False(t, stats.Aborted, "first sync aborted: %+v", stats)
+	assert.Equal(t, 1, stats.Synced, "first sync writes the storage session")
+	sessionID := "opencode:same-mtime-hash"
+	assertMessageContent(
+		t, env.db, sessionID, "original prompt", "original answer",
+	)
+	before := openCodeStoredSession(t, env.db, sessionID)
+	require.NotNil(t, before.FileMtime, "file_mtime before rewrite")
+	require.NotNil(t, before.FileHash, "file_hash before rewrite")
+	require.NotNil(t, before.LocalModifiedAt,
+		"local_modified_at before rewrite")
+
+	time.Sleep(20 * time.Millisecond)
+	storage.addSession(
+		t, "proj", "same-mtime-hash",
+		"/home/user/code/opencode-app",
+		"Hash Guard with same-mtime metadata padding",
+		1779012000000, 1779012030000,
+	)
+	storage.addTextPart(
+		t, "same-mtime-hash", "msg-user", "part-user",
+		"changed prompt with different fingerprint",
+		1779012000000,
+	)
+	setFileMtime(t, sessionPath, *before.FileMtime)
+	setFileMtime(t, userPartPath, *before.FileMtime)
+
+	stats = env.engine.SyncAll(context.Background(), nil)
+	require.False(t, stats.Aborted, "second sync aborted: %+v", stats)
+	assert.Equal(t, 1, stats.Synced,
+		"same-mtime storage fingerprint changes must be rewritten")
+	assertMessageContent(
+		t, env.db, sessionID,
+		"changed prompt with different fingerprint", "original answer",
+	)
+	after := openCodeStoredSession(t, env.db, sessionID)
+	require.NotNil(t, after.FileMtime, "file_mtime after rewrite")
+	require.NotNil(t, after.FileHash, "file_hash after rewrite")
+	require.NotNil(t, after.LocalModifiedAt,
+		"local_modified_at after rewrite")
+	assert.Equal(t, *before.FileMtime, *after.FileMtime,
+		"same-mtime rewrite keeps the OpenCode storage source mtime")
+	assert.NotEqual(t, *before.FileHash, *after.FileHash,
+		"changed child content must change the storage fingerprint")
+	assert.Greater(t, *after.LocalModifiedAt, *before.LocalModifiedAt,
+		"successful rewrite must bump local_modified_at for push windows")
+}
+
+func TestWatcherOverflowReverifiesSameStatOpenCodeStorage(t *testing.T) {
+	env := setupSingleAgentTestEnv(t, parser.AgentOpenCode)
+	storage := createOpenCodeStorageFixture(t, env.opencodeDir)
+	storage.addSession(
+		t, "proj", "overflow-same-stat",
+		"/home/user/code/opencode-app", "Overflow Guard",
+		1779012000000, 1779012030000,
+	)
+	storage.addMessage(
+		t, "overflow-same-stat", "msg-user", "user",
+		1779012000000, nil,
+	)
+	partPath := storage.addTextPart(
+		t, "overflow-same-stat", "msg-user", "part-user",
+		"original prompt", 1779012000000,
+	)
+
+	stats := env.engine.SyncAll(context.Background(), nil)
+	require.False(t, stats.Aborted)
+	require.Equal(t, 1, stats.Synced)
+	const sessionID = "opencode:overflow-same-stat"
+	assertMessageContent(t, env.db, sessionID, "original prompt")
+	partInfo, err := os.Stat(partPath)
+	require.NoError(t, err)
+
+	storage.addTextPart(
+		t, "overflow-same-stat", "msg-user", "part-user",
+		"modified prompt", 1779012000000,
+	)
+	require.NoError(t, os.Chtimes(partPath, partInfo.ModTime(), partInfo.ModTime()))
+	rewrittenInfo, err := os.Stat(partPath)
+	require.NoError(t, err)
+	require.Equal(t, partInfo.Size(), rewrittenInfo.Size())
+	require.Equal(t, partInfo.ModTime(), rewrittenInfo.ModTime())
+
+	stats = env.engine.SyncAllAfterWatcherOverflow(context.Background(), nil)
+	require.False(t, stats.Aborted)
+	assert.Equal(t, 1, stats.Synced,
+		"overflow recovery must reparse event-sensitive storage sessions")
+	assertMessageContent(t, env.db, sessionID, "modified prompt")
 }
 
 func TestSyncEngineKiroSQLiteUpdatePaths(t *testing.T) {
@@ -1083,6 +2130,173 @@ func TestResyncAllAppliesWorktreeProjectMappingDuringBulkWrites(
 	)
 }
 
+func TestResyncAllWithOptionsIngestsContributors(t *testing.T) {
+	localRoot := t.TempDir()
+	remoteRoot := t.TempDir()
+	env := setupSingleAgentTestEnvWithDirs(t, parser.AgentClaude, []string{localRoot})
+
+	localPath := filepath.Join(localRoot, "project-local", "local-session.jsonl")
+	remotePath := filepath.Join(remoteRoot, "project-remote", "remote-session.jsonl")
+	dbtest.WriteTestFile(t, localPath, []byte(testjsonl.NewSessionBuilder().
+		AddClaudeUser(tsZero, "local rebuild message").String()))
+	dbtest.WriteTestFile(t, remotePath, []byte(testjsonl.NewSessionBuilder().
+		AddClaudeUser(tsEarlyS1, "remote rebuild message").String()))
+	olderPath := filepath.Join(localRoot, "archived", "older-active.jsonl")
+	dbtest.WriteTestFile(t, olderPath, []byte(testjsonl.NewSessionBuilder().
+		AddClaudeUser(tsEarly, "older active archive message").String()))
+	require.Equal(t, 2, env.engine.SyncAll(context.Background(), nil).Synced)
+	require.NoError(t, os.Remove(olderPath))
+	observedBeforeSwap := false
+
+	stats, err := env.engine.ResyncAllWithOptions(
+		context.Background(), nil, sync.RebuildOptions{Contributors: []sync.RebuildContributor{{
+			Name: "remote-host",
+			Config: sync.EngineConfig{
+				AgentDirs:    map[parser.AgentType][]string{parser.AgentClaude: {remoteRoot}},
+				Machine:      "remote-host",
+				IDPrefix:     "remote~",
+				PathRewriter: func(path string) string { return "remote:" + path },
+				Ephemeral:    true,
+			},
+			AfterSync: func(_ *sync.Engine, tempDB *db.DB) error {
+				observedBeforeSwap = true
+				assert.NotEqual(t, env.db.Path(), tempDB.Path())
+				assert.Equal(t, env.db.Path()+"-resync", tempDB.Path())
+
+				older, getErr := env.db.GetSession(context.Background(), "older-active")
+				require.NoError(t, getErr)
+				require.NotNil(t, older, "active archive lost old row before swap")
+				assertMessageContent(t, env.db, "older-active", "older active archive message")
+				page, searchErr := env.db.Search(context.Background(), db.SearchFilter{
+					Query: "older active archive message", Limit: 5,
+				})
+				require.NoError(t, searchErr)
+				require.Len(t, page.Results, 1, "active search changed before swap")
+				remote, getErr := env.db.GetSession(context.Background(), "remote~remote-session")
+				require.NoError(t, getErr)
+				assert.Nil(t, remote, "contributor row reached active DB before swap")
+
+				remote, getErr = tempDB.GetSession(context.Background(), "remote~remote-session")
+				require.NoError(t, getErr)
+				require.NotNil(t, remote, "contributor row missing from temporary DB")
+				older, getErr = tempDB.GetSession(context.Background(), "older-active")
+				require.NoError(t, getErr)
+				assert.Nil(t, older, "orphan copy ran before contributor callback")
+				return nil
+			},
+		}}},
+	)
+	require.NoError(t, err)
+	require.True(t, observedBeforeSwap)
+	require.False(t, stats.Aborted, "resync aborted: %+v", stats)
+	assert.Equal(t, 2, stats.Synced)
+	assert.Equal(t, 1, stats.OrphanedCopied)
+
+	local, err := env.db.GetSession(context.Background(), "local-session")
+	require.NoError(t, err)
+	require.NotNil(t, local)
+	assert.Equal(t, "local", local.Machine)
+	remote, err := env.db.GetSession(context.Background(), "remote~remote-session")
+	require.NoError(t, err)
+	require.NotNil(t, remote)
+	assert.Equal(t, "remote-host", remote.Machine)
+	assert.Equal(t, "remote:"+remotePath, env.db.GetSessionFilePath(remote.ID))
+	older, err := env.db.GetSession(context.Background(), "older-active")
+	require.NoError(t, err)
+	require.NotNil(t, older)
+
+	for _, query := range []string{"local rebuild message", "remote rebuild message"} {
+		page, searchErr := env.db.Search(context.Background(), db.SearchFilter{Query: query, Limit: 5})
+		require.NoError(t, searchErr)
+		assert.Len(t, page.Results, 1, query)
+	}
+	require.Len(t, stats.RebuildPhases, 2)
+	require.Len(t, env.engine.LastSyncStats().RebuildPhases, 2)
+	assert.Equal(t, "local", stats.RebuildPhases[0].Contributor)
+	assert.EqualValues(t, 1, stats.RebuildPhases[0].BatchedWrites)
+	assert.Equal(t, "remote-host", stats.RebuildPhases[1].Contributor)
+	assert.EqualValues(t, 1, stats.RebuildPhases[1].BatchedWrites)
+}
+
+func TestResyncContributorFailureLeavesArchiveUnchanged(t *testing.T) {
+	localRoot := t.TempDir()
+	remoteRoot := t.TempDir()
+	env := setupSingleAgentTestEnvWithDirs(t, parser.AgentClaude, []string{localRoot})
+	oldPath := filepath.Join(localRoot, "old-project", "old-session.jsonl")
+	dbtest.WriteTestFile(t, oldPath, []byte(testjsonl.NewSessionBuilder().
+		AddClaudeUser(tsZero, "durable old archive message").String()))
+	require.Equal(t, 1, env.engine.SyncAll(context.Background(), nil).Synced)
+	require.NoError(t, os.Remove(oldPath))
+	newPath := filepath.Join(localRoot, "new-project", "new-session.jsonl")
+	dbtest.WriteTestFile(t, newPath, []byte(testjsonl.NewSessionBuilder().
+		AddClaudeUser(tsEarlyS1, "partial replacement message").String()))
+	remotePath := filepath.Join(remoteRoot, "remote-project", "remote-session.jsonl")
+	dbtest.WriteTestFile(t, remotePath, []byte(testjsonl.NewSessionBuilder().
+		AddClaudeUser(tsEarlyS5, "partial remote message").String()))
+
+	sentinel := errors.New("after sync failed")
+	stats, err := env.engine.ResyncAllWithOptions(context.Background(), nil,
+		sync.RebuildOptions{Contributors: []sync.RebuildContributor{{
+			Name: "broken-remote",
+			Config: sync.EngineConfig{
+				AgentDirs: map[parser.AgentType][]string{parser.AgentClaude: {remoteRoot}},
+				Machine:   "broken-remote",
+				IDPrefix:  "broken~",
+				Ephemeral: true,
+			},
+			AfterSync: func(*sync.Engine, *db.DB) error { return sentinel },
+		}}})
+	require.Error(t, err)
+	assert.True(t, stats.Aborted)
+	var contributorErr *sync.RebuildContributorError
+	require.True(t, errors.As(err, &contributorErr))
+	assert.Equal(t, "broken-remote", contributorErr.Contributor)
+	assert.ErrorIs(t, err, sentinel)
+	assert.Contains(t, stats.Warnings,
+		`resync contributor "broken-remote" failed: after sync failed`)
+
+	oldSession, getErr := env.db.GetSession(context.Background(), "old-session")
+	require.NoError(t, getErr)
+	require.NotNil(t, oldSession)
+	newSession, getErr := env.db.GetSession(context.Background(), "new-session")
+	require.NoError(t, getErr)
+	assert.Nil(t, newSession)
+	page, searchErr := env.db.Search(context.Background(), db.SearchFilter{
+		Query: "durable old archive message", Limit: 5,
+	})
+	require.NoError(t, searchErr)
+	require.Len(t, page.Results, 1)
+	assert.NoFileExists(t, env.db.Path()+"-resync")
+	assert.NoFileExists(t, env.db.Path()+"-resync-wal")
+	assert.NoFileExists(t, env.db.Path()+"-resync-shm")
+}
+
+func TestResyncEmptyContributorDoesNotAbortNonEmptyLocalRebuild(t *testing.T) {
+	localRoot := t.TempDir()
+	emptyRoot := t.TempDir()
+	env := setupSingleAgentTestEnvWithDirs(t, parser.AgentClaude, []string{localRoot})
+	dbtest.WriteTestFile(t, filepath.Join(localRoot, "project", "local.jsonl"),
+		[]byte(testjsonl.NewSessionBuilder().
+			AddClaudeUser(tsZero, "nonempty local rebuild").String()))
+
+	stats, err := env.engine.ResyncAllWithOptions(context.Background(), nil,
+		sync.RebuildOptions{Contributors: []sync.RebuildContributor{{
+			Name: "empty",
+			Config: sync.EngineConfig{
+				AgentDirs: map[parser.AgentType][]string{parser.AgentClaude: {emptyRoot}},
+				Machine:   "empty",
+				IDPrefix:  "empty~",
+				Ephemeral: true,
+			},
+		}}})
+	require.NoError(t, err)
+	assert.False(t, stats.Aborted, "resync aborted: %+v", stats)
+	assert.Equal(t, 1, stats.Synced)
+	assert.EqualValues(t, 1, stats.RebuildPhases[0].BatchedWrites)
+	assert.Zero(t, stats.RebuildPhases[1].BatchedWrites)
+	assertSessionMessageCount(t, env.db, "local", 1)
+}
+
 func TestResyncAllExcludesExistingClaudeUsageProbe(t *testing.T) {
 	env := setupSingleAgentTestEnv(t, parser.AgentClaude)
 
@@ -1129,6 +2343,305 @@ func TestResyncAllExcludesExistingClaudeUsageProbe(t *testing.T) {
 		"parser exclusions must not become permanent user deletions")
 }
 
+func TestResyncContributorExclusionIsNotRestoredAsOrphan(t *testing.T) {
+	localRoot := t.TempDir()
+	remoteRoot := t.TempDir()
+	env := setupSingleAgentTestEnvWithDirs(t, parser.AgentClaude, []string{localRoot})
+	dbtest.WriteTestFile(t, filepath.Join(localRoot, "local", "local.jsonl"),
+		[]byte(testjsonl.NewSessionBuilder().AddClaudeUser(tsZero, "local").String()))
+
+	const rawID = "remote-usage-probe"
+	const storedID = "remote~remote-usage-probe"
+	usageCmd := "<command-name>/usage</command-name>\n" +
+		"<command-message>usage</command-message>\n<command-args></command-args>"
+	content := testjsonl.ClaudeUserJSON(usageCmd, tsEarly)
+	path := filepath.Join(remoteRoot, "remote", rawID+".jsonl")
+	dbtest.WriteTestFile(t, path, []byte(content))
+	storedPath := "remote:" + path
+	size := int64(len(content))
+	mtime := time.Now().Add(-time.Hour).UnixNano()
+	firstMessage := "/usage"
+	startedAt := tsEarly
+	require.NoError(t, env.db.UpsertSession(db.Session{
+		ID: storedID, Project: "remote", Machine: "remote", Agent: string(parser.AgentClaude),
+		FirstMessage: &firstMessage, StartedAt: &startedAt, EndedAt: &startedAt,
+		MessageCount: 1, UserMessageCount: 1, FilePath: &storedPath,
+		FileSize: &size, FileMtime: &mtime,
+	}))
+
+	stats, err := env.engine.ResyncAllWithOptions(context.Background(), nil,
+		sync.RebuildOptions{Contributors: []sync.RebuildContributor{{
+			Name: "remote",
+			Config: sync.EngineConfig{
+				AgentDirs: map[parser.AgentType][]string{parser.AgentClaude: {remoteRoot}},
+				Machine:   "remote", IDPrefix: "remote~", Ephemeral: true,
+				PathRewriter: func(path string) string { return "remote:" + path },
+			},
+		}}})
+	require.NoError(t, err)
+	require.False(t, stats.Aborted, "resync aborted: %+v", stats)
+	assert.Zero(t, stats.OrphanedCopied)
+	got, getErr := env.db.GetSession(context.Background(), storedID)
+	require.NoError(t, getErr)
+	assert.Nil(t, got)
+}
+
+func TestResyncContributorPreservesPinnedAndTrashedRemoteState(t *testing.T) {
+	localRoot := t.TempDir()
+	remoteRoot := t.TempDir()
+	env := setupSingleAgentTestEnvWithDirs(t, parser.AgentClaude, []string{localRoot})
+	dbtest.WriteTestFile(t, filepath.Join(localRoot, "local", "local.jsonl"),
+		[]byte(testjsonl.NewSessionBuilder().AddClaudeUser(tsZero, "local").String()))
+	remotePath := filepath.Join(remoteRoot, "remote", "remote-trash.jsonl")
+	dbtest.WriteTestFile(t, remotePath, []byte(testjsonl.NewSessionBuilder().
+		AddClaudeUser(tsEarly, "preserved remote prompt").
+		AddClaudeAssistant(tsEarlyS1, "preserved remote reply").String()))
+	remoteConfig := sync.EngineConfig{
+		AgentDirs: map[parser.AgentType][]string{parser.AgentClaude: {remoteRoot}},
+		Machine:   "remote", IDPrefix: "remote~", Ephemeral: true,
+		PathRewriter: func(path string) string { return "remote:" + path },
+	}
+	remoteEngine := sync.NewEngine(env.db, remoteConfig)
+	require.Equal(t, 1, remoteEngine.SyncAll(context.Background(), nil).Synced)
+	remoteEngine.Close()
+	msgs := fetchMessages(t, env.db, "remote~remote-trash")
+	require.Len(t, msgs, 2)
+	note := "keep this remote message"
+	_, err := env.db.PinMessage("remote~remote-trash", msgs[1].ID, &note)
+	require.NoError(t, err)
+	require.NoError(t, env.db.SoftDeleteSession("remote~remote-trash"))
+
+	stats, err := env.engine.ResyncAllWithOptions(context.Background(), nil,
+		sync.RebuildOptions{Contributors: []sync.RebuildContributor{{
+			Name: "remote", Config: remoteConfig,
+		}}})
+	require.NoError(t, err)
+	require.False(t, stats.Aborted, "resync aborted: %+v", stats)
+	full, err := env.db.GetSessionFull(context.Background(), "remote~remote-trash")
+	require.NoError(t, err)
+	require.NotNil(t, full)
+	assert.NotNil(t, full.DeletedAt)
+	preservedMessages := fetchMessages(t, env.db, "remote~remote-trash")
+	require.Len(t, preservedMessages, 2)
+	assert.Equal(t, "preserved remote prompt", preservedMessages[0].Content)
+	assert.Equal(t, "preserved remote reply", preservedMessages[1].Content)
+	pins, err := env.db.ListPinnedMessages(context.Background(), "remote~remote-trash", "")
+	require.NoError(t, err)
+	require.Len(t, pins, 1)
+	require.NotNil(t, pins[0].Note)
+	assert.Equal(t, note, *pins[0].Note)
+}
+
+type usageParityProvider struct {
+	parser.ProviderBase
+	source parser.SourceRef
+	result parser.ParseResult
+}
+
+func (p *usageParityProvider) Discover(context.Context) ([]parser.SourceRef, error) {
+	return []parser.SourceRef{p.source}, nil
+}
+
+func (p *usageParityProvider) Fingerprint(
+	context.Context, parser.SourceRef,
+) (parser.SourceFingerprint, error) {
+	return parser.SourceFingerprint{
+		Key: p.source.FingerprintKey, Size: 128, MTimeNS: 1_700_000_000_000_000_000,
+	}, nil
+}
+
+func (p *usageParityProvider) Parse(
+	context.Context, parser.ParseRequest,
+) (parser.ParseOutcome, error) {
+	return parser.ParseOutcome{
+		Results:           []parser.ParseResultOutcome{{Result: p.result}},
+		ResultSetComplete: true,
+	}, nil
+}
+
+type usageParityFactory struct{ provider *usageParityProvider }
+
+func (f usageParityFactory) Definition() parser.AgentDef {
+	return f.provider.Definition()
+}
+
+func (f usageParityFactory) Capabilities() parser.Capabilities {
+	return f.provider.Capabilities()
+}
+
+func (f usageParityFactory) NewProvider(parser.ProviderConfig) parser.Provider {
+	return f.provider
+}
+
+func newUsageParityProvider(sourcePath, machine string) *usageParityProvider {
+	const rawID = "usage-equivalent"
+	messageOrdinal := 0
+	costUSD := 0.0125
+	started := time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)
+	return &usageParityProvider{
+		ProviderBase: parser.ProviderBase{
+			Def: parser.AgentDef{Type: parser.AgentCowork, FileBased: true},
+			Caps: parser.Capabilities{Source: parser.SourceCapabilities{
+				DiscoverSources:      parser.CapabilitySupported,
+				CompositeFingerprint: parser.CapabilitySupported,
+			}},
+		},
+		source: parser.SourceRef{
+			Provider: parser.AgentCowork, Key: sourcePath,
+			DisplayPath: sourcePath, FingerprintKey: sourcePath,
+		},
+		result: parser.ParseResult{
+			Session: parser.ParsedSession{
+				ID: rawID, Project: "usage-parity", Machine: machine,
+				Agent: parser.AgentCowork, StartedAt: started, EndedAt: started,
+				FirstMessage: "usage parity fixture", MessageCount: 1,
+				UserMessageCount: 1,
+				File: parser.FileInfo{
+					Path: sourcePath, Size: 128, Mtime: 1_700_000_000_000_000_000,
+				},
+			},
+			Messages: []parser.ParsedMessage{{
+				Ordinal: 0, Role: parser.RoleUser,
+				Content: "usage parity fixture", Timestamp: started,
+			}},
+			UsageEvents: []parser.ParsedUsageEvent{{
+				SessionID: rawID, MessageOrdinal: &messageOrdinal,
+				Source: "literal-provider-usage", Model: "literal-model-v1",
+				InputTokens: 101, OutputTokens: 37,
+				CacheCreationInputTokens: 23, CacheReadInputTokens: 19,
+				ReasoningTokens: 11, CostUSD: &costUSD,
+				CostStatus: "exact", CostSource: "literal-fixture",
+				OccurredAt: "2026-01-02T03:04:05Z",
+				DedupKey:   "usage-equivalent:event-1",
+			}},
+		},
+	}
+}
+
+func TestResyncContributorPersistsEquivalentUsageEvents(t *testing.T) {
+	localRoot := t.TempDir()
+	remoteRoot := t.TempDir()
+	localProvider := newUsageParityProvider(
+		filepath.Join(localRoot, "usage-equivalent.fixture"), "local",
+	)
+	remoteProvider := newUsageParityProvider(
+		filepath.Join(remoteRoot, "usage-equivalent.fixture"), "remote",
+	)
+	database := dbtest.OpenTestDB(t)
+	engine := sync.NewEngine(database, sync.EngineConfig{
+		AgentDirs: map[parser.AgentType][]string{parser.AgentCowork: {localRoot}},
+		Machine:   "local",
+		ProviderFactories: []parser.ProviderFactory{
+			usageParityFactory{provider: localProvider},
+		},
+		ProviderMigrationModes: map[parser.AgentType]parser.ProviderMigrationMode{
+			parser.AgentCowork: parser.ProviderMigrationProviderAuthoritative,
+		},
+	})
+	t.Cleanup(engine.Close)
+
+	stats, err := engine.ResyncAllWithOptions(context.Background(), nil,
+		sync.RebuildOptions{Contributors: []sync.RebuildContributor{{
+			Name: "remote",
+			Config: sync.EngineConfig{
+				AgentDirs: map[parser.AgentType][]string{parser.AgentCowork: {remoteRoot}},
+				Machine:   "remote", IDPrefix: "remote~", Ephemeral: true,
+				ProviderFactories: []parser.ProviderFactory{
+					usageParityFactory{provider: remoteProvider},
+				},
+				ProviderMigrationModes: map[parser.AgentType]parser.ProviderMigrationMode{
+					parser.AgentCowork: parser.ProviderMigrationProviderAuthoritative,
+				},
+			},
+		}}})
+	require.NoError(t, err)
+	require.False(t, stats.Aborted, "resync aborted: %+v", stats)
+
+	localEvents, err := database.GetUsageEvents(context.Background(), "usage-equivalent")
+	require.NoError(t, err)
+	require.Len(t, localEvents, 1)
+	remoteEvents, err := database.GetUsageEvents(context.Background(), "remote~usage-equivalent")
+	require.NoError(t, err)
+	require.Len(t, remoteEvents, 1)
+
+	localEvent := localEvents[0]
+	remoteEvent := remoteEvents[0]
+	assert.Equal(t, "usage-equivalent", localEvent.SessionID)
+	assert.Equal(t, "remote~usage-equivalent", remoteEvent.SessionID)
+	localEvent.ID = 0
+	remoteEvent.ID = 0
+	remoteEvent.SessionID = localEvent.SessionID
+	assert.Equal(t, localEvent, remoteEvent,
+		"contributor usage must differ only by its persisted session namespace")
+
+	messageOrdinal := 0
+	costUSD := 0.0125
+	assert.Equal(t, db.UsageEvent{
+		SessionID: "usage-equivalent", MessageOrdinal: &messageOrdinal,
+		Source: "literal-provider-usage", Model: "literal-model-v1",
+		InputTokens: 101, OutputTokens: 37,
+		CacheCreationInputTokens: 23, CacheReadInputTokens: 19,
+		ReasoningTokens: 11, CostUSD: &costUSD,
+		CostStatus: "exact", CostSource: "literal-fixture",
+		OccurredAt: "2026-01-02T03:04:05Z",
+		DedupKey:   "usage-equivalent:event-1",
+	}, localEvent)
+}
+
+func TestResyncContributorPreservesAnnotationsOrphansAndOtherHosts(t *testing.T) {
+	localRoot := t.TempDir()
+	remoteRoot := t.TempDir()
+	otherRoot := t.TempDir()
+	env := setupSingleAgentTestEnvWithDirs(t, parser.AgentClaude, []string{localRoot})
+	dbtest.WriteTestFile(t, filepath.Join(localRoot, "local", "local.jsonl"),
+		[]byte(testjsonl.NewSessionBuilder().AddClaudeUser(tsZero, "local").String()))
+	remoteCurrent := filepath.Join(remoteRoot, "remote", "annotated.jsonl")
+	remoteOrphan := filepath.Join(remoteRoot, "remote", "remote-orphan.jsonl")
+	dbtest.WriteTestFile(t, remoteCurrent, []byte(testjsonl.NewSessionBuilder().
+		AddClaudeUser(tsEarly, "annotated remote").String()))
+	dbtest.WriteTestFile(t, remoteOrphan, []byte(testjsonl.NewSessionBuilder().
+		AddClaudeUser(tsEarlyS1, "remote orphan").String()))
+	remoteConfig := sync.EngineConfig{
+		AgentDirs: map[parser.AgentType][]string{parser.AgentClaude: {remoteRoot}},
+		Machine:   "remote", IDPrefix: "remote~", Ephemeral: true,
+	}
+	remoteEngine := sync.NewEngine(env.db, remoteConfig)
+	require.Equal(t, 2, remoteEngine.SyncAll(context.Background(), nil).Synced)
+	remoteEngine.Close()
+	annotation := "user annotation survives"
+	require.NoError(t, env.db.RenameSession("remote~annotated", &annotation))
+	require.NoError(t, os.Remove(remoteOrphan))
+
+	otherPath := filepath.Join(otherRoot, "other", "other-host.jsonl")
+	dbtest.WriteTestFile(t, otherPath, []byte(testjsonl.NewSessionBuilder().
+		AddClaudeUser(tsEarlyS5, "other host archive").String()))
+	otherEngine := sync.NewEngine(env.db, sync.EngineConfig{
+		AgentDirs: map[parser.AgentType][]string{parser.AgentClaude: {otherRoot}},
+		Machine:   "other", IDPrefix: "other~", Ephemeral: true,
+	})
+	require.Equal(t, 1, otherEngine.SyncAll(context.Background(), nil).Synced)
+	otherEngine.Close()
+	require.NoError(t, os.Remove(otherPath))
+
+	stats, err := env.engine.ResyncAllWithOptions(context.Background(), nil,
+		sync.RebuildOptions{Contributors: []sync.RebuildContributor{{
+			Name: "remote", Config: remoteConfig,
+		}}})
+	require.NoError(t, err)
+	require.False(t, stats.Aborted, "resync aborted: %+v", stats)
+	assert.Equal(t, 2, stats.OrphanedCopied)
+	annotated, err := env.db.GetSession(context.Background(), "remote~annotated")
+	require.NoError(t, err)
+	require.NotNil(t, annotated)
+	require.NotNil(t, annotated.DisplayName)
+	assert.Equal(t, annotation, *annotated.DisplayName)
+	for _, id := range []string{"remote~remote-orphan", "other~other-host"} {
+		session, getErr := env.db.GetSession(context.Background(), id)
+		require.NoError(t, getErr)
+		assert.NotNil(t, session, id)
+	}
+}
+
 func TestSyncEngineCodex(t *testing.T) {
 	env := setupSingleAgentTestEnv(t, parser.AgentCodex)
 
@@ -1149,6 +2662,84 @@ func TestSyncEngineCodex(t *testing.T) {
 	assertSessionState(t, env.db, "codex:test-uuid", func(sess *db.Session) {
 		assert.Equal(t, "codex", sess.Agent, "agent = %q", sess.Agent)
 	})
+}
+
+func TestSyncEngineCodexSubagentLineage(t *testing.T) {
+	env := setupSingleAgentTestEnv(t, parser.AgentCodex)
+	const (
+		parentID = "01900000-0000-7000-8000-000000000001"
+		childID  = "01900000-0000-7000-8000-000000000002"
+	)
+
+	parentContent := testjsonl.JoinJSONL(
+		testjsonl.CodexSessionMetaJSON(parentID, "/tmp/project", "user", tsEarly),
+		testjsonl.CodexMsgJSON("user", "delegate the task", tsEarlyS1),
+		testjsonl.CodexFunctionCallWithCallIDJSON(
+			"spawn_agent", "call_spawn",
+			map[string]any{"task_name": "identity_lifecycle"}, tsEarlyS5,
+		),
+	)
+	childContent := testjsonl.JoinJSONL(
+		testjsonl.CodexSubagentSessionMetaJSON(
+			childID, parentID, "/tmp/project", "user",
+			"2024-01-01T10:01:00Z",
+		),
+		testjsonl.CodexMsgJSON(
+			"assistant", "subtask complete", "2024-01-01T10:01:05Z",
+		),
+	)
+
+	parentPath := env.writeCodexSession(
+		t, filepath.Join("2024", "01", "15"),
+		"rollout-20240115-parent.jsonl", parentContent,
+	)
+	env.writeCodexSession(
+		t, filepath.Join("2024", "01", "15"),
+		"rollout-20240115-child.jsonl", childContent,
+	)
+
+	runSyncAndAssert(t, env.engine, sync.SyncStats{
+		TotalSessions: 2, Synced: 2,
+	})
+
+	assertSessionState(t, env.db, "codex:"+childID, func(sess *db.Session) {
+		require.NotNil(t, sess.ParentSessionID)
+		assert.Equal(t, "codex:"+parentID, *sess.ParentSessionID)
+		assert.Equal(t, "subagent", sess.RelationshipType)
+	})
+
+	var linkedID sql.NullString
+	err := env.db.Reader().QueryRow(`
+		SELECT subagent_session_id
+		FROM tool_calls
+		WHERE session_id = ? AND tool_use_id = ?`,
+		"codex:"+parentID, "call_spawn",
+	).Scan(&linkedID)
+	require.NoError(t, err)
+	assert.False(t, linkedID.Valid)
+
+	appended := testjsonl.CodexSubagentActivityJSON(
+		"started", "call_spawn", childID,
+		"/root/identity_lifecycle", "2024-01-01T10:01:00Z",
+	)
+	f, err := os.OpenFile(parentPath, os.O_APPEND|os.O_WRONLY, 0o644)
+	require.NoError(t, err)
+	_, writeErr := f.WriteString(appended + "\n")
+	closeErr := f.Close()
+	require.NoError(t, writeErr)
+	require.NoError(t, closeErr)
+
+	env.engine.SyncPaths([]string{parentPath})
+
+	err = env.db.Reader().QueryRow(`
+		SELECT subagent_session_id
+		FROM tool_calls
+		WHERE session_id = ? AND tool_use_id = ?`,
+		"codex:"+parentID, "call_spawn",
+	).Scan(&linkedID)
+	require.NoError(t, err)
+	require.True(t, linkedID.Valid)
+	assert.Equal(t, "codex:"+childID, linkedID.String)
 }
 
 func TestSyncEngineProgress(t *testing.T) {
@@ -1797,9 +3388,10 @@ func TestCodexExecMigrationIdempotent(t *testing.T) {
 	)
 	info, err := os.Stat(path)
 	require.NoError(t, err, "stat codex session")
+	cacheKey := fmt.Sprintf("%s?source_hash=%x", path, sha256.Sum256([]byte(content)))
 
 	require.NoError(t, env.db.ReplaceSkippedFiles(map[string]int64{
-		path: info.ModTime().UnixNano(),
+		cacheKey: info.ModTime().UnixNano(),
 	}), "seed skipped files")
 
 	// Rebuild the engine without resetting the migration
@@ -1823,7 +3415,7 @@ func TestCodexExecMigrationIdempotent(t *testing.T) {
 
 	loaded, err := env.db.LoadSkippedFiles()
 	require.NoError(t, err, "load skipped files")
-	_, ok := loaded[path]
+	_, ok := loaded[cacheKey]
 	require.True(t, ok,
 		"post-migration skip entry for %s was cleared; migration must be idempotent",
 		path,
@@ -2496,6 +4088,72 @@ func TestSyncAllSinceCodexIndexRenameBelowStoredMtimeRefreshesName(t *testing.T)
 	if assert.NotNil(t, sess.SessionName, "expected renamed session_name") {
 		assert.Equal(t, "Renamed title", *sess.SessionName)
 	}
+}
+
+func TestSyncAllWarmGateCodexIndexSameStatRenameRefreshesName(t *testing.T) {
+	root := t.TempDir()
+	codexDir := filepath.Join(root, "sessions")
+	require.NoError(t, os.MkdirAll(codexDir, 0o755))
+	env := setupTestEnv(t, WithCodexDirs([]string{codexDir}))
+
+	uuid := "019eb791-cf7d-75c1-8439-9ed74c1229e1"
+	content := testjsonl.NewSessionBuilder().
+		AddCodexMeta(tsEarly, uuid, "/tmp/project", "user").
+		AddCodexMessage(tsEarlyS1, "user", "Rename me").
+		String()
+	path := env.writeCodexSession(
+		t,
+		filepath.Join("2026", "06", "11"),
+		"rollout-2026-06-11T12-44-06-"+uuid+".jsonl",
+		content,
+	)
+
+	indexPath := filepath.Join(root, parser.CodexSessionIndexFilename)
+	indexLine := func(title string) []byte {
+		return fmt.Appendf(nil,
+			`{"id":"%s","thread_name":"%s","updated_at":"2026-06-11T17:34:20Z"}`+"\n",
+			uuid, title,
+		)
+	}
+	originalIndex := indexLine("Title Alpha")
+	renamedIndex := indexLine("Title Bravo")
+	require.Len(t, renamedIndex, len(originalIndex),
+		"fixture must preserve the index size")
+	require.NoError(t, os.WriteFile(indexPath, originalIndex, 0o644))
+
+	transcriptTime := time.Now().Add(-30 * time.Minute)
+	indexTime := time.Now().Add(-2 * time.Hour)
+	require.NoError(t, os.Chtimes(path, transcriptTime, transcriptTime))
+	require.NoError(t, os.Chtimes(indexPath, indexTime, indexTime))
+
+	first := env.engine.SyncAll(context.Background(), nil)
+	require.Equal(t, 1, first.Synced)
+	second := env.engine.SyncAll(context.Background(), nil)
+	require.Equal(t, 0, second.Synced, "second pass must warm source trust")
+
+	sess, err := env.db.GetSessionFull(context.Background(), "codex:"+uuid)
+	require.NoError(t, err)
+	require.NotNil(t, sess)
+	require.NotNil(t, sess.SessionName)
+	require.Equal(t, "Title Alpha", *sess.SessionName)
+	require.NotNil(t, sess.FileMtime)
+	require.Equal(t, transcriptTime.UnixNano(), *sess.FileMtime,
+		"transcript mtime must remain the stored watermark")
+
+	// Simulate a missed watcher event: rewrite only the sidecar while restoring
+	// its lower mtime and preserving its size. The full sync must still reload
+	// the index and repair the persisted title.
+	require.NoError(t, os.WriteFile(indexPath, renamedIndex, 0o644))
+	require.NoError(t, os.Chtimes(indexPath, indexTime, indexTime))
+
+	third := env.engine.SyncAll(context.Background(), nil)
+	require.Equal(t, 1, third.Synced,
+		"same-stat title rewrite must bypass warm source trust")
+	sess, err = env.db.GetSessionFull(context.Background(), "codex:"+uuid)
+	require.NoError(t, err)
+	require.NotNil(t, sess)
+	require.NotNil(t, sess.SessionName)
+	assert.Equal(t, "Title Bravo", *sess.SessionName)
 }
 
 func TestSyncAllSinceCodexIndexRefreshOnlySyncsRenamedSession(t *testing.T) {
@@ -4373,6 +6031,262 @@ func TestOpenCodeHybridRootSyncsSQLiteSessions(t *testing.T) {
 	)
 }
 
+// TestOpenCodeHybridUnshadowedSQLiteSessionParsesAfterStorageRemoval pins
+// the container gate against hybrid shadow removal: a SQLite row hidden by
+// a same-ID storage JSON during the verified pass becomes discoverable when
+// the storage copy is deleted, while the DB — and so its trusted state — is
+// untouched. The newly exposed row must be parsed and take over the
+// session, not gate-skipped as part of an unchanged container.
+func TestOpenCodeHybridUnshadowedSQLiteSessionParsesAfterStorageRemoval(t *testing.T) {
+	env := setupSingleAgentTestEnv(t, parser.AgentOpenCode)
+	storage := createOpenCodeStorageFixture(t, env.opencodeDir)
+	const sessionID = "oc-unshadow"
+	sessionPath := storage.addSession(
+		t, "global", sessionID,
+		"/home/user/code/app", "Unshadow",
+		1704067200000, 1704067205000,
+	)
+	storage.addMessage(
+		t, sessionID, "msg-s1", "assistant", 1704067201000, nil,
+	)
+	storage.addTextPart(
+		t, sessionID, "msg-s1", "part-s1",
+		"storage canonical reply", 1704067201000,
+	)
+	// The archived storage session's mtime is a composite over the storage
+	// tree's files and directories; backdate the whole tree so the SQLite
+	// copy's updated time is comparably newer.
+	storageMtime := time.UnixMilli(1704067205000)
+	require.NoError(t, filepath.WalkDir(
+		filepath.Join(env.opencodeDir, "storage"),
+		func(p string, _ fs.DirEntry, err error) error {
+			if err != nil {
+				return err
+			}
+			return os.Chtimes(p, storageMtime, storageMtime)
+		},
+	), "backdate storage tree")
+
+	// The SQLite copy is newer than the storage copy from the start, so
+	// once exposed it must supersede the preserved storage archive; while
+	// the storage JSON exists, the same-ID shadow keeps the row out of
+	// discovery regardless of recency.
+	sqlite := createOpenCodeDB(t, env.opencodeDir)
+	sqlite.addProject(t, "proj-1", "/home/user/code/app")
+	sqlite.addSession(t, sessionID, "proj-1", 1704067200000, 1704067299000)
+	sqlite.addMessage(t, "msg-q1", sessionID, "user", 1704067200000)
+	sqlite.addTextPart(
+		t, "part-q1", sessionID, "msg-q1",
+		"sqlite only question", 1704067200000,
+	)
+	// A second, unshadowed row makes the verified pass discover the
+	// container at all — a fully shadowed container is never promoted, so
+	// only this row's presence puts the container's trust on the line.
+	const otherID = "oc-unshadow-other"
+	sqlite.addSession(t, otherID, "proj-1", 1704067200000, 1704067205000)
+	sqlite.addMessage(t, "msg-o1", otherID, "user", 1704067200000)
+	sqlite.addTextPart(
+		t, "part-o1", otherID, "msg-o1",
+		"other sqlite question", 1704067200000,
+	)
+
+	// The verified pass sees the storage copy and the unshadowed SQLite
+	// row; the shadowed row stays out of discovery, and the container is
+	// promoted to trusted with only the unshadowed row verified.
+	runSyncAndAssert(t, env.engine, sync.SyncStats{
+		TotalSessions: 2,
+		Synced:        2,
+	})
+	assertMessageContent(
+		t, env.db, "opencode:"+sessionID, "storage canonical reply",
+	)
+
+	// Removing the storage copy exposes the SQLite row without touching
+	// the DB, so the container still matches its trusted state.
+	require.NoError(t, os.Remove(sessionPath), "remove session json")
+	require.NoError(t, os.RemoveAll(filepath.Join(
+		env.opencodeDir, "storage", "message", sessionID,
+	)), "remove message dir")
+	require.NoError(t, os.RemoveAll(filepath.Join(
+		env.opencodeDir, "storage", "part", "msg-s1",
+	)), "remove part dir")
+
+	runSyncAndAssert(t, env.engine, sync.SyncStats{
+		TotalSessions: 2,
+		Synced:        1,
+		Skipped:       1,
+	})
+	assertMessageContent(
+		t, env.db, "opencode:"+sessionID, "sqlite only question",
+	)
+	virtualPath := parser.OpenCodeSQLiteVirtualPath(sqlite.path, sessionID)
+	assert.Equal(t, virtualPath,
+		env.engine.FindSourceFile("opencode:"+sessionID),
+		"the session must now resolve to the SQLite source")
+}
+
+// TestOpenCodeHybridFullyShadowedContainerDropsStaleTrust pins the
+// shadow-then-unshadow cycle with no other rows: a verified SQLite-only
+// session gets shadowed by a later storage JSON, so the next full sync
+// discovers no SQLite sources at all for the container. That pass must
+// drop the container's trusted entry — otherwise the stale session set
+// still matches once the storage JSON is removed again (the DB never
+// changed), and the re-exposed row is gate-skipped instead of parsed.
+func TestOpenCodeHybridFullyShadowedContainerDropsStaleTrust(t *testing.T) {
+	env := setupSingleAgentTestEnv(t, parser.AgentOpenCode)
+	const sessionID = "oc-reshadow"
+	sqlite := createOpenCodeDB(t, env.opencodeDir)
+	sqlite.addProject(t, "proj-1", "/home/user/code/app")
+	sqlite.addSession(t, sessionID, "proj-1", 1704067200000, 1704067299000)
+	sqlite.addMessage(t, "msg-q1", sessionID, "user", 1704067200000)
+	sqlite.addTextPart(
+		t, "part-q1", sessionID, "msg-q1",
+		"sqlite canonical question", 1704067200000,
+	)
+
+	// The verified pass sees only the SQLite row and trusts the container.
+	runSyncAndAssert(t, env.engine, sync.SyncStats{
+		TotalSessions: 1,
+		Synced:        1,
+	})
+	assertMessageContent(
+		t, env.db, "opencode:"+sessionID, "sqlite canonical question",
+	)
+
+	// A storage JSON appears for the same session and shadows the row;
+	// this full sync discovers no SQLite sources for the container.
+	storage := createOpenCodeStorageFixture(t, env.opencodeDir)
+	sessionPath := storage.addSession(
+		t, "global", sessionID,
+		"/home/user/code/app", "Reshadow",
+		1704067200000, 1704067205000,
+	)
+	storage.addMessage(
+		t, sessionID, "msg-s1", "assistant", 1704067201000, nil,
+	)
+	storage.addTextPart(
+		t, sessionID, "msg-s1", "part-s1",
+		"storage interim reply", 1704067201000,
+	)
+	// Backdate the storage tree so the SQLite copy stays comparably newer
+	// (the archived session mtime is a composite over files and dirs).
+	storageMtime := time.UnixMilli(1704067205000)
+	require.NoError(t, filepath.WalkDir(
+		filepath.Join(env.opencodeDir, "storage"),
+		func(p string, _ fs.DirEntry, err error) error {
+			if err != nil {
+				return err
+			}
+			return os.Chtimes(p, storageMtime, storageMtime)
+		},
+	), "backdate storage tree")
+
+	runSyncAndAssert(t, env.engine, sync.SyncStats{
+		TotalSessions: 1,
+		Synced:        1,
+	})
+	assertMessageContent(
+		t, env.db, "opencode:"+sessionID, "storage interim reply",
+	)
+
+	// The storage copy disappears again; the DB never changed, so a stale
+	// trusted entry from the first pass would still match and gate-skip
+	// the re-exposed, newer row.
+	require.NoError(t, os.Remove(sessionPath), "remove session json")
+	require.NoError(t, os.RemoveAll(filepath.Join(
+		env.opencodeDir, "storage", "message", sessionID,
+	)), "remove message dir")
+	require.NoError(t, os.RemoveAll(filepath.Join(
+		env.opencodeDir, "storage", "part", "msg-s1",
+	)), "remove part dir")
+
+	runSyncAndAssert(t, env.engine, sync.SyncStats{
+		TotalSessions: 1,
+		Synced:        1,
+	})
+	assertMessageContent(
+		t, env.db, "opencode:"+sessionID, "sqlite canonical question",
+	)
+}
+
+// TestOpenCodeHybridWatcherShadowCycleDropsRowTrust pins the watcher-path
+// shadow/unshadow cycle: a storage JSON for a trusted SQLite row arrives
+// via a changed-path sync (which replaces the archived row but never
+// re-promotes containers) and disappears again before any full pass
+// observes the shadowed state. Processing the storage session must drop
+// the row's trusted membership, or the next full pass — container state
+// unchanged, membership still verified — would gate-skip the re-exposed
+// row forever and the archive would keep the interim storage copy.
+func TestOpenCodeHybridWatcherShadowCycleDropsRowTrust(t *testing.T) {
+	env := setupSingleAgentTestEnv(t, parser.AgentOpenCode)
+	const sessionID = "oc-watcher-shadow"
+	sqlite := createOpenCodeDB(t, env.opencodeDir)
+	sqlite.addProject(t, "proj-1", "/home/user/code/app")
+	sqlite.addSession(t, sessionID, "proj-1", 1704067200000, 1704067299000)
+	sqlite.addMessage(t, "msg-q1", sessionID, "user", 1704067200000)
+	sqlite.addTextPart(
+		t, "part-q1", sessionID, "msg-q1",
+		"sqlite canonical question", 1704067200000,
+	)
+
+	// The verified pass trusts the container with the row's membership.
+	runSyncAndAssert(t, env.engine, sync.SyncStats{
+		TotalSessions: 1,
+		Synced:        1,
+	})
+
+	// A storage JSON for the same session arrives and is synced through
+	// the watcher's changed-path pass, replacing the archived row.
+	storage := createOpenCodeStorageFixture(t, env.opencodeDir)
+	sessionPath := storage.addSession(
+		t, "global", sessionID,
+		"/home/user/code/app", "Watcher Shadow",
+		1704067200000, 1704067205000,
+	)
+	storage.addMessage(
+		t, sessionID, "msg-s1", "assistant", 1704067201000, nil,
+	)
+	storage.addTextPart(
+		t, sessionID, "msg-s1", "part-s1",
+		"storage interim reply", 1704067201000,
+	)
+	storageMtime := time.UnixMilli(1704067205000)
+	require.NoError(t, filepath.WalkDir(
+		filepath.Join(env.opencodeDir, "storage"),
+		func(p string, _ fs.DirEntry, err error) error {
+			if err != nil {
+				return err
+			}
+			return os.Chtimes(p, storageMtime, storageMtime)
+		},
+	), "backdate storage tree")
+	env.engine.SyncPaths([]string{sessionPath})
+	assertMessageContent(
+		t, env.db, "opencode:"+sessionID, "storage interim reply",
+	)
+
+	// The storage copy disappears again without the watcher observing it
+	// and without any full pass having seen the shadowed state; the DB
+	// never changed.
+	require.NoError(t, os.Remove(sessionPath), "remove session json")
+	require.NoError(t, os.RemoveAll(filepath.Join(
+		env.opencodeDir, "storage", "message", sessionID,
+	)), "remove message dir")
+	require.NoError(t, os.RemoveAll(filepath.Join(
+		env.opencodeDir, "storage", "part", "msg-s1",
+	)), "remove part dir")
+
+	// The full pass must re-verify the re-exposed row: it is newer than
+	// the interim storage archive and takes the session back.
+	runSyncAndAssert(t, env.engine, sync.SyncStats{
+		TotalSessions: 1,
+		Synced:        1,
+	})
+	assertMessageContent(
+		t, env.db, "opencode:"+sessionID, "sqlite canonical question",
+	)
+}
+
 // TestFindSourceFileSkipsHybridRootMissingSession covers the
 // multi-root shadowing case: an early hybrid root with an
 // opencode.db that lacks the requested session must not shadow a
@@ -6063,6 +7977,68 @@ func TestResyncAllPreservesInsights(t *testing.T) {
 	assert.Equal(t, "test insight survives resync", insights[0].Content, "insight content = %q, want preserved", insights[0].Content)
 }
 
+func TestResyncAllPreservesModelPricing(t *testing.T) {
+	env := setupTestEnv(t)
+
+	content := testjsonl.NewSessionBuilder().
+		AddClaudeUser(tsEarly, "Hello").
+		AddClaudeAssistant(tsEarlyS5, "Hi there!").
+		String()
+
+	env.writeClaudeSession(
+		t, "test-proj", "pricing-test.jsonl", content,
+	)
+
+	env.engine.SyncAll(context.Background(), nil)
+	assertSessionMessageCount(t, env.db, "pricing-test", 2)
+
+	require.NoError(t, env.db.UpsertModelPricing([]db.ModelPricing{
+		{
+			ModelPattern:  "claude-opus-4-8",
+			InputPerMTok:  15,
+			OutputPerMTok: 75,
+		},
+	}), "UpsertModelPricing")
+
+	stats := env.engine.ResyncAll(context.Background(), nil)
+	require.NotZero(t, stats.Synced, "expected at least 1 synced session")
+
+	pricing, err := env.db.GetModelPricing("claude-opus-4-8")
+	require.NoError(t, err, "GetModelPricing")
+	require.NotNil(t, pricing,
+		"model pricing must survive the resync swap")
+	assert.Equal(t, 15.0, pricing.InputPerMTok, "input rate")
+	assert.Equal(t, 75.0, pricing.OutputPerMTok, "output rate")
+}
+
+func TestResyncAllAbortsWhenSessionSnapshotMetadataCannotCopy(t *testing.T) {
+	env := setupTestEnv(t)
+	content := testjsonl.NewSessionBuilder().
+		AddClaudeUser(tsEarly, "original content").
+		AddClaudeAssistant(tsEarlyS5, "original reply").
+		String()
+	env.writeClaudeSession(t, "test-proj", "metadata-copy.jsonl", content)
+	env.engine.SyncAll(context.Background(), nil)
+	assertSessionMessageCount(t, env.db, "metadata-copy", 2)
+
+	dbPath := env.db.Path()
+	require.NoError(t, env.db.Close())
+	raw, err := sql.Open("sqlite3", dbPath)
+	require.NoError(t, err)
+	_, err = raw.Exec(`DROP TABLE starred_sessions;
+		CREATE TABLE starred_sessions (broken_column TEXT)`)
+	require.NoError(t, err)
+	require.NoError(t, raw.Close())
+	require.NoError(t, env.db.Reopen())
+
+	stats := env.engine.ResyncAll(context.Background(), nil)
+
+	assert.True(t, stats.Aborted)
+	assert.Contains(t, strings.Join(stats.Warnings, "\n"),
+		"session metadata copy failed, aborting swap")
+	assertSessionMessageCount(t, env.db, "metadata-copy", 2)
+}
+
 // TestResyncAllAbortsOnFailures verifies that ResyncAll
 // does not swap the DB when sync has more failures than
 // successes.
@@ -7579,14 +9555,21 @@ func TestIncrementalSync_ClaudeAppend(t *testing.T) {
 		assert.Equal(t, "inc-test", m.SessionID, "msgs[%d].SessionID = %q, want inc-test", i, m.SessionID)
 	}
 
-	// Metadata preserved (file_hash not cleared).
+	// file_hash is refreshed to the appended content's fingerprint (not
+	// cleared, not left on the pre-append snapshot) so the freshness gate can
+	// use it to detect a later same-size in-place rewrite.
 	updated, err := env.db.GetSessionFull(
 		context.Background(), "inc-test",
 	)
 	require.NoError(t, err, "GetSessionFull after incremental")
-	require.NotNil(t, updated.FileHash, "file_hash = nil, want %q (preserved)", origHash)
-	assert.Equal(t, origHash, *updated.FileHash,
-		"file_hash = %v, want %q (preserved)", updated.FileHash, origHash)
+	require.NotNil(t, updated.FileHash, "file_hash = nil, want appended-content hash")
+	require.NotEmpty(t, *updated.FileHash, "file_hash empty after incremental append")
+	assert.NotEqual(t, origHash, *updated.FileHash,
+		"file_hash = %q, want it refreshed away from the pre-append snapshot", origHash)
+	wantHash, err := sync.ComputeFileHash(path)
+	require.NoError(t, err, "hash appended file")
+	assert.Equal(t, wantHash, *updated.FileHash,
+		"file_hash does not match the appended file content")
 	assert.True(t, updated.HasTotalOutputTokens, "HasTotalOutputTokens = false, want true")
 	assert.True(t, updated.HasPeakContextTokens, "HasPeakContextTokens = false, want true")
 	assert.Equal(t, 200, updated.TotalOutputTokens, "TotalOutputTokens = %d, want 200", updated.TotalOutputTokens)
@@ -7595,6 +9578,81 @@ func TestIncrementalSync_ClaudeAppend(t *testing.T) {
 	assert.True(t, msgs[1].HasOutputTokens, "assistant HasOutputTokens = false, want true")
 	assert.Equal(t, 200, msgs[1].OutputTokens, "assistant OutputTokens = %d, want 200", msgs[1].OutputTokens)
 	assert.Equal(t, 500, msgs[1].ContextTokens, "assistant ContextTokens = %d, want 500", msgs[1].ContextTokens)
+}
+
+func TestIncrementalSync_ClaudeAgentSettingAppendUsesFullParse(t *testing.T) {
+	env := setupTestEnv(t)
+
+	initial := testjsonl.JoinJSONL(
+		testjsonl.ClaudeUserJSON("hello", tsZero),
+	)
+	path := env.writeClaudeSession(
+		t, "proj", "identity-append.jsonl", initial,
+	)
+	env.engine.SyncAll(context.Background(), nil)
+
+	assertSessionState(t, env.db, "identity-append", func(sess *db.Session) {
+		assert.Equal(t, string(parser.AgentClaude), sess.Agent)
+		assert.Equal(t, "", sess.AgentLabel)
+		assert.Equal(t, "", sess.Entrypoint)
+	})
+
+	appended := `{"type":"user","timestamp":"2026-06-01T00:00:02Z","uuid":"u2","parentUuid":"u1","agentSetting":"triage","entrypoint":"sdk-cli","message":{"content":"late identity"}}` + "\n"
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0o644)
+	require.NoError(t, err, "open for append")
+	_, err = f.WriteString(appended)
+	require.NoError(t, err, "append")
+	require.NoError(t, f.Close(), "close append")
+
+	env.engine.SyncPaths([]string{path})
+
+	assertSessionMessageCount(t, env.db, "identity-append", 2)
+	assertSessionState(t, env.db, "identity-append", func(sess *db.Session) {
+		assert.Equal(t, string(parser.AgentClaude), sess.Agent)
+		assert.Equal(t, "triage", sess.AgentLabel)
+		assert.Equal(t, "sdk-cli", sess.Entrypoint)
+	})
+}
+
+func TestIncrementalSync_ClaudeStoredEntrypointAppendStaysIncremental(t *testing.T) {
+	env := setupTestEnv(t)
+
+	// Real Claude CLI transcripts carry a top-level entrypoint ("cli") on
+	// most message lines; the first full parse stores it as session
+	// identity.
+	initial := `{"type":"user","timestamp":"2026-06-01T00:00:00Z","uuid":"u1","entrypoint":"cli","message":{"content":"hello"}}` + "\n"
+	path := env.writeClaudeSession(
+		t, "proj", "identity-stored.jsonl", initial,
+	)
+	env.engine.SyncAll(context.Background(), nil)
+
+	assertSessionState(t, env.db, "identity-stored", func(sess *db.Session) {
+		assert.Equal(t, "cli", sess.Entrypoint)
+		assert.Equal(t, 0, sess.ParserMalformedLines)
+	})
+
+	// The appended batch repeats the already-stored entrypoint and adds a
+	// malformed line. The incremental reader skips malformed lines without
+	// recounting them, while a full-parse escalation re-derives
+	// parser_malformed_lines for the whole file and would store 1. The
+	// count staying 0 proves the append stayed on the incremental path.
+	appended := "not json\n" +
+		`{"type":"user","timestamp":"2026-06-01T00:00:02Z","uuid":"u2","parentUuid":"u1","entrypoint":"cli","message":{"content":"routine append"}}` + "\n"
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0o644)
+	require.NoError(t, err, "open for append")
+	_, err = f.WriteString(appended)
+	require.NoError(t, err, "append")
+	require.NoError(t, f.Close(), "close append")
+
+	env.engine.SyncPaths([]string{path})
+
+	assertSessionMessageCount(t, env.db, "identity-stored", 2)
+	assertSessionState(t, env.db, "identity-stored", func(sess *db.Session) {
+		assert.Equal(t, "cli", sess.Entrypoint)
+		assert.Equal(t, "", sess.AgentLabel)
+		assert.Equal(t, 0, sess.ParserMalformedLines,
+			"append with already-stored identity must stay incremental")
+	})
 }
 
 func TestIncrementalSync_ClaudeFilteredTailAdvancesNextOrdinal(t *testing.T) {
@@ -8052,6 +10110,124 @@ func TestIncrementalSync_ClaudePathRewriterIgnoresTempInodeChange(t *testing.T) 
 	})
 }
 
+// TestIncrementalSync_ClaudePathRewriterSameSizeSameMtimeRewrite covers the
+// remote (path-rewritten) equivalent of the same-size, same-mtime in-place
+// rewrite. A remote re-download always lands on a fresh inode, so the inode net
+// is disabled for path-rewritten sources; only the content hash can tell an
+// unchanged re-download from a rewrite that kept the same size and mtime. The
+// content guard hashes the materialized download, so an unchanged copy must
+// still skip while a genuine same-size same-mtime rewrite must full-parse.
+func TestIncrementalSync_ClaudePathRewriterSameSizeSameMtimeRewrite(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("identity tracking is a no-op on Windows")
+	}
+
+	original := testjsonl.JoinJSONL(
+		testjsonl.ClaudeUserJSON("first", tsZero),
+		testjsonl.ClaudeAssistantJSON("alpha", tsZeroS5),
+	)
+	changed := testjsonl.JoinJSONL(
+		testjsonl.ClaudeUserJSON("third", tsZero),
+		testjsonl.ClaudeAssistantJSON("bravo", tsZeroS5),
+	)
+	require.Len(t, changed, len(original), "fixtures must keep same byte size")
+
+	const remoteRoot = "/home/test/.claude/projects"
+	mkRewriter := func(roots ...string) func(string) string {
+		return func(p string) string {
+			for _, root := range roots {
+				rel, err := filepath.Rel(root, p)
+				if err == nil && !strings.HasPrefix(rel, "..") {
+					return "host:" + filepath.ToSlash(
+						filepath.Join(remoteRoot, rel),
+					)
+				}
+			}
+			return "host:" + filepath.ToSlash(p)
+		}
+	}
+
+	tests := []struct {
+		name          string
+		second        string
+		wantSynced    int
+		wantSkipped   int
+		wantUser      string
+		wantAssistant string
+	}{
+		{
+			name:          "unchanged re-download skips",
+			second:        original,
+			wantSynced:    0,
+			wantSkipped:   1,
+			wantUser:      "first",
+			wantAssistant: "alpha",
+		},
+		{
+			name:          "same-size same-mtime rewrite full-parses",
+			second:        changed,
+			wantSynced:    1,
+			wantSkipped:   0,
+			wantUser:      "third",
+			wantAssistant: "bravo",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			database := dbtest.OpenTestDB(t)
+			firstRoot := t.TempDir()
+			secondRoot := t.TempDir()
+			rewriter := mkRewriter(firstRoot, secondRoot)
+
+			firstPath := filepath.Join(firstRoot, "proj", "remote-rewrite.jsonl")
+			dbtest.WriteTestFile(t, firstPath, []byte(original))
+			firstInfo, err := os.Stat(firstPath)
+			require.NoError(t, err, "stat first temp copy")
+			firstEngine := sync.NewEngine(database, sync.EngineConfig{
+				AgentDirs: map[parser.AgentType][]string{
+					parser.AgentClaude: {firstRoot},
+				},
+				Machine:      "host",
+				IDPrefix:     "host~",
+				PathRewriter: rewriter,
+				Ephemeral:    true,
+			})
+			runSyncAndAssert(t, firstEngine, sync.SyncStats{
+				TotalSessions: 1, Synced: 1,
+			})
+
+			// Second temp copy: same byte size, same mtime, different inode.
+			// Only the content differs (or not, per the case).
+			secondPath := filepath.Join(secondRoot, "proj", "remote-rewrite.jsonl")
+			dbtest.WriteTestFile(t, secondPath, []byte(tt.second))
+			require.NoError(t,
+				os.Chtimes(secondPath, firstInfo.ModTime(), firstInfo.ModTime()),
+				"preserve remote mtime on second temp copy",
+			)
+			secondEngine := sync.NewEngine(database, sync.EngineConfig{
+				AgentDirs: map[parser.AgentType][]string{
+					parser.AgentClaude: {secondRoot},
+				},
+				Machine:      "host",
+				IDPrefix:     "host~",
+				PathRewriter: rewriter,
+				Ephemeral:    true,
+			})
+			runSyncAndAssert(t, secondEngine, sync.SyncStats{
+				TotalSessions: 1,
+				Synced:        tt.wantSynced,
+				Skipped:       tt.wantSkipped,
+			})
+
+			msgs := fetchMessages(t, database, "host~remote-rewrite")
+			require.Len(t, msgs, 2)
+			assert.Equal(t, tt.wantUser, msgs[0].Content)
+			assert.Equal(t, tt.wantAssistant, msgs[1].Content)
+		})
+	}
+}
+
 func TestIncrementalSync_ClaudeSameSizeInPlaceRewriteClearsStaleRows(t *testing.T) {
 	env := setupSingleAgentTestEnv(t, parser.AgentClaude)
 
@@ -8091,6 +10267,70 @@ func TestIncrementalSync_ClaudeSameSizeInPlaceRewriteClearsStaleRows(t *testing.
 	msgs := fetchMessages(t, env.db, "same-size-in-place")
 	require.Len(t, msgs, 1)
 	assert.Contains(t, msgs[0].Content, "replacement")
+}
+
+// TestIncrementalSync_ClaudeSameSizeSameMtimeInPlaceRewriteUsesFullParse pins
+// the worst case for the stat-only fast-skip: a file rewritten in place (same
+// inode and device) with the same byte size and the same mtime. Two fast
+// successive writes landing in one filesystem mtime granule produce exactly
+// this state in the wild, and neither the size/mtime skip nor the inode net can
+// see the change. The engine must still detect the new content and full-parse
+// instead of serving the stale rows.
+func TestIncrementalSync_ClaudeSameSizeSameMtimeInPlaceRewriteUsesFullParse(
+	t *testing.T,
+) {
+	if runtime.GOOS == "windows" {
+		t.Skip("identity tracking is a no-op on Windows")
+	}
+	env := setupSingleAgentTestEnv(t, parser.AgentClaude)
+
+	original := testjsonl.JoinJSONL(
+		testjsonl.ClaudeUserJSON("first", tsZero),
+		testjsonl.ClaudeAssistantJSON("alpha", tsZeroS5),
+	)
+	path := env.writeClaudeSession(
+		t, "proj", "same-size-same-mtime-in-place.jsonl", original,
+	)
+	env.engine.SyncAll(context.Background(), nil)
+	assertSessionMessageCount(t, env.db, "same-size-same-mtime-in-place", 2)
+
+	full, err := env.db.GetSessionFull(
+		context.Background(), "same-size-same-mtime-in-place",
+	)
+	require.NoError(t, err, "GetSessionFull")
+	require.NotNil(t, full.FileInode, "file_inode not populated after initial sync")
+	origInode := *full.FileInode
+	info, err := os.Stat(path)
+	require.NoError(t, err, "stat original")
+	originalMtime := info.ModTime()
+
+	replacement := testjsonl.JoinJSONL(
+		testjsonl.ClaudeUserJSON("third", tsZero),
+		testjsonl.ClaudeAssistantJSON("bravo", tsZeroS5),
+	)
+	require.Len(t, replacement, len(original), "replacement fixture must keep same byte size")
+
+	// Rewrite in place so the inode/device do not change, then restore the
+	// original mtime so size, mtime, inode, and device all match what the
+	// initial sync stored. Only the content differs.
+	require.NoError(t, os.WriteFile(path, []byte(replacement), 0o644), "in-place rewrite")
+	require.NoError(t, os.Chtimes(path, originalMtime, originalMtime), "restore mtime")
+
+	env.engine.SyncPaths([]string{path})
+
+	msgs := fetchMessages(t, env.db, "same-size-same-mtime-in-place")
+	require.Len(t, msgs, 2)
+	assert.Equal(t, "third", msgs[0].Content)
+	assert.Equal(t, "bravo", msgs[1].Content)
+
+	full, err = env.db.GetSessionFull(
+		context.Background(), "same-size-same-mtime-in-place",
+	)
+	require.NoError(t, err, "GetSessionFull after replace")
+	require.NotNil(t, full.FileInode, "file_inode cleared after replace")
+	// The rewrite was in place, so the inode is unchanged: the fix must catch
+	// the content change through the stored hash, not the identity net.
+	assert.Equal(t, origInode, *full.FileInode)
 }
 
 // TestIncrementalSync_ClaudeMidStreamSplitFallsBackToFullParse covers
@@ -8176,15 +10416,12 @@ func TestIncrementalSync_ClaudeMidStreamSplitFallsBackToFullParse(t *testing.T) 
 	assert.Equal(t, "Hello world", msgs[1].Content, "msgs[1].Content = %q, want exactly %q", msgs[1].Content, "Hello world")
 }
 
-// TestIncrementalSync_ClaudeAgentIDFallbackUpdatesStoredToolCall covers
-// the cross-sync subagent linkage case: the first sync stores an
-// assistant tool_use row with no subagent_session_id, and a later sync
-// appends a tool_result whose toolUseResult.agentId should populate the
-// already-stored tool_call. The parser signals
-// IsIncrementalFullParseFallback, so the full-parse fallback must run
-// with forceReplace=true; otherwise the append-only write path skips
-// the existing row and the linkage is silently dropped.
-func TestIncrementalSync_ClaudeAgentIDFallbackUpdatesStoredToolCall(t *testing.T) {
+// TestIncrementalSync_ClaudeAgentIDLinksIncrementally covers the cross-
+// sync subagent linkage case: the first sync stores an assistant
+// tool_use row with no subagent_session_id, and a later sync appends a
+// tool_result whose toolUseResult.agentId should populate the
+// already-stored tool_call without forcing a full message replacement.
+func TestIncrementalSync_ClaudeAgentIDLinksIncrementally(t *testing.T) {
 	env := setupTestEnv(t)
 
 	parentInitial := testjsonl.JoinJSONL(
@@ -8214,6 +10451,14 @@ func TestIncrementalSync_ClaudeAgentIDFallbackUpdatesStoredToolCall(t *testing.T
 	env.engine.SyncAll(context.Background(), nil)
 
 	// Linkage starts empty (the toolUseResult hasn't appeared yet).
+	var assistantMessageID int64
+	require.NoError(t, env.db.Reader().QueryRow(`
+		SELECT id
+		FROM messages
+		WHERE session_id = ? AND ordinal = 1`,
+		"parent-late-link",
+	).Scan(&assistantMessageID), "query message id before append")
+
 	var got sql.NullString
 	require.NoError(t, env.db.Reader().QueryRow(`
 		SELECT subagent_session_id
@@ -8229,7 +10474,7 @@ func TestIncrementalSync_ClaudeAgentIDFallbackUpdatesStoredToolCall(t *testing.T
 	// the existing subagent session. Incremental parse will return
 	// ErrClaudeIncrementalNeedsFullParse so the engine must full-
 	// parse with forceReplace to update the stored tool_call row.
-	toolResult := `{"type":"user","timestamp":"2024-01-01T10:00:02Z","uuid":"r1","parentUuid":"a1","message":{"content":[{"type":"tool_result","tool_use_id":"toolu_late","content":"done"}]},"toolUseResult":{"status":"completed","agentId":"childlate"}}`
+	toolResult := `{"type":"user","timestamp":"2024-01-01T10:00:02Z","uuid":"r1","parentUuid":"a1","message":{"content":[{"type":"tool_result","tool_use_id":"toolu_late","content":"done\u0000\u0001"}]},"toolUseResult":{"status":"completed","agentId":"childlate"}}`
 	f, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0o644)
 	require.NoError(t, err, "open for append")
 	_, writeErr := f.WriteString(toolResult + "\n")
@@ -8238,13 +10483,263 @@ func TestIncrementalSync_ClaudeAgentIDFallbackUpdatesStoredToolCall(t *testing.T
 
 	env.engine.SyncPaths([]string{path})
 
+	var gotMessageID int64
+	require.NoError(t, env.db.Reader().QueryRow(`
+		SELECT id
+		FROM messages
+		WHERE session_id = ? AND ordinal = 1`,
+		"parent-late-link",
+	).Scan(&gotMessageID), "query message id after append")
+
 	require.NoError(t, env.db.Reader().QueryRow(`
 		SELECT subagent_session_id
 		FROM tool_calls
 		WHERE session_id = ? AND tool_use_id = ?`,
 		"parent-late-link", "toolu_late",
 	).Scan(&got), "query after append")
+	assert.Equal(t, assistantMessageID, gotMessageID, "assistant message row should remain in place during incremental linkage")
 	assert.Equal(t, "agent-childlate", got.String, "subagent_session_id = %q, want %q", got.String, "agent-childlate")
+	msgs := fetchMessages(t, env.db, "parent-late-link")
+	require.Len(t, msgs, 2)
+	require.Len(t, msgs[1].ToolCalls, 1)
+	assert.Equal(t, "done", msgs[1].ToolCalls[0].ResultContent)
+	assert.Equal(t, len("done"), msgs[1].ToolCalls[0].ResultContentLength)
+}
+
+func TestIncrementalSync_ClaudeAgentIDLinkUsesRemotePrefix(t *testing.T) {
+	claudeDir := t.TempDir()
+	database := dbtest.OpenTestDB(t)
+	env := &testEnv{claudeDir: claudeDir, db: database}
+	env.engine = sync.NewEngine(database, sync.EngineConfig{
+		AgentDirs: map[parser.AgentType][]string{
+			parser.AgentClaude: {claudeDir},
+		},
+		Machine:  "host",
+		IDPrefix: "host~",
+	})
+
+	initial := testjsonl.JoinJSONL(
+		`{"type":"user","timestamp":"2024-01-01T10:00:00Z","uuid":"u1","message":{"content":"go"},"cwd":"/tmp"}`,
+		`{"type":"assistant","timestamp":"2024-01-01T10:00:01Z","uuid":"a1","parentUuid":"u1","message":{"content":[{"type":"tool_use","id":"toolu_prefix","name":"Agent","input":{"description":"d","subagent_type":"Explore","prompt":"p"}}]}}`,
+	)
+	path := env.writeClaudeSession(
+		t, "proj-prefix-link", "parent-prefix-link.jsonl", initial,
+	)
+	env.engine.SyncAll(context.Background(), nil)
+
+	toolResult := `{"type":"user","timestamp":"2024-01-01T10:00:02Z","uuid":"r1","parentUuid":"a1","message":{"content":[{"type":"tool_result","tool_use_id":"toolu_prefix","content":"done"}]},"toolUseResult":{"status":"completed","agentId":"childprefix"}}`
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0o644)
+	require.NoError(t, err, "open for append")
+	_, writeErr := f.WriteString(toolResult + "\n")
+	require.NoError(t, f.Close(), "close append")
+	require.NoError(t, writeErr, "append")
+
+	env.engine.SyncPaths([]string{path})
+
+	var got string
+	require.NoError(t, database.Reader().QueryRow(`
+		SELECT subagent_session_id
+		FROM tool_calls
+		WHERE session_id = ? AND tool_use_id = ?`,
+		"host~parent-prefix-link", "toolu_prefix",
+	).Scan(&got), "query prefixed link")
+	assert.Equal(t, "host~agent-childprefix", got)
+}
+
+func TestIncrementalSync_ClaudeAgentIDLinksToolUseFromSameAppend(t *testing.T) {
+	env := setupTestEnv(t)
+
+	initial := testjsonl.JoinJSONL(
+		`{"type":"user","timestamp":"2024-01-01T10:00:00Z","uuid":"u1","message":{"content":"go"},"cwd":"/tmp"}`,
+	)
+	path := env.writeClaudeSession(
+		t, "proj-same-append-link", "parent-same-append-link.jsonl", initial,
+	)
+	env.engine.SyncAll(context.Background(), nil)
+
+	appended := testjsonl.JoinJSONL(
+		`{"type":"assistant","timestamp":"2024-01-01T10:00:01Z","uuid":"a1","parentUuid":"u1","message":{"id":"msg_one","content":[{"type":"tool_use","id":"toolu_same_append","name":"Agent","input":{"description":"d","subagent_type":"Explore","prompt":"p"}}],"usage":{"input_tokens":1,"output_tokens":1},"stop_reason":"tool_use"}}`,
+		`{"type":"user","timestamp":"2024-01-01T10:00:02Z","uuid":"r1","parentUuid":"a1","message":{"content":[{"type":"tool_result","tool_use_id":"toolu_same_append","content":"done"}]},"toolUseResult":{"status":"completed","agentId":"childsameappend"}}`,
+	)
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0o644)
+	require.NoError(t, err, "open for append")
+	_, writeErr := f.WriteString(appended)
+	require.NoError(t, f.Close(), "close append")
+	require.NoError(t, writeErr, "append")
+
+	env.engine.SyncPaths([]string{path})
+
+	assertSessionMessageCount(t, env.db, "parent-same-append-link", 2)
+	var got sql.NullString
+	require.NoError(t, env.db.Reader().QueryRow(`
+		SELECT subagent_session_id
+		FROM tool_calls
+		WHERE session_id = ? AND tool_use_id = ?`,
+		"parent-same-append-link", "toolu_same_append",
+	).Scan(&got), "query after append")
+	assert.Equal(t, "agent-childsameappend", got.String)
+}
+
+func TestIncrementalSync_ClaudeAgentIDUsesFirstLinkAndLatestResult(t *testing.T) {
+	env := setupTestEnv(t)
+
+	initial := testjsonl.JoinJSONL(
+		`{"type":"user","timestamp":"2024-01-01T10:00:00Z","uuid":"u1","message":{"content":"go"},"cwd":"/tmp"}`,
+	)
+	path := env.writeClaudeSession(
+		t, "proj-multiple-links", "parent-multiple-links.jsonl", initial,
+	)
+	env.engine.SyncAll(context.Background(), nil)
+
+	appended := testjsonl.JoinJSONL(
+		`{"type":"assistant","timestamp":"2024-01-01T10:00:01Z","uuid":"a1","parentUuid":"u1","message":{"content":[{"type":"tool_use","id":"toolu_multiple_links","name":"Agent","input":{"description":"d","subagent_type":"Explore","prompt":"p"}}]}}`,
+		`{"type":"user","timestamp":"2024-01-01T10:00:02Z","uuid":"r1","parentUuid":"a1","message":{"content":[{"type":"tool_result","tool_use_id":"toolu_multiple_links","content":"partial"}]},"toolUseResult":{"status":"running","agentId":"firstchild"}}`,
+		`{"type":"user","timestamp":"2024-01-01T10:00:03Z","uuid":"r2","parentUuid":"r1","message":{"content":[{"type":"tool_result","tool_use_id":"toolu_multiple_links","content":"final"}]},"toolUseResult":{"status":"completed","agentId":"laterchild"}}`,
+	)
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0o644)
+	require.NoError(t, err, "open for append")
+	_, writeErr := f.WriteString(appended)
+	require.NoError(t, f.Close(), "close append")
+	require.NoError(t, writeErr, "append")
+
+	env.engine.SyncPaths([]string{path})
+
+	msgs := fetchMessages(t, env.db, "parent-multiple-links")
+	require.Len(t, msgs, 2)
+	require.Len(t, msgs[1].ToolCalls, 1)
+	assert.Equal(t, "agent-firstchild", msgs[1].ToolCalls[0].SubagentSessionID)
+	assert.Equal(t, "final", msgs[1].ToolCalls[0].ResultContent)
+	assert.Equal(t, len("final"), msgs[1].ToolCalls[0].ResultContentLength)
+}
+
+func TestIncrementalSync_ClaudeAgentIDPreservesExistingSubagentLink(t *testing.T) {
+	env := setupTestEnv(t)
+
+	initial := testjsonl.JoinJSONL(
+		`{"type":"user","timestamp":"2024-01-01T10:00:00Z","uuid":"u1","message":{"content":"go"},"cwd":"/tmp"}`,
+		`{"type":"assistant","timestamp":"2024-01-01T10:00:01Z","uuid":"a1","parentUuid":"u1","message":{"content":[{"type":"tool_use","id":"toolu_first_link","name":"Agent","input":{"description":"d","subagent_type":"Explore","prompt":"p"}}]}}`,
+		`{"type":"queue-operation","operation":"enqueue","timestamp":"2024-01-01T10:00:02Z","sessionId":"parent-first-link","content":"{\"task_id\":\"queuefirst\",\"tool_use_id\":\"toolu_first_link\",\"description\":\"d\",\"task_type\":\"local_agent\"}"}`,
+	)
+	path := env.writeClaudeSession(
+		t, "proj-first-link", "parent-first-link.jsonl", initial,
+	)
+	env.engine.SyncAll(context.Background(), nil)
+
+	toolResult := `{"type":"user","timestamp":"2024-01-01T10:00:03Z","uuid":"r1","parentUuid":"a1","message":{"content":[{"type":"tool_result","tool_use_id":"toolu_first_link","content":"done"}]},"toolUseResult":{"status":"completed","agentId":"laterresult"}}`
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0o644)
+	require.NoError(t, err, "open for append")
+	_, writeErr := f.WriteString(toolResult + "\n")
+	require.NoError(t, f.Close(), "close append")
+	require.NoError(t, writeErr, "append")
+
+	env.engine.SyncPaths([]string{path})
+
+	var got string
+	require.NoError(t, env.db.Reader().QueryRow(`
+		SELECT subagent_session_id
+		FROM tool_calls
+		WHERE session_id = ? AND tool_use_id = ?`,
+		"parent-first-link", "toolu_first_link",
+	).Scan(&got), "query after append")
+	assert.Equal(t, "agent-queuefirst", got)
+}
+
+func TestIncrementalSync_ClaudeAgentIDDoesNotLinkNonSubagentTool(t *testing.T) {
+	env := setupTestEnv(t)
+
+	initial := testjsonl.JoinJSONL(
+		`{"type":"user","timestamp":"2024-01-01T10:00:00Z","uuid":"u1","message":{"content":"go"},"cwd":"/tmp"}`,
+	)
+	path := env.writeClaudeSession(
+		t, "proj-read-link", "parent-read-link.jsonl", initial,
+	)
+	env.engine.SyncAll(context.Background(), nil)
+
+	appended := testjsonl.JoinJSONL(
+		`{"type":"assistant","timestamp":"2024-01-01T10:00:01Z","uuid":"a1","parentUuid":"u1","message":{"content":[{"type":"tool_use","id":"toolu_read_link","name":"Read","input":{"file_path":"README.md"}}]}}`,
+		`{"type":"user","timestamp":"2024-01-01T10:00:02Z","uuid":"r1","parentUuid":"a1","message":{"content":[{"type":"tool_result","tool_use_id":"toolu_read_link","content":"done"}]},"toolUseResult":{"status":"completed","agentId":"notasubagent"}}`,
+	)
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0o644)
+	require.NoError(t, err, "open for append")
+	_, writeErr := f.WriteString(appended)
+	require.NoError(t, f.Close(), "close append")
+	require.NoError(t, writeErr, "append")
+
+	env.engine.SyncPaths([]string{path})
+
+	var got sql.NullString
+	require.NoError(t, env.db.Reader().QueryRow(`
+		SELECT subagent_session_id
+		FROM tool_calls
+		WHERE session_id = ? AND tool_use_id = ?`,
+		"parent-read-link", "toolu_read_link",
+	).Scan(&got), "query after append")
+	assert.False(t, got.Valid)
+}
+
+func TestIncrementalSync_ClaudeAgentIDMissingToolCallAdvancesCursor(t *testing.T) {
+	env := setupTestEnv(t)
+
+	initial := testjsonl.JoinJSONL(
+		`{"type":"user","timestamp":"2024-01-01T10:00:00Z","uuid":"u1","message":{"content":"go"},"cwd":"/tmp"}`,
+	)
+	path := env.writeClaudeSession(
+		t, "proj-missing-link", "parent-missing-link.jsonl", initial,
+	)
+	env.engine.SyncAll(context.Background(), nil)
+
+	appended := `{"type":"user","isMeta":true,"timestamp":"2024-01-01T10:00:01Z","message":{"content":[{"type":"tool_result","tool_use_id":"toolu_missing","content":"done"}]},"toolUseResult":{"status":"completed","agentId":"missingchild"}}` + "\n"
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0o644)
+	require.NoError(t, err, "open for append")
+	_, writeErr := f.WriteString(appended)
+	require.NoError(t, f.Close(), "close append")
+	require.NoError(t, writeErr, "append")
+
+	env.engine.SyncPaths([]string{path})
+
+	info, err := os.Stat(path)
+	require.NoError(t, err, "stat appended transcript")
+	sess, err := env.db.GetSessionFull(context.Background(), "parent-missing-link")
+	require.NoError(t, err, "get session after append")
+	require.NotNil(t, sess.FileSize)
+	assert.Equal(t, info.Size(), *sess.FileSize)
+	assert.True(t, sess.LastWriteIncremental)
+	assertSessionMessageCount(t, env.db, "parent-missing-link", 1)
+}
+
+func TestIncrementalSync_ClaudeMetaAgentIDResultMatchesFullParse(t *testing.T) {
+	env := setupTestEnv(t)
+
+	initial := testjsonl.JoinJSONL(
+		`{"type":"user","timestamp":"2024-01-01T10:00:00Z","uuid":"u1","message":{"content":"go"},"cwd":"/tmp"}`,
+		`{"type":"assistant","timestamp":"2024-01-01T10:00:01Z","uuid":"a1","parentUuid":"u1","message":{"content":[{"type":"tool_use","id":"toolu_meta_link","name":"Agent","input":{"description":"d","subagent_type":"Explore","prompt":"p"}}]}}`,
+	)
+	path := env.writeClaudeSession(
+		t, "proj-meta-link", "parent-meta-link.jsonl", initial,
+	)
+	env.engine.SyncAll(context.Background(), nil)
+
+	appended := `{"type":"user","isMeta":true,"timestamp":"2024-01-01T10:00:02Z","uuid":"r1","parentUuid":"a1","message":{"content":[{"type":"tool_result","tool_use_id":"toolu_meta_link","content":"meta-only output"}]},"toolUseResult":{"status":"completed","agentId":"metachild"}}` + "\n"
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0o644)
+	require.NoError(t, err, "open for append")
+	_, writeErr := f.WriteString(appended)
+	require.NoError(t, f.Close(), "close append")
+	require.NoError(t, writeErr, "append")
+
+	env.engine.SyncPaths([]string{path})
+
+	assertToolCall := func(stage string) {
+		msgs := fetchMessages(t, env.db, "parent-meta-link")
+		require.Len(t, msgs, 2, stage)
+		require.Len(t, msgs[1].ToolCalls, 1, stage)
+		assert.Equal(t, "agent-metachild", msgs[1].ToolCalls[0].SubagentSessionID, stage)
+		assert.Empty(t, msgs[1].ToolCalls[0].ResultContent, stage)
+		assert.Zero(t, msgs[1].ToolCalls[0].ResultContentLength, stage)
+	}
+	assertToolCall("incremental parse")
+
+	env.engine.ResyncAll(context.Background(), nil)
+	assertToolCall("full parse")
 }
 
 func TestIncrementalSync_ClaudeCrossSyncToolResultFallback(t *testing.T) {
@@ -8290,9 +10785,9 @@ func TestIncrementalSync_CodexAppend(t *testing.T) {
 	)
 	env.engine.SyncAll(context.Background(), nil)
 
-	assertSessionMessageCount(
-		t, env.db, "codex:inc-cx", 1,
-	)
+	before := fetchMessages(t, env.db, "codex:inc-cx")
+	require.Len(t, before, 1)
+	firstMessageID := before[0].ID
 
 	// Append new messages.
 	appended := testjsonl.JoinJSONL(
@@ -8310,18 +10805,519 @@ func TestIncrementalSync_CodexAppend(t *testing.T) {
 
 	env.engine.SyncPaths([]string{path})
 
-	assertSessionMessageCount(
-		t, env.db, "codex:inc-cx", 2,
-	)
-	assertMessageRoles(
-		t, env.db, "codex:inc-cx", "user", "assistant",
-	)
+	msgs := fetchMessages(t, env.db, "codex:inc-cx")
+	require.Len(t, msgs, 2)
+	assert.Equal(t, firstMessageID, msgs[0].ID,
+		"incremental append must preserve the existing message row")
+	assert.Equal(t, "hello", msgs[0].Content)
+	assert.Equal(t, "world", msgs[1].Content)
+	assert.Equal(t, []string{"user", "assistant"},
+		[]string{msgs[0].Role, msgs[1].Role})
 
 	// Verify session_id on all messages.
-	msgs := fetchMessages(t, env.db, "codex:inc-cx")
 	for i, m := range msgs {
 		assert.Equal(t, "codex:inc-cx", m.SessionID, "msgs[%d].SessionID = %q, want codex:inc-cx", i, m.SessionID)
 	}
+
+	sess, err := env.db.GetSessionFull(context.Background(), "codex:inc-cx")
+	require.NoError(t, err, "GetSessionFull after append")
+	require.NotNil(t, sess)
+	assert.True(t, sess.LastWriteIncremental)
+	assert.Equal(t, 2, sess.NextOrdinal)
+	assert.Equal(t, 2, sess.MessageCount)
+	assert.Equal(t, 1, sess.UserMessageCount)
+}
+
+func TestSyncPathsCodexSameStatInPlaceRewriteUsesContentHash(t *testing.T) {
+	env := setupSingleAgentTestEnv(t, parser.AgentCodex)
+
+	const uuid = "019eb791-cf7d-75c1-8439-9ed74c1229f5"
+	original := testjsonl.JoinJSONL(
+		testjsonl.CodexSessionMetaJSON(
+			uuid, "/tmp/proj", "codex_cli_rs", tsEarly,
+		),
+		testjsonl.CodexMsgJSON("user", "alpha request", tsEarlyS1),
+	)
+	rewritten := testjsonl.JoinJSONL(
+		testjsonl.CodexSessionMetaJSON(
+			uuid, "/tmp/proj", "codex_cli_rs", tsEarly,
+		),
+		testjsonl.CodexMsgJSON("user", "bravo request", tsEarlyS1),
+	)
+	require.Len(t, rewritten, len(original), "transcript fixtures must have equal length")
+	path := env.writeCodexSession(
+		t, filepath.Join("2024", "01", "01"),
+		"rollout-2024-01-01T10-00-00-"+uuid+".jsonl", original,
+	)
+	env.engine.SyncAll(context.Background(), nil)
+
+	before, err := env.db.GetSessionFull(context.Background(), "codex:"+uuid)
+	require.NoError(t, err)
+	require.NotNil(t, before)
+	require.NotNil(t, before.FileHash)
+	beforeHash := *before.FileHash
+	beforeInfo, err := os.Stat(path)
+	require.NoError(t, err)
+	env.engine.InjectSkipCache(map[string]int64{
+		path: beforeInfo.ModTime().UnixNano(),
+	})
+
+	require.NoError(t, os.WriteFile(path, []byte(rewritten), 0o644))
+	require.NoError(t, os.Chtimes(path, beforeInfo.ModTime(), beforeInfo.ModTime()))
+	afterInfo, err := os.Stat(path)
+	require.NoError(t, err)
+	require.Equal(t, beforeInfo.Size(), afterInfo.Size(), "rewrite must keep file size")
+	require.Equal(t, beforeInfo.ModTime(), afterInfo.ModTime(), "rewrite must keep mtime")
+	require.True(t, os.SameFile(beforeInfo, afterInfo), "rewrite must keep file identity")
+
+	env.engine.SyncPaths([]string{path})
+
+	msgs := fetchMessages(t, env.db, "codex:"+uuid)
+	require.Len(t, msgs, 1)
+	assert.Equal(t, "bravo request", msgs[0].Content)
+	after, err := env.db.GetSessionFull(context.Background(), "codex:"+uuid)
+	require.NoError(t, err)
+	require.NotNil(t, after)
+	require.NotNil(t, after.FileHash)
+	assert.False(t, after.LastWriteIncremental,
+		"same-size rewrite must use a full replacement")
+	assert.NotEqual(t, beforeHash, *after.FileHash)
+	wantHash, err := sync.ComputeFileHash(path)
+	require.NoError(t, err)
+	assert.Equal(t, wantHash, *after.FileHash)
+}
+
+func TestSyncAllCodexPathRewriterSameStatRewriteUsesContentHash(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test")
+	}
+	database := dbtest.OpenTestDB(t)
+	firstRoot := filepath.Join(t.TempDir(), "sessions")
+	secondRoot := filepath.Join(t.TempDir(), "sessions")
+	const (
+		uuid       = "019eb791-cf7d-75c1-8439-9ed74c1229f6"
+		remoteRoot = "/home/test/.codex/sessions"
+	)
+	original := testjsonl.JoinJSONL(
+		testjsonl.CodexSessionMetaJSON(
+			uuid, "/tmp/proj", "codex_cli_rs", tsEarly,
+		),
+		testjsonl.CodexMsgJSON("user", "alpha request", tsEarlyS1),
+	)
+	rewritten := testjsonl.JoinJSONL(
+		testjsonl.CodexSessionMetaJSON(
+			uuid, "/tmp/proj", "codex_cli_rs", tsEarly,
+		),
+		testjsonl.CodexMsgJSON("user", "bravo request", tsEarlyS1),
+	)
+	require.Len(t, rewritten, len(original), "transcript fixtures must have equal length")
+	relPath := filepath.Join(
+		"2024", "01", "01",
+		"rollout-2024-01-01T10-00-00-"+uuid+".jsonl",
+	)
+	firstPath := filepath.Join(firstRoot, relPath)
+	secondPath := filepath.Join(secondRoot, relPath)
+	dbtest.WriteTestFile(t, firstPath, []byte(original))
+	firstInfo, err := os.Stat(firstPath)
+	require.NoError(t, err)
+	dbtest.WriteTestFile(t, secondPath, []byte(rewritten))
+	require.NoError(t, os.Chtimes(secondPath, firstInfo.ModTime(), firstInfo.ModTime()))
+	secondInfo, err := os.Stat(secondPath)
+	require.NoError(t, err)
+	require.Equal(t, firstInfo.Size(), secondInfo.Size())
+	require.Equal(t, firstInfo.ModTime(), secondInfo.ModTime())
+
+	rewriter := func(path string) string {
+		for _, root := range []string{firstRoot, secondRoot} {
+			rel, relErr := filepath.Rel(root, path)
+			if relErr == nil && !strings.HasPrefix(rel, "..") {
+				return "host:" + filepath.ToSlash(filepath.Join(remoteRoot, rel))
+			}
+		}
+		return "host:" + filepath.ToSlash(path)
+	}
+	firstEngine := sync.NewEngine(database, sync.EngineConfig{
+		AgentDirs: map[parser.AgentType][]string{parser.AgentCodex: {firstRoot}},
+		Machine:   "host", IDPrefix: "host~", PathRewriter: rewriter, Ephemeral: true,
+	})
+	runSyncAndAssert(t, firstEngine, sync.SyncStats{TotalSessions: 1, Synced: 1})
+	before, err := database.GetSessionFull(context.Background(), "host~codex:"+uuid)
+	require.NoError(t, err)
+	require.NotNil(t, before)
+	require.NotNil(t, before.FileHash)
+	beforeHash := *before.FileHash
+
+	secondEngine := sync.NewEngine(database, sync.EngineConfig{
+		AgentDirs: map[parser.AgentType][]string{parser.AgentCodex: {secondRoot}},
+		Machine:   "host", IDPrefix: "host~", PathRewriter: rewriter, Ephemeral: true,
+	})
+	runSyncAndAssert(t, secondEngine, sync.SyncStats{TotalSessions: 1, Synced: 1})
+
+	msgs := fetchMessages(t, database, "host~codex:"+uuid)
+	require.Len(t, msgs, 1)
+	assert.Equal(t, "bravo request", msgs[0].Content)
+	after, err := database.GetSessionFull(context.Background(), "host~codex:"+uuid)
+	require.NoError(t, err)
+	require.NotNil(t, after)
+	require.NotNil(t, after.FileHash)
+	assert.False(t, after.LastWriteIncremental)
+	assert.NotEqual(t, beforeHash, *after.FileHash)
+	wantHash, err := sync.ComputeFileHash(secondPath)
+	require.NoError(t, err)
+	assert.Equal(t, wantHash, *after.FileHash)
+}
+
+func TestIncrementalSync_CodexLifecycleTailUpdatesTermination(t *testing.T) {
+	env := setupTestEnv(t)
+
+	const uuid = "019eb791-cf7d-75c1-8439-9ed74c1229e7"
+	initial := testjsonl.JoinJSONL(
+		testjsonl.CodexSessionMetaJSON(
+			uuid, "/tmp/proj", "codex_cli_rs", tsEarly,
+		),
+		testjsonl.CodexMsgJSON("user", "hello", tsEarlyS1),
+		`{"type":"event_msg","timestamp":"2024-01-01T10:00:02Z","payload":{"type":"task_complete"}}`,
+	)
+	path := env.writeCodexSession(
+		t, filepath.Join("2024", "01", "01"),
+		"rollout-2024-01-01T10-00-00-"+uuid+".jsonl", initial,
+	)
+	env.engine.SyncAll(context.Background(), nil)
+
+	before := fetchMessages(t, env.db, "codex:"+uuid)
+	require.Len(t, before, 1)
+	firstMessageID := before[0].ID
+	sess, err := env.db.GetSessionFull(context.Background(), "codex:"+uuid)
+	require.NoError(t, err, "GetSessionFull after initial parse")
+	require.NotNil(t, sess)
+	require.NotNil(t, sess.TerminationStatus)
+	assert.Equal(t, "awaiting_user", *sess.TerminationStatus)
+
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0o644)
+	require.NoError(t, err, "open for task_started append")
+	_, err = f.WriteString(
+		`{"type":"event_msg","timestamp":"2024-01-01T10:00:03Z","payload":{"type":"task_started"}}` + "\n",
+	)
+	require.NoError(t, err, "append task_started")
+	require.NoError(t, f.Close())
+	env.engine.SyncPaths([]string{path})
+
+	sess, err = env.db.GetSessionFull(context.Background(), "codex:"+uuid)
+	require.NoError(t, err, "GetSessionFull after task_started")
+	require.NotNil(t, sess)
+	require.NotNil(t, sess.TerminationStatus)
+	assert.Equal(t, "tool_call_pending", *sess.TerminationStatus)
+	assert.True(t, sess.LastWriteIncremental)
+	afterStarted := fetchMessages(t, env.db, "codex:"+uuid)
+	require.Len(t, afterStarted, 1)
+	assert.Equal(t, firstMessageID, afterStarted[0].ID,
+		"message-less lifecycle tail must not replace messages")
+
+	f, err = os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0o644)
+	require.NoError(t, err, "open for task_complete append")
+	_, err = f.WriteString(
+		`{"type":"event_msg","timestamp":"2024-01-01T10:00:04Z","payload":{"type":"task_complete"}}` + "\n",
+	)
+	require.NoError(t, err, "append task_complete")
+	require.NoError(t, f.Close())
+	env.engine.SyncPaths([]string{path})
+
+	sess, err = env.db.GetSessionFull(context.Background(), "codex:"+uuid)
+	require.NoError(t, err, "GetSessionFull after task_complete")
+	require.NotNil(t, sess)
+	require.NotNil(t, sess.TerminationStatus)
+	assert.Equal(t, "awaiting_user", *sess.TerminationStatus)
+	assert.True(t, sess.LastWriteIncremental)
+	afterComplete := fetchMessages(t, env.db, "codex:"+uuid)
+	require.Len(t, afterComplete, 1)
+	assert.Equal(t, firstMessageID, afterComplete[0].ID)
+
+	f, err = os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0o644)
+	require.NoError(t, err, "open for message-bearing lifecycle append")
+	_, err = f.WriteString(testjsonl.JoinJSONL(
+		`{"type":"event_msg","timestamp":"2024-01-01T10:00:05Z","payload":{"type":"task_started"}}`,
+		testjsonl.CodexMsgJSON(
+			"assistant", "working", "2024-01-01T10:00:06Z",
+		),
+	))
+	require.NoError(t, err, "append message-bearing lifecycle tail")
+	require.NoError(t, f.Close())
+	env.engine.SyncPaths([]string{path})
+
+	sess, err = env.db.GetSessionFull(context.Background(), "codex:"+uuid)
+	require.NoError(t, err, "GetSessionFull after message-bearing tail")
+	require.NotNil(t, sess)
+	require.NotNil(t, sess.TerminationStatus)
+	assert.Equal(t, "tool_call_pending", *sess.TerminationStatus)
+	assert.True(t, sess.LastWriteIncremental)
+	afterMessage := fetchMessages(t, env.db, "codex:"+uuid)
+	require.Len(t, afterMessage, 2)
+	assert.Equal(t, firstMessageID, afterMessage[0].ID)
+	assert.Equal(t, "working", afterMessage[1].Content)
+}
+
+func TestIncrementalSync_CodexStaleProjectForcesFullReparse(t *testing.T) {
+	env := setupTestEnv(t)
+
+	const uuid = "019eb791-cf7d-75c1-8439-9ed74c1229e8"
+	initial := testjsonl.JoinJSONL(
+		testjsonl.CodexSessionMetaJSON(
+			uuid, "/home/user/code/agentsview", "codex_cli_rs", tsEarly,
+		),
+		testjsonl.CodexMsgJSON("user", "hello", tsEarlyS1),
+	)
+	path := env.writeCodexSession(
+		t, filepath.Join("2024", "01", "01"),
+		"rollout-2024-01-01T10-00-00-"+uuid+".jsonl", initial,
+	)
+	env.engine.SyncAll(context.Background(), nil)
+
+	before, err := env.db.GetSessionFull(context.Background(), "codex:"+uuid)
+	require.NoError(t, err)
+	require.NotNil(t, before)
+	require.Equal(t, "agentsview", before.Project)
+	require.NoError(t, env.db.Update(func(tx *sql.Tx) error {
+		_, err := tx.Exec(
+			"UPDATE sessions SET project = ? WHERE id = ?",
+			"roborev_ci_28293_3831737461", "codex:"+uuid,
+		)
+		return err
+	}))
+
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0o644)
+	require.NoError(t, err, "open for append")
+	_, err = f.WriteString(
+		testjsonl.CodexMsgJSON("assistant", "world", tsEarlyS5) + "\n",
+	)
+	require.NoError(t, err, "append assistant message")
+	require.NoError(t, f.Close())
+	env.engine.SyncPaths([]string{path})
+
+	after, err := env.db.GetSessionFull(context.Background(), "codex:"+uuid)
+	require.NoError(t, err)
+	require.NotNil(t, after)
+	assert.Equal(t, "agentsview", after.Project)
+	assert.False(t, after.LastWriteIncremental,
+		"project repair must use the authoritative full parse")
+	assertSessionMessageCount(t, env.db, "codex:"+uuid, 2)
+}
+
+func TestSyncSingleSessionCodexAppendForcesFullReplacement(t *testing.T) {
+	root := t.TempDir()
+	codexDir := filepath.Join(root, "sessions")
+	require.NoError(t, os.MkdirAll(codexDir, 0o755))
+	env := setupTestEnv(t, WithCodexDirs([]string{codexDir}))
+
+	const uuid = "019eb791-cf7d-75c1-8439-9ed74c1229e9"
+	initial := testjsonl.JoinJSONL(
+		testjsonl.CodexSessionMetaJSON(
+			uuid, "/tmp/proj", "codex_cli_rs", tsEarly,
+		),
+		testjsonl.CodexMsgJSON("user", "hello", tsEarlyS1),
+	)
+	path := env.writeCodexSession(
+		t, filepath.Join("2024", "01", "01"),
+		"rollout-2024-01-01T10-00-00-"+uuid+".jsonl", initial,
+	)
+	indexPath := filepath.Join(root, "session_index.jsonl")
+	require.NoError(t, os.WriteFile(indexPath, []byte(
+		`{"id":"`+uuid+`","thread_name":"Original title"}`+"\n",
+	), 0o644))
+	env.engine.SyncAll(context.Background(), nil)
+
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0o644)
+	require.NoError(t, err, "open for append")
+	_, err = f.WriteString(
+		testjsonl.CodexMsgJSON("assistant", "world", tsEarlyS5) + "\n",
+	)
+	require.NoError(t, err, "append assistant message")
+	require.NoError(t, f.Close())
+
+	require.NoError(t, env.engine.SyncSingleSession("codex:"+uuid))
+
+	sess, err := env.db.GetSessionFull(context.Background(), "codex:"+uuid)
+	require.NoError(t, err)
+	require.NotNil(t, sess)
+	require.NotNil(t, sess.SessionName)
+	assert.Equal(t, "Original title", *sess.SessionName)
+	assert.False(t, sess.LastWriteIncremental,
+		"per-file ForceParse must take the full replacement path")
+	msgs := fetchMessages(t, env.db, "codex:"+uuid)
+	require.Len(t, msgs, 2)
+	assert.Equal(t, []string{"hello", "world"},
+		[]string{msgs[0].Content, msgs[1].Content})
+}
+
+func TestSyncPathsCodexEqualFingerprintTitleOnlyRefreshesName(t *testing.T) {
+	root := t.TempDir()
+	codexDir := filepath.Join(root, "sessions")
+	require.NoError(t, os.MkdirAll(codexDir, 0o755))
+	env := setupTestEnv(t, WithCodexDirs([]string{codexDir}))
+
+	const uuid = "019eb791-cf7d-75c1-8439-9ed74c1229eb"
+	initial := testjsonl.JoinJSONL(
+		testjsonl.CodexSessionMetaJSON(
+			uuid, "/tmp/proj", "codex_cli_rs", tsEarly,
+		),
+		testjsonl.CodexMsgJSON("user", "keep this message", tsEarlyS1),
+	)
+	path := env.writeCodexSession(
+		t, filepath.Join("2024", "01", "01"),
+		"rollout-2024-01-01T10-00-00-"+uuid+".jsonl", initial,
+	)
+	indexPath := filepath.Join(root, "session_index.jsonl")
+	require.NoError(t, os.WriteFile(indexPath, []byte(
+		`{"id":"`+uuid+`","thread_name":"Original title"}`+"\n",
+	), 0o644))
+	transcriptTime := time.Now().Add(-2 * time.Hour)
+	indexTime := time.Now().Add(-time.Hour)
+	require.NoError(t, os.Chtimes(path, transcriptTime, transcriptTime))
+	require.NoError(t, os.Chtimes(indexPath, indexTime, indexTime))
+	env.engine.SyncAll(context.Background(), nil)
+
+	before, err := env.db.GetSessionFull(context.Background(), "codex:"+uuid)
+	require.NoError(t, err)
+	require.NotNil(t, before)
+	require.NotNil(t, before.SessionName)
+	require.NotNil(t, before.FileSize)
+	require.NotNil(t, before.FileMtime)
+	assert.Equal(t, "Original title", *before.SessionName)
+	rolloutInfo, err := os.Stat(path)
+	require.NoError(t, err)
+	require.Equal(t, rolloutInfo.Size(), *before.FileSize,
+		"stored transcript size precondition")
+	require.Less(t, rolloutInfo.ModTime().UnixNano(), *before.FileMtime,
+		"index mtime must determine the composite fingerprint")
+
+	require.NoError(t, os.WriteFile(indexPath, []byte(
+		`{"id":"`+uuid+`","thread_name":"Renamed title"}`+"\n",
+	), 0o644))
+	storedMtime := time.Unix(0, *before.FileMtime)
+	require.NoError(t, os.Chtimes(indexPath, storedMtime, storedMtime),
+		"restore index mtime after title-only rewrite")
+	indexInfo, err := os.Stat(indexPath)
+	require.NoError(t, err)
+	require.Equal(t, *before.FileMtime, indexInfo.ModTime().UnixNano(),
+		"title-only rewrite keeps the stored composite mtime")
+
+	env.engine.SyncPaths([]string{path})
+
+	after, err := env.db.GetSessionFull(context.Background(), "codex:"+uuid)
+	require.NoError(t, err)
+	require.NotNil(t, after)
+	require.NotNil(t, after.SessionName)
+	assert.Equal(t, "Renamed title", *after.SessionName)
+	assert.False(t, after.LastWriteIncremental,
+		"title refresh must use an authoritative full replacement")
+	msgs := fetchMessages(t, env.db, "codex:"+uuid)
+	require.Len(t, msgs, 1)
+	assert.Equal(t, "keep this message", msgs[0].Content)
+}
+
+func TestSyncPathsCodexIndexEventReloadsSameStatTitle(t *testing.T) {
+	root := t.TempDir()
+	codexDir := filepath.Join(root, "sessions")
+	require.NoError(t, os.MkdirAll(codexDir, 0o755))
+	env := setupTestEnv(t, WithCodexDirs([]string{codexDir}))
+
+	const uuid = "019eb791-cf7d-75c1-8439-9ed74c1229f7"
+	initial := testjsonl.JoinJSONL(
+		testjsonl.CodexSessionMetaJSON(
+			uuid, "/tmp/proj", "codex_cli_rs", tsEarly,
+		),
+		testjsonl.CodexMsgJSON("user", "keep this message", tsEarlyS1),
+	)
+	env.writeCodexSession(
+		t, filepath.Join("2024", "01", "01"),
+		"rollout-2024-01-01T10-00-00-"+uuid+".jsonl", initial,
+	)
+	indexPath := filepath.Join(root, parser.CodexSessionIndexFilename)
+	original := `{"id":"` + uuid + `","thread_name":"Alpha title"}` + "\n"
+	rewritten := `{"id":"` + uuid + `","thread_name":"Bravo title"}` + "\n"
+	require.Len(t, rewritten, len(original), "index fixtures must have equal length")
+	require.NoError(t, os.WriteFile(indexPath, []byte(original), 0o644))
+	stableTime := time.Unix(1_800_000_000, 456_000_000)
+	require.NoError(t, os.Chtimes(indexPath, stableTime, stableTime))
+	env.engine.SyncAll(context.Background(), nil)
+
+	before, err := env.db.GetSessionFull(context.Background(), "codex:"+uuid)
+	require.NoError(t, err)
+	require.NotNil(t, before)
+	require.NotNil(t, before.SessionName)
+	assert.Equal(t, "Alpha title", *before.SessionName)
+	indexInfo, err := os.Stat(indexPath)
+	require.NoError(t, err)
+
+	require.NoError(t, os.WriteFile(indexPath, []byte(rewritten), 0o644))
+	require.NoError(t, os.Chtimes(indexPath, indexInfo.ModTime(), indexInfo.ModTime()))
+	rewrittenInfo, err := os.Stat(indexPath)
+	require.NoError(t, err)
+	require.Equal(t, indexInfo.Size(), rewrittenInfo.Size())
+	require.Equal(t, indexInfo.ModTime(), rewrittenInfo.ModTime())
+
+	env.engine.SyncPaths([]string{indexPath})
+
+	after, err := env.db.GetSessionFull(context.Background(), "codex:"+uuid)
+	require.NoError(t, err)
+	require.NotNil(t, after)
+	require.NotNil(t, after.SessionName)
+	assert.Equal(t, "Bravo title", *after.SessionName)
+	assert.False(t, after.LastWriteIncremental,
+		"index event refresh must use a full replacement")
+}
+
+func TestWatcherOverflowReloadsSameStatCodexIndexTitle(t *testing.T) {
+	root := t.TempDir()
+	codexDir := filepath.Join(root, "sessions")
+	require.NoError(t, os.MkdirAll(codexDir, 0o755))
+	env := setupTestEnv(t, WithCodexDirs([]string{codexDir}))
+
+	const uuid = "019eb791-cf7d-75c1-8439-9ed74c1229f8"
+	initial := testjsonl.JoinJSONL(
+		testjsonl.CodexSessionMetaJSON(
+			uuid, "/tmp/proj", "codex_cli_rs", tsEarly,
+		),
+		testjsonl.CodexMsgJSON("user", "keep overflow message", tsEarlyS1),
+	)
+	env.writeCodexSession(
+		t, filepath.Join("2024", "01", "01"),
+		"rollout-2024-01-01T10-00-00-"+uuid+".jsonl", initial,
+	)
+	indexPath := filepath.Join(root, parser.CodexSessionIndexFilename)
+	original := `{"id":"` + uuid + `","thread_name":"Alpha title"}` + "\n"
+	rewritten := `{"id":"` + uuid + `","thread_name":"Bravo title"}` + "\n"
+	require.Len(t, rewritten, len(original), "index fixtures must have equal length")
+	require.NoError(t, os.WriteFile(indexPath, []byte(original), 0o644))
+	stableTime := time.Unix(1_800_000_001, 456_000_000)
+	require.NoError(t, os.Chtimes(indexPath, stableTime, stableTime))
+	env.engine.SyncAll(context.Background(), nil)
+
+	before, err := env.db.GetSessionFull(context.Background(), "codex:"+uuid)
+	require.NoError(t, err)
+	require.NotNil(t, before)
+	require.NotNil(t, before.SessionName)
+	assert.Equal(t, "Alpha title", *before.SessionName)
+	indexInfo, err := os.Stat(indexPath)
+	require.NoError(t, err)
+
+	require.NoError(t, os.WriteFile(indexPath, []byte(rewritten), 0o644))
+	require.NoError(t, os.Chtimes(indexPath, indexInfo.ModTime(), indexInfo.ModTime()))
+	rewrittenInfo, err := os.Stat(indexPath)
+	require.NoError(t, err)
+	require.Equal(t, indexInfo.Size(), rewrittenInfo.Size())
+	require.Equal(t, indexInfo.ModTime(), rewrittenInfo.ModTime())
+
+	stats := env.engine.SyncAllAfterWatcherOverflow(context.Background(), nil)
+	require.False(t, stats.Aborted)
+	after, err := env.db.GetSessionFull(context.Background(), "codex:"+uuid)
+	require.NoError(t, err)
+	require.NotNil(t, after)
+	require.NotNil(t, after.SessionName)
+	assert.Equal(t, "Bravo title", *after.SessionName)
+	assert.False(t, after.LastWriteIncremental)
+	msgs := fetchMessages(t, env.db, "codex:"+uuid)
+	require.Len(t, msgs, 1)
+	assert.Equal(t, "keep overflow message", msgs[0].Content)
 }
 
 // TestIncrementalSync_CodexStoresEffectiveMtime pins that the incremental
@@ -8388,6 +11384,8 @@ func TestIncrementalSync_CodexStoresEffectiveMtime(t *testing.T) {
 	require.NoError(t, err, "GetSessionFull")
 	require.NotNil(t, sess, "session present")
 	require.NotNil(t, sess.FileMtime, "file_mtime stored")
+	assert.True(t, sess.LastWriteIncremental,
+		"an unchanged-title append should stay on the incremental path")
 
 	// Compare against re-stats (not the requested Chtimes values) so the
 	// assertion is robust to filesystem mtime granularity.
@@ -8401,7 +11399,7 @@ func TestIncrementalSync_CodexStoresEffectiveMtime(t *testing.T) {
 		"effective mtime exceeds the plain rollout mtime")
 }
 
-func TestIncrementalSync_CodexAppendFullReparseStoresRawFileSize(t *testing.T) {
+func TestIncrementalSync_CodexPartialTailCommitsOnlySafeRecords(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping integration test")
 	}
@@ -8421,14 +11419,18 @@ func TestIncrementalSync_CodexAppendFullReparseStoresRawFileSize(t *testing.T) {
 	env.engine.SyncAll(context.Background(), nil)
 	assertSessionMessageCount(t, env.db, "codex:"+uuid, 1)
 
-	appended := testjsonl.JoinJSONL(
+	completeTail := testjsonl.JoinJSONL(
 		testjsonl.CodexMsgJSON("assistant", "world", tsEarlyS5),
 	)
+	partialLine := testjsonl.CodexMsgJSON(
+		"assistant", "completed later", "2024-01-01T10:00:10Z",
+	)
+	partialAt := len(partialLine) / 2
 	f, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0o644)
 	require.NoError(t, err, "open for append")
-	_, err = f.WriteString(appended)
+	_, err = f.WriteString(completeTail)
 	require.NoError(t, err, "append complete message")
-	_, err = f.WriteString(`{"timestamp":"2024-01-01T10:00:10Z"`)
+	_, err = f.WriteString(partialLine[:partialAt])
 	require.NoError(t, err, "append partial trailing JSON")
 	require.NoError(t, f.Close(), "close after append")
 
@@ -8440,20 +11442,166 @@ func TestIncrementalSync_CodexAppendFullReparseStoresRawFileSize(t *testing.T) {
 	require.NotNil(t, sess, "session present")
 	require.NotNil(t, sess.FileSize, "file_size stored")
 	require.NotNil(t, sess.FileHash, "file_hash stored")
+	require.True(t, sess.LastWriteIncremental)
 
-	live, err := os.ReadFile(path)
+	safeSize := int64(len(initial) + len(completeTail))
+	require.Equal(t, safeSize, *sess.FileSize,
+		"incremental cursor stops before the partial record")
+	safePrefix, err := os.ReadFile(path)
 	require.NoError(t, err, "read live transcript")
-	// Codex does not advertise incremental append, so re-syncing the appended
-	// transcript is a full re-parse that stores the raw file size and hash
-	// (including the ignored partial trailing line). The parsed-snapshot vs
-	// partial-tail distinction is enforced at parse-diff time via
-	// CodexTranscriptConsumedSize, not in the stored fingerprint.
-	require.Equal(t, int64(len(live)), *sess.FileSize,
-		"full Codex re-parse stores the raw file size")
-	sum := sha256.Sum256(live)
+	sum := sha256.Sum256(safePrefix[:safeSize])
 	wantHash := fmt.Sprintf("%x", sum[:])
 	assert.Equal(t, wantHash, *sess.FileHash,
-		"stored Codex hash matches the whole-file fingerprint")
+		"stored Codex hash covers only the committed safe prefix")
+
+	f, err = os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0o644)
+	require.NoError(t, err, "reopen for append")
+	_, err = f.WriteString(partialLine[partialAt:] + "\n")
+	require.NoError(t, err, "complete partial record")
+	_, err = f.WriteString(testjsonl.CodexMsgJSON(
+		"assistant", "after partial", "2024-01-01T10:00:11Z",
+	) + "\n")
+	require.NoError(t, err, "append later record")
+	require.NoError(t, f.Close(), "close completed transcript")
+
+	env.engine.SyncPaths([]string{path})
+
+	msgs := fetchMessages(t, env.db, "codex:"+uuid)
+	require.Len(t, msgs, 4)
+	assert.Equal(t, []string{
+		"hello", "world", "completed later", "after partial",
+	}, []string{msgs[0].Content, msgs[1].Content, msgs[2].Content, msgs[3].Content})
+	sess, err = env.db.GetSessionFull(context.Background(), "codex:"+uuid)
+	require.NoError(t, err, "GetSessionFull after partial completion")
+	require.NotNil(t, sess)
+	info, err := os.Stat(path)
+	require.NoError(t, err, "stat completed transcript")
+	require.NotNil(t, sess.FileSize)
+	assert.Equal(t, info.Size(), *sess.FileSize)
+	assert.True(t, sess.LastWriteIncremental)
+}
+
+func TestIncrementalSync_CodexZeroConsumedPartialTailRetriesAtSameMtime(t *testing.T) {
+	env := setupTestEnv(t)
+
+	const uuid = "019eb791-cf7d-75c1-8439-9ed74c1229ec"
+	initial := testjsonl.JoinJSONL(
+		testjsonl.CodexSessionMetaJSON(
+			uuid, "/tmp/proj", "codex_cli_rs", tsEarly,
+		),
+		testjsonl.CodexMsgJSON("user", "hello", tsEarlyS1),
+	)
+	path := env.writeCodexSession(
+		t, filepath.Join("2024", "01", "01"),
+		"rollout-2024-01-01T10-00-00-"+uuid+".jsonl", initial,
+	)
+	env.engine.SyncAll(context.Background(), nil)
+
+	completeLine := testjsonl.CodexMsgJSON(
+		"assistant", "arrived after partial write", tsEarlyS5,
+	)
+	partialAt := len(completeLine) / 2
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0o644)
+	require.NoError(t, err, "open transcript for partial append")
+	_, err = f.WriteString(completeLine[:partialAt])
+	require.NoError(t, err, "append incomplete record")
+	require.NoError(t, f.Close())
+	fixedMtime := time.Now().Add(-time.Hour).Truncate(time.Second)
+	require.NoError(t, os.Chtimes(path, fixedMtime, fixedMtime))
+
+	env.engine.SyncPaths([]string{path})
+
+	intermediate, err := env.db.GetSessionFull(
+		context.Background(), "codex:"+uuid,
+	)
+	require.NoError(t, err)
+	require.NotNil(t, intermediate)
+	require.NotNil(t, intermediate.FileSize)
+	assert.Equal(t, int64(len(initial)), *intermediate.FileSize,
+		"an incomplete record must not advance the committed offset")
+	assert.Equal(t, 1, intermediate.MessageCount)
+	assert.False(t, intermediate.LastWriteIncremental,
+		"zero consumed bytes must not write an incremental update")
+
+	f, err = os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0o644)
+	require.NoError(t, err, "reopen transcript to complete record")
+	_, err = f.WriteString(completeLine[partialAt:] + "\n")
+	require.NoError(t, err, "complete record")
+	require.NoError(t, f.Close())
+	require.NoError(t, os.Chtimes(path, fixedMtime, fixedMtime),
+		"restore the exact mtime cached by the partial pass")
+
+	env.engine.SyncPaths([]string{path})
+
+	msgs := fetchMessages(t, env.db, "codex:"+uuid)
+	require.Len(t, msgs, 2)
+	assert.Equal(t, []string{"hello", "arrived after partial write"},
+		[]string{msgs[0].Content, msgs[1].Content})
+	final, err := env.db.GetSessionFull(context.Background(), "codex:"+uuid)
+	require.NoError(t, err)
+	require.NotNil(t, final)
+	require.NotNil(t, final.FileSize)
+	info, err := os.Stat(path)
+	require.NoError(t, err)
+	assert.Equal(t, info.Size(), *final.FileSize)
+	assert.True(t, final.LastWriteIncremental)
+}
+
+func TestIncrementalSync_CodexUnsafeStoredOffsetForcesFullReparse(t *testing.T) {
+	env := setupTestEnv(t)
+
+	const uuid = "019eb791-cf7d-75c1-8439-9ed74c1229ea"
+	safePrefix := testjsonl.JoinJSONL(
+		testjsonl.CodexSessionMetaJSON(
+			uuid, "/tmp/proj", "codex_cli_rs", tsEarly,
+		),
+		testjsonl.CodexMsgJSON("user", "hello", tsEarlyS1),
+	)
+	completedLine := testjsonl.CodexMsgJSON(
+		"assistant", "completed record", tsEarlyS5,
+	)
+	partialAt := len(completedLine) / 2
+	unsafeSnapshot := safePrefix + completedLine[:partialAt]
+	path := env.writeCodexSession(
+		t, filepath.Join("2024", "01", "01"),
+		"rollout-2024-01-01T10-00-00-"+uuid+".jsonl",
+		unsafeSnapshot,
+	)
+	env.engine.SyncAll(context.Background(), nil)
+
+	initial, err := env.db.GetSessionFull(context.Background(), "codex:"+uuid)
+	require.NoError(t, err)
+	require.NotNil(t, initial)
+	require.NotNil(t, initial.FileSize)
+	assert.Equal(t, int64(len(unsafeSnapshot)), *initial.FileSize,
+		"full parse records the raw snapshot size even when it ends mid-record")
+	assertSessionMessageCount(t, env.db, "codex:"+uuid, 1)
+
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0o644)
+	require.NoError(t, err, "open unsafe snapshot for completion")
+	_, err = f.WriteString(completedLine[partialAt:] + "\n")
+	require.NoError(t, err, "complete stored mid-record line")
+	_, err = f.WriteString(testjsonl.CodexMsgJSON(
+		"assistant", "later record", "2024-01-01T10:00:06Z",
+	) + "\n")
+	require.NoError(t, err, "append later record")
+	require.NoError(t, f.Close())
+
+	env.engine.SyncPaths([]string{path})
+
+	msgs := fetchMessages(t, env.db, "codex:"+uuid)
+	require.Len(t, msgs, 3)
+	assert.Equal(t, []string{"hello", "completed record", "later record"},
+		[]string{msgs[0].Content, msgs[1].Content, msgs[2].Content})
+	after, err := env.db.GetSessionFull(context.Background(), "codex:"+uuid)
+	require.NoError(t, err)
+	require.NotNil(t, after)
+	assert.False(t, after.LastWriteIncremental,
+		"unsafe stored offset must force an authoritative message replacement")
+	info, err := os.Stat(path)
+	require.NoError(t, err)
+	require.NotNil(t, after.FileSize)
+	assert.Equal(t, info.Size(), *after.FileSize)
 }
 
 func TestIncrementalSync_CodexExecAppendRetainsEvents(t *testing.T) {
@@ -8712,6 +11860,8 @@ func TestIncrementalSync_CodexIndexRenameBelowStoredMtimeRefreshesName(t *testin
 	if assert.NotNil(t, sess.SessionName, "expected renamed session_name") {
 		assert.Equal(t, "Renamed title", *sess.SessionName)
 	}
+	assert.False(t, sess.LastWriteIncremental,
+		"a changed title must force an authoritative full replacement")
 	// The incremental append must still have landed.
 	msgs := fetchMessages(t, env.db, "codex:"+uuid)
 	require.Len(t, msgs, 2)
@@ -8809,6 +11959,9 @@ func TestResyncAllCancelledPreservesOriginalDB(t *testing.T) {
 	stats := env.engine.ResyncAll(ctx, nil)
 
 	require.True(t, stats.Aborted, "expected ResyncAll to report Aborted")
+	assert.Equal(t, []string{"resync aborted: 0 synced, 0 failed"}, stats.Warnings)
+	assert.Equal(t, stats, env.engine.LastSyncStats(),
+		"legacy LastSyncStats must match the returned cancellation result")
 
 	// Original DB should be preserved — session still
 	// has the original data.

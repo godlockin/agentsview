@@ -11,6 +11,8 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"go.kenn.io/agentsview/internal/db"
+	"go.kenn.io/agentsview/internal/export"
+	"go.kenn.io/agentsview/internal/service"
 )
 
 func prepareUsageSchema(
@@ -86,9 +88,9 @@ func TestStoreGetDailyUsageWithBreakdowns(t *testing.T) {
 			id, machine, project, agent, started_at,
 			message_count, user_message_count
 		) VALUES
-			('usage-breakdown-001', 'test-machine', 'proj-a', 'claude',
+			('usage-breakdown-001', 'host-a', 'proj-a', 'claude',
 			 '2026-03-12T10:00:00Z'::timestamptz, 1, 1),
-			('usage-breakdown-002', 'test-machine', 'proj-b', 'codex',
+			('usage-breakdown-002', 'host-b', 'proj-b', 'codex',
 			 '2026-03-12T11:00:00Z'::timestamptz, 1, 1)`)
 	require.NoError(t, err, "insert sessions")
 	_, err = store.DB().ExecContext(ctx, `
@@ -120,6 +122,11 @@ func TestStoreGetDailyUsageWithBreakdowns(t *testing.T) {
 	assert.Len(t, day.ProjectBreakdowns, 2)
 	assert.Len(t, day.AgentBreakdowns, 2)
 	assert.Len(t, day.ModelBreakdowns, 2)
+	require.Len(t, day.MachineBreakdowns, 2)
+	assert.Equal(t, "host-a", day.MachineBreakdowns[0].MachineName)
+	assert.Equal(t, "host-b", day.MachineBreakdowns[1].MachineName)
+	assert.InDelta(t, day.TotalCost,
+		day.MachineBreakdowns[0].Cost+day.MachineBreakdowns[1].Cost, 1e-9)
 	assert.Greater(t, day.TotalCost, 0.0)
 
 	noCounts, err := store.GetDailyUsage(ctx, db.UsageFilter{
@@ -217,7 +224,7 @@ func TestStoreGetSessionUsagePricedModel(t *testing.T) {
 		)`)
 	require.NoError(t, err, "insert message")
 
-	got, err := store.GetSessionUsage(ctx, "codex:usage-priced")
+	got, err := store.GetSessionUsage(ctx, "codex:usage-priced", true)
 	require.NoError(t, err, "GetSessionUsage")
 	require.NotNil(t, got, "GetSessionUsage result")
 	assert.Equal(t, "codex:usage-priced", got.SessionID)
@@ -230,6 +237,129 @@ func TestStoreGetSessionUsagePricedModel(t *testing.T) {
 	assert.InDelta(t, 0.01134, got.CostUSD, 1e-9)
 	assert.Equal(t, []string{"gpt-5.1"}, got.Models)
 	assert.Empty(t, got.UnpricedModels)
+	require.Len(t, got.Breakdown, 1, "Breakdown")
+	entry := got.Breakdown[0]
+	assert.Equal(t, 1, entry.Ordinal)
+	require.NotNil(t, entry.MessageOrdinal)
+	assert.Equal(t, 1, *entry.MessageOrdinal)
+	assert.Equal(t, "message", entry.Source)
+	assert.Equal(t, "Prompt 2", entry.Label)
+	assert.Equal(t, "2026-03-12T10:01:00Z", entry.Timestamp)
+	assert.Equal(t, "gpt-5.1", entry.Model)
+	assert.Equal(t, 1000, entry.InputTokens)
+	assert.Equal(t, 500, entry.OutputTokens)
+	assert.Equal(t, 200, entry.CacheCreationInputTokens)
+	assert.Equal(t, 300, entry.CacheReadInputTokens)
+	assert.True(t, entry.HasCost)
+	assert.InDelta(t, 0.01134, entry.CostUSD, 1e-9)
+}
+
+func TestStoreSessionUsageRollupParity(t *testing.T) {
+	_, store := prepareUsageSchema(t, "agentsview_session_usage_rollup_test")
+	ctx := context.Background()
+	_, err := store.DB().ExecContext(ctx, `
+		INSERT INTO model_pricing (
+			model_pattern, input_per_mtok, output_per_mtok,
+			cache_creation_per_mtok, cache_read_per_mtok, updated_at
+		) VALUES ('gpt-5.1', 3, 15, 3.75, 0.30, 'seed')`)
+	require.NoError(t, err)
+	_, err = store.DB().ExecContext(ctx, `
+		INSERT INTO sessions (
+			id, machine, project, agent, started_at, message_count,
+			user_message_count, parent_session_id, relationship_type
+		) VALUES
+			('pg-rollup-root', 'test', 'project', 'codex', '2026-03-12T10:00:00Z', 1, 1, NULL, 'root'),
+			('pg-rollup-continuation', 'test', 'project', 'codex', '2026-03-12T10:01:00Z', 0, 0, 'pg-rollup-root', 'continuation'),
+			('pg-rollup-child', 'test', 'project', 'codex', '2026-03-12T10:02:00Z', 1, 1, 'pg-rollup-continuation', 'subagent')`)
+	require.NoError(t, err)
+	_, err = store.DB().ExecContext(ctx, `
+		INSERT INTO messages (
+			session_id, ordinal, role, content, timestamp, content_length,
+			model, token_usage, claude_message_id, claude_request_id
+		) VALUES
+			('pg-rollup-root', 0, 'assistant', 'root', '2026-03-12T10:00:00Z', 4, 'gpt-5.1', '{"input_tokens":1000,"output_tokens":500}', 'pg-rollup-shared', 'pg-rollup-request'),
+			('pg-rollup-child', 0, 'assistant', 'child', '2026-03-12T10:02:00Z', 5, 'gpt-5.1', '{"input_tokens":1000,"output_tokens":500}', 'pg-rollup-shared', 'pg-rollup-request'),
+			('pg-rollup-child', 1, 'assistant', 'child unique', '2026-03-12T10:03:00Z', 12, 'gpt-5.1', '{"input_tokens":1000,"output_tokens":500}', 'pg-rollup-unique', 'pg-rollup-unique-request')`)
+	require.NoError(t, err)
+
+	rollup, err := service.GetSessionUsageRollup(ctx, store, "pg-rollup-root", false)
+	require.NoError(t, err)
+	require.Equal(t, 1, rollup.SubagentCount)
+	require.True(t, rollup.HasCost)
+	assert.InDelta(t, 0.021, rollup.CostUSD, 1e-9)
+}
+
+func TestStoreSessionUsageRollupUsesCopilotReportedSessionCost(t *testing.T) {
+	_, store := prepareUsageSchema(t, "agentsview_session_usage_rollup_copilot_test")
+	ctx := context.Background()
+	_, err := store.DB().ExecContext(ctx, `
+		INSERT INTO model_pricing (
+			model_pattern, input_per_mtok, output_per_mtok,
+			cache_creation_per_mtok, cache_read_per_mtok, updated_at
+		) VALUES ('gpt-5.1', 3, 15, 3.75, 0.30, 'seed')`)
+	require.NoError(t, err)
+	_, err = store.DB().ExecContext(ctx, `
+		INSERT INTO sessions (
+			id, machine, project, agent, started_at, message_count,
+			user_message_count, parent_session_id, relationship_type
+		) VALUES
+			('pg-copilot-rollup-root', 'test', 'project', 'copilot',
+			 '2026-03-12T10:00:00Z', 1, 1, NULL, 'root'),
+			('pg-copilot-rollup-child', 'test', 'project', 'copilot',
+			 '2026-03-12T10:02:00Z', 1, 1,
+			 'pg-copilot-rollup-root', 'subagent')`)
+	require.NoError(t, err)
+	_, err = store.DB().ExecContext(ctx, `
+		INSERT INTO usage_events (
+			session_id, source, model, input_tokens, output_tokens,
+			cost_usd, cost_status, cost_source, occurred_at, dedup_key
+		) VALUES
+			('pg-copilot-rollup-root', 'shutdown', 'gpt-5.1', 1000, 500,
+			 NULL, '', '', '2026-03-12T10:01:00Z', 'first'),
+			('pg-copilot-rollup-root', 'shutdown', 'gpt-5.1', 1000, 500,
+			 0.03, 'exact', 'copilot-reported', '2026-03-12T10:02:00Z', 'final'),
+			('pg-copilot-rollup-child', 'provider', 'gpt-5.1', 0, 0,
+			 0.02, 'exact', 'provider', '2026-03-12T10:03:00Z', 'child')`)
+	require.NoError(t, err)
+
+	rollup, err := service.GetSessionUsageRollup(
+		ctx, store, "pg-copilot-rollup-root", false)
+	require.NoError(t, err)
+	require.True(t, rollup.HasCost)
+	assert.InDelta(t, 0.05, rollup.CostUSD, 1e-12)
+}
+
+func TestStoreSessionUsageRollupIncludesUntimedRows(t *testing.T) {
+	_, store := prepareUsageSchema(t, "agentsview_session_usage_rollup_untimed_test")
+	ctx := context.Background()
+	_, err := store.DB().ExecContext(ctx, `
+		INSERT INTO model_pricing (
+			model_pattern, input_per_mtok, output_per_mtok,
+			cache_creation_per_mtok, cache_read_per_mtok, updated_at
+		) VALUES ('gpt-5.1', 3, 15, 3.75, 0.30, 'seed')`)
+	require.NoError(t, err)
+	_, err = store.DB().ExecContext(ctx, `
+		INSERT INTO sessions (
+			id, machine, project, agent, started_at, message_count,
+			user_message_count, parent_session_id, relationship_type
+		) VALUES
+			('pg-rollup-untimed-root', 'test', 'project', 'codex', '2026-03-12T10:00:00Z', 1, 1, NULL, 'root'),
+			('pg-rollup-untimed-child', 'test', 'project', 'codex', '2026-03-12T10:02:00Z', 1, 1, 'pg-rollup-untimed-root', 'subagent')`)
+	require.NoError(t, err)
+	_, err = store.DB().ExecContext(ctx, `
+		INSERT INTO messages (
+			session_id, ordinal, role, content, timestamp, content_length,
+			model, token_usage
+		) VALUES
+			('pg-rollup-untimed-root', 0, 'assistant', 'root', NULL, 4, 'gpt-5.1', '{"input_tokens":1000,"output_tokens":500}'),
+			('pg-rollup-untimed-child', 0, 'assistant', 'child', NULL, 5, 'gpt-5.1', '{"input_tokens":1000,"output_tokens":500}')`)
+	require.NoError(t, err)
+
+	rollup, err := service.GetSessionUsageRollup(ctx, store, "pg-rollup-untimed-root", false)
+	require.NoError(t, err)
+	require.Equal(t, 1, rollup.SubagentCount)
+	require.True(t, rollup.HasCost)
+	assert.InDelta(t, 0.021, rollup.CostUSD, 1e-9)
 }
 
 func TestStoreGetSessionUsageDedupesSourceUUIDWhenClaudePairIncomplete(t *testing.T) {
@@ -266,12 +396,15 @@ func TestStoreGetSessionUsageDedupesSourceUUIDWhenClaudePairIncomplete(t *testin
 			 'msg-1', '', 'source-1')`)
 	require.NoError(t, err, "insert messages")
 
-	got, err := store.GetSessionUsage(ctx, "claude:usage-source")
+	got, err := store.GetSessionUsage(ctx, "claude:usage-source", true)
 	require.NoError(t, err, "GetSessionUsage")
 	require.NotNil(t, got, "GetSessionUsage result")
 	assert.True(t, got.HasCost)
 	assert.InDelta(t, 0.0175, got.CostUSD, 1e-9)
 	assert.Equal(t, []string{"claude-opus-4-6"}, got.Models)
+	require.Len(t, got.Breakdown, 1, "Breakdown")
+	require.NotNil(t, got.Breakdown[0].MessageOrdinal)
+	assert.Equal(t, 0, *got.Breakdown[0].MessageOrdinal)
 }
 
 func TestStoreGetSessionUsageNoTokenRowsKeepsMetadata(t *testing.T) {
@@ -288,7 +421,7 @@ func TestStoreGetSessionUsageNoTokenRowsKeepsMetadata(t *testing.T) {
 		)`)
 	require.NoError(t, err, "insert session")
 
-	got, err := store.GetSessionUsage(ctx, "codex:usage-empty")
+	got, err := store.GetSessionUsage(ctx, "codex:usage-empty", true)
 	require.NoError(t, err, "GetSessionUsage")
 	require.NotNil(t, got, "GetSessionUsage result")
 	assert.Equal(t, "codex:usage-empty", got.SessionID)
@@ -299,12 +432,13 @@ func TestStoreGetSessionUsageNoTokenRowsKeepsMetadata(t *testing.T) {
 	assert.Zero(t, got.CostUSD)
 	assert.Empty(t, got.Models)
 	assert.Empty(t, got.UnpricedModels)
+	assert.Empty(t, got.Breakdown)
 }
 
 func TestStoreGetSessionUsageNotFound(t *testing.T) {
 	_, store := prepareUsageSchema(t, "agentsview_session_usage_missing_test")
 
-	got, err := store.GetSessionUsage(context.Background(), "missing")
+	got, err := store.GetSessionUsage(context.Background(), "missing", true)
 	require.NoError(t, err, "GetSessionUsage")
 	assert.Nil(t, got, "GetSessionUsage")
 }
@@ -805,10 +939,10 @@ func TestPostgresUsagePreservesSessionSummaryUsageEventTokens(t *testing.T) {
 	require.NoError(t, err, "insert session")
 	_, err = store.DB().ExecContext(ctx, `
 		INSERT INTO usage_events (
-			session_id, source, model, input_tokens, output_tokens,
-			occurred_at, dedup_key
+			session_id, message_ordinal, source, model, input_tokens,
+			output_tokens, occurred_at, dedup_key
 		) VALUES (
-			'hermes-summary', 'session', 'gpt-5.4', $1, $2,
+			'hermes-summary', 0, 'session', 'gpt-5.4', $1, $2,
 			'2026-05-14T10:05:00Z'::timestamptz, 'session:hermes-summary'
 		)`, rawInput, rawOutput)
 	require.NoError(t, err, "insert usage event")
@@ -823,7 +957,7 @@ func TestPostgresUsagePreservesSessionSummaryUsageEventTokens(t *testing.T) {
 	assert.Equal(t, rawInput, daily.Totals.InputTokens, "daily input")
 	assert.Equal(t, rawOutput, daily.Totals.OutputTokens, "daily output")
 
-	usage, err := store.GetSessionUsage(ctx, "hermes-summary")
+	usage, err := store.GetSessionUsage(ctx, "hermes-summary", true)
 	require.NoError(t, err, "GetSessionUsage")
 	require.NotNil(t, usage, "session usage")
 	assert.Equal(t, rawOutput, usage.TotalOutputTokens)
@@ -831,6 +965,65 @@ func TestPostgresUsagePreservesSessionSummaryUsageEventTokens(t *testing.T) {
 	require.True(t, usage.HasCost, "HasCost")
 	wantCost := (float64(rawInput)*1.0 + float64(rawOutput)*2.0) / 1_000_000
 	assert.InDelta(t, wantCost, usage.CostUSD, 1e-9, "session cost")
+	require.Len(t, usage.Breakdown, 1, "Breakdown")
+	entry := usage.Breakdown[0]
+	assert.Equal(t, "session", entry.Source)
+	assert.Equal(t, "Step 1", entry.Label)
+	require.NotNil(t, entry.MessageOrdinal)
+	assert.Equal(t, 0, *entry.MessageOrdinal)
+	assert.Equal(t, rawInput, entry.InputTokens)
+	assert.Equal(t, rawOutput, entry.OutputTokens)
+	assert.True(t, entry.HasCost)
+	assert.InDelta(t, wantCost, entry.CostUSD, 1e-9, "breakdown cost")
+}
+
+func TestPostgresUsageCostsMessageReasoningTokens(t *testing.T) {
+	_, store := prepareUsageSchema(t, "agentsview_usage_message_reasoning_test")
+
+	ctx := context.Background()
+	_, err := store.DB().ExecContext(ctx, `
+		INSERT INTO model_pricing (
+			model_pattern, input_per_mtok, output_per_mtok,
+			cache_creation_per_mtok, cache_read_per_mtok, updated_at
+		) VALUES ('gpt-5.4', 1, 2, 0, 0, 'seed')`)
+	require.NoError(t, err, "insert pricing")
+	_, err = store.DB().ExecContext(ctx, `
+		INSERT INTO sessions (
+			id, machine, project, agent, started_at,
+			message_count, user_message_count
+		) VALUES (
+			'pg-message-reasoning', 'test-machine', 'proj', 'codex',
+			'2026-05-14T10:00:00Z'::timestamptz, 1, 1
+		)`)
+	require.NoError(t, err, "insert session")
+	_, err = store.DB().ExecContext(ctx, `
+		INSERT INTO messages (
+			session_id, ordinal, role, content, timestamp,
+			content_length, model, token_usage
+		) VALUES (
+			'pg-message-reasoning', 0, 'assistant', 'done',
+			'2026-05-14T10:30:00Z'::timestamptz, 4,
+			'gpt-5.4',
+			'{"input_tokens":1000,"output_tokens":0,"reasoning_tokens":3000000000}'
+		)`)
+	require.NoError(t, err, "insert message")
+
+	daily, err := store.GetDailyUsage(ctx, db.UsageFilter{
+		From:     "2026-05-14",
+		To:       "2026-05-14",
+		Timezone: "UTC",
+	})
+	require.NoError(t, err, "GetDailyUsage")
+	require.Len(t, daily.Daily, 1, "daily entries")
+	assert.Equal(t, 1000, daily.Totals.InputTokens)
+	assert.Zero(t, daily.Totals.OutputTokens)
+	assert.InDelta(t, 4.001, daily.Totals.TotalCost, 1e-12)
+
+	usage, err := store.GetSessionUsage(ctx, "pg-message-reasoning", true)
+	require.NoError(t, err, "GetSessionUsage")
+	require.NotNil(t, usage)
+	assert.True(t, usage.HasCost)
+	assert.InDelta(t, 4.001, usage.CostUSD, 1e-12)
 }
 
 func TestStoreGetDailyUsageSkipsCursorUsageForTerminationFilter(t *testing.T) {
@@ -968,7 +1161,7 @@ func TestPushFallsBackToBuiltinPricingWhenLocalTableEmpty(t *testing.T) {
 		"fallback pricing not synced")
 }
 
-func TestStoreGetSessionUsage_CopilotAICreditsComputed(t *testing.T) {
+func TestStoreGetSessionUsage_CopilotExplicitCost(t *testing.T) {
 	_, store := prepareUsageSchema(t, "agentsview_copilot_credits_test")
 
 	ctx := context.Background()
@@ -990,7 +1183,7 @@ func TestStoreGetSessionUsage_CopilotAICreditsComputed(t *testing.T) {
 		)`)
 	require.NoError(t, err, "insert usage event")
 
-	u, err := store.GetSessionUsage(ctx, "copilot:s1")
+	u, err := store.GetSessionUsage(ctx, "copilot:s1", true)
 	require.NoError(t, err, "GetSessionUsage")
 	require.NotNil(t, u, "usage is nil")
 	assert.True(t, u.HasCost, "HasCost")
@@ -998,7 +1191,101 @@ func TestStoreGetSessionUsage_CopilotAICreditsComputed(t *testing.T) {
 	assert.Equal(t, 10.0, u.AICredits, "AICredits")
 }
 
-func TestStoreGetSessionUsage_CopilotNoAICreditsUnpriced(t *testing.T) {
+func TestStoreGetSessionUsage_CopilotReportedCost(t *testing.T) {
+	_, store := prepareUsageSchema(t, "agentsview_copilot_reported_cost_test")
+
+	ctx := context.Background()
+	_, err := store.DB().ExecContext(ctx, `
+		INSERT INTO sessions (
+			id, machine, project, agent, started_at,
+			message_count, user_message_count
+		) VALUES (
+			'copilot:reported', 'test-machine', 'proj', 'copilot',
+			'2026-03-12T10:00:00Z'::timestamptz, 1, 1
+		)`)
+	require.NoError(t, err)
+	_, err = store.DB().ExecContext(ctx, `
+		INSERT INTO usage_events (
+			session_id, source, model, input_tokens, output_tokens,
+			cost_usd, cost_status, cost_source, occurred_at, dedup_key
+		) VALUES
+			('copilot:reported', 'shutdown', 'gpt-4', 1000, 500,
+			 NULL, '', '', '2026-03-12T10:01:00Z'::timestamptz, 'segment-1'),
+			('copilot:reported', 'shutdown', 'gpt-4', 1000, 500,
+			 0.0275, 'exact', 'copilot-reported',
+			 '2026-03-13T10:02:00Z'::timestamptz, 'segment-2')`)
+	require.NoError(t, err)
+
+	usage, err := store.GetSessionUsage(ctx, "copilot:reported", true)
+	require.NoError(t, err)
+	require.NotNil(t, usage)
+	assert.InDelta(t, 0.0275, usage.CostUSD, 1e-12)
+	assert.InDelta(t, 0.0275/0.01, usage.AICredits, 1e-9)
+	require.Len(t, usage.Breakdown, 2)
+	assert.InDelta(t, 0.01375, usage.Breakdown[0].CostUSD, 1e-12)
+	assert.InDelta(t, 0.01375, usage.Breakdown[1].CostUSD, 1e-12)
+	assert.Equal(t, usage.CostUSD,
+		usage.Breakdown[0].CostUSD+usage.Breakdown[1].CostUSD)
+
+	daily, err := store.GetDailyUsage(ctx, db.UsageFilter{
+		From: "2026-03-12", To: "2026-03-13", Timezone: "UTC",
+	})
+	require.NoError(t, err)
+	require.Len(t, daily.Daily, 2)
+	assert.InDelta(t, 0.01375, daily.Daily[0].TotalCost, 1e-12)
+	assert.InDelta(t, 0.01375, daily.Daily[1].TotalCost, 1e-12)
+	for _, day := range daily.Daily {
+		require.Len(t, day.ModelBreakdowns, 1)
+		assert.Equal(t, day.TotalCost, day.ModelBreakdowns[0].Cost)
+	}
+	assert.InDelta(t, 0.0275, daily.Totals.TotalCost, 1e-12)
+	assert.InDelta(t, 2.75, daily.Totals.CopilotAICredits, 1e-9,
+		"credits derive from the authoritative reported cost")
+	require.NotNil(t, daily.Pricing)
+	assert.Equal(t, export.CostSourceMixed, daily.Pricing.CostSource,
+		"authoritative reported cost must surface in pricing provenance")
+	assert.Equal(t, export.CostSourceComputed,
+		daily.Pricing.Models["gpt-4"].CostSource)
+}
+
+func TestStoreGetSessionUsage_CopilotCostOnlyReported(t *testing.T) {
+	_, store := prepareUsageSchema(t, "agentsview_copilot_cost_only_test")
+
+	ctx := context.Background()
+	_, err := store.DB().ExecContext(ctx, `
+		INSERT INTO sessions (
+			id, machine, project, agent, started_at,
+			message_count, user_message_count
+		) VALUES (
+			'copilot:cost-only', 'test-machine', 'proj', 'copilot',
+			'2026-03-12T10:00:00Z'::timestamptz, 1, 1
+		)`)
+	require.NoError(t, err)
+	_, err = store.DB().ExecContext(ctx, `
+		INSERT INTO usage_events (
+			session_id, source, model, input_tokens, output_tokens,
+			cost_usd, cost_status, cost_source, occurred_at, dedup_key
+		) VALUES (
+			'copilot:cost-only', 'shutdown', 'copilot', 0, 0,
+			0.0175, 'exact', 'copilot-reported',
+			'2026-03-12T10:01:00Z'::timestamptz, 'cost-only'
+		)`)
+	require.NoError(t, err)
+
+	u, err := store.GetSessionUsage(ctx, "copilot:cost-only", true)
+	require.NoError(t, err)
+	require.NotNil(t, u)
+	assert.True(t, u.HasCost)
+	assert.InDelta(t, 0.0175, u.CostUSD, 1e-12)
+	assert.False(t, u.HasTokenData,
+		"a cost-only reported row is not token data")
+	assert.Empty(t, u.Models,
+		"a cost-only carrier row must not surface a model")
+	assert.Zero(t, u.BreakdownCount)
+	assert.Empty(t, u.Breakdown)
+}
+
+func TestStoreGetSessionUsage_CopilotUnpricedNoCost(t *testing.T) {
 	_, store := prepareUsageSchema(t, "agentsview_copilot_unpriced_test")
 
 	ctx := context.Background()
@@ -1020,9 +1307,10 @@ func TestStoreGetSessionUsage_CopilotNoAICreditsUnpriced(t *testing.T) {
 		)`)
 	require.NoError(t, err, "insert usage event")
 
-	u, err := store.GetSessionUsage(ctx, "copilot:s2")
+	u, err := store.GetSessionUsage(ctx, "copilot:s2", true)
 	require.NoError(t, err, "GetSessionUsage")
 	require.NotNil(t, u, "usage is nil")
 	assert.False(t, u.HasCost, "HasCost should be false")
+	assert.Zero(t, u.CostUSD, "CostUSD should be 0 when unpriced")
 	assert.Equal(t, 0.0, u.AICredits, "AICredits should be 0 when unpriced")
 }

@@ -29,6 +29,8 @@ func NormalizeToolCategory(rawName string) string {
 	case "shell_command", "exec_command",
 		"write_stdin", "shell":
 		return "Bash"
+	case "list_files":
+		return "Read"
 	case "apply_patch":
 		return "Edit"
 	case "spawn_agent":
@@ -202,6 +204,40 @@ func NormalizeToolCategory(rawName string) string {
 	case "change_dir", "output_iframe", "llm_one_shot",
 		"browser_emulate", "browser_network",
 		"browser_accessibility", "browser_profile":
+		return "Tool"
+
+	// Posit Assistant tools (excluding names already handled above:
+	// read→Read, edit→Edit, write→Write, bash→Bash, grep→Grep,
+	// skill→Tool, web_search→Tool)
+	case "ls", "getConsoleContent":
+		return "Read"
+	case "runCode", "executeCode":
+		return "Bash"
+	case "todoWrite", "webfetch", "EnterMode", "ExitMode":
+		return "Tool"
+	case "explore":
+		return "Task"
+
+	// RooCode / Cline tools
+	case "readFile":
+		return "Read"
+	case "writeToFile":
+		return "Write"
+	case "insertContent":
+		return "Write"
+	case "searchAndReplace":
+		return "Edit"
+	case "appliedDiff":
+		return "Edit"
+	case "listFiles", "listFilesTopLevel", "listFilesRecursive":
+		return "Read"
+	case "listCodeDefinitionNames":
+		return "Read"
+	case "searchFiles":
+		return "Grep"
+	case "newTask":
+		return "Task"
+	case "search":
 		return "Tool"
 
 	// Warp tools

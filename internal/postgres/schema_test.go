@@ -36,6 +36,7 @@ type schemaProbeState struct {
 	mu                  sync.Mutex
 	informationQueries  int
 	execs               []string
+	queries             []string
 	execArgs            [][]driver.NamedValue
 	alterTableExecs     []string
 	currentSchema       string
@@ -139,6 +140,9 @@ func (c *schemaProbeConn) QueryContext(
 	_ context.Context, query string, args []driver.NamedValue,
 ) (driver.Rows, error) {
 	normalized := strings.ToLower(query)
+	c.state.mu.Lock()
+	c.state.queries = append(c.state.queries, query)
+	c.state.mu.Unlock()
 	for _, queryErr := range c.state.queryErrors {
 		if strings.Contains(
 			normalized,
@@ -217,6 +221,15 @@ func (c *schemaProbeConn) QueryContext(
 				"user_message_count", "is_automated",
 			},
 		}, nil
+	case strings.Contains(normalized, "from source_project_identity_observations") &&
+		strings.Contains(normalized, "select project"):
+		return &schemaProbeRows{
+			columns: []string{
+				"project", "machine", "root_path", "git_remote",
+				"git_remote_name", "worktree_name", "worktree_root_path",
+				"observed_at", "normalized_remote", "key_source", "key",
+			},
+		}, nil
 	case strings.Contains(normalized, "select exists") &&
 		strings.Contains(normalized, "from sync_metadata"):
 		done := true
@@ -278,6 +291,12 @@ func (s *schemaProbeState) executedSQL() string {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return strings.Join(s.execs, "\n")
+}
+
+func (s *schemaProbeState) queriedSQL() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return strings.Join(s.queries, "\n")
 }
 
 func (s *schemaProbeState) execArgValueSeen(value string) bool {
@@ -467,8 +486,11 @@ func TestEnsureSchemaChecksDataVersionBeforeDDL(t *testing.T) {
 func TestSyncEnsureSchemaSkipsDDLWhenSchemaCompatible(t *testing.T) {
 	pg, state := newSchemaProbeDB(t, nil)
 	state.existingTables = map[string]bool{
-		"model_pricing":       true,
-		"cursor_usage_events": true,
+		"model_pricing":                             true,
+		"source_archives":                           true,
+		"source_project_identity_observations":      true,
+		"source_session_project_identity_snapshots": true,
+		"cursor_usage_events":                       true,
 	}
 	state.existingIndexes = map[string]bool{
 		"idx_cursor_usage_events_dedup": true,
@@ -488,6 +510,34 @@ func TestSyncEnsureSchemaSkipsDDLWhenSchemaCompatible(t *testing.T) {
 		"compatible PG schema must not run column migrations")
 	assert.Contains(t, executed, "insert into sync_metadata",
 		"compatible PG schema must still run row-level data repairs")
+}
+
+func TestEnsureSchemaScrubsProjectIdentityGitRemoteCredentials(t *testing.T) {
+	pg, state := newSchemaProbeDB(t, nil)
+	state.existingTables = map[string]bool{
+		"model_pricing":                             true,
+		"source_archives":                           true,
+		"source_project_identity_observations":      true,
+		"source_session_project_identity_snapshots": true,
+		"cursor_usage_events":                       true,
+	}
+	state.existingIndexes = map[string]bool{
+		"idx_cursor_usage_events_dedup": true,
+	}
+	state.syncMetadataKeys = map[string]bool{
+		sourceCurationBackfillMetadataKey: true,
+		tokenCoverageRepairMetadataKey:    true,
+	}
+	syncer := &Sync{pg: pg, schema: "agentsview"}
+
+	require.NoError(t, syncer.EnsureSchema(context.Background()))
+
+	queried := strings.ToLower(state.queriedSQL())
+	assert.Contains(t, queried, "source_project_identity_observations",
+		"schema repair must touch project identity observations")
+	assert.True(t,
+		state.execArgValueSeen(projectIdentityRemoteScrubMetadataKey),
+		"schema repair must store the scrub marker only after the scan")
 }
 
 func TestCheckSchemaCompatIgnoresPushOnlySchema(t *testing.T) {
@@ -543,6 +593,51 @@ func TestCheckSchemaCompatRequiresSessionAliases(t *testing.T) {
 
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "session_aliases table missing")
+}
+
+func TestCheckSchemaCompatRequiresProjectIdentityObservations(t *testing.T) {
+	pg, state := newSchemaProbeDB(t, nil)
+	state.queryErrors = []schemaProbeQueryError{{
+		contains: "from source_project_identity_observations",
+		err: errors.New(
+			`ERROR: relation "source_project_identity_observations" does not exist (SQLSTATE 42P01)`),
+	}}
+
+	err := CheckSchemaCompat(context.Background(), pg)
+
+	require.Error(t, err)
+	assert.Contains(t, err.Error(),
+		"source_project_identity_observations table missing required columns")
+}
+
+func TestCheckSchemaCompatRequiresSessionProjectIdentitySnapshots(t *testing.T) {
+	pg, state := newSchemaProbeDB(t, nil)
+	state.queryErrors = []schemaProbeQueryError{{
+		contains: "from source_session_project_identity_snapshots",
+		err: errors.New(
+			`ERROR: relation "source_session_project_identity_snapshots" does not exist (SQLSTATE 42P01)`),
+	}}
+
+	err := CheckSchemaCompat(context.Background(), pg)
+
+	require.Error(t, err)
+	assert.Contains(t, err.Error(),
+		"source session project identity snapshots missing required columns")
+}
+
+func TestCheckSchemaCompatRequiresSourceArchives(t *testing.T) {
+	pg, state := newSchemaProbeDB(t, nil)
+	state.queryErrors = []schemaProbeQueryError{{
+		contains: "from source_archives",
+		err: errors.New(
+			`ERROR: relation "source_archives" does not exist (SQLSTATE 42P01)`),
+	}}
+
+	err := CheckSchemaCompat(context.Background(), pg)
+
+	require.Error(t, err)
+	assert.Contains(t, err.Error(),
+		"source_archives table missing required columns")
 }
 
 func TestSyncEnsureSchemaRunsDDLWhenPushMetadataMissing(t *testing.T) {
@@ -751,10 +846,11 @@ func TestEnsureSchemaGroupsMissingColumnMigrationsByTable(t *testing.T) {
 
 	require.NoError(t, EnsureSchema(context.Background(), db, "agentsview"))
 
-	// Two tables have missing columns (sessions: termination_status;
+	// Three tables have missing columns (sessions: termination_status;
 	// messages: source_parent_uuid, is_sidechain, is_compact_boundary,
-	// thinking_text). Per-table batching means one ALTER each. tool_calls
+	// thinking_text; source_project_identity_observations: repository/worktree/
+	// checkout/remote context). Per-table batching means one ALTER each. tool_calls
 	// lists all its migration columns (call_index, file_path) as present, so
 	// it contributes no ALTER.
-	assert.Equal(t, 2, state.alterTableExecCount(), "ALTER TABLE execs")
+	assert.Equal(t, 3, state.alterTableExecCount(), "ALTER TABLE execs")
 }

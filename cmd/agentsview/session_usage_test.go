@@ -26,6 +26,43 @@ func TestRenderSessionUsageHuman_WithCost(t *testing.T) {
 	assert.Contains(t, s, "claude-opus-4-6", "output missing model")
 }
 
+func TestRenderSessionUsageHuman_ReportedCostOmitsEstimateMarker(t *testing.T) {
+	var out sessionUsageOutput
+	require.NoError(t, json.Unmarshal([]byte(`{
+		"session_id":"hermes:s1",
+		"agent":"hermes",
+		"cost_usd":0.03,
+		"has_cost":true,
+		"cost_source":"reported",
+		"models":["model-a"]
+	}`), &out))
+
+	var b strings.Builder
+	require.NoError(t, renderSessionUsageHuman(&b, &out))
+	assert.Contains(t, b.String(), "$0.03 (model-a)")
+	assert.NotContains(t, b.String(), "~$0.03")
+}
+
+func TestRenderSessionUsageHuman_AuthoritativeCostWithoutModelsOmitsEstimateMarker(
+	t *testing.T,
+) {
+	var out sessionUsageOutput
+	require.NoError(t, json.Unmarshal([]byte(`{
+		"session_id":"copilot:cost-only",
+		"agent":"copilot",
+		"cost_usd":0.03,
+		"has_cost":true,
+		"cost_source":"reported",
+		"models":[]
+	}`), &out))
+
+	var b strings.Builder
+	require.NoError(t, renderSessionUsageHuman(&b, &out))
+	assert.Contains(t, b.String(), "$0.03")
+	assert.NotContains(t, b.String(), "~$0.03")
+	assert.NotContains(t, b.String(), "()")
+}
+
 func TestRenderSessionUsageHuman_NoCostNoModels(t *testing.T) {
 	out := &sessionUsageOutput{
 		SessionUsage: db.SessionUsage{
@@ -116,6 +153,8 @@ func TestRenderSessionUsageHuman_CopilotNoCost(t *testing.T) {
 	var b strings.Builder
 	require.NoError(t, renderSessionUsageHuman(&b, out))
 	s := b.String()
+	assert.Contains(t, s, "n/a (unpriced: gpt-4)",
+		"unpriced Copilot sessions should report n/a cost")
 	assert.NotContains(t, s, "AI Credits",
 		"unpriced Copilot sessions should not show AI Credits")
 }
@@ -146,6 +185,8 @@ func TestSessionUsageJSONSchemaIncludesCostContract(t *testing.T) {
 		"session_id":          "codex:abc",
 		"agent":               "codex",
 		"project":             "my-project",
+		"breakdown_count":     float64(0),
+		"breakdown":           nil,
 		"total_output_tokens": float64(123),
 		"peak_context_tokens": float64(456),
 		"has_token_data":      true,

@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"io"
 	"strings"
 	"time"
 
@@ -334,6 +335,52 @@ func (s *Store) GetCachedInsight(
 		return nil, fmt.Errorf("getting cached insight: %w", err)
 	}
 	return &insight, nil
+}
+
+func (s *Store) ListRecallEntries(
+	_ context.Context, _ db.RecallQuery,
+) ([]db.RecallEntry, error) {
+	return nil, db.ErrReadOnly
+}
+
+func (s *Store) GetRecallEntry(
+	_ context.Context, _ string,
+) (*db.RecallEntry, error) {
+	return nil, db.ErrReadOnly
+}
+
+func (s *Store) QueryRecallEntries(
+	_ context.Context, _ db.RecallQuery,
+) (db.RecallPage, error) {
+	return db.RecallPage{}, db.ErrReadOnly
+}
+
+func (s *Store) RecordRecallQueryEvent(
+	_ context.Context, _ db.RecallQueryEvent,
+) (string, error) {
+	return "", db.ErrReadOnly
+}
+
+func (s *Store) InsertRecallEntry(_ db.RecallEntry) (string, error) {
+	return "", db.ErrReadOnly
+}
+
+func (s *Store) ImportAcceptedRecallEntriesJSONL(
+	_ context.Context, _ io.Reader,
+) (db.RecallImportResult, error) {
+	return db.RecallImportResult{}, db.ErrReadOnly
+}
+
+func (s *Store) ImportAcceptedRecallEntriesJSONLWithOptions(
+	_ context.Context, _ io.Reader, _ db.RecallImportOptions,
+) (db.RecallImportResult, error) {
+	return db.RecallImportResult{}, db.ErrReadOnly
+}
+
+func (s *Store) IngestEvalTrajectory(
+	_ context.Context, _ db.EvalTrajectoryIngest,
+) (db.EvalTrajectoryIngestResult, error) {
+	return db.EvalTrajectoryIngestResult{}, db.ErrReadOnly
 }
 
 // RenameSession updates the visible session name in PG.

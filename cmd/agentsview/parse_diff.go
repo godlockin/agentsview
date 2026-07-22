@@ -62,9 +62,11 @@ func newParseDiffCommand() *cobra.Command {
 			"Use it to vet parser changes against the real archive before\n" +
 			"bumping the data version, or to detect upstream format drift.\n" +
 			"Run it against a quiescent archive: sessions still being\n" +
-			"written, and sessions last written through the incremental\n" +
-			"append path, can show benign drift against a full re-parse. A\n" +
-			"freshly resynced archive gives the cleanest baseline.",
+			"written can show benign drift against a full re-parse and are\n" +
+			"classified as raced. Sessions last written through the\n" +
+			"incremental-append path are detected and classified as\n" +
+			"incremental_skew (both excluded from --fail-on-change); a\n" +
+			"freshly resynced archive still gives the cleanest baseline.",
 		GroupID:      groupData,
 		SilenceUsage: true,
 		Args:         cobra.NoArgs,
@@ -125,7 +127,8 @@ func doParseDiff(cfg ParseDiffConfig) (failed bool) {
 
 	engine := sync.NewDiffEngine(database, sync.EngineConfig{
 		AgentDirs:               appCfg.AgentDirs,
-		Machine:                 "local",
+		IncludeCwdPrefixes:      appCfg.SyncIncludeCwdPrefixes,
+		Machine:                 appCfg.LocalMachineName,
 		BlockedResultCategories: appCfg.ResultContentBlockedCategories,
 	})
 
@@ -240,8 +243,7 @@ func parseDiffAgentTypes(names []string) ([]parser.AgentType, error) {
 		}
 		if !parseDiffAgentSupported(def) {
 			return nil, fmt.Errorf(
-				"agent %q is not supported by parse-diff "+
-					"(no on-disk source to re-parse)",
+				"agent %q is not supported by parse-diff",
 				raw,
 			)
 		}
@@ -268,9 +270,9 @@ func parseDiffAgentSupported(def parser.AgentDef) bool {
 	// A provider-authoritative agent with a registered factory has a
 	// Discover()/Parse() parse-diff can re-parse, whether it reads literal
 	// per-session files or a shared SQLite store it fans out per session
-	// (Kiro, OpenCode, Forge, Piebald, Warp). FileBased is not consulted:
-	// import-only agents are already excluded because they are not
-	// provider-authoritative.
+	// (Kiro, OpenCode, Forge, Devin, Piebald, Warp). FileBased is not
+	// consulted: import-only agents are already excluded because they are
+	// not provider-authoritative.
 	switch parser.ProviderMigrationModes()[def.Type] {
 	case parser.ProviderMigrationProviderAuthoritative:
 		_, ok := parser.ProviderFactoryByType(def.Type)
@@ -315,8 +317,26 @@ func renderParseDiffReport(
 	renderParseDiffParseErrors(w, r.Sessions)
 	renderParseDiffChanged(w, r.Sessions, verbose)
 	renderParseDiffRaced(w, r.Sessions, verbose)
+	renderParseDiffIncrementalSkew(w, r.Sessions, verbose)
 	if verbose {
 		renderParseDiffPendingResync(w, r.Sessions)
+	}
+
+	// Incremental-skew sessions are suppressed from --fail-on-change but
+	// still signal that the comparison basis is compromised for those
+	// rows. A full resync rewrites them through normalization, clears the
+	// marker, and restores full diff scrutiny -- so recommend it, mirroring
+	// the vacuous-resync warning above. Totals.IncrementalSkew is already
+	// in the JSON, so no new bool method is needed to gate the note.
+	if r.Totals.IncrementalSkew > 0 {
+		fmt.Fprintf(w,
+			"Note: %d session(s) were last written through the "+
+				"incremental-append path, so a full re-parse legitimately "+
+				"differs from the stored rows. They are classified "+
+				"incremental_skew and excluded from --fail-on-change. Run a "+
+				"full resync for a clean parse-diff baseline that restores "+
+				"drift detection on these sessions.\n\n",
+			r.Totals.IncrementalSkew)
 	}
 
 	fmt.Fprintf(w, "%d sessions changed, %d identical.\n",
@@ -397,6 +417,8 @@ func renderParseDiffSummary(w io.Writer, t sync.ParseDiffTotals) {
 		"(source not re-parsed: missing, remote, trashed, or not sampled)")
 	line("Raced", t.Raced,
 		"(source changed mid-run; inconclusive, not counted as drift)")
+	line("Incremental skew", t.IncrementalSkew,
+		"(last written incrementally; full re-parse differs, not counted as drift)")
 	line("Excluded by parser", t.ExcludedByParser,
 		"(parser intentionally drops these; sync would delete them)")
 	line("Parse errors", t.ParseErrors,
@@ -507,6 +529,54 @@ func renderParseDiffRaced(
 	}
 	tw.Flush()
 	if extra := len(raced) - len(shown); extra > 0 {
+		fmt.Fprintf(w, "  ... (%d more; use --verbose or --json)\n",
+			extra)
+	}
+	fmt.Fprintln(w)
+}
+
+// renderParseDiffIncrementalSkew lists sessions whose would-be change
+// was reclassified as incremental-append skew: the stored row was last
+// written through the incremental-append path, so a full re-parse
+// legitimately differs. These never trip --fail-on-change, but surfacing
+// them tells the operator the comparison basis is compromised for those
+// rows and a full resync gives a clean baseline. Compact by default;
+// verbose shows the masked field diffs.
+func renderParseDiffIncrementalSkew(
+	w io.Writer, sessions []sync.SessionDiff, verbose bool,
+) {
+	var skew []sync.SessionDiff
+	for _, s := range sessions {
+		if s.Class == sync.DiffIncrementalSkew {
+			skew = append(skew, s)
+		}
+	}
+	if len(skew) == 0 {
+		return
+	}
+	fmt.Fprintln(w,
+		"Incremental-skew sessions "+
+			"(last written incrementally; not counted as drift)")
+	if verbose {
+		for _, s := range skew {
+			renderParseDiffSessionVerbose(w, s)
+		}
+		fmt.Fprintln(w)
+		return
+	}
+	shown := skew
+	if len(shown) > parseDiffChangedCap {
+		shown = shown[:parseDiffChangedCap]
+	}
+	tw := tabwriter.NewWriter(w, 0, 4, 2, ' ', 0)
+	for _, s := range shown {
+		fmt.Fprintf(tw, "  %s\t%s\t%s\n",
+			sanitizeTerminal(s.Agent),
+			sanitizeTerminal(shortID(s.SessionID)),
+			sanitizeTerminal(parseDiffFieldSummary(s.Fields)))
+	}
+	tw.Flush()
+	if extra := len(skew) - len(shown); extra > 0 {
 		fmt.Fprintf(w, "  ... (%d more; use --verbose or --json)\n",
 			extra)
 	}

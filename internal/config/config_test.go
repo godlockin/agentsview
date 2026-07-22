@@ -50,6 +50,12 @@ func setupTestEnv(t *testing.T) string {
 	return dir
 }
 
+func setTestHome(t *testing.T, home string) {
+	t.Helper()
+	t.Setenv("HOME", home)
+	t.Setenv("USERPROFILE", home)
+}
+
 type configFixture struct {
 	Dir string
 }
@@ -222,6 +228,35 @@ func loadConfigFromPFlags(t *testing.T, args ...string) (Config, error) {
 	return LoadPFlags(fs)
 }
 
+func TestLoad_WriteTimeout(t *testing.T) {
+	t.Run("defaults to 30s when unset", func(t *testing.T) {
+		cfg, err := loadConfigFromFlags(t)
+		require.NoError(t, err)
+		assert.Equal(t, 30*time.Second, cfg.WriteTimeout)
+	})
+
+	cases := []struct {
+		name  string
+		value string
+		want  time.Duration
+	}{
+		{"raised for slow aggregates", "120s", 120 * time.Second},
+		{"zero disables the deadline", "0s", 0},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name+" (flag)", func(t *testing.T) {
+			cfg, err := loadConfigFromFlags(t, "-write-timeout", tc.value)
+			require.NoError(t, err)
+			assert.Equal(t, tc.want, cfg.WriteTimeout)
+		})
+		t.Run(tc.name+" (pflag)", func(t *testing.T) {
+			cfg, err := loadConfigFromPFlags(t, "--write-timeout", tc.value)
+			require.NoError(t, err)
+			assert.Equal(t, tc.want, cfg.WriteTimeout)
+		})
+	}
+}
+
 func TestLoadMinimal_LoadsAgentBinaryConfig(t *testing.T) {
 	f := newConfigFixture(t)
 	f.WriteConfigText(t, `[agent.claude]
@@ -281,6 +316,54 @@ func TestDefault_SkipsAiderUntilConfigured(t *testing.T) {
 	// opts in via AIDER_DIR or aider_dirs.
 	assert.Empty(t, cfg.ResolveDirs(parser.AgentAider))
 	assert.False(t, cfg.IsUserConfigured(parser.AgentAider))
+}
+
+func TestDefault_IncludesDevinLocalShareRoots(t *testing.T) {
+	cfg, err := Default()
+	require.NoError(t, err)
+
+	dirs := cfg.ResolveDirs(parser.AgentDevin)
+	require.Len(t, dirs, 2)
+	assert.True(t, strings.HasSuffix(dirs[0], filepath.Join("Library", "Application Support", "devin")), "dirs[0] = %q", dirs[0])
+	assert.True(t, strings.HasSuffix(dirs[1], filepath.Join(".local", "share", "devin")), "dirs[1] = %q", dirs[1])
+	assert.False(t, cfg.IsUserConfigured(parser.AgentDevin))
+}
+
+func TestDefault_IncludesHermesProfilesRoot(t *testing.T) {
+	home := t.TempDir()
+	setTestHome(t, home)
+	require.NoError(t, os.MkdirAll(filepath.Join(home, ".hermes", "sessions"), 0o755))
+
+	cfg, err := Default()
+	require.NoError(t, err)
+	dirs := cfg.ResolveDirs(parser.AgentHermes)
+
+	assert.Contains(t, dirs, filepath.Join(home, ".hermes", "sessions"))
+	assert.Contains(t, dirs, filepath.Join(home, ".hermes", "profiles"))
+}
+
+func TestDefault_HermesNoProfilesDirIsSafe(t *testing.T) {
+	home := t.TempDir()
+	setTestHome(t, home)
+	require.NoError(t, os.MkdirAll(filepath.Join(home, ".hermes", "sessions"), 0o755))
+	cfg, err := Default()
+	require.NoError(t, err)
+	dirs := cfg.ResolveDirs(parser.AgentHermes)
+	assert.Contains(t, dirs, filepath.Join(home, ".hermes", "sessions"))
+	assert.Contains(t, dirs, filepath.Join(home, ".hermes", "profiles"))
+}
+
+func TestDefault_HermesEnvReplacesDefaultAndProfilesRoots(t *testing.T) {
+	home := t.TempDir()
+	setTestHome(t, home)
+	custom := filepath.Join(t.TempDir(), "hermes-sessions")
+	t.Setenv("HERMES_SESSIONS_DIR", custom)
+
+	cfg, err := Default()
+	require.NoError(t, err)
+	cfg.loadEnv()
+
+	assert.Equal(t, []string{custom}, cfg.ResolveDirs(parser.AgentHermes))
 }
 
 func TestLoadEnv_OverridesDataDir(t *testing.T) {
@@ -367,6 +450,7 @@ func TestLoadPFlags_AppliesExplicitFlags(t *testing.T) {
 }
 
 func TestLoad_NilFlagSet(t *testing.T) {
+	setupTestEnv(t)
 	cfg, err := Load(nil)
 	require.NoError(t, err)
 
@@ -388,6 +472,49 @@ func TestLoad_PublicOriginFlagOverridesConfigFile(t *testing.T) {
 
 	got := strings.Join(cfg.PublicOrigins, ",")
 	assert.Equal(t, "https://viewer.example.test,http://viewer.example.test:8004", got)
+}
+
+func TestLoad_HostFromConfigFile(t *testing.T) {
+	cfg := loadMinimalWithConfig(t, map[string]any{
+		"host": "0.0.0.0",
+	})
+
+	assert.Equal(t, "0.0.0.0", cfg.Host)
+	assert.False(t, cfg.HostExplicit,
+		"config-file host must not count as an explicit flag")
+}
+
+func TestLoad_HostFlagOverridesConfigFile(t *testing.T) {
+	tmp := setupTestEnv(t)
+	writeConfig(t, tmp, map[string]any{
+		"host": "0.0.0.0",
+	})
+
+	cfg, err := loadConfigFromFlags(t, "-host", "192.168.1.5")
+	require.NoError(t, err)
+
+	assert.Equal(t, "192.168.1.5", cfg.Host)
+	assert.True(t, cfg.HostExplicit)
+}
+
+func TestLoad_PortFromConfigFile(t *testing.T) {
+	cfg := loadMinimalWithConfig(t, map[string]any{
+		"port": 7357,
+	})
+
+	assert.Equal(t, 7357, cfg.Port)
+}
+
+func TestLoad_PortFlagOverridesConfigFile(t *testing.T) {
+	tmp := setupTestEnv(t)
+	writeConfig(t, tmp, map[string]any{
+		"port": 7357,
+	})
+
+	cfg, err := loadConfigFromFlags(t, "-port", "9090")
+	require.NoError(t, err)
+
+	assert.Equal(t, 9090, cfg.Port)
 }
 
 func TestLoad_PublicOriginsFromConfigFile(t *testing.T) {
@@ -748,6 +875,46 @@ func TestResolveDirs_ClaudeConfigDirRootEnvVar(t *testing.T) {
 		assert.Equal(t, []string{"/from/config"},
 			cfg.ResolveDirs(parser.AgentClaude))
 		assert.True(t, cfg.IsUserConfigured(parser.AgentClaude))
+	})
+}
+
+func TestResolveDirs_DevinPrecedenceAndMergeRules(t *testing.T) {
+	t.Run("config overrides defaults", func(t *testing.T) {
+		cfg := loadMinimalWithConfig(t, map[string]any{
+			"devin_dirs": []string{"/from/config/devin"},
+		})
+
+		assert.Equal(t, []string{"/from/config/devin"},
+			cfg.ResolveDirs(parser.AgentDevin))
+		assert.True(t, cfg.IsUserConfigured(parser.AgentDevin))
+	})
+
+	t.Run("env overrides config", func(t *testing.T) {
+		f := newConfigFixture(t)
+		f.WriteTOML(t, map[string]any{
+			"devin_dirs": []string{"/from/config/devin"},
+		})
+		t.Setenv("DEVIN_DIR", "/from/env/devin")
+
+		cfg := f.LoadMinimal(t)
+
+		assert.Equal(t, []string{"/from/env/devin"},
+			cfg.ResolveDirs(parser.AgentDevin))
+		assert.True(t, cfg.IsUserConfigured(parser.AgentDevin))
+	})
+
+	t.Run("config file still applies when env unset", func(t *testing.T) {
+		f := newConfigFixture(t)
+		f.WriteTOML(t, map[string]any{
+			"devin_dirs": []string{"/from/config/devin", "/second/config/devin"},
+		})
+		t.Setenv("DEVIN_DIR", "")
+
+		cfg := f.LoadMinimal(t)
+
+		assert.Equal(t, []string{"/from/config/devin", "/second/config/devin"},
+			cfg.ResolveDirs(parser.AgentDevin))
+		assert.True(t, cfg.IsUserConfigured(parser.AgentDevin))
 	})
 }
 
@@ -1237,6 +1404,16 @@ func TestResolvePG_Defaults(t *testing.T) {
 	assert.NotEmpty(t, resolved.MachineName, "MachineName should default to hostname")
 }
 
+func TestLoadResolvesLocalMachineNameFromHostname(t *testing.T) {
+	setupTestEnv(t)
+	cfg, err := loadConfigFromPFlags(t)
+	require.NoError(t, err)
+	hostname, err := os.Hostname()
+	require.NoError(t, err)
+
+	assert.Equal(t, hostname, cfg.LocalMachineName)
+}
+
 func TestResolvePG_ExpandsEnvVars(t *testing.T) {
 	t.Setenv("PGPASS", "env-secret")
 	t.Setenv("PGURL", "postgres://localhost/test")
@@ -1637,4 +1814,136 @@ func TestValidateRemoteHosts(t *testing.T) {
 			requireErrorContains(t, err, tt.wantErr...)
 		})
 	}
+}
+
+func TestLoadFile_SyncIncludeCwdPrefixes(t *testing.T) {
+	f := newConfigFixture(t)
+	f.WriteConfigText(t, `sync_include_cwd_prefixes = ["/home/me/work", "/home/me/oss"]
+`)
+
+	cfg := f.LoadMinimal(t)
+
+	assert.Equal(t,
+		[]string{"/home/me/work", "/home/me/oss"},
+		cfg.SyncIncludeCwdPrefixes,
+	)
+}
+
+func TestLoadFile_SyncIncludeCwdPrefixesDefaultsEmpty(t *testing.T) {
+	f := newConfigFixture(t)
+	f.WriteConfigText(t, `host = "127.0.0.1"
+`)
+
+	cfg := f.LoadMinimal(t)
+
+	assert.Empty(t, cfg.SyncIncludeCwdPrefixes)
+}
+
+func TestIsDefaultAgentsviewDBPath(t *testing.T) {
+	t.Parallel()
+
+	// A plain file inside a real ~/.agentsview directory.
+	defaultDir := filepath.Join(t.TempDir(), ".agentsview")
+	require.NoError(t, os.MkdirAll(defaultDir, 0o700))
+	defaultDB := filepath.Join(defaultDir, "sessions.db")
+	require.NoError(t, os.WriteFile(defaultDB, []byte("db"), 0o600))
+
+	// A plain file outside ~/.agentsview.
+	labDir := filepath.Join(t.TempDir(), "recall-lab-data")
+	require.NoError(t, os.MkdirAll(labDir, 0o700))
+	labDB := filepath.Join(labDir, "sessions.db")
+	require.NoError(t, os.WriteFile(labDB, []byte("db"), 0o600))
+
+	// A symlink whose target already exists inside ~/.agentsview.
+	liveLink := filepath.Join(labDir, "live-link.db")
+	require.NoError(t, os.Symlink(defaultDB, liveLink))
+
+	// An absolute symlink whose target does not exist yet. Opening SQLite
+	// through it would create the production archive, so it must be guarded
+	// even though EvalSymlinks cannot resolve the dangling target.
+	danglingLink := filepath.Join(labDir, "dangling.db")
+	require.NoError(t, os.Symlink(
+		filepath.Join(defaultDir, "not-created-yet.db"), danglingLink,
+	))
+
+	// A relative dangling symlink resolves against the link's own directory.
+	siblingRoot := t.TempDir()
+	require.NoError(t, os.MkdirAll(
+		filepath.Join(siblingRoot, ".agentsview"), 0o700,
+	))
+	relLinkDir := filepath.Join(siblingRoot, "lab")
+	require.NoError(t, os.MkdirAll(relLinkDir, 0o700))
+	relLink := filepath.Join(relLinkDir, "sessions.db")
+	require.NoError(t, os.Symlink(
+		filepath.Join("..", ".agentsview", "missing.db"), relLink,
+	))
+
+	// A symlink pointing at a harmless location is not the default archive.
+	safeLink := filepath.Join(labDir, "safe-link.db")
+	require.NoError(t, os.Symlink(labDB, safeLink))
+
+	tests := []struct {
+		name   string
+		dbPath string
+		want   bool
+	}{
+		{"empty", "", false},
+		{"whitespace", "   ", false},
+		{"plain file in default dir", defaultDB, true},
+		{"plain file outside default dir", labDB, false},
+		{"symlink to existing default db", liveLink, true},
+		{"absolute dangling symlink into default dir", danglingLink, true},
+		{"relative dangling symlink into default dir", relLink, true},
+		{"symlink to non-default db", safeLink, false},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			assert.Equal(t, tc.want, IsDefaultAgentsviewDBPath(tc.dbPath))
+		})
+	}
+}
+
+func TestPGConfigPushVectorsEnabled(t *testing.T) {
+	boolPtr := func(b bool) *bool { return &b }
+	tests := []struct {
+		name string
+		cfg  PGConfig
+		want bool
+	}{
+		{"unset defaults to true", PGConfig{}, true},
+		{"explicit false", PGConfig{PushVectors: boolPtr(false)}, false},
+		{"explicit true", PGConfig{PushVectors: boolPtr(true)}, true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.want, tt.cfg.PushVectorsEnabled())
+		})
+	}
+}
+
+func TestPGConfig_LoadsFromTOML(t *testing.T) {
+	f := newConfigFixture(t)
+	f.WriteTOML(t, map[string]any{
+		"pg": map[string]any{
+			"url":          "postgres://localhost/test",
+			"push_vectors": false,
+		},
+	})
+
+	cfg := f.LoadMinimal(t)
+
+	assert.False(t, cfg.PG.PushVectorsEnabled())
+}
+
+func TestPGConfig_PushVectorsDefaultsTrue(t *testing.T) {
+	f := newConfigFixture(t)
+	f.WriteTOML(t, map[string]any{
+		"pg": map[string]any{
+			"url": "postgres://localhost/test",
+		},
+	})
+
+	cfg := f.LoadMinimal(t)
+
+	assert.True(t, cfg.PG.PushVectorsEnabled())
 }

@@ -26,6 +26,7 @@ const usageServiceMocks = vi.hoisted(() => ({
     daily: [],
     projectTotals: [
       {
+        project_key: "pl1:sha256:alpha",
         project: "alpha",
         inputTokens: 0,
         outputTokens: 0,
@@ -34,6 +35,7 @@ const usageServiceMocks = vi.hoisted(() => ({
         cost: 0,
       },
       {
+        project_key: "pl1:sha256:beta",
         project: "beta",
         inputTokens: 0,
         outputTokens: 0,
@@ -128,11 +130,24 @@ const usageServiceMocks = vi.hoisted(() => ({
   getApiV1UsageTopSessions: vi.fn().mockResolvedValue([]),
 }));
 
-const apiRuntimeMocks = vi.hoisted(() => ({
-  configureGeneratedClient: vi.fn(),
-  callGenerated: vi.fn((request: () => Promise<unknown>) => request()),
-  isAbortError: vi.fn(() => false),
-}));
+const apiRuntimeMocks = vi.hoisted(() => {
+  class ApiError extends Error {
+    constructor(
+      public readonly status: number,
+      message: string,
+      public readonly code?: string,
+    ) {
+      super(message);
+      this.name = "ApiError";
+    }
+  }
+  return {
+    ApiError,
+    configureGeneratedClient: vi.fn(),
+    callGenerated: vi.fn((request: () => Promise<unknown>) => request()),
+    isAbortError: vi.fn(() => false),
+  };
+});
 
 vi.mock("../api/runtime.js", () => apiRuntimeMocks);
 
@@ -190,6 +205,7 @@ function usageSummary(totalCost = 0): UsageSummaryResponse {
     daily: [],
     projectTotals: [
       {
+        project_key: "pl1:sha256:alpha",
         project: "alpha",
         inputTokens: 0,
         outputTokens: 0,
@@ -198,6 +214,7 @@ function usageSummary(totalCost = 0): UsageSummaryResponse {
         cost: 0,
       },
       {
+        project_key: "pl1:sha256:beta",
         project: "beta",
         inputTokens: 0,
         outputTokens: 0,
@@ -273,6 +290,7 @@ function usageSummaryWithOptions(options: {
     },
     daily: [],
     projectTotals: projects.map((project) => ({
+      project_key: `pl1:sha256:${project}`,
       project,
       inputTokens: 0,
       outputTokens: 0,
@@ -369,6 +387,7 @@ describe("UsageStore filter persistence", () => {
   it("saves exclude filters to localStorage on fetchAll", async () => {
     const { usage } = await loadStore();
     usage.excludedProjects = "proj-a";
+    usage.excludedProjectKeys = "pl1:sha256:proj-a";
     usage.excludedAgents = "claude";
     await usage.fetchAll();
 
@@ -376,6 +395,7 @@ describe("UsageStore filter persistence", () => {
       localStorage.getItem("usage-filters") ?? "{}",
     );
     expect(saved.excludedProjects).toBe("proj-a");
+    expect(saved.excludedProjectKeys).toBeUndefined();
     expect(saved.excludedAgents).toBe("claude");
   });
 
@@ -384,12 +404,14 @@ describe("UsageStore filter persistence", () => {
       "usage-filters",
       JSON.stringify({
         excludedProjects: "saved-proj",
+        excludedProjectKeys: "pl1:sha256:saved-proj",
         excludedModels: "opus",
         selectedModels: "sonnet",
       }),
     );
     const { usage } = await loadStore();
     expect(usage.excludedProjects).toBe("saved-proj");
+    expect(usage.excludedProjectKeys).toBe("");
     expect(usage.excludedModels).toBe("");
     expect(usage.selectedModels).toBe("sonnet");
     expect(usage.excludedAgents).toBe("");
@@ -518,6 +540,67 @@ describe("UsageStore session filter params", () => {
     );
   });
 
+  it("passes exclusion filters to usage endpoints", async () => {
+    const { usage } = await loadStore();
+
+    usage.excludedProjects = "proj-a,proj-b";
+    usage.excludedProjectKeys = "pl1:sha256:project";
+    usage.excludedAgents = "codex";
+
+    await usage.fetchAll();
+
+    expect(usageServiceMocks.getApiV1UsageSummary).toHaveBeenLastCalledWith(
+      expect.objectContaining({
+        excludeProject: "proj-a,proj-b",
+        excludeProjectKey: "pl1:sha256:project",
+        excludeAgent: "codex",
+      }),
+    );
+    expect(usageServiceMocks.getApiV1UsageTopSessions).toHaveBeenLastCalledWith(
+      expect.objectContaining({
+        excludeProject: "proj-a,proj-b",
+        excludeProjectKey: "pl1:sha256:project",
+        excludeAgent: "codex",
+      }),
+    );
+  });
+
+  it("refreshes response-scoped project selections after archive identity changes", async () => {
+    usageServiceMocks.getApiV1UsageSummary.mockRejectedValueOnce(
+      new apiRuntimeMocks.ApiError(
+        400,
+        "unknown project key",
+        "unknown_project_key",
+      ),
+    );
+    const { usage } = await loadStore();
+    usage.excludedProjectKeys = "pl1:sha256:stale";
+    usage.pairwiseSelection = {
+      left: { dimension: "project", value: "pl1:sha256:stale" },
+      right: { dimension: "model", value: "gpt-4o" },
+    };
+
+    await usage.fetchAll();
+
+    expect(usage.excludedProjectKeys).toBe("");
+    expect(usageServiceMocks.getApiV1UsageSummary).toHaveBeenCalledTimes(2);
+    expect(usageServiceMocks.getApiV1UsageSummary).toHaveBeenNthCalledWith(
+      1,
+      expect.objectContaining({
+        excludeProjectKey: "pl1:sha256:stale",
+      }),
+    );
+    expect(usageServiceMocks.getApiV1UsageSummary).toHaveBeenNthCalledWith(
+      2,
+      expect.not.objectContaining({ excludeProjectKey: expect.anything() }),
+    );
+    expect(usageServiceMocks.getApiV1UsageTopSessions).toHaveBeenCalledTimes(2);
+    expect(usage.pairwiseSelection.left.value).not.toBe(
+      "pl1:sha256:stale",
+    );
+    expect(usage.summary).not.toBeNull();
+  });
+
   it("stores pairwise comparison data from the generated API", async () => {
     const { usage } = await loadStore();
 
@@ -576,8 +659,8 @@ describe("UsageStore session filter params", () => {
     await Promise.resolve();
 
     expect(usage.pairwiseSelection).toEqual({
-      left: { dimension: "project", value: "beta" },
-      right: { dimension: "project", value: "gamma" },
+      left: { dimension: "project", value: "pl1:sha256:beta" },
+      right: { dimension: "project", value: "pl1:sha256:gamma" },
     });
     expect(usage.pairwiseComparison).toBeNull();
   });
@@ -899,6 +982,26 @@ describe("UsageStore session filter params", () => {
     expect(signals[0]?.aborted).toBe(true);
   });
 
+  it("aborts visible panel requests on teardown", async () => {
+    const signals: (AbortSignal | undefined)[] = [];
+    apiRuntimeMocks.callGenerated.mockImplementation(
+      (request: () => Promise<unknown>, signal?: AbortSignal) => {
+        signals.push(signal);
+        return request();
+      },
+    );
+    usageServiceMocks.getApiV1UsageSummary.mockImplementationOnce(
+      () => new Promise(() => {}),
+    );
+    const { usage } = await loadStore();
+
+    void usage.fetchSummary();
+    await Promise.resolve();
+    usage.cancelInFlightReads();
+
+    expect(signals[0]?.aborted).toBe(true);
+  });
+
   it("reuses summary params for top sessions during full refresh", async () => {
     vi.useFakeTimers({ toFake: ["Date"] });
     try {
@@ -1092,7 +1195,7 @@ describe("UsageStore session filter params", () => {
 
     usage.setPairwiseSide("right", {
       dimension: "project",
-      value: "alpha",
+      value: "pl1:sha256:alpha",
     });
     await Promise.resolve();
 
@@ -1137,7 +1240,7 @@ describe("UsageStore session filter params", () => {
       expect.objectContaining({
         leftDimension: "project",
         rightDimension: "project",
-        rightValue: "alpha",
+        rightValue: "pl1:sha256:alpha",
       }),
     );
   });
@@ -1211,20 +1314,20 @@ describe("UsageStore rolling default date range", () => {
     const { usage } = await loadStore();
     expect(usage.isPinned).toBe(false);
     expect(usage.windowDays).toBe(30);
-    expect(usage.from).toBe("2026-03-26");
+    expect(usage.from).toBe("2026-03-27");
     expect(usage.to).toBe("2026-04-25");
   });
 
   it("fetchAll re-derives from/to against the current clock while unpinned", async () => {
     const { usage } = await loadStore();
 
-    expect(usage.from).toBe("2026-03-26");
+    expect(usage.from).toBe("2026-03-27");
     expect(usage.to).toBe("2026-04-25");
 
     vi.setSystemTime(new Date("2026-04-26T12:00:00"));
     await usage.fetchAll();
 
-    expect(usage.from).toBe("2026-03-27");
+    expect(usage.from).toBe("2026-03-28");
     expect(usage.to).toBe("2026-04-26");
   });
 
@@ -1252,19 +1355,19 @@ describe("UsageStore rolling default date range", () => {
 
     expect(usage.isPinned).toBe(false);
     expect(usage.windowDays).toBe(7);
-    expect(usage.from).toBe("2026-04-18");
+    expect(usage.from).toBe("2026-04-19");
     expect(usage.to).toBe("2026-04-25");
   });
 
   it("after setRollingWindow, fetchAll keeps rolling", async () => {
     const { usage } = await loadStore();
     usage.setRollingWindow(7);
-    expect(usage.from).toBe("2026-04-18");
+    expect(usage.from).toBe("2026-04-19");
 
     vi.setSystemTime(new Date("2026-04-26T12:00:00"));
     await usage.fetchAll();
 
-    expect(usage.from).toBe("2026-04-19");
+    expect(usage.from).toBe("2026-04-20");
     expect(usage.to).toBe("2026-04-26");
   });
 });
@@ -1278,12 +1381,14 @@ describe("buildUsageUrlParams", () => {
       isPinned: false,
       windowDays: 30,
       excludedProjects: "p1",
+      excludedProjectKeys: "pk1",
       excludedAgents: "a1",
       excludedModels: "m1",
       selectedModels: "m2",
     });
     expect(params).toEqual({
       exclude_project: "p1",
+      exclude_agent: "a1",
       model: "m2",
     });
   });
@@ -1296,6 +1401,7 @@ describe("buildUsageUrlParams", () => {
       isPinned: true,
       windowDays: 30,
       excludedProjects: "",
+      excludedProjectKeys: "",
       excludedAgents: "",
       excludedModels: "",
       selectedModels: "",
@@ -1314,6 +1420,7 @@ describe("buildUsageUrlParams", () => {
       isPinned: false,
       windowDays: 30,
       excludedProjects: "",
+      excludedProjectKeys: "",
       excludedAgents: "",
       excludedModels: "",
       selectedModels: "",
@@ -1329,6 +1436,7 @@ describe("buildUsageUrlParams", () => {
       isPinned: true,
       windowDays: 30,
       excludedProjects: "",
+      excludedProjectKeys: "",
       excludedAgents: "",
       excludedModels: "",
       selectedModels: "",
@@ -1344,6 +1452,7 @@ describe("buildUsageUrlParams", () => {
       isPinned: false,
       windowDays: 7,
       excludedProjects: "",
+      excludedProjectKeys: "",
       excludedAgents: "",
       excludedModels: "",
       selectedModels: "",
@@ -1359,6 +1468,7 @@ describe("buildUsageUrlParams", () => {
       isPinned: true,
       windowDays: 7,
       excludedProjects: "",
+      excludedProjectKeys: "",
       excludedAgents: "",
       excludedModels: "",
       selectedModels: "",

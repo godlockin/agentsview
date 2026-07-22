@@ -36,13 +36,15 @@ import (
 //     blanked. Empty-string handling is preserved as-is so downstream
 //     localTime treats a blanked timestamp as invalid.
 //
-// Message.TokenUsage (json.RawMessage), tool-call input JSON, and transient
+// Message.TokenUsage (json.RawMessage) and transient
 // ToolResults.ContentRaw are intentionally not run through this pass. They are
 // raw provider payloads, not persisted display text. Persisted result content
 // (tool_calls.result_content and tool_result_events.content) follows the same
 // text contract as Message.Content, with length fields reduced by the
 // stripped-byte delta so re-ingest rewrites historical poison rows into the
-// stable stored shape.
+// stable stored shape. Persisted tool-call input JSON (tool_calls.input_json,
+// as of dataVersion 59) is sanitized without length tracking since no length
+// column exists for it.
 //
 // CRITICAL idempotency invariant: SanitizeUTF8 is the shared
 // sanitization seam used here, by the local fingerprint builders, and
@@ -181,7 +183,7 @@ func SanitizeMessage(m *Message) ValidationStats {
 	sanitizeStringField(&m.SourceParentUUID, &stats)
 
 	for i := range m.ToolCalls {
-		sanitizeToolCallResultContent(&m.ToolCalls[i], &stats)
+		sanitizeToolCallContent(&m.ToolCalls[i], &stats)
 	}
 
 	sanitizeStringField(&m.Model, &stats)
@@ -203,9 +205,13 @@ func SanitizeMessage(m *Message) ValidationStats {
 	return stats
 }
 
-func sanitizeToolCallResultContent(
+func sanitizeToolCallContent(
 	tc *ToolCall, stats *ValidationStats,
 ) {
+	// InputJSON is raw model output and can carry NUL/control bytes
+	// just like result content; unsanitized rows break DuckDB pushes
+	// and force the resync copy path to re-scan them (#945).
+	sanitizeStringField(&tc.InputJSON, stats)
 	sanitizeLengthTrackedString(
 		&tc.ResultContent, &tc.ResultContentLength, stats,
 	)
@@ -216,6 +222,14 @@ func sanitizeToolCallResultContent(
 			stats,
 		)
 	}
+}
+
+// SanitizeToolCall applies the parser-derived content contract to one tool
+// call that is being updated outside a normal message write.
+func SanitizeToolCall(tc *ToolCall) ValidationStats {
+	var stats ValidationStats
+	sanitizeToolCallContent(tc, &stats)
+	return stats
 }
 
 // SanitizeUsageEvent applies the contract to a single usage event row.
@@ -287,6 +301,8 @@ func SanitizeSession(s *Session) ValidationStats {
 	sanitizeStringField(&s.Project, &stats)
 	sanitizeStringField(&s.Machine, &stats)
 	sanitizeStringField(&s.Agent, &stats)
+	sanitizeStringField(&s.AgentLabel, &stats)
+	sanitizeStringField(&s.Entrypoint, &stats)
 	sanitizeStringField(&s.Cwd, &stats)
 	sanitizeStringField(&s.GitBranch, &stats)
 	sanitizeStringField(&s.SourceSessionID, &stats)
