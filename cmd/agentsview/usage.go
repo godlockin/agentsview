@@ -17,6 +17,7 @@ import (
 	"go.kenn.io/agentsview/internal/config"
 	"go.kenn.io/agentsview/internal/db"
 	"go.kenn.io/agentsview/internal/export"
+	"go.kenn.io/agentsview/internal/money"
 	"go.kenn.io/agentsview/internal/parser"
 	"go.kenn.io/agentsview/internal/pricing"
 	"go.kenn.io/agentsview/internal/pricingrefresh"
@@ -374,17 +375,25 @@ func printSyncSummaryStderr(stats sync.SyncStats, t time.Time) {
 	}
 }
 
-// seedPricing ensures fallback rates are present in
-// model_pricing, then kicks off a background multi-source
-// pricing refresh.
+// seedPricing ensures fallback rates are present in model_pricing, then
+// kicks off a background multi-source pricing refresh.
 //
 // Fallback rates are only upserted when the stored seed
-// version differs from pricing.FallbackVersion (or is
-// absent). This avoids overwriting live upstream rates on
+// version differs from pricing.SeedVersion (or is absent). This avoids
+// overwriting live upstream rates on every restart.
 // every restart while still propagating corrected fallback
-// rates when the binary is upgraded.
-func seedPricing(database *db.DB) {
-	if err := pricingrefresh.SeedFallback(database); err != nil {
+// rates when the binary is upgraded. SeedVersion folds in
+// the supplemental alias version, so curated alias additions
+// (see internal/pricing/supplemental.go) also reach existing
+// databases without a resync.
+func seedPricing(
+	database *db.DB,
+	runner pricingRefreshExclusiveRunner,
+) {
+	err := runPricingExclusive(runner, func() error {
+		return pricingrefresh.SeedFallback(database)
+	})
+	if err != nil {
 		log.Printf("pricing seed: %v", err)
 	}
 	go refreshPricingFromSources(database)
@@ -535,10 +544,10 @@ func applyFallbackPricing(
 		// through pricing.Resolve, so normalized/canonical aliases still match
 		// when this read-only path cannot seed model_pricing rows.
 		rates[p.ModelPattern] = config.CustomModelRate{
-			Input:         p.InputPerMTok,
-			Output:        p.OutputPerMTok,
-			CacheCreation: p.CacheCreationPerMTok,
-			CacheRead:     p.CacheReadPerMTok,
+			InputMicrodollarsPerMTok:         p.InputPerMTok.Microdollars,
+			OutputMicrodollarsPerMTok:        p.OutputPerMTok.Microdollars,
+			CacheCreationMicrodollarsPerMTok: p.CacheCreationPerMTok.Microdollars,
+			CacheReadMicrodollarsPerMTok:     p.CacheReadPerMTok.Microdollars,
 		}
 		sources[p.ModelPattern] = export.PricingRowSourceEmbedded
 	}
@@ -689,11 +698,8 @@ func localTimezone() string {
 // matching conventional currency display. Non-zero values
 // under half a cent would otherwise round to "$0.00" and
 // read as "free", so they render as "<$0.01" instead.
-func fmtCost(v float64) string {
-	if v > 0 && v < 0.005 {
-		return "<$0.01"
-	}
-	return fmt.Sprintf("$%.2f", v)
+func fmtCost(v money.Money) string {
+	return money.FormatUSD(v, money.DisplayCents)
 }
 
 func joinModels(models []string) string {

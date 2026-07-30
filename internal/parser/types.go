@@ -4,6 +4,8 @@ import (
 	"encoding/json"
 	"strings"
 	"time"
+
+	"go.kenn.io/agentsview/internal/money"
 )
 
 // AgentType identifies the AI agent that produced a session.
@@ -19,6 +21,7 @@ const (
 	AgentMiMoCode       AgentType = "mimocode"
 	AgentOpenCode       AgentType = "opencode"
 	AgentKilo           AgentType = "kilo"
+	AgentKiloLegacy     AgentType = "kilo-legacy"
 	AgentOpenHands      AgentType = "openhands"
 	AgentCursor         AgentType = "cursor"
 	AgentIflow          AgentType = "iflow"
@@ -36,6 +39,7 @@ const (
 	AgentOpenClaw       AgentType = "openclaw"
 	AgentQClaw          AgentType = "qclaw"
 	AgentKimi           AgentType = "kimi"
+	AgentKimiWork       AgentType = "kimi-work"
 	AgentClaudeAI       AgentType = "claude-ai"
 	AgentChatGPT        AgentType = "chatgpt"
 	AgentKiro           AgentType = "kiro"
@@ -63,6 +67,8 @@ const (
 	AgentReasonix       AgentType = "reasonix"
 	AgentIcodemate      AgentType = "icodemate"
 	AgentRooCode        AgentType = "roocode"
+	AgentPoolside       AgentType = "poolside"
+	AgentOmnigent       AgentType = "omnigent"
 )
 
 // AgentDef describes a supported coding agent's filesystem
@@ -79,6 +85,19 @@ type AgentDef struct {
 	ShallowWatch      bool     // true = watch root only, rely on periodic sync for subdirs
 	FileBased         bool     // false for DB-backed agents
 	Usage             UsageCapabilities
+
+	// PeriodicReconcile opts the agent into scheduled scoped reconciliation
+	// when its declared watcher coverage is deliberately non-authoritative,
+	// such as shallow directory watches or bounded database change cursors.
+	// Expensive scheduling inputs default to unsupported.
+	PeriodicReconcile bool
+
+	// RemoteSyncExcluded keeps every path under the agent's roots out of
+	// remote sync artifacts: resolve scripts, manifests, archives, delta
+	// roots, and tar commands. Set for stores that co-locate transcripts
+	// with secrets or state that cannot be copied safely; each artifact
+	// seam checks it so exclusion fails closed.
+	RemoteSyncExcluded bool
 
 	// WatchRootsFunc resolves the directories to watch for live
 	// updates under a configured root, for agents whose watch
@@ -216,14 +235,41 @@ var Registry = []AgentDef{
 		WatchRootsFunc: ResolveKiloWatchRoots,
 	},
 	{
-		Type:         AgentOpenHands,
-		DisplayName:  "OpenHands CLI",
-		EnvVar:       "OPENHANDS_CONVERSATIONS_DIR",
-		ConfigKey:    "openhands_dirs",
-		DefaultDirs:  []string{".openhands/conversations"},
-		IDPrefix:     "openhands:",
-		FileBased:    true,
-		ShallowWatch: true,
+		// Kilo (legacy) is the legacy RooCode-derived VSCode
+		// extension from Kilocode. Sessions live under
+		// <vscode-globalStorage>/kilocode.kilo-code/tasks/<uuid>/
+		// with task_metadata.json (only `files_in_context`), the
+		// Claude-shaped api_conversation_history.json, and the
+		// Cline-shaped ui_messages.json. Default paths use the
+		// lowercase extension id that VSCode actually writes
+		// on disk, not the mixed-case marketplace id.
+		//
+		// LEGACY-ONLY: covers the pre-OpenCode extension
+		// (RooCode-derived). After Kilo rebuilt the extension on an
+		// OpenCode core (beta 2026-03-10, GA 2026-04-02), new
+		// sessions moved to ~/.local/share/kilo/kilo.db — the same
+		// SQLite the Kilo CLI uses — and are tracked by the `kilo`
+		// agent. This agent is frozen at the legacy tasks/<uuid>/
+		// format for historical sessions.
+		Type:        AgentKiloLegacy,
+		DisplayName: "Kilo (legacy)",
+		EnvVar:      "KILO_LEGACY_DIR",
+		ConfigKey:   "kilo_legacy_dirs",
+		DefaultDirs: kiloLegacyDefaultDirs(),
+		IDPrefix:    "kilo-legacy:",
+		FileBased:   true,
+		Usage:       UsageCapabilities{NoPerMessageTokenData: true},
+	},
+	{
+		Type:              AgentOpenHands,
+		DisplayName:       "OpenHands CLI",
+		EnvVar:            "OPENHANDS_CONVERSATIONS_DIR",
+		ConfigKey:         "openhands_dirs",
+		DefaultDirs:       []string{".openhands/conversations"},
+		IDPrefix:          "openhands:",
+		FileBased:         true,
+		ShallowWatch:      true,
+		PeriodicReconcile: true,
 	},
 	{
 		Type:        AgentCursor,
@@ -340,6 +386,10 @@ var Registry = []AgentDef{
 		WatchSubdirs: []string{"workspaceStorage", "globalStorage"},
 		FileBased:    true,
 		Usage:        UsageCapabilities{NoPerMessageTokenData: true},
+		// Trae's modern layout stores sessions as encrypted state that a
+		// remote machine cannot read; shipping it would copy opaque
+		// encrypted blobs.
+		RemoteSyncExcluded: true,
 	},
 	{
 		Type:        AgentVSCopilot,
@@ -443,6 +493,29 @@ var Registry = []AgentDef{
 			".kimi-code/sessions",
 		},
 		IDPrefix:  "kimi:",
+		FileBased: true,
+	},
+	{
+		// Kimi Work (the kimi-desktop app's "daimon" runtime) stores
+		// conversations as kimi-code kernel sessions: wire.jsonl
+		// transcripts under <root>/wd_<workspace>_<hash>/<session>/
+		// agents/<agent>/wire.jsonl. Only conv-* session directories are
+		// user conversations; aux sessions (ctitle-*, sklsum-*, dvlt-*)
+		// are filtered out by the provider.
+		Type:        AgentKimiWork,
+		DisplayName: "Kimi Work",
+		EnvVar:      "KIMI_WORK_DIR",
+		ConfigKey:   "kimi_work_dirs",
+		DefaultDirs: []string{
+			// macOS
+			"Library/Application Support/kimi-desktop/daimon-share/daimon/runtime/kimi-code/home/sessions",
+			// Linux
+			".config/kimi-desktop/daimon-share/daimon/runtime/kimi-code/home/sessions",
+			".local/share/kimi-desktop/daimon-share/daimon/runtime/kimi-code/home/sessions",
+			// Windows
+			"AppData/Roaming/kimi-desktop/daimon-share/daimon/runtime/kimi-code/home/sessions",
+		},
+		IDPrefix:  "kimi-work:",
 		FileBased: true,
 	},
 	{
@@ -709,13 +782,14 @@ var Registry = []AgentDef{
 		// roots; watch those roots shallowly and rely on the 15-minute
 		// periodic sync to pick up new repos' history files. Aider history
 		// is append-mostly, so this is an acceptable latency tradeoff.
-		Type:         AgentAider,
-		DisplayName:  "Aider",
-		EnvVar:       "AIDER_DIR",
-		ConfigKey:    "aider_dirs",
-		IDPrefix:     "aider:",
-		FileBased:    true,
-		ShallowWatch: true,
+		Type:              AgentAider,
+		DisplayName:       "Aider",
+		EnvVar:            "AIDER_DIR",
+		ConfigKey:         "aider_dirs",
+		IDPrefix:          "aider:",
+		FileBased:         true,
+		ShallowWatch:      true,
+		PeriodicReconcile: true,
 	},
 	{
 		Type:         AgentReasonix,
@@ -762,6 +836,40 @@ var Registry = []AgentDef{
 		IDPrefix:  "roocode:",
 		FileBased: true,
 	},
+	{
+		Type:        AgentPoolside,
+		DisplayName: "Poolside",
+		EnvVar:      "POOLSIDE_DIR",
+		ConfigKey:   "poolside_dirs",
+		DefaultDirs: []string{
+			// macOS
+			"Library/Application Support/poolside",
+			// Linux
+			".local/state/poolside",
+			// Windows
+			"AppData/Roaming/poolside",
+		},
+		IDPrefix:  "poolside:",
+		FileBased: true,
+	},
+	{
+		// Omnigent stores every conversation in one shared SQLite database
+		// (chat.db); the provider fans it out into one session per conversation
+		// addressed by a "<db>#<id>" virtual path.
+		Type:              AgentOmnigent,
+		DisplayName:       "Omnigent",
+		EnvVar:            "OMNIGENT_DIR",
+		ConfigKey:         "omnigent_dirs",
+		DefaultDirs:       []string{".omnigent"},
+		IDPrefix:          "omnigent:",
+		FileBased:         true,
+		PeriodicReconcile: true,
+		// chat.db co-locates transcripts with authentication secrets, and
+		// copying or sanitizing the source database can retain deleted
+		// pages. Remote sync stays disabled until Omnigent has a fresh,
+		// allowlisted export schema.
+		RemoteSyncExcluded: true,
+	},
 }
 
 // NonFileBackedAgents returns agent types where FileBased is false.
@@ -783,6 +891,13 @@ func AgentByType(t AgentType) (AgentDef, bool) {
 		}
 	}
 	return AgentDef{}, false
+}
+
+// RemoteSyncExcludedAgent reports whether the agent's raw source tree must
+// stay out of every remote sync artifact. Unknown agents are not excluded.
+func RemoteSyncExcludedAgent(agent AgentType) bool {
+	def, ok := AgentByType(agent)
+	return ok && def.RemoteSyncExcluded
 }
 
 // AgentNameLacksPerMessageTokenData reports whether the named agent
@@ -969,6 +1084,14 @@ type ParsedSession struct {
 	// agent format does not yet support classification).
 	TerminationStatus TerminationStatus
 
+	// ClaudeLinearParse reports whether the Claude full parser fell
+	// back to linear processing for this session's file (multi-root or
+	// unresolvable-parent uuid DAG). Linearity is monotonic across
+	// appends, so the incremental parser skips fork detection for
+	// linear-bound sessions. Only set by the Claude parser; nil for
+	// all other agents.
+	ClaudeLinearParse *bool
+
 	TotalOutputTokens    int
 	PeakContextTokens    int
 	HasTotalOutputTokens bool
@@ -1083,7 +1206,7 @@ type ParsedUsageEvent struct {
 	CacheCreationInputTokens int
 	CacheReadInputTokens     int
 	ReasoningTokens          int
-	CostUSD                  *float64
+	Cost                     *money.Money
 	CostStatus               string
 	CostSource               string
 	OccurredAt               string

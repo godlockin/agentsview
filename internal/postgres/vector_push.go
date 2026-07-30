@@ -10,6 +10,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"time"
 )
 
 // VectorGenerationInfo identifies the local embedding generation being pushed.
@@ -46,23 +47,22 @@ type VectorPushDoc struct {
 	Chunks      []VectorPushChunk
 }
 
-// VectorPushSource supplies the locally built vectors.db active generation to
-// the PG push phase. Generation reports the active generation (ok=false when
-// none is built, an error wrapping ErrVectorSourceNotReady when one exists but
-// must not be exported right now). SessionDocHashes returns per-session
-// aggregate hashes used for delta detection; SessionDocs returns the full docs
-// for one session only when that session needs a (re)push, together with the
-// aggregate hash of exactly the returned doc set computed in the same read
-// snapshot ("" when no docs are embedded). The push compares that hash against
-// the delta-scan hash and defers the session on any divergence, so a local
-// index rewritten between the scan and the export can never overwrite valid PG
-// vectors with a partial view.
+// VectorPushSource supplies one transaction-owned local export for a PG push
+// phase. The export keeps generation metadata, aggregate hashes, and document
+// and chunk reads on one SQLite snapshot.
 type VectorPushSource interface {
-	Generation(ctx context.Context) (VectorGenerationInfo, bool, error)
-	SessionDocHashes(ctx context.Context) (map[string]string, error)
+	BeginExport(ctx context.Context, sessionIDs []string) (VectorExport, bool, error)
+}
+
+type VectorExport interface {
+	Generation() VectorGenerationInfo
+	SessionDocHashes(
+		ctx context.Context, sessionIDs []string,
+	) (map[string]string, error)
 	SessionDocs(
 		ctx context.Context, sessionID string,
 	) ([]VectorPushDoc, string, error)
+	Close() error
 }
 
 // ErrVectorSourceNotReady marks a Generation error meaning the local vector
@@ -91,15 +91,25 @@ type VectorPushResult struct {
 	SkippedReason     string
 	SessionsPushed    int
 	SessionsUnchanged int
-	// SessionsDeferred counts changed sessions whose vectors were withheld
-	// because their session-phase push failed this run; the delta state is
-	// untouched, so the next successful push sends them.
+	// SessionsDeferred counts sessions whose vector reconciliation was
+	// withheld this run — a failed session-phase push, an export hash
+	// that diverged mid-push, or an eviction abandoned because the local
+	// generation changed; the delta state is untouched, so the next
+	// generation-wide reconciliation sends them.
 	SessionsDeferred int
 	DocsPushed       int
 	ChunksPushed     int
 	DocsDeleted      int
 	SessionsEvicted  int
 	Conflicts        int
+	// GenerationID is the PG id of the generation this phase reconciled,
+	// zero when the phase was skipped or found no active generation. The
+	// watch orchestrator records it after a clean generation-wide pass so
+	// a later push against a different generation id — a re-embed, or a
+	// reset/drop that recreated the row under any machine — promotes the
+	// next scoped push to a generation-wide reconciliation instead of
+	// writing only the changed sessions' chunks into it.
+	GenerationID int64
 }
 
 // vectorChunkInsertBatch caps rows per multi-row INSERT so parameter counts
@@ -114,9 +124,17 @@ const vectorProgressStride = 2000
 // the schema-qualified halfvec type. The type must be qualified because the
 // connection's search_path is the target schema only, while pgvector's types
 // live in whichever schema first installed the extension.
+// machineRecorded reports whether this pusher's scoped witness record already
+// existed for the generation before this push touched it: recreating the
+// vector tables restarts the id sequence, so a reused id can satisfy the memo
+// comparison while the recreated generation is empty, and the witness record
+// — keyed by local push marker plus sync/filter scope and wiped in the same
+// reset — is what survives id reuse safely.
 type vectorGeneration struct {
-	id          int64
-	halfvecType string
+	id              int64
+	createdAt       time.Time
+	halfvecType     string
+	machineRecorded bool
 }
 
 // vectorPushScope carries the push-wide constants threaded through every
@@ -127,10 +145,9 @@ type vectorGeneration struct {
 // pusher's owner identity. Bundling them keeps per-session helpers under the
 // positional-parameter limit.
 type vectorPushScope struct {
-	gen         vectorGeneration
-	fingerprint string
-	genIDs      []int64
-	owner       vectorOwnerIdentity
+	gen    vectorGeneration
+	genIDs []int64
+	owner  vectorOwnerIdentity
 }
 
 // vectorPushStateRow is the PG-side delta state for one owned session in one
@@ -201,10 +218,17 @@ func (s *Sync) vectorOwnerIdentity(
 // current. failedSessions names sessions whose session-phase push failed this
 // run: their vectors are deferred (counted in SessionsDeferred) so pgvector
 // data never runs ahead of the corresponding sessions/messages rows.
+// scope, when non-nil, limits the local hash read and the PG state read to
+// those session IDs: reconciliation (including eviction) touches only the
+// scoped sessions, and everything else — PG-only rows, vector-only changes
+// from a later embeddings build — waits for the next generation-wide push.
+// An empty non-nil scope returns immediately without reading anything.
 // onProgress, when non-nil, receives Phase "vectors" reports so interactive
 // pushes are not silent through a long first vector push.
 func (s *Sync) pushVectors(
-	ctx context.Context, full bool, failedSessions map[string]struct{},
+	ctx context.Context, full bool, scope []string,
+	lastReconciledGeneration int64,
+	failedSessions map[string]struct{},
 	onProgress func(PushProgress),
 ) (VectorPushResult, error) {
 	var res VectorPushResult
@@ -212,7 +236,11 @@ func (s *Sync) pushVectors(
 		res.Skipped, res.SkippedReason = true, "no vector source configured"
 		return res, nil
 	}
-	gen, hasGen, err := s.vectorSource.Generation(ctx)
+	if scope != nil && len(scope) == 0 {
+		log.Printf("vector push: no changed sessions; deferring reconciliation to the next generation-wide push")
+		return res, nil
+	}
+	export, hasGen, err := s.vectorSource.BeginExport(ctx, scope)
 	if errors.Is(err, ErrVectorSourceNotReady) {
 		res.Skipped, res.SkippedReason = true, err.Error()
 		log.Printf("vector push: skipped: %v", err)
@@ -225,6 +253,15 @@ func (s *Sync) pushVectors(
 		res.Skipped, res.SkippedReason = true, "no active local generation"
 		return res, nil
 	}
+	if export == nil {
+		return res, fmt.Errorf("resolving local vector generation: BeginExport returned a nil export")
+	}
+	defer func() {
+		if export != nil {
+			_ = export.Close()
+		}
+	}()
+	gen := export.Generation()
 	unavailable, err := ensureVectorBaseSchemaPG(ctx, s.pg)
 	if err != nil {
 		if s.skipVectorsOnPrivilegeError(err, &res) {
@@ -236,37 +273,277 @@ func (s *Sync) pushVectors(
 		res.Skipped, res.SkippedReason = true, unavailable
 		return res, nil
 	}
-	resolved, err := s.resolveVectorGeneration(ctx, gen)
+	witnessKey, err := s.vectorGenerationWitnessKey()
 	if err != nil {
-		if s.skipVectorsOnPrivilegeError(err, &res) {
-			return res, nil
-		}
 		return res, err
 	}
+	// A scoped push writes only its changed sessions' chunks, which is safe
+	// only within the exact generation instance this process last reconciled
+	// generation-wide. Two signals identify that instance. The PG generation
+	// id catches every recreation that keeps the tables: row deletion never
+	// resets the sequence, so a re-embed (new fingerprint), reset, or admin
+	// drop yields a new id, whoever recreates it. Recreating the tables
+	// themselves restarts the sequence, so a reused id can match a stale
+	// memo; this pusher's scoped witness record, wiped in the same reset and
+	// written only after a clean generation-wide reconciliation, is the
+	// witness for that case. Either signal failing means the prior
+	// reconciliation no longer covers this generation and scoping would leave
+	// search reading an incomplete one until the interval floor.
+	// Promote to a generation-wide read. A zero memo means no reconciliation
+	// to trust yet, so the reconcile bit already forces this push
+	// generation-wide and the id check must not fire.
+	requestedScope := scope
+	var resolved vectorGeneration
+	if scope != nil {
+		initialProbe, found, err := s.lookupVectorGeneration(ctx, gen.Fingerprint, witnessKey)
+		if err != nil {
+			return res, err
+		}
+		if !found {
+			log.Printf("vector push: generation %q is not yet registered in PostgreSQL; promoting scoped push to generation-wide reconciliation",
+				gen.Fingerprint)
+			scope = nil
+		} else if !initialProbe.machineRecorded {
+			log.Printf("vector push: no prior scoped witness against generation %d; promoting scoped push to generation-wide reconciliation",
+				initialProbe.id)
+			scope = nil
+		} else if lastReconciledGeneration != 0 &&
+			initialProbe.id != lastReconciledGeneration {
+			log.Printf("vector push: active generation id %d differs from the last reconciled %d; promoting scoped push to generation-wide reconciliation",
+				initialProbe.id, lastReconciledGeneration)
+			scope = nil
+		} else {
+			if s.afterVectorGenerationLookup != nil {
+				hook := s.afterVectorGenerationLookup
+				s.afterVectorGenerationLookup = nil
+				hook()
+			}
+			currentProbe, found, err := s.lookupVectorGeneration(ctx, gen.Fingerprint, witnessKey)
+			if err != nil {
+				return res, err
+			}
+			if !found {
+				log.Printf("vector push: generation %q disappeared before scoped reconciliation; promoting scoped push to generation-wide reconciliation",
+					gen.Fingerprint)
+				scope = nil
+			} else if !currentProbe.machineRecorded {
+				log.Printf("vector push: no prior scoped witness against generation %d before scoped reconciliation; promoting scoped push to generation-wide reconciliation",
+					currentProbe.id)
+				scope = nil
+			} else if currentProbe.id != initialProbe.id {
+				log.Printf("vector push: active generation id changed from %d to %d before scoped reconciliation; promoting scoped push to generation-wide reconciliation",
+					initialProbe.id, currentProbe.id)
+				scope = nil
+			} else {
+				resolved = currentProbe
+			}
+		}
+	}
+	if requestedScope != nil && scope == nil {
+		_ = export.Close()
+		export, hasGen, err = s.vectorSource.BeginExport(ctx, nil)
+		if errors.Is(err, ErrVectorSourceNotReady) {
+			res.Skipped, res.SkippedReason = true, err.Error()
+			log.Printf("vector push: skipped after scoped promotion: %v", err)
+			return res, nil
+		}
+		if err != nil {
+			return res, fmt.Errorf(
+				"rechecking local vector generation after scoped promotion: %w", err,
+			)
+		}
+		if !hasGen {
+			res.Skipped, res.SkippedReason = true, "no active local generation"
+			return res, nil
+		}
+		if export == nil {
+			return res, fmt.Errorf(
+				"rechecking local vector generation after scoped promotion: BeginExport returned a nil export",
+			)
+		}
+		gen = export.Generation()
+	}
+	if scope == nil {
+		resolved, err = s.resolveVectorGeneration(ctx, gen, witnessKey)
+		if err != nil {
+			if s.skipVectorsOnPrivilegeError(err, &res) {
+				return res, nil
+			}
+			return res, err
+		}
+	}
+	res.GenerationID = resolved.id
 	owner, err := s.vectorOwnerIdentity(ctx)
 	if err != nil {
 		return res, err
 	}
-	local, err := s.vectorSource.SessionDocHashes(ctx)
+	local, err := export.SessionDocHashes(ctx, scope)
 	if err != nil {
 		return res, fmt.Errorf("reading local vector doc hashes: %w", err)
 	}
-	pgState, err := s.readVectorPushState(ctx, resolved.id)
+	var pgState map[string]vectorPushStateRow
+	if scope != nil {
+		pgState, err = s.readVectorPushStateForSessions(
+			ctx, resolved.id, scope,
+		)
+	} else {
+		pgState, err = s.readVectorPushState(ctx, resolved.id)
+	}
 	if err != nil {
 		return res, err
 	}
-	log.Printf("vector push: comparing %d local session(s) against %d PG state row(s) for generation %d",
-		len(local), len(pgState), resolved.id)
+	if scope != nil {
+		log.Printf("vector push: change-scoped reconciliation of %d candidate session(s): %d local hash(es), %d PG state row(s) for generation %d",
+			len(scope), len(local), len(pgState), resolved.id)
+	} else {
+		log.Printf("vector push: comparing %d local session(s) against %d PG state row(s) for generation %d",
+			len(local), len(pgState), resolved.id)
+	}
 	if err := s.applyVectorDeltas(
-		ctx, resolved, gen.Fingerprint, owner, full, local, pgState,
+		ctx, resolved, owner, full, local, pgState, export,
 		failedSessions, onProgress, &res,
 	); err != nil {
 		return res, err
+	}
+	if s.afterVectorApply != nil {
+		hook := s.afterVectorApply
+		s.afterVectorApply = nil
+		hook()
+	}
+	if scope != nil {
+		if s.afterScopedVectorApply != nil {
+			hook := s.afterScopedVectorApply
+			s.afterScopedVectorApply = nil
+			hook()
+		}
+		retryGenerationWide := func(msg string, args ...any) (VectorPushResult, error) {
+			log.Printf(msg, args...)
+			_ = export.Close()
+			export = nil
+			return s.pushVectors(
+				ctx, full, nil, lastReconciledGeneration, failedSessions, onProgress,
+			)
+		}
+		finalProbe, found, err := s.lookupVectorGeneration(ctx, gen.Fingerprint, witnessKey)
+		if err != nil {
+			return res, err
+		}
+		if !found {
+			return retryGenerationWide(
+				"vector push: generation %q disappeared after scoped reconciliation; retrying generation-wide",
+				gen.Fingerprint,
+			)
+		}
+		if !finalProbe.machineRecorded {
+			return retryGenerationWide(
+				"vector push: no prior scoped witness against generation %d after scoped reconciliation; retrying generation-wide",
+				finalProbe.id,
+			)
+		}
+		if finalProbe.id != resolved.id {
+			return retryGenerationWide(
+				"vector push: active generation id changed from %d to %d after scoped reconciliation; retrying generation-wide",
+				resolved.id, finalProbe.id,
+			)
+		}
+	} else {
+		retryGenerationWide := func(msg string, args ...any) (VectorPushResult, error) {
+			log.Printf(msg, args...)
+			_ = export.Close()
+			export = nil
+			return s.pushVectors(
+				ctx, full, nil, lastReconciledGeneration, failedSessions, onProgress,
+			)
+		}
+		finalProbe, found, err := s.lookupVectorGeneration(ctx, gen.Fingerprint, witnessKey)
+		if err != nil {
+			return res, err
+		}
+		if !found {
+			return retryGenerationWide(
+				"vector push: generation %q disappeared before recording the generation-wide witness; retrying generation-wide",
+				gen.Fingerprint,
+			)
+		}
+		if finalProbe.id != resolved.id {
+			return retryGenerationWide(
+				"vector push: active generation id changed from %d to %d before recording the generation-wide witness; retrying generation-wide",
+				resolved.id, finalProbe.id,
+			)
+		}
+		if !finalProbe.createdAt.Equal(resolved.createdAt) {
+			return retryGenerationWide(
+				"vector push: generation %d was recreated before recording the generation-wide witness; retrying generation-wide",
+				resolved.id,
+			)
+		}
+	}
+	if scope == nil && res.SessionsDeferred == 0 {
+		if s.beforeVectorWitnessRecord != nil {
+			hook := s.beforeVectorWitnessRecord
+			s.beforeVectorWitnessRecord = nil
+			hook()
+		}
+		recorded, err := s.recordVectorGenerationMachine(
+			ctx, gen.Fingerprint, resolved, witnessKey,
+		)
+		if err != nil {
+			return res, err
+		}
+		if !recorded {
+			log.Printf("vector push: generation %d changed after verification and before witness insert; retrying generation-wide",
+				resolved.id)
+			_ = export.Close()
+			export = nil
+			return s.pushVectors(
+				ctx, full, nil, lastReconciledGeneration, failedSessions, onProgress,
+			)
+		}
 	}
 	log.Printf("vector push: %d session(s) pushed, %d unchanged, %d deferred, %d evicted, %d chunks",
 		res.SessionsPushed, res.SessionsUnchanged, res.SessionsDeferred,
 		res.SessionsEvicted, res.ChunksPushed)
 	return res, nil
+}
+
+func (s *Sync) lookupVectorGeneration(
+	ctx context.Context, fingerprint, witnessKey string,
+) (vectorGeneration, bool, error) {
+	var genID int64
+	var createdAt time.Time
+	err := s.pg.QueryRowContext(ctx,
+		`SELECT id, created_at FROM vector_generations WHERE fingerprint = $1`,
+		fingerprint,
+	).Scan(&genID, &createdAt)
+	if err == sql.ErrNoRows {
+		return vectorGeneration{}, false, nil
+	}
+	if isUndefinedTable(err) {
+		return vectorGeneration{}, false, nil
+	}
+	if err != nil {
+		return vectorGeneration{}, false, fmt.Errorf("looking up vector generation: %w", err)
+	}
+	extSchema, err := vectorExtensionSchema(ctx, s.pg)
+	if err != nil {
+		return vectorGeneration{}, false, err
+	}
+	var machineRecorded bool
+	if err := s.pg.QueryRowContext(ctx, `
+SELECT EXISTS (
+    SELECT 1 FROM vector_generation_machines
+     WHERE generation_id = $1 AND machine = $2)`,
+		genID, witnessKey).Scan(&machineRecorded); err != nil {
+		return vectorGeneration{}, false, fmt.Errorf(
+			"reading vector push machine record: %w", err,
+		)
+	}
+	return vectorGeneration{
+		id:              genID,
+		createdAt:       createdAt,
+		halfvecType:     extSchema + ".halfvec",
+		machineRecorded: machineRecorded,
+	}, true, nil
 }
 
 // skipVectorsOnPrivilegeError reports whether err is an
@@ -311,10 +588,10 @@ func (s *Sync) skipVectorsOnPrivilegeError(err error, res *VectorPushResult) boo
 // vectorProgressStride examined ones, so long delta scans stay visible
 // without a callback per unchanged session.
 func (s *Sync) applyVectorDeltas(
-	ctx context.Context, gen vectorGeneration, fingerprint string,
+	ctx context.Context, gen vectorGeneration,
 	owner vectorOwnerIdentity, full bool,
 	local map[string]string, pgState map[string]vectorPushStateRow,
-	failedSessions map[string]struct{}, onProgress func(PushProgress),
+	export VectorExport, failedSessions map[string]struct{}, onProgress func(PushProgress),
 	res *VectorPushResult,
 ) error {
 	allGenIDs, err := s.allVectorGenerationIDs(ctx)
@@ -326,7 +603,9 @@ func (s *Sync) applyVectorDeltas(
 		return err
 	}
 	scope := vectorPushScope{
-		gen: gen, fingerprint: fingerprint, genIDs: genIDs, owner: owner,
+		gen:    gen,
+		genIDs: genIDs,
+		owner:  owner,
 	}
 
 	outOfScope, err := s.vectorSessionsOutOfScope(ctx, local, pgState)
@@ -364,7 +643,7 @@ func (s *Sync) applyVectorDeltas(
 			res.SessionsDeferred++
 			continue
 		}
-		outcome, err := s.pushVectorSession(ctx, scope, sessionID, agg)
+		outcome, err := s.pushVectorSession(ctx, scope, export, sessionID, agg)
 		if err != nil {
 			return err
 		}
@@ -373,17 +652,6 @@ func (s *Sync) applyVectorDeltas(
 		}
 		if outcome.deferred {
 			res.SessionsDeferred++
-			// One diverged session can be a transient local change; a source
-			// that is no longer ready (or swapped generations) means a build
-			// is rewriting the whole index — every remaining session would
-			// diverge too, so stop the phase (evictions included) and let the
-			// next push, run against the completed build, send everything.
-			if !s.vectorSourceStillCurrent(ctx, scope.fingerprint) {
-				log.Printf(
-					"vector push: stopping after %d pushed session(s): local generation changed or became unready mid-push",
-					res.SessionsPushed)
-				return nil
-			}
 		}
 		if outcome.pushed {
 			res.SessionsPushed++
@@ -416,34 +684,7 @@ func (s *Sync) applyVectorDeltas(
 			res.Conflicts++
 		}
 	}
-	if len(evict) > 0 && !s.vectorSourceStillCurrent(ctx, scope.fingerprint) {
-		log.Printf(
-			"vector push: skipping eviction of %d session(s): local generation changed or became unready mid-push",
-			len(evict))
-		return nil
-	}
 	return s.evictVectorSessions(ctx, scope, evict, res)
-}
-
-// vectorSourceStillCurrent re-verifies that the local source still reports the
-// same fully embedded generation the delta scan read its hashes from. It gates
-// two decisions computed from that earlier read: the eviction list (an
-// embeddings build that starts mid-push collapses the local coverage the list
-// was computed from — evicting on that view would remove valid PG vectors
-// wholesale — and a generation swap invalidates it outright) and whether to
-// keep pushing after a session's export hash diverged from its delta-scan hash
-// (an unready source means every remaining session would diverge too).
-// Deferring is always safe: both the eviction list and per-session deltas are
-// re-derived from scratch on the next push. (A full rebuild that both starts
-// and completes between the hash read and this check is not detectable from
-// the source's state, but the per-session export-hash comparison in
-// pushVectorSession covers the replacement path regardless, and eviction
-// candidates lost to that window are re-pushed by the next push.)
-func (s *Sync) vectorSourceStillCurrent(
-	ctx context.Context, fingerprint string,
-) bool {
-	cur, ok, err := s.vectorSource.Generation(ctx)
-	return err == nil && ok && cur.Fingerprint == fingerprint
 }
 
 // vectorSessionsOutOfScope computes the set of candidate sessions a filtered
@@ -624,9 +865,15 @@ func vectorOutOfScopeQuery(
 }
 
 // resolveVectorGeneration registers the generation, creates its chunk table,
-// and records this machine's push against it.
+// and reads whether this machine has already completed a generation-wide push
+// against it. Its id is the generation
+// instance's identity, which a scoped push compares against the last one it
+// reconciled generation-wide to decide whether to promote; whether this
+// scoped witness predated this call is captured first, because that record is
+// the incarnation witness the promotion check falls back on when a recreated
+// id sequence hands the new generation the memoized id.
 func (s *Sync) resolveVectorGeneration(
-	ctx context.Context, gen VectorGenerationInfo,
+	ctx context.Context, gen VectorGenerationInfo, witnessKey string,
 ) (vectorGeneration, error) {
 	genID, err := ensureVectorGeneration(
 		ctx, s.pg, gen.Fingerprint, gen.Model, gen.Dimension,
@@ -641,14 +888,54 @@ func (s *Sync) resolveVectorGeneration(
 	if err != nil {
 		return vectorGeneration{}, err
 	}
-	if _, err := s.pg.ExecContext(ctx, `
-INSERT INTO vector_generation_machines (generation_id, machine, last_push_at)
-VALUES ($1, $2, now())
-ON CONFLICT (generation_id, machine) DO UPDATE SET last_push_at = now()`,
-		genID, s.machine); err != nil {
-		return vectorGeneration{}, fmt.Errorf("recording vector push machine: %w", err)
+	var createdAt time.Time
+	if err := s.pg.QueryRowContext(ctx,
+		`SELECT created_at FROM vector_generations WHERE id = $1`, genID,
+	).Scan(&createdAt); err != nil {
+		return vectorGeneration{}, fmt.Errorf("reading vector generation created_at: %w", err)
 	}
-	return vectorGeneration{id: genID, halfvecType: extSchema + ".halfvec"}, nil
+	var machineRecorded bool
+	if err := s.pg.QueryRowContext(ctx, `
+SELECT EXISTS (
+    SELECT 1 FROM vector_generation_machines
+     WHERE generation_id = $1 AND machine = $2)`,
+		genID, witnessKey).Scan(&machineRecorded); err != nil {
+		return vectorGeneration{}, fmt.Errorf("reading vector push machine record: %w", err)
+	}
+	return vectorGeneration{
+		id:              genID,
+		createdAt:       createdAt,
+		halfvecType:     extSchema + ".halfvec",
+		machineRecorded: machineRecorded,
+	}, nil
+}
+
+func (s *Sync) vectorGenerationWitnessKey() (string, error) {
+	markerID, err := s.pushMarkerID()
+	if err != nil {
+		return "", err
+	}
+	return s.machine + "|" + s.pushMarkerMetadataKey(pushMarkerKeyPrefix, markerID), nil
+}
+
+func (s *Sync) recordVectorGenerationMachine(
+	ctx context.Context, fingerprint string, gen vectorGeneration, witnessKey string,
+) (bool, error) {
+	res, err := s.pg.ExecContext(ctx, `
+INSERT INTO vector_generation_machines (generation_id, machine, last_push_at)
+SELECT id, $4, now()
+  FROM vector_generations
+ WHERE id = $1 AND fingerprint = $2 AND created_at = $3
+ON CONFLICT (generation_id, machine) DO UPDATE SET last_push_at = EXCLUDED.last_push_at`,
+		gen.id, fingerprint, gen.createdAt, witnessKey)
+	if err != nil {
+		return false, fmt.Errorf("recording vector push machine: %w", err)
+	}
+	rows, err := res.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("confirming vector push machine record: %w", err)
+	}
+	return rows > 0, nil
 }
 
 // readVectorPushState loads the delta state for genID, joined with each
@@ -669,7 +956,32 @@ SELECT ps.session_id, ps.doc_agg_hash, s.owner_marker, s.machine,
 		return nil, fmt.Errorf("reading vector push state: %w", err)
 	}
 	defer rows.Close()
+	return scanVectorPushState(rows)
+}
 
+// readVectorPushStateForSessions is readVectorPushState limited to the given
+// session IDs, so a change-scoped push reads state proportional to its
+// changed set instead of the whole generation.
+func (s *Sync) readVectorPushStateForSessions(
+	ctx context.Context, genID int64, sessionIDs []string,
+) (map[string]vectorPushStateRow, error) {
+	rows, err := s.pg.QueryContext(ctx, `
+SELECT ps.session_id, ps.doc_agg_hash, s.owner_marker, s.machine,
+       (s.id IS NOT NULL)
+  FROM vector_push_state ps
+  LEFT JOIN sessions s ON s.id = ps.session_id
+ WHERE ps.generation_id = $1
+   AND ps.session_id = ANY($2)`, genID, sessionIDs)
+	if err != nil {
+		return nil, fmt.Errorf("reading scoped vector push state: %w", err)
+	}
+	defer rows.Close()
+	return scanVectorPushState(rows)
+}
+
+func scanVectorPushState(
+	rows *sql.Rows,
+) (map[string]vectorPushStateRow, error) {
 	state := make(map[string]vectorPushStateRow)
 	for rows.Next() {
 		var sessionID, aggHash string
@@ -725,7 +1037,7 @@ type vectorSessionOutcome struct {
 // generation's chunks for them (see deleteParkedVectorDocs). This mirrors the
 // local mirror's park-to-sentinel slot replacement (internal/vector/mirror.go).
 func (s *Sync) pushVectorSession(
-	ctx context.Context, scope vectorPushScope, sessionID, aggHash string,
+	ctx context.Context, scope vectorPushScope, export VectorExport, sessionID, aggHash string,
 ) (vectorSessionOutcome, error) {
 	tx, err := s.pg.BeginTx(ctx, nil)
 	if err != nil {
@@ -761,7 +1073,7 @@ func (s *Sync) pushVectorSession(
 	// session passes the existence/ownership probe. A local-only session with no
 	// PG row, or one owned elsewhere, skips forever; fetching docs first would
 	// re-export them on every push for sessions that never land.
-	docs, exportHash, err := s.vectorSource.SessionDocs(ctx, sessionID)
+	docs, exportHash, err := export.SessionDocs(ctx, sessionID)
 	if err != nil {
 		return vectorSessionOutcome{}, fmt.Errorf(
 			"reading local docs for session %s: %w", sessionID, err)

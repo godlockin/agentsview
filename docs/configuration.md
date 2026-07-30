@@ -254,15 +254,19 @@ can still be parsed.
 | iFlow                 | `~/.iflow/projects/`                                                             | JSONL per session                                                                                                               |
 | Kilo                  | `~/.local/share/kilo/`                                                           | SQLite DB or `storage/` JSON files                                                                                              |
 | Kimi                  | `~/.kimi/sessions/` and `~/.kimi-code/sessions/`                                 | JSONL per session                                                                                                               |
+| Kimi Work             | (platform-specific, see below)                                                   | JSONL per session (kimi-code kernel wire logs)                                                                                  |
 | Kiro CLI              | `~/.kiro/sessions/cli/` and `~/.local/share/kiro-cli/`                           | JSONL per session and SQLite database                                                                                           |
 | Kiro IDE              | (platform-specific, see below)                                                   | JSON / chat files                                                                                                               |
+| Kilo (legacy)         | (platform-specific, see below)                                                   | `tasks/<uuid>/{task_metadata.json,ui_messages.json,api_conversation_history.json}`                                              |
 | MiMoCode              | `~/.local/share/mimocode/`                                                       | SQLite DB or `storage/` JSON files                                                                                              |
 | Mistral Vibe          | `~/.vibe/logs/session/`                                                          | Per-session `messages.jsonl` plus `meta.json`                                                                                   |
 | OhMyPi                | `~/.omp/agent/sessions/`                                                         | JSONL per session                                                                                                               |
 | OpenClaw              | `~/.openclaw/assets/static/agents/` and `~/.kimi_openclaw/assets/static/agents/` | JSONL per session                                                                                                               |
 | OpenCode              | `~/.local/share/opencode/`                                                       | SQLite DB or `storage/` JSON files                                                                                              |
 | OpenHands CLI         | `~/.openhands/conversations/`                                                    | Per-conversation `base_state.json` + `events/*.json`                                                                            |
+| Omnigent              | `~/.omnigent/`                                                                   | SQLite `chat.db`, one session per conversation                                                                                  |
 | Pi                    | `~/.pi/agent/sessions/`                                                          | JSONL per session                                                                                                               |
+| Poolside              | `~/Library/Application Support/poolside/trajectories/` (macOS), `~/.local/state/poolside/trajectories/` (Linux), `%APPDATA%\\poolside\\trajectories\\` (Windows) | NDJSON trajectory files                                                                                                         |
 | Piebald               | `~/.local/share/piebald/`                                                        | SQLite database (`app.db`)                                                                                                      |
 | Posit Assistant       | `~/.posit/assistant/workspaces/`                                                 | Per-conversation `conversation.json` tree plus `lm-messages.jsonl` transcript                                                   |
 | Positron Assistant    | (platform-specific, see below)                                                   | JSON / JSONL per session                                                                                                        |
@@ -276,7 +280,7 @@ can still be parsed.
 | Visual Studio Copilot | (platform-specific, see below)                                                   | Trace JSONL files                                                                                                               |
 | VS Code Copilot       | (platform-specific, see below)                                                   | JSON / JSONL per session                                                                                                        |
 | Windsurf              | (platform-specific, see below)                                                   | SQLite `workspaceStorage/<hash>/state.vscdb` workspace chat data                                                                |
-| Trae                  | (platform-specific, see below)                                                   | SQLite `workspaceStorage/<hash>/state.vscdb` and `globalStorage/state.vscdb` chat data                                        |
+| Trae                  | (platform-specific, see below)                                                   | Legacy inline chat data in SQLite `workspaceStorage/<hash>/state.vscdb` and `globalStorage/state.vscdb`; modern encrypted layouts are detected as unsupported |
 | Warp                  | (platform-specific, see below)                                                   | SQLite database                                                                                                                 |
 | WorkBuddy             | `~/.workbuddy/projects/`                                                         | JSONL per session                                                                                                               |
 | ZCode                 | `~/.zcode/cli/db/` or `~/.zcode/cli/`                                            | SQLite database (`db.sqlite`) with usage rows                                                                                   |
@@ -289,6 +293,16 @@ present for the full transcript (user turns, assistant replies, thinking,
 and tool calls). If `chat_history.jsonl` is missing, AgentsView falls back
 to summary-only mode. Set `GROK_DIR` or `grok_dirs` to override the default
 directory.
+
+Omnigent sessions are read from `~/.omnigent/chat.db`. Set `OMNIGENT_DIR` or
+`omnigent_dirs` to override the default directory. AgentsView creates one
+session per conversation and supports the split text-ID and current
+binary-UUID schema generations; the older single-table schema is detected and
+reported as unsupported without losing sessions already synced from it.
+Remote HTTP and SSH sync stay disabled for Omnigent because `chat.db`
+co-locates transcripts with authentication secrets. A metadata-only edit made
+directly in `chat.db` can be deferred by the immediate filesystem-event sync;
+the next scheduled reconciliation pass or an explicit resync picks it up.
 
 **VS Code Copilot default directories** vary by platform:
 
@@ -329,11 +343,25 @@ Trae stores chats in `workspaceStorage/<hash>/state.vscdb` and
 AgentsView watches `workspaceStorage` and `globalStorage`, then reads chat
 records from those SQLite stores.
 
-Trae local parsing is supported, but remote HTTP and SSH target resolution is
-still disabled. A Trae root is a full user profile, and AgentsView does not
+Trae legacy inline-message parsing is supported. Modern encrypted transcript
+layouts are detected and reported as unsupported. Remote HTTP and SSH target
+resolution is still disabled. A Trae root is a full user profile, and AgentsView does not
 archive or ship that profile wholesale. The follow-up path is Windsurf-style
 curated file targets only: `state.vscdb`, `state.vscdb-wal`, and
 `workspace.json` for each supported workspace store.
+
+**Kimi Work default directories** vary by platform. Kimi Work is the
+kimi-desktop app (the "daimon" runtime); it stores conversations as kimi-code
+kernel wire logs under `<root>/wd_<workspace>_<hash>/<session>/agents/<agent>/wire.jsonl`:
+
+- **macOS:** `~/Library/Application Support/kimi-desktop/daimon-share/daimon/runtime/kimi-code/home/sessions/`
+- **Linux:** `~/.config/kimi-desktop/daimon-share/daimon/runtime/kimi-code/home/sessions/`
+  (or `~/.local/share/...` on some installs)
+- **Windows:** `%APPDATA%/kimi-desktop/daimon-share/daimon/runtime/kimi-code/home/sessions/`
+
+Only `conv-*` session directories are user conversations; auxiliary internal
+sessions (`ctitle-*`, `sklsum-*`, `dvlt-*`) are excluded from discovery. Set
+`KIMI_WORK_DIR` or `kimi_work_dirs` if your installation stores them elsewhere.
 
 **Positron Assistant default directory** (macOS only):
 
@@ -461,6 +489,35 @@ RooCode was shut down on May 15, 2026. ZooCode (Zoo-CodeInc.zoo-cline) is the
 active community fork and will be supported separately. Set `ROOCODE_DIR` or
 `roocode_dirs` if your VSCode globalStorage directory is elsewhere.
 
+**Kilo (legacy) default directories** vary by platform, all rooted at the
+canonical lowercase `kilocode.kilo-code` global storage directory that VSCode
+writes on disk:
+
+- **macOS:** `~/Library/Application Support/Code/User/globalStorage/kilocode.kilo-code/`
+- **Linux:** `~/.config/Code/User/globalStorage/kilocode.kilo-code/`
+- **Windows:** `%APPDATA%/Code/User/globalStorage/kilocode.kilo-code/`
+
+Each `<root>/tasks/<uuid>/` task directory carries three JSON files:
+`task_metadata.json` (only stores `files_in_context`), the Claude-shaped
+`api_conversation_history.json`, and the Cline-shaped `ui_messages.json`.
+AgentsView folds the latter two into a composite fingerprint with
+`task_metadata.json` as the source anchor so changes to any of the three trigger
+a reparse. Sessions are parsed through RooCode-descended Cline message handling
+(tool-call and result pairing, reasoning pipeline, compact boundaries, error
+linking). Set `KILO_LEGACY_DIR` or `kilo_legacy_dirs` when the legacy extension
+stores its data outside the standard locations.
+
+**Kilo (legacy) vs Kilo.** These are two different agents. *Kilo* (the
+`kilo` agent) is the OpenCode-based core at `~/.local/share/kilo/`; it
+covers both the Kilo CLI and the rebuilt Kilo Code VS Code extension,
+which share that same `kilo.db`. *Kilo (legacy)* (the `kilo-legacy` agent)
+is the legacy RooCode-derived VS Code extension that wrote per-task JSON
+under `kilocode.kilo-code/tasks/` and stopped receiving new sessions after
+Kilo rebuilt the extension on OpenCode (public beta 2026-03-10, GA
+2026-04-02). The `kilo-legacy` agent is frozen at that legacy format and
+only archives older sessions; newer Kilo VS Code activity appears under
+`kilo`.
+
 **Antigravity CLI transcript sources:** Antigravity CLI has used both SQLite
 databases and AES-encrypted `.pb` files. AgentsView reads whichever source is
 richest, in this order:
@@ -530,8 +587,10 @@ export HERMES_SESSIONS_DIR=~/custom/hermes
 export IFLOW_DIR=~/custom/iflow
 export KILO_DIR=~/custom/kilo
 export KIMI_DIR=~/custom/kimi
+export KIMI_WORK_DIR=~/custom/kimi-work
 export KIRO_SESSIONS_DIR=~/custom/kiro
 export KIRO_IDE_DIR=~/custom/kiro-ide
+export KILO_LEGACY_DIR=~/custom/kilo-legacy
 export MIMOCODE_DIR=~/custom/mimocode
 export VIBE_SESSIONS_DIR=~/custom/vibe/logs/session
 export OMP_DIR=~/custom/omp
@@ -540,6 +599,7 @@ export OPENCODE_DIR=~/custom/opencode
 export OPENHANDS_CONVERSATIONS_DIR=~/custom/openhands
 export PI_DIR=~/custom/pi
 export PIEBALD_DIR=~/custom/piebald
+export POOLSIDE_DIR=~/custom/poolside/trajectories
 export POSIT_ASSISTANT_DIR=~/custom/posit-assistant/workspaces
 export POSITRON_DIR=~/custom/positron
 export QCLAW_DIR=~/custom/qclaw
@@ -549,6 +609,7 @@ export QWENPAW_DIR=~/custom/qwenpaw
 export REASONIX_DIR=~/custom/reasonix
 export ROOCODE_DIR=~/custom/roocode
 export SHELLEY_DIR=~/custom/shelley
+export TRAE_DIR=~/custom/trae/User
 export VISUALSTUDIO_COPILOT_DIR=~/custom/visualstudio-copilot/traces
 export VSCODE_COPILOT_DIR=~/custom/vscode
 export WINDSURF_DIR=~/custom/windsurf/User
@@ -580,11 +641,12 @@ The corresponding fields are `aider_dirs`, `amp_dirs`, `antigravity_dirs`,
 `cowork_dirs`, `devin_dirs`, `codex_sessions_dirs`, `commandcode_project_dirs`,
 `copilot_dirs`, `cortex_dirs`, `cursor_project_dirs`,
 `deepseek_tui_sessions_dirs`, `forge_dirs`, `gemini_dirs`, `gptme_dirs`,
-`grok_dirs`, `hermes_sessions_dirs`, `iflow_dirs`, `kilo_dirs`, `kimi_dirs`,
-`kiro_dirs`, `kiro_ide_dirs`, `mimocode_dirs`, `vibe_session_dirs`,
-`omp_dirs`, `openclaw_dirs`, `opencode_dirs`, `openhands_dirs`, `pi_dirs`,
-`piebald_dirs`, `posit_assistant_dirs`, `positron_dirs`, `qclaw_dirs`,
-`qoder_project_dirs`, `qwen_project_dirs`, `qwenpaw_dirs`, `reasonix_dirs`, `roocode_dirs`,
+`grok_dirs`, `hermes_sessions_dirs`, `iflow_dirs`, `kilo_dirs`,
+`kilo_legacy_dirs`, `kimi_dirs`, `kimi_work_dirs`, `kiro_dirs`, `kiro_ide_dirs`,
+`mimocode_dirs`, `vibe_session_dirs`, `omp_dirs`, `openclaw_dirs`,
+`opencode_dirs`, `openhands_dirs`, `pi_dirs`, `piebald_dirs`,
+`posit_assistant_dirs`, `positron_dirs`, `qclaw_dirs`, `qoder_project_dirs`,
+`qwen_project_dirs`, `qwenpaw_dirs`, `reasonix_dirs`, `roocode_dirs`,
 `shelley_dirs`, `visualstudio_copilot_dirs`, `vscode_copilot_dirs`,
 `windsurf_dirs`, `warp_dirs`, `workbuddy_project_dirs`, `zcode_dirs`,
 `zed_dirs`, and `zencoder_dirs`. Each accepts an array of paths. When set,

@@ -18,6 +18,8 @@ describe("KNOWN_AGENTS", () => {
       "devin",
       "gemini",
       "opencode",
+      "kilo",
+      "kilo-legacy",
       "openhands",
       "cursor",
       "amp",
@@ -33,6 +35,7 @@ describe("KNOWN_AGENTS", () => {
       "qclaw",
       "iflow",
       "kimi",
+      "kimi-work",
       "claude-ai",
       "chatgpt",
       "kiro",
@@ -46,6 +49,8 @@ describe("KNOWN_AGENTS", () => {
       "vibe",
       "posit-assistant",
       "roocode",
+      "poolside",
+      "omnigent",
     ]);
   });
 
@@ -121,6 +126,9 @@ describe("agentColor", () => {
     expect(agentColor("roocode")).toBe(
       "var(--accent-rose)",
     );
+    expect(agentColor("omnigent")).toBe(
+      "var(--accent-teal)",
+    );
   });
 
   it("falls back to blue for unknown agents", () => {
@@ -189,6 +197,7 @@ describe("agentLabel", () => {
     expect(agentLabel("openclaw")).toBe("OpenClaw");
     expect(agentLabel("qclaw")).toBe("QClaw");
     expect(agentLabel("iflow")).toBe("iFlow");
+    expect(agentLabel("kimi-work")).toBe("Kimi Work");
     expect(agentLabel("workbuddy")).toBe("WorkBuddy");
     expect(agentLabel("piebald")).toBe("Piebald");
     expect(agentLabel("zed")).toBe("Zed");
@@ -197,6 +206,7 @@ describe("agentLabel", () => {
     expect(agentLabel("deepseek-tui")).toBe("DeepSeek TUI");
     expect(agentLabel("qoder")).toBe("Qoder");
     expect(agentLabel("roocode")).toBe("RooCode");
+    expect(agentLabel("omnigent")).toBe("Omnigent");
   });
 
   it("capitalizes simple agent names", () => {

@@ -2,6 +2,7 @@ package server_test
 
 import (
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -10,6 +11,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"go.kenn.io/agentsview/internal/db"
+	"go.kenn.io/agentsview/internal/money"
 	"go.kenn.io/agentsview/internal/server"
 	"go.kenn.io/agentsview/internal/service"
 )
@@ -246,7 +248,7 @@ func TestHandleUsageSummaryIncludesUnsupportedCopilotSignal(t *testing.T) {
 	require.NotNil(t, resp.UnsupportedUsage)
 	assert.Equal(t, service.UnsupportedUsageKindCopilotNoTokenData, resp.UnsupportedUsage.Kind)
 	assert.Equal(t, 0, resp.SessionCounts.Total)
-	assert.Equal(t, 0.0, resp.Totals.TotalCost)
+	assert.Equal(t, money.Money{}, resp.Totals.TotalCost)
 }
 
 func TestHandleUsageSummarySkipsUnsupportedCopilotSignalForMixedFilters(t *testing.T) {
@@ -278,8 +280,8 @@ func TestHandleUsageSummaryIncludesCursorUsageEvents(t *testing.T) {
 		OutputTokens:     567,
 		CacheWriteTokens: 0,
 		CacheReadTokens:  8901,
-		ChargedCents:     15.66,
-		CursorTokenFee:   3.32,
+		Charged:          money.MustParseDollars("0.1566"),
+		CursorTokenFee:   money.MustParseDollars("0.0332"),
 		UserID:           "152683922",
 		UserEmail:        "member@example.com",
 		IsHeadless:       false,
@@ -295,7 +297,7 @@ func TestHandleUsageSummaryIncludesCursorUsageEvents(t *testing.T) {
 
 	resp := decode[server.UsageSummaryResponse](t, w)
 	require.Len(t, resp.Daily, 1)
-	assert.InDelta(t, 0.1566, resp.Totals.TotalCost, 1e-9)
+	assert.Equal(t, money.MustParseDollars("0.1566"), resp.Totals.TotalCost)
 	require.NotEmpty(t, resp.AgentTotals)
 	assert.Equal(t, "cursor", resp.AgentTotals[0].Agent)
 }
@@ -334,6 +336,69 @@ func TestHandleUsageTopSessionsLimit(t *testing.T) {
 	var entries []db.TopSessionEntry
 	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &entries))
 	assert.LessOrEqual(t, len(entries), 1)
+}
+
+func TestHandleUsageTopSessionsRanksBySelectedTokenTypes(t *testing.T) {
+	te := setup(t)
+	for _, fixture := range []struct {
+		id        string
+		input     int
+		output    int
+		startedAt string
+	}{
+		{
+			id: "input-heavy", input: 1000, output: 1,
+			startedAt: "2024-06-01T09:00:00Z",
+		},
+		{
+			id: "output-heavy", input: 10, output: 50,
+			startedAt: "2024-06-01T10:00:00Z",
+		},
+	} {
+		te.seedSession(t, fixture.id, "demo", 1, func(sess *db.Session) {
+			sess.Agent = "codex"
+			sess.StartedAt = &fixture.startedAt
+		})
+		te.seedMessages(t, fixture.id, 1, func(_ int, msg *db.Message) {
+			msg.Role = "assistant"
+			msg.Timestamp = fixture.startedAt
+			msg.Model = "gpt-5.4"
+			msg.TokenUsage = json.RawMessage(
+				`{"input_tokens":` + fmt.Sprint(fixture.input) +
+					`,"output_tokens":` + fmt.Sprint(fixture.output) + `}`,
+			)
+		})
+	}
+
+	w := te.get(t, buildPathURL(
+		"/api/v1/usage/top-sessions",
+		map[string]string{
+			"from":        "2024-06-01",
+			"to":          "2024-06-01",
+			"timezone":    "UTC",
+			"sort":        "tokens",
+			"token_types": "output",
+			"limit":       "1",
+		}))
+	assertStatus(t, w, http.StatusOK)
+
+	var entries []db.TopSessionEntry
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &entries))
+	require.Len(t, entries, 1)
+	assert.Equal(t, "output-heavy", entries[0].SessionID)
+	assert.Equal(t, 10, entries[0].InputTokens)
+	assert.Equal(t, 50, entries[0].OutputTokens)
+	assert.Equal(t, 60, entries[0].TotalTokens)
+}
+
+func TestHandleUsageTopSessionsRejectsUnknownTokenType(t *testing.T) {
+	te := setup(t)
+
+	w := te.get(t, buildPathURL(
+		"/api/v1/usage/top-sessions",
+		map[string]string{"token_types": "output,unknown"},
+	))
+	assertStatus(t, w, http.StatusBadRequest)
 }
 
 func TestHandleUsagePairwiseComparisonJSONShape(t *testing.T) {

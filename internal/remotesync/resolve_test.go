@@ -83,6 +83,33 @@ func TestResolveTargetsFiltersAndIncludesSpecialFiles(t *testing.T) {
 	assert.Contains(t, targets.ExtraFiles, codexIndex)
 }
 
+func TestResolveTargetsExcludesRemoteSyncExcludedAgentState(t *testing.T) {
+	root := t.TempDir()
+	chatDB := filepath.Join(root, "chat.db")
+	for _, path := range []string{
+		chatDB,
+		chatDB + "-wal",
+		chatDB + "-shm",
+		chatDB + "-journal",
+	} {
+		require.NoError(t, os.WriteFile(path, []byte("sqlite"), 0o644))
+	}
+	require.NoError(t, os.WriteFile(
+		filepath.Join(root, "credentials.json"), []byte("secret"), 0o600,
+	))
+
+	targets := remotesync.ResolveTargets(config.Config{
+		AgentDirs: map[parser.AgentType][]string{
+			parser.AgentTrae: {root},
+		},
+	})
+
+	assert.NotContains(t, targets.Dirs, parser.AgentTrae)
+	assert.NotContains(t, targets.Files, parser.AgentTrae)
+	assert.Equal(t, []string{filepath.Clean(root)}, targets.ForbiddenRoots,
+		"excluded-provider roots must remain as transfer boundaries")
+}
+
 func TestResolveTargetsExcludesTraeProfile(t *testing.T) {
 	root := t.TempDir()
 	traeRoot := filepath.Join(root, "TRAE", "User")
@@ -96,6 +123,122 @@ func TestResolveTargetsExcludesTraeProfile(t *testing.T) {
 	}})
 	assert.NotContains(t, targets.Dirs, parser.AgentTrae)
 	assert.Equal(t, []string{claudeRoot}, targets.Dirs[parser.AgentClaude])
+}
+
+// TestResolveTargetsOmitsAllowedTargetsInsideForbiddenRoots pins the fix
+// for overlapping directory overrides: an allowed agent's root nested
+// inside an excluded agent's root must be omitted from the advertised
+// TargetSet — not advertised and then rejected — so an honest client
+// echoing the advertised set syncs the remaining targets instead of
+// failing the whole request with 403.
+func TestResolveTargetsOmitsAllowedTargetsInsideForbiddenRoots(t *testing.T) {
+	base := t.TempDir()
+	traeRoot := filepath.Join(base, "trae")
+	nestedClaude := filepath.Join(traeRoot, "claude")
+	outsideClaude := filepath.Join(base, "claude")
+	require.NoError(t, os.MkdirAll(nestedClaude, 0o755))
+	require.NoError(t, os.MkdirAll(outsideClaude, 0o755))
+
+	targets := remotesync.ResolveTargets(config.Config{
+		AgentDirs: map[parser.AgentType][]string{
+			parser.AgentTrae:   {traeRoot},
+			parser.AgentClaude: {nestedClaude, outsideClaude},
+		},
+	})
+
+	assert.Equal(t, []string{outsideClaude}, targets.Dirs[parser.AgentClaude],
+		"nested root must be dropped from the advertised set, siblings kept")
+	assert.Equal(t, []string{traeRoot}, targets.ForbiddenRoots)
+
+	selected, ok := remotesync.SelectAllowedTargets(targets, targets)
+	require.True(t, ok,
+		"a client echoing the advertised set must not be rejected")
+	assert.Equal(t, []string{outsideClaude}, selected.Dirs[parser.AgentClaude])
+}
+
+// TestResolveTargetsDropsFileScopedAgentWhenSessionFilesForbidden guards
+// the file-scoped pairing invariant: when a forbidden root swallows a
+// file-scoped agent's curated session files but not its advertised root,
+// both halves must be dropped — otherwise the agent would degrade to a
+// raw directory target and expose settings and caches its file scoping
+// exists to keep unreachable.
+func TestResolveTargetsDropsFileScopedAgentWhenSessionFilesForbidden(
+	t *testing.T,
+) {
+	base := t.TempDir()
+	rooRoot := filepath.Join(base, "globalStorage", "rooveterinaryinc.roo-cline")
+	tasksDir := filepath.Join(rooRoot, "tasks")
+	taskDir := filepath.Join(tasksDir, "task-1")
+	require.NoError(t, os.MkdirAll(taskDir, 0o755))
+	require.NoError(t, os.WriteFile(
+		filepath.Join(taskDir, "history_item.json"),
+		[]byte(`{"id":"task-1","ts":1,"task":"t"}`), 0o644,
+	))
+
+	targets := remotesync.ResolveTargets(config.Config{
+		AgentDirs: map[parser.AgentType][]string{
+			parser.AgentTrae:    {tasksDir},
+			parser.AgentRooCode: {rooRoot},
+		},
+	})
+
+	assert.Equal(t, []string{tasksDir}, targets.ForbiddenRoots)
+	assert.NotContains(t, targets.Dirs, parser.AgentRooCode,
+		"file-scoped root must not survive as a raw directory target")
+	assert.NotContains(t, targets.Files, parser.AgentRooCode)
+}
+
+// TestResolveTargetsPoolsideNarrowsToTrajectories ensures the HTTP
+// remote-sync resolver narrows Poolside's application-data root to
+// only the trajectories/ subdirectory, preventing unrelated config,
+// caches, or credentials from being archived.
+func TestResolveTargetsPoolsideNarrowsToTrajectories(t *testing.T) {
+	root := t.TempDir()
+	trajectoriesDir := filepath.Join(root, "trajectories")
+	settingsFile := filepath.Join(root, "config.json")
+	require.NoError(t, os.MkdirAll(trajectoriesDir, 0o755))
+	require.NoError(t, os.WriteFile(settingsFile, []byte(`{"api_key":"sk-secret"}`), 0o644))
+
+	targets := remotesync.ResolveTargets(config.Config{AgentDirs: map[parser.AgentType][]string{
+		parser.AgentPoolside: {root},
+	}})
+
+	require.Len(t, targets.Dirs[parser.AgentPoolside], 1,
+		"Poolside must resolve to exactly one directory (trajectories/)")
+	assert.Equal(t, trajectoriesDir, targets.Dirs[parser.AgentPoolside][0],
+		"resolved target must be the trajectories/ subdirectory, not the parent root")
+	assert.NotContains(t, targets.Dirs[parser.AgentPoolside], root,
+		"the application-data root itself must not be an archived target")
+}
+
+// TestResolveTargetsPoolsideSkipsMissingTrajectories ensures the HTTP
+// resolver emits nothing when the trajectories/ subdirectory does not
+// exist.
+func TestResolveTargetsPoolsideSkipsMissingTrajectories(t *testing.T) {
+	root := t.TempDir()
+
+	targets := remotesync.ResolveTargets(config.Config{AgentDirs: map[parser.AgentType][]string{
+		parser.AgentPoolside: {root},
+	}})
+
+	assert.NotContains(t, targets.Dirs, parser.AgentPoolside,
+		"a Poolside root without trajectories/ must not produce a target")
+}
+
+// TestResolveTargetsPoolsideTrajectoriesRoot verifies the HTTP resolver
+// handles a configured root that IS already the trajectories/ directory,
+// using it as-is without producing trajectories/trajectories/.
+func TestResolveTargetsPoolsideTrajectoriesRoot(t *testing.T) {
+	trajectoriesDir := filepath.Join(t.TempDir(), "trajectories")
+	require.NoError(t, os.MkdirAll(trajectoriesDir, 0o755))
+
+	targets := remotesync.ResolveTargets(config.Config{AgentDirs: map[parser.AgentType][]string{
+		parser.AgentPoolside: {trajectoriesDir},
+	}})
+
+	require.Len(t, targets.Dirs[parser.AgentPoolside], 1)
+	assert.Equal(t, trajectoriesDir, targets.Dirs[parser.AgentPoolside][0],
+		"a trajectories/ root must be used as-is, not appended to")
 }
 
 func TestResolveTargetsExpandsHermesProfilesWithDatabaseFiles(t *testing.T) {
@@ -232,6 +375,32 @@ func TestSelectAllowedTargetsReturnsResolvedValues(t *testing.T) {
 	assert.Equal(t, []string{"/srv/.codex/session_index.jsonl"}, selected.ExtraFiles)
 }
 
+func TestSelectAllowedTargetsRetainsForbiddenRootsAndRejectsForbiddenDelta(t *testing.T) {
+	root := t.TempDir()
+	allowedRoot := filepath.Join(root, "sessions")
+	forbiddenRoot := filepath.Join(allowedRoot, ".forbidden-provider")
+	secret := filepath.Join(forbiddenRoot, "chat.db")
+	keep := filepath.Join(allowedRoot, "session.jsonl")
+	require.NoError(t, os.MkdirAll(forbiddenRoot, 0o755))
+	require.NoError(t, os.WriteFile(keep, []byte("session"), 0o644))
+	require.NoError(t, os.WriteFile(secret, []byte("authentication state"), 0o600))
+
+	allowed := remotesync.TargetSet{
+		Dirs:           map[parser.AgentType][]string{parser.AgentClaude: {allowedRoot}},
+		ForbiddenRoots: []string{forbiddenRoot},
+	}
+	selected, ok := remotesync.SelectAllowedTargets(allowed, remotesync.TargetSet{
+		Dirs: map[parser.AgentType][]string{parser.AgentClaude: {allowedRoot}},
+	})
+
+	require.True(t, ok)
+	assert.Equal(t, []string{forbiddenRoot}, selected.ForbiddenRoots,
+		"archive and manifest writers need the server-resolved boundary")
+	_, ok = remotesync.SelectAllowedFiles(allowed, []string{secret})
+	assert.False(t, ok,
+		"the delta request must reject a forbidden file even under an allowed root")
+}
+
 func TestSelectAllowedTargetsRejectsFileScopedDirOnlyRequest(t *testing.T) {
 	allowed := remotesync.TargetSet{
 		Dirs: map[parser.AgentType][]string{
@@ -277,7 +446,11 @@ func TestResolveTargetsMatchesSSHResolverForRepresentativeHome(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("SSH resolver parity test compares Unix shell path dialects")
 	}
-	home := t.TempDir()
+	// The resolve script emits physical paths, so the parity fixture must
+	// live at a physical spelling (macOS t.TempDir() sits under the /var
+	// symlink).
+	home, err := filepath.EvalSymlinks(t.TempDir())
+	require.NoError(t, err)
 	claudeDir := filepath.Join(home, ".claude", "projects")
 	codexDir := filepath.Join(home, ".codex", "sessions")
 	devinDir := filepath.Join(home, ".local", "share", "devin")
@@ -288,11 +461,14 @@ func TestResolveTargetsMatchesSSHResolverForRepresentativeHome(t *testing.T) {
 	windsurfWorkspaceDir := filepath.Join(windsurfWorkspaceRoot, "workspace-a")
 	windsurfStateDB := filepath.Join(windsurfWorkspaceDir, parser.WindsurfStateDBName)
 	windsurfWorkspaceJSON := filepath.Join(windsurfWorkspaceDir, "workspace.json")
+	poolsideRoot := filepath.Join(home, ".local", "state", "poolside")
+	poolsideTrajectories := filepath.Join(poolsideRoot, "trajectories")
 	require.NoError(t, os.MkdirAll(claudeDir, 0o755))
 	require.NoError(t, os.MkdirAll(codexDir, 0o755))
 	require.NoError(t, os.MkdirAll(devinDir, 0o755))
 	require.NoError(t, os.MkdirAll(filepath.Dir(aiderHistory), 0o755))
 	require.NoError(t, os.MkdirAll(windsurfWorkspaceDir, 0o755))
+	require.NoError(t, os.MkdirAll(poolsideTrajectories, 0o755))
 	require.NoError(t, os.WriteFile(aiderHistory, []byte("# aider\n"), 0o644))
 	require.NoError(t, os.WriteFile(windsurfStateDB, []byte("state"), 0o644))
 	require.NoError(t, os.WriteFile(windsurfWorkspaceJSON, []byte("{}\n"), 0o644))
@@ -304,17 +480,16 @@ func TestResolveTargetsMatchesSSHResolverForRepresentativeHome(t *testing.T) {
 	cmd.Env = []string{"HOME=" + home, "AIDER_DIR=" + aiderRoot, "DEVIN_DIR=" + devinDir}
 	out, err := cmd.CombinedOutput()
 	require.NoError(t, err, "ssh resolver output: %s", out)
-	sshDirs, sshFiles, sshExtra := ssh.ParseResolvedTargetsWithFilesForTest(string(out))
+	sshDirs, sshFiles, sshExtra, _ := ssh.ParseResolvedTargetsWithFilesForTest(string(out))
 
 	goTargets := remotesync.ResolveTargets(config.Config{
 		AgentDirs: map[parser.AgentType][]string{
-			parser.AgentClaude: {claudeDir},
-			parser.AgentCodex:  {codexDir},
-			parser.AgentDevin:  {devinDir},
-			parser.AgentAider:  {aiderRoot},
-			parser.AgentWindsurf: {
-				windsurfUserRoot,
-			},
+			parser.AgentClaude:   {claudeDir},
+			parser.AgentCodex:    {codexDir},
+			parser.AgentDevin:    {devinDir},
+			parser.AgentAider:    {aiderRoot},
+			parser.AgentWindsurf: {windsurfUserRoot},
+			parser.AgentPoolside: {poolsideRoot},
 		},
 	})
 	assert.ElementsMatch(t, sshDirs[parser.AgentClaude], goTargets.Dirs[parser.AgentClaude])
@@ -335,6 +510,10 @@ func TestResolveTargetsMatchesSSHResolverForRepresentativeHome(t *testing.T) {
 	assert.ElementsMatch(t, sshFiles[parser.AgentWindsurf], goTargets.Files[parser.AgentWindsurf])
 	assert.NotContains(t, sshDirs[parser.AgentWindsurf], windsurfWorkspaceRoot)
 	assert.ElementsMatch(t, sshExtra, goTargets.ExtraFiles)
+	// Poolside: both resolvers must narrow to the trajectories/
+	// subdirectory, not the application-data root.
+	assert.ElementsMatch(t, []string{poolsideTrajectories}, sshDirs[parser.AgentPoolside])
+	assert.ElementsMatch(t, sshDirs[parser.AgentPoolside], goTargets.Dirs[parser.AgentPoolside])
 }
 
 func TestSelectAllowedFiles(t *testing.T) {

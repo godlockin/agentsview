@@ -91,34 +91,48 @@ func (e *QueryEncodeError) Unwrap() error { return e.Err }
 func (ix *Index) Search(
 	ctx context.Context, enc kitvec.EncodeFunc, query string, limit int,
 ) ([]Hit, error) {
+	hits, _, err := ix.SearchPage(ctx, enc, query, limit)
+	return hits, err
+}
+
+// SearchPage returns semantic hits and whether the vector store exhausted the
+// active generation before reaching limit. Callers that progressively expand
+// selective searches need the pre-rollup exhaustion signal: several chunk
+// hits can collapse into one document, so len(hits) alone cannot prove that
+// no lower-ranked documents remain.
+func (ix *Index) SearchPage(
+	ctx context.Context, enc kitvec.EncodeFunc, query string, limit int,
+) ([]Hit, bool, error) {
 	if ix.versionMismatch {
-		return nil, ErrMirrorVersionMismatch
+		return nil, false, ErrMirrorVersionMismatch
 	}
 
 	active, hasActive, err := ix.ActiveFingerprint(ctx)
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 	if !hasActive {
-		return nil, ix.noActiveGenerationError(ctx)
+		return nil, false, ix.noActiveGenerationError(ctx)
 	}
 
 	vectors, err := kitvec.EncodeBatched(ctx, enc,
 		[]kitvec.Chunk{{Index: 0, Text: query}}, kitvec.BatchOptions{})
 	if err != nil {
-		return nil, &QueryEncodeError{Err: err}
+		return nil, false, &QueryEncodeError{Err: err}
 	}
 
 	hits, err := ix.store.QueryGeneration(ctx, active, vectors[0], limit)
 	if err != nil {
-		return nil, fmt.Errorf("search: %w", err)
+		return nil, false, fmt.Errorf("search: %w", err)
 	}
+	exhausted := len(hits) < limit
 	hits = kitvec.RollupByDocument(hits)
 	if len(hits) > limit {
 		hits = hits[:limit]
 	}
 
-	return ix.hydrateHits(ctx, hits)
+	hydrated, err := ix.hydrateHits(ctx, hits)
+	return hydrated, exhausted, err
 }
 
 // noActiveGenerationError distinguishes an empty index (ErrNoActiveGeneration)
@@ -379,12 +393,21 @@ func (ix *Index) snippet(content string, chunkIndex int) string {
 // chunkSnippet is the snippet method's package-level body, shared with
 // DocAnchor for backends (the PG vector searcher) that resolve chunk hits
 // against a document loaded outside an Index.
+//
+// Chunk.Index counts windows, not surviving chunks: kitvec.Split omits blank
+// windows, so a document with an all-whitespace window stores chunk indexes
+// with a gap in them. Match on Index rather than slice position or such a hit
+// resolves to a neighboring chunk's text, or to none at all.
 func chunkSnippet(content string, chunkIndex int, split kitvec.SplitOptions) string {
-	chunks := kitvec.Split(content, split)
-	if chunkIndex < 0 || chunkIndex >= len(chunks) {
+	if chunkIndex < 0 {
 		return ""
 	}
-	return truncateRunes(chunks[chunkIndex].Text, snippetMaxRunes)
+	for _, chunk := range kitvec.Split(content, split) {
+		if chunk.Index == chunkIndex {
+			return truncateRunes(chunk.Text, snippetMaxRunes)
+		}
+	}
+	return ""
 }
 
 // truncateRunes truncates s to at most maxRunes runes, appending an
@@ -454,10 +477,10 @@ SELECT doc_key, ordinal, ordinal_end, subordinate
 }
 
 // StaleActive reports whether the active generation's fingerprint differs
-// from want (the fingerprint of the current config) — the "index stale"
-// signal surfaced by the db layer. It returns false when there is no active
-// generation at all: Search already distinguishes that case with
-// ErrNoActiveGeneration / BuildingError.
+// from want or the last successfully completed corpus revision differs from
+// wantRevision. It returns false when there is no active generation at all:
+// Search already distinguishes that case with ErrNoActiveGeneration /
+// BuildingError. An expected revision with no completed stamp is stale.
 //
 // Like Search, StaleActive fails closed with ErrMirrorVersionMismatch —
 // before touching any table — when ix was opened read-only against a
@@ -465,7 +488,9 @@ SELECT doc_key, ordinal, ordinal_end, subordinate
 // staleness before searching, so without this gate a version-mismatched
 // index would surface a raw SQL error (or a wrong staleness verdict) here
 // and the sentinel in Search would never be reached.
-func (ix *Index) StaleActive(ctx context.Context, want string) (bool, error) {
+func (ix *Index) StaleActive(
+	ctx context.Context, want, wantRevision string,
+) (bool, error) {
 	if ix.versionMismatch {
 		return false, ErrMirrorVersionMismatch
 	}
@@ -476,5 +501,15 @@ func (ix *Index) StaleActive(ctx context.Context, want string) (bool, error) {
 	if !hasActive {
 		return false, nil
 	}
-	return active != want, nil
+	if active != want {
+		return true, nil
+	}
+	if wantRevision == "" {
+		return false, nil
+	}
+	completed, ok, err := ix.metaGet(ctx, completedCorpusRevisionMetaKey+active)
+	if err != nil {
+		return false, fmt.Errorf("reading completed corpus revision: %w", err)
+	}
+	return !ok || completed != wantRevision, nil
 }

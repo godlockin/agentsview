@@ -408,8 +408,12 @@ type EmbeddableUnit struct {
 	Ordinal     int    // first member's ordinal (ordinal_start)
 	OrdinalEnd  int    // last member's ordinal (== Ordinal for user docs)
 	Subordinate bool
-	Content     string       // members joined with "\n\n"
-	Offsets     []UnitOffset // one per member; nil for user docs
+	// Deleted marks a stable document identity that left its source corpus.
+	// Incremental mirror refreshes remove its row and vectors instead of
+	// embedding Content. Message scans never emit tombstones; recall scans do.
+	Deleted bool
+	Content string       // members joined with "\n\n"
+	Offsets []UnitOffset // one per member; nil for user docs
 }
 
 // UnitOffset locates one member message inside a run's joined content.
@@ -1153,6 +1157,12 @@ func (db *DB) ReplaceSessionMessages(
 		return fmt.Errorf("beginning tx: %w", err)
 	}
 	defer func() { _ = tx.Rollback() }()
+	queueGenerationBefore, queueExistedBefore, err := artifactExportGenerationTx(
+		tx, sessionID,
+	)
+	if err != nil {
+		return err
+	}
 	var pendingRecallRevocations recallEvidenceRevocationEvents
 
 	if useDiff {
@@ -1190,6 +1200,11 @@ func (db *DB) ReplaceSessionMessages(
 		return err
 	}
 	if err := invalidateSessionSignalsTx(tx, sessionID); err != nil {
+		return err
+	}
+	if err := enqueueArtifactExportIfGenerationUnchangedTx(
+		tx, sessionID, queueGenerationBefore, queueExistedBefore,
+	); err != nil {
 		return err
 	}
 	if err := tx.Commit(); err != nil {
@@ -1360,6 +1375,12 @@ func (db *DB) ReplaceSessionContent(
 		return fmt.Errorf("beginning tx: %w", err)
 	}
 	defer func() { _ = tx.Rollback() }()
+	queueGenerationBefore, queueExistedBefore, err := artifactExportGenerationTx(
+		tx, sessionID,
+	)
+	if err != nil {
+		return err
+	}
 	var pendingRecallRevocations recallEvidenceRevocationEvents
 
 	if useDiff {
@@ -1397,6 +1418,11 @@ func (db *DB) ReplaceSessionContent(
 	// the count cannot diverge from the findings it summarizes.
 	if err := replaceSecretFindingsTx(tx, sessionID, findings,
 		signals.SecretLeakCount, signals.SecretsRulesVersion); err != nil {
+		return err
+	}
+	if err := enqueueArtifactExportIfGenerationUnchangedTx(
+		tx, sessionID, queueGenerationBefore, queueExistedBefore,
+	); err != nil {
 		return err
 	}
 	if err := tx.Commit(); err != nil {

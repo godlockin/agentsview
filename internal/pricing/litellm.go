@@ -149,16 +149,16 @@ func MergePricing(sources map[string][]ModelPricing) map[string]ModelPricing {
 				continue
 			}
 			merged := existing
-			if merged.InputPerMTok == 0 && p.InputPerMTok != 0 {
+			if merged.InputPerMTok.Microdollars == 0 && p.InputPerMTok.Microdollars != 0 {
 				merged.InputPerMTok = p.InputPerMTok
 			}
-			if merged.OutputPerMTok == 0 && p.OutputPerMTok != 0 {
+			if merged.OutputPerMTok.Microdollars == 0 && p.OutputPerMTok.Microdollars != 0 {
 				merged.OutputPerMTok = p.OutputPerMTok
 			}
-			if merged.CacheCreationPerMTok == 0 && p.CacheCreationPerMTok != 0 {
+			if merged.CacheCreationPerMTok.Microdollars == 0 && p.CacheCreationPerMTok.Microdollars != 0 {
 				merged.CacheCreationPerMTok = p.CacheCreationPerMTok
 			}
-			if merged.CacheReadPerMTok == 0 && p.CacheReadPerMTok != 0 {
+			if merged.CacheReadPerMTok.Microdollars == 0 && p.CacheReadPerMTok.Microdollars != 0 {
 				merged.CacheReadPerMTok = p.CacheReadPerMTok
 			}
 			out[p.ModelPattern] = merged

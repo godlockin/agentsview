@@ -40,23 +40,11 @@ func TestVectorOwnerIdentityOwns(t *testing.T) {
 // adapter does while an embeddings build is rewriting the active generation.
 type notReadyVectorSource struct{}
 
-func (notReadyVectorSource) Generation(
-	context.Context,
-) (VectorGenerationInfo, bool, error) {
-	return VectorGenerationInfo{}, false, fmt.Errorf(
+func (notReadyVectorSource) BeginExport(
+	context.Context, []string,
+) (VectorExport, bool, error) {
+	return nil, false, fmt.Errorf(
 		"%w: 7 document(s) pending", ErrVectorSourceNotReady)
-}
-
-func (notReadyVectorSource) SessionDocHashes(
-	context.Context,
-) (map[string]string, error) {
-	return nil, nil
-}
-
-func (notReadyVectorSource) SessionDocs(
-	context.Context, string,
-) ([]VectorPushDoc, string, error) {
-	return nil, "", nil
 }
 
 // TestPushVectorsSkipsWhenSourceNotReady pins that a not-ready source turns
@@ -65,10 +53,36 @@ func (notReadyVectorSource) SessionDocs(
 func TestPushVectorsSkipsWhenSourceNotReady(t *testing.T) {
 	sync := &Sync{vectorSource: notReadyVectorSource{}}
 
-	res, err := sync.pushVectors(context.Background(), false, nil, nil)
+	res, err := sync.pushVectors(context.Background(), false, nil, 0, nil, nil)
 
 	require.NoError(t, err)
 	assert.True(t, res.Skipped)
 	assert.Contains(t, res.SkippedReason, "not fully embedded")
 	assert.Contains(t, res.SkippedReason, "7 document(s) pending")
+}
+
+// spyVectorSource fails the test on any call: an empty change scope must
+// finish the vector phase without touching the source (or PG) at all.
+type spyVectorSource struct{ t *testing.T }
+
+func (s spyVectorSource) BeginExport(context.Context, []string) (VectorExport, bool, error) {
+	s.t.Fatal("BeginExport must not be called for an empty scope")
+	return nil, false, nil
+}
+
+// TestPushVectorsEmptyScopeReadsNothing pins the change-scoped contract for
+// pushes with no changed sessions: no source reads, no PG reads, no skip
+// marker (an empty scope is a successful no-op, not a degraded phase, so the
+// watch loop keeps scoping subsequent change pushes).
+func TestPushVectorsEmptyScopeReadsNothing(t *testing.T) {
+	sync := &Sync{vectorSource: spyVectorSource{t: t}}
+
+	res, err := sync.pushVectors(
+		context.Background(), false, []string{}, 0, nil, nil,
+	)
+
+	require.NoError(t, err)
+	assert.False(t, res.Skipped)
+	assert.Zero(t, res.SessionsPushed)
+	assert.Zero(t, res.SessionsEvicted)
 }

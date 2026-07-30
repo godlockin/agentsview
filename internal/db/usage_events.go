@@ -5,6 +5,8 @@ import (
 	"database/sql"
 	"fmt"
 	"strings"
+
+	"go.kenn.io/agentsview/internal/money"
 )
 
 // UsageEvent records token and cost accounting that does not belong
@@ -21,7 +23,7 @@ type UsageEvent struct {
 	CacheCreationInputTokens int
 	CacheReadInputTokens     int
 	ReasoningTokens          int
-	CostUSD                  *float64
+	Cost                     *money.Money
 	CostStatus               string
 	CostSource               string
 	OccurredAt               string
@@ -41,7 +43,7 @@ func (db *DB) ensureUsageEventsSchemaLocked(w *writerHandle) error {
 			cache_creation_input_tokens INTEGER NOT NULL DEFAULT 0,
 			cache_read_input_tokens INTEGER NOT NULL DEFAULT 0,
 			reasoning_tokens INTEGER NOT NULL DEFAULT 0,
-			cost_usd REAL,
+			cost_microdollars INTEGER,
 			cost_status TEXT NOT NULL DEFAULT '',
 			cost_source TEXT NOT NULL DEFAULT '',
 			occurred_at TEXT,
@@ -74,7 +76,7 @@ func (db *DB) ReplaceSessionUsageEvents(
 	}
 	defer func() { _ = tx.Rollback() }()
 
-	if err := replaceSessionUsageEventsTx(tx, sessionID, events); err != nil {
+	if err := replaceSessionUsageEventsTx(tx, sessionID, events, true); err != nil {
 		return err
 	}
 
@@ -82,7 +84,7 @@ func (db *DB) ReplaceSessionUsageEvents(
 }
 
 func replaceSessionUsageEventsTx(
-	tx *sql.Tx, sessionID string, events []UsageEvent,
+	tx *sql.Tx, sessionID string, events []UsageEvent, enqueueArtifact bool,
 ) error {
 	if _, err := tx.Exec(
 		`DELETE FROM usage_events WHERE session_id = ?`,
@@ -106,8 +108,8 @@ func replaceSessionUsageEventsTx(
 			ordinal = *ev.MessageOrdinal
 		}
 		var cost any
-		if ev.CostUSD != nil {
-			cost = *ev.CostUSD
+		if ev.Cost != nil {
+			cost = ev.Cost.Microdollars
 		}
 		var occurredAt any
 		if ev.OccurredAt != "" {
@@ -118,7 +120,7 @@ func replaceSessionUsageEventsTx(
 				session_id, message_ordinal, source, model,
 				input_tokens, output_tokens,
 				cache_creation_input_tokens, cache_read_input_tokens,
-				reasoning_tokens, cost_usd, cost_status, cost_source,
+				reasoning_tokens, cost_microdollars, cost_status, cost_source,
 				occurred_at, dedup_key
 			) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 			ev.SessionID, ordinal, ev.Source, ev.Model,
@@ -146,6 +148,11 @@ func replaceSessionUsageEventsTx(
 			"bumping local_modified_at for %s after usage replace: %w",
 			sessionID, err,
 		)
+	}
+	if enqueueArtifact {
+		if err := enqueueArtifactExportTx(tx, sessionID); err != nil {
+			return err
+		}
 	}
 	return nil
 }
@@ -190,7 +197,7 @@ func (db *DB) appendUsageEventFingerprints(
 		SELECT session_id, message_ordinal, source, model,
 			input_tokens, output_tokens,
 			cache_creation_input_tokens, cache_read_input_tokens,
-			reasoning_tokens, cost_usd, cost_status, cost_source,
+			reasoning_tokens, cost_microdollars, cost_status, cost_source,
 			occurred_at, dedup_key
 		FROM usage_events
 		WHERE session_id IN (`+strings.Join(placeholders, ",")+`)
@@ -210,7 +217,7 @@ func (db *DB) appendUsageEventFingerprints(
 		var inputTokens, outputTokens int
 		var cacheCreationInputTokens, cacheReadInputTokens int
 		var reasoningTokens int
-		var cost sql.NullFloat64
+		var cost sql.NullInt64
 		var occurredAt, dedupKey sql.NullString
 		if err := rows.Scan(
 			&sessionID, &ordinal, &source, &model,
@@ -239,7 +246,7 @@ func (db *DB) appendUsageEventFingerprints(
 		costSource = SanitizeUTF8(costSource)
 		dedupKey.String = SanitizeUTF8(dedupKey.String)
 		fmt.Fprintf(b,
-			"%t|%d|%d:%s|%d:%s|%d|%d|%d|%d|%d|%t|%g|%d:%s|%d:%s|%d:%s|%d:%s;",
+			"%t|%d|%d:%s|%d:%s|%d|%d|%d|%d|%d|%t|%d|%d:%s|%d:%s|%d:%s|%d:%s;",
 			ordinal.Valid,
 			ordinal.Int64,
 			len(source), source,
@@ -250,7 +257,7 @@ func (db *DB) appendUsageEventFingerprints(
 			cacheReadInputTokens,
 			reasoningTokens,
 			cost.Valid,
-			cost.Float64,
+			cost.Int64,
 			len(costStatus), costStatus,
 			len(costSource), costSource,
 			len(occurred), occurred,
@@ -278,17 +285,27 @@ func (db *DB) UsageEventFingerprint(sessionID string) (string, error) {
 func (db *DB) GetUsageEvents(
 	ctx context.Context, sessionID string,
 ) ([]UsageEvent, error) {
-	rows, err := db.getReader().QueryContext(ctx, `
+	return usageEventsWithQuerier(ctx, db.getReader(), sessionID, 0)
+}
+
+func usageEventsWithQuerier(
+	ctx context.Context, q messageRowsQuerier, sessionID string, limit int,
+) ([]UsageEvent, error) {
+	query := `
 		SELECT id, session_id, message_ordinal, source, model,
 			input_tokens, output_tokens,
 			cache_creation_input_tokens, cache_read_input_tokens,
-			reasoning_tokens, cost_usd, cost_status, cost_source,
+			reasoning_tokens, cost_microdollars, cost_status, cost_source,
 			occurred_at, dedup_key
 		FROM usage_events
 		WHERE session_id = ?
-		ORDER BY COALESCE(occurred_at, ''), id`,
-		sessionID,
-	)
+		ORDER BY COALESCE(occurred_at, ''), id`
+	args := []any{sessionID}
+	if limit > 0 {
+		query += ` LIMIT ?`
+		args = append(args, limit)
+	}
+	rows, err := q.QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, fmt.Errorf("querying usage events: %w", err)
 	}
@@ -298,7 +315,7 @@ func (db *DB) GetUsageEvents(
 	for rows.Next() {
 		var ev UsageEvent
 		var ordinal sql.NullInt64
-		var cost sql.NullFloat64
+		var cost sql.NullInt64
 		var occurred sql.NullString
 		if err := rows.Scan(
 			&ev.ID, &ev.SessionID, &ordinal, &ev.Source, &ev.Model,
@@ -314,8 +331,8 @@ func (db *DB) GetUsageEvents(
 			ev.MessageOrdinal = &v
 		}
 		if cost.Valid {
-			v := cost.Float64
-			ev.CostUSD = &v
+			v := money.Money{Microdollars: cost.Int64}
+			ev.Cost = &v
 		}
 		if occurred.Valid {
 			ev.OccurredAt = occurred.String

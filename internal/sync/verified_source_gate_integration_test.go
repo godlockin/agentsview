@@ -283,7 +283,7 @@ func TestVerifiedSourceGateRechecksAfterStatAndWatcherInvalidation(t *testing.T)
 	assert.Equal(t, 2, provider.fingerprintCalls,
 		"same-size rewrite with restored mtime must deep-verify")
 
-	classified := engine.classifyPaths([]string{file.Path})
+	classified := requireClassifyPaths(t, engine, []string{file.Path})
 	require.Len(t, classified, 1)
 	res := engine.processFile(context.Background(), classified[0])
 	require.NoError(t, res.err)
@@ -337,10 +337,16 @@ func TestVerifiedSourceGateLegacyClaudeRowMustEstablishFingerprint(t *testing.T)
 				Type: parser.AgentClaude, DisplayName: "Claude",
 				IDPrefix: "claude:", FileBased: true,
 			},
-			Caps: parser.Capabilities{Source: parser.SourceCapabilities{
-				IncrementalAppend: parser.CapabilitySupported,
-				VerifiedLocalStat: parser.CapabilitySupported,
-			}},
+			Caps: parser.Capabilities{
+				Source: parser.SourceCapabilities{
+					IncrementalAppend: parser.CapabilitySupported,
+					VerifiedLocalStat: parser.CapabilitySupported,
+				},
+				Sync: parser.ProviderSyncSemantics{
+					FingerprintHashInCacheKey:           true,
+					FingerprintHashRequiredForFreshness: true,
+				},
+			},
 		},
 		root:    root,
 		sources: make(map[string]parser.SourceRef),

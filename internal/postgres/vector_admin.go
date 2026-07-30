@@ -129,12 +129,23 @@ func vectorGenerationMachines(
 		if err := rows.Scan(&m); err != nil {
 			return nil, fmt.Errorf("scanning generation machine: %w", err)
 		}
-		machines = append(machines, m)
+		display := vectorGenerationMachineDisplayName(m)
+		if len(machines) > 0 && machines[len(machines)-1] == display {
+			continue
+		}
+		machines = append(machines, display)
 	}
 	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("iterating generation machines: %w", err)
 	}
 	return machines, nil
+}
+
+func vectorGenerationMachineDisplayName(raw string) string {
+	if head, _, ok := strings.Cut(raw, "|"+pushMarkerKeyPrefix); ok {
+		return head
+	}
+	return raw
 }
 
 // DropVectorGeneration removes a generation and all of its data: its chunk

@@ -7,6 +7,8 @@ import (
 	"net/http"
 	"strings"
 	"time"
+
+	"go.kenn.io/agentsview/internal/money"
 )
 
 // openrouterURL is the public OpenRouter models endpoint. Unlike
@@ -102,16 +104,16 @@ func ParseOpenRouterPricing(data []byte) ([]ModelPricing, error) {
 		}
 		p := ModelPricing{ModelPattern: e.ID}
 		if okPrompt {
-			p.InputPerMTok = prompt * perMTok
+			p.InputPerMTok = prompt
 		}
 		if okCompletion {
-			p.OutputPerMTok = completion * perMTok
+			p.OutputPerMTok = completion
 		}
 		if cr, ok := parsePricePerToken(e.Pricing.InputCacheRead); ok {
-			p.CacheReadPerMTok = cr * perMTok
+			p.CacheReadPerMTok = cr
 		}
 		if cw, ok := parsePricePerToken(e.Pricing.InputCacheWrite); ok {
-			p.CacheCreationPerMTok = cw * perMTok
+			p.CacheCreationPerMTok = cw
 		}
 		prices = append(prices, p)
 		if bare := bareSuffix(e.ID); bare != "" && bare != e.ID &&
@@ -159,16 +161,13 @@ func producesText(modality string) bool {
 // ("0.000003") into a float64 USD-per-token. Empty strings
 // return ok=false so the caller can fall back to the
 // input or output rate if only one of the two is published.
-func parsePricePerToken(s string) (float64, bool) {
+func parsePricePerToken(s string) (money.Money, bool) {
 	if s == "" {
-		return 0, false
+		return money.Money{}, false
 	}
-	var f float64
-	if _, err := fmt.Sscanf(s, "%f", &f); err != nil {
-		return 0, false
+	microdollars, err := money.ParseScaledDecimal(s, 12)
+	if err != nil || microdollars <= 0 {
+		return money.Money{}, false
 	}
-	if f <= 0 {
-		return 0, false
-	}
-	return f, true
+	return money.Money{Microdollars: microdollars}, true
 }

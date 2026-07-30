@@ -17,6 +17,7 @@ import (
 	"github.com/danielgtaylor/huma/v2"
 	"go.kenn.io/agentsview/internal/db"
 	"go.kenn.io/agentsview/internal/export"
+	"go.kenn.io/agentsview/internal/money"
 	"go.kenn.io/agentsview/internal/parser"
 	"go.kenn.io/agentsview/internal/service"
 	"go.kenn.io/agentsview/internal/sessionwatch"
@@ -67,6 +68,7 @@ type sessionFilterInput struct {
 	Date             string            `query:"date" format:"date" doc:"Filter sessions active on this YYYY-MM-DD date"`
 	DateFrom         string            `query:"date_from" format:"date" doc:"Filter sessions active on or after this date"`
 	DateTo           string            `query:"date_to" format:"date" doc:"Filter sessions active on or before this date"`
+	Timezone         string            `query:"timezone" doc:"IANA timezone for calendar-date filters; defaults to UTC"`
 	ActiveSince      string            `query:"active_since" format:"date-time" doc:"Filter sessions active since this RFC3339 timestamp"`
 	MinMessages      int               `query:"min_messages" minimum:"0" doc:"Minimum total message count"`
 	MaxMessages      int               `query:"max_messages" minimum:"0" doc:"Maximum total message count"`
@@ -115,6 +117,10 @@ func (in *sessionFilterInput) listFilter() (service.ListFilter, error) {
 	if err := validateDateFilterValues(in.Date, in.DateFrom, in.DateTo, in.ActiveSince); err != nil {
 		return service.ListFilter{}, err
 	}
+	timezone, err := db.NormalizeSessionTimezone(in.Timezone)
+	if err != nil {
+		return service.ListFilter{}, apiError(http.StatusBadRequest, err.Error())
+	}
 	if _, err := db.ParseSortSpec(in.OrderBy); err != nil {
 		return service.ListFilter{}, apiError(http.StatusBadRequest, "invalid order_by: "+err.Error())
 	}
@@ -128,6 +134,7 @@ func (in *sessionFilterInput) listFilter() (service.ListFilter, error) {
 		Date:             in.Date,
 		DateFrom:         in.DateFrom,
 		DateTo:           in.DateTo,
+		Timezone:         timezone,
 		ActiveSince:      in.ActiveSince,
 		MinMessages:      in.MinMessages,
 		MaxMessages:      in.MaxMessages,
@@ -155,6 +162,10 @@ func (in *sessionFilterInput) dbFilter(includeChildren bool) (db.SessionFilter, 
 	if err := validateDateFilterValues(in.Date, in.DateFrom, in.DateTo, in.ActiveSince); err != nil {
 		return db.SessionFilter{}, err
 	}
+	timezone, err := db.NormalizeSessionTimezone(in.Timezone)
+	if err != nil {
+		return db.SessionFilter{}, apiError(http.StatusBadRequest, err.Error())
+	}
 	// The order_by param is shared with the list route via this struct; reject
 	// malformed specs here too (the dropped enum used to guard every route),
 	// even though the sidebar index applies its own ordering and ignores it.
@@ -174,6 +185,7 @@ func (in *sessionFilterInput) dbFilter(includeChildren bool) (db.SessionFilter, 
 		Date:             in.Date,
 		DateFrom:         in.DateFrom,
 		DateTo:           in.DateTo,
+		Timezone:         timezone,
 		ActiveSince:      in.ActiveSince,
 		MinMessages:      in.MinMessages,
 		MaxMessages:      in.MaxMessages,
@@ -364,7 +376,7 @@ type sessionUsageResponse struct {
 	TotalOutputTokens   int                             `json:"total_output_tokens"`
 	PeakContextTokens   int                             `json:"peak_context_tokens"`
 	HasTokenData        bool                            `json:"has_token_data"`
-	CostUSD             float64                         `json:"cost_usd"`
+	Cost                money.Money                     `json:"cost"`
 	HasCost             bool                            `json:"has_cost"`
 	CostSource          export.CostSource               `json:"cost_source,omitempty"`
 	AICredits           float64                         `json:"ai_credits,omitempty"`
@@ -373,7 +385,7 @@ type sessionUsageResponse struct {
 	BreakdownCount      int                             `json:"breakdown_count"`
 	Breakdown           []sessionUsageBreakdownResponse `json:"breakdown"`
 	ServerRunning       bool                            `json:"server_running"`
-	RollupCostUSD       *float64                        `json:"rollup_cost_usd,omitempty"`
+	RollupCost          *money.Money                    `json:"rollup_cost,omitempty"`
 	RollupCostSource    export.CostSource               `json:"rollup_cost_source,omitempty"`
 	HasRollupCost       *bool                           `json:"has_rollup_cost,omitempty"`
 	RollupSubagentCount *int                            `json:"rollup_subagent_count,omitempty"`
@@ -386,18 +398,18 @@ type sessionUsageInput struct {
 }
 
 type sessionUsageBreakdownResponse struct {
-	Ordinal                  int     `json:"ordinal"`
-	MessageOrdinal           *int    `json:"message_ordinal,omitempty"`
-	Source                   string  `json:"source"`
-	Label                    string  `json:"label"`
-	Timestamp                string  `json:"timestamp"`
-	Model                    string  `json:"model"`
-	InputTokens              int     `json:"input_tokens"`
-	OutputTokens             int     `json:"output_tokens"`
-	CacheCreationInputTokens int     `json:"cache_creation_input_tokens"`
-	CacheReadInputTokens     int     `json:"cache_read_input_tokens"`
-	CostUSD                  float64 `json:"cost_usd"`
-	HasCost                  bool    `json:"has_cost"`
+	Ordinal                  int         `json:"ordinal"`
+	MessageOrdinal           *int        `json:"message_ordinal,omitempty"`
+	Source                   string      `json:"source"`
+	Label                    string      `json:"label"`
+	Timestamp                string      `json:"timestamp"`
+	Model                    string      `json:"model"`
+	InputTokens              int         `json:"input_tokens"`
+	OutputTokens             int         `json:"output_tokens"`
+	CacheCreationInputTokens int         `json:"cache_creation_input_tokens"`
+	CacheReadInputTokens     int         `json:"cache_read_input_tokens"`
+	Cost                     money.Money `json:"cost"`
+	HasCost                  bool        `json:"has_cost"`
 }
 
 type sessionUsageErrorBody struct {
@@ -436,7 +448,7 @@ func newSessionUsageHumaResponse(usage *db.SessionUsage) sessionUsageResponse {
 			OutputTokens:             entry.OutputTokens,
 			CacheCreationInputTokens: entry.CacheCreationInputTokens,
 			CacheReadInputTokens:     entry.CacheReadInputTokens,
-			CostUSD:                  entry.CostUSD,
+			Cost:                     entry.Cost,
 			HasCost:                  entry.HasCost,
 		})
 	}
@@ -447,7 +459,7 @@ func newSessionUsageHumaResponse(usage *db.SessionUsage) sessionUsageResponse {
 		TotalOutputTokens: usage.TotalOutputTokens,
 		PeakContextTokens: usage.PeakContextTokens,
 		HasTokenData:      usage.HasTokenData,
-		CostUSD:           usage.CostUSD,
+		Cost:              usage.Cost,
 		HasCost:           usage.HasCost,
 		CostSource:        usage.CostSource,
 		AICredits:         usage.AICredits,
@@ -476,7 +488,7 @@ func (s *Server) humaSessionUsage(
 		}
 		body := newSessionUsageHumaResponse(rollup.Usage)
 		if rollup.HasCost {
-			body.RollupCostUSD = &rollup.CostUSD
+			body.RollupCost = &rollup.Cost
 			body.RollupCostSource = rollup.CostSource
 		}
 		body.HasRollupCost = &rollup.HasCost

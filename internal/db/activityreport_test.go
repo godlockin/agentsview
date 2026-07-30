@@ -15,6 +15,10 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"go.kenn.io/agentsview/internal/activity"
+	"go.kenn.io/agentsview/internal/db/driver"
+	"go.kenn.io/agentsview/internal/export"
+	"go.kenn.io/agentsview/internal/money"
+	pricingpkg "go.kenn.io/agentsview/internal/pricing"
 )
 
 func reportSessionIDs(sessions []activity.SessionRow) map[string]struct{} {
@@ -100,8 +104,8 @@ func TestGetActivityReport_UsageCostAndTokens(t *testing.T) {
 	ctx := context.Background()
 	require.NoError(t, d.UpsertModelPricing([]ModelPricing{{
 		ModelPattern:  "claude-sonnet-4-20250514",
-		InputPerMTok:  3.0,
-		OutputPerMTok: 15.0,
+		InputPerMTok:  money.MustParseDollars("3.0"),
+		OutputPerMTok: money.MustParseDollars("15.0"),
 	}}), "UpsertModelPricing")
 
 	insertSession(t, d, "s1", "proj1", func(s *Session) {
@@ -125,22 +129,125 @@ func TestGetActivityReport_UsageCostAndTokens(t *testing.T) {
 	assert.Equal(t, 1, r.Totals.Sessions)
 	assert.Equal(t, 500, r.Totals.OutputTokens)
 	// Cost = (1000*3 + 500*15) / 1e6 = 0.0105
-	assert.InDelta(t, 0.0105, r.Totals.Cost, 1e-9)
+	assert.Equal(t, money.MustParseDollars("0.0105"), r.Totals.Cost)
+}
+
+func TestSQLiteActivityReportRowStatusCanonicalizesKimiAliasByTimestamp(t *testing.T) {
+	tests := []struct {
+		name         string
+		timestamp    string
+		canonical    string
+		expectedCost money.Money
+	}{
+		{
+			name:         "before cutoff",
+			timestamp:    "2026-07-18T23:59:59Z",
+			canonical:    pricingpkg.KimiK26Canonical,
+			expectedCost: money.MustParseDollars("1"),
+		},
+		{
+			name:         "at cutoff",
+			timestamp:    "2026-07-19T00:00:00Z",
+			canonical:    pricingpkg.KimiK3Canonical,
+			expectedCost: money.MustParseDollars("2"),
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			resolver := export.NewPricingResolver([]export.EffectivePricingRow{
+				{
+					ModelPattern: pricingpkg.KimiK26Canonical,
+					Rates: export.ModelRates{
+						InputPerMTok: money.MustParseDollars("1"),
+					},
+				},
+				{
+					ModelPattern: pricingpkg.KimiK3Canonical,
+					Rates: export.ModelRates{
+						InputPerMTok: money.MustParseDollars("2"),
+					},
+				},
+			})
+
+			cost, priced, contributes, err := sqliteActivityReportRowStatus(
+				dailyUsageScanRow{
+					usageSource: "provider",
+					model:       "daimon-kimi-code",
+					ts:          tt.timestamp,
+					inputTokens: 1_000_000,
+				},
+				resolver,
+			)
+
+			require.NoError(t, err)
+			assert.True(t, priced)
+			assert.True(t, contributes)
+			assert.Equal(t, tt.expectedCost, cost)
+			block, err := resolver.BuildBlock()
+			require.NoError(t, err)
+			require.Contains(t, block.Models, "daimon-kimi-code")
+			resolutions := block.Models["daimon-kimi-code"].Resolutions
+			require.Len(t, resolutions, 1)
+			assert.Equal(t, tt.canonical, resolutions[0].PricedModel)
+			assert.NotContains(t, block.Models, tt.canonical)
+		})
+	}
+}
+
+func TestSQLiteActivityReportRowStatusPrefersExactCustomKimiAlias(t *testing.T) {
+	resolver := export.NewPricingResolver([]export.EffectivePricingRow{
+		{
+			ModelPattern: "daimon-kimi-code",
+			Rates: export.ModelRates{
+				InputPerMTok: money.MustParseDollars("7"),
+				Source:       export.PricingRowSourceCustom,
+			},
+		},
+		{
+			ModelPattern: pricingpkg.KimiK3Canonical,
+			Rates: export.ModelRates{
+				InputPerMTok: money.MustParseDollars("2"),
+				Source:       export.PricingRowSourceFetched,
+			},
+		},
+	})
+
+	cost, priced, contributes, err := sqliteActivityReportRowStatus(
+		dailyUsageScanRow{
+			usageSource: "provider",
+			model:       "daimon-kimi-code",
+			ts:          "2026-07-19T00:00:00Z",
+			inputTokens: 1_000_000,
+		},
+		resolver,
+	)
+
+	require.NoError(t, err)
+	assert.True(t, priced)
+	assert.True(t, contributes)
+	assert.Equal(t, money.MustParseDollars("7"), cost)
+	block, err := resolver.BuildBlock()
+	require.NoError(t, err)
+	require.Contains(t, block.Models, "daimon-kimi-code")
+	resolutions := block.Models["daimon-kimi-code"].Resolutions
+	require.Len(t, resolutions, 1)
+	assert.Equal(t, "daimon-kimi-code", resolutions[0].PricedModel)
 }
 
 func TestGetActivityReport_CopilotReportedCostReplacesSessionEstimates(t *testing.T) {
 	d := testDB(t)
 	ctx := context.Background()
 	require.NoError(t, d.UpsertModelPricing([]ModelPricing{
-		{ModelPattern: "copilot-model-a", InputPerMTok: 10},
-		{ModelPattern: "copilot-model-b", InputPerMTok: 20},
+		{ModelPattern: "copilot-model-a", InputPerMTok: money.MustParseDollars("10")},
+		{ModelPattern: "copilot-model-b", InputPerMTok: money.MustParseDollars("20")},
 	}))
 	insertSession(t, d, "copilot:activity-authoritative", "proj1", func(s *Session) {
 		s.Agent = "copilot"
 		s.StartedAt = Ptr("2026-06-16T10:00:00Z")
 		s.EndedAt = Ptr("2026-06-16T10:10:00Z")
 	})
-	reportedCost := 0.03
+	reportedCost := money.MustParseDollars("0.03")
 	require.NoError(t, d.ReplaceSessionUsageEvents(
 		"copilot:activity-authoritative",
 		[]UsageEvent{
@@ -152,7 +259,7 @@ func TestGetActivityReport_CopilotReportedCostReplacesSessionEstimates(t *testin
 			{
 				Source: "shutdown", Model: "copilot-model-b",
 				InputTokens: 1_000_000,
-				CostUSD:     &reportedCost, CostStatus: "exact",
+				Cost:        &reportedCost, CostStatus: "exact",
 				CostSource: CopilotReportedCostSource,
 				OccurredAt: "2026-06-16T10:10:00Z", DedupKey: "final",
 			},
@@ -162,17 +269,17 @@ func TestGetActivityReport_CopilotReportedCostReplacesSessionEstimates(t *testin
 	r, err := d.GetActivityReport(ctx, AnalyticsFilter{Timezone: "UTC"},
 		dayQuery(t, "2026-06-16", "UTC"))
 	require.NoError(t, err)
-	assert.InDelta(t, reportedCost, r.Totals.Cost, 1e-12)
+	assert.Equal(t, reportedCost, r.Totals.Cost)
 	require.Len(t, r.BySession, 1)
-	assert.InDelta(t, reportedCost, r.BySession[0].Cost, 1e-12)
-	modelCosts := make(map[string]float64, len(r.ByModel))
+	assert.Equal(t, reportedCost, r.BySession[0].Cost)
+	modelCosts := make(map[string]money.Money, len(r.ByModel))
 	for _, model := range r.ByModel {
 		modelCosts[model.Key] = model.Cost
 	}
-	assert.InDelta(t, 0.01, modelCosts["copilot-model-a"], 1e-12)
-	assert.InDelta(t, 0.02, modelCosts["copilot-model-b"], 1e-12)
+	assert.Equal(t, money.MustParseDollars("0.01"), modelCosts["copilot-model-a"])
+	assert.Equal(t, money.MustParseDollars("0.02"), modelCosts["copilot-model-b"])
 	assert.Equal(t, r.Totals.Cost,
-		modelCosts["copilot-model-a"]+modelCosts["copilot-model-b"])
+		money.MustAdd(modelCosts["copilot-model-a"], modelCosts["copilot-model-b"]))
 }
 
 func TestGetActivityReport_PricingModelsOnlyIncludeDedupSurvivors(t *testing.T) {
@@ -181,13 +288,13 @@ func TestGetActivityReport_PricingModelsOnlyIncludeDedupSurvivors(t *testing.T) 
 	require.NoError(t, d.UpsertModelPricing([]ModelPricing{
 		{
 			ModelPattern:  "kept-model",
-			InputPerMTok:  3.0,
-			OutputPerMTok: 15.0,
+			InputPerMTok:  money.MustParseDollars("3.0"),
+			OutputPerMTok: money.MustParseDollars("15.0"),
 		},
 		{
 			ModelPattern:  "discarded-model",
-			InputPerMTok:  3.0,
-			OutputPerMTok: 15.0,
+			InputPerMTok:  money.MustParseDollars("3.0"),
+			OutputPerMTok: money.MustParseDollars("15.0"),
 		},
 	}), "UpsertModelPricing")
 
@@ -236,8 +343,8 @@ func TestGetActivityReport_IncludesSubagentUsage(t *testing.T) {
 	d := testDB(t)
 	ctx := context.Background()
 	require.NoError(t, d.UpsertModelPricing([]ModelPricing{
-		{ModelPattern: "root-model", InputPerMTok: 3.0, OutputPerMTok: 15.0},
-		{ModelPattern: "sub-model", InputPerMTok: 3.0, OutputPerMTok: 15.0},
+		{ModelPattern: "root-model", InputPerMTok: money.MustParseDollars("3.0"), OutputPerMTok: money.MustParseDollars("15.0")},
+		{ModelPattern: "sub-model", InputPerMTok: money.MustParseDollars("3.0"), OutputPerMTok: money.MustParseDollars("15.0")},
 	}), "UpsertModelPricing")
 
 	insertSession(t, d, "root", "proj1", func(s *Session) {
@@ -292,7 +399,7 @@ func TestGetActivityReport_IncludesSubagentUsage(t *testing.T) {
 		"totals include subagent usage; the fork's replayed row dedups away")
 	// Cost = root (1000*3+500*15)/1e6 + subagent (2000*3+700*15)/1e6; the
 	// fork's duplicate row contributes nothing.
-	assert.InDelta(t, 0.0105+0.0165, r.Totals.Cost, 1e-9)
+	assert.Equal(t, money.MustParseDollars("0.027"), r.Totals.Cost)
 }
 
 // TestGetActivityReport_ExcludesOtherDays confirms the candidate-session
@@ -437,8 +544,8 @@ func TestGetActivityReport_ExcludesIneligibleUsage(t *testing.T) {
 	ctx := context.Background()
 	require.NoError(t, d.UpsertModelPricing([]ModelPricing{{
 		ModelPattern:  "claude-sonnet-4-20250514",
-		InputPerMTok:  3.0,
-		OutputPerMTok: 15.0,
+		InputPerMTok:  money.MustParseDollars("3.0"),
+		OutputPerMTok: money.MustParseDollars("15.0"),
 	}}), "UpsertModelPricing")
 
 	insertSession(t, d, "s1", "proj1", func(s *Session) {
@@ -473,7 +580,7 @@ func TestGetActivityReport_ExcludesIneligibleUsage(t *testing.T) {
 		dayQuery(t, "2026-06-16", "UTC"))
 	require.NoError(t, err)
 	assert.Equal(t, 500, r.Totals.OutputTokens, "synthetic message excluded")
-	assert.InDelta(t, 0.0105, r.Totals.Cost, 1e-9)
+	assert.Equal(t, money.MustParseDollars("0.0105"), r.Totals.Cost)
 }
 
 // TestGetActivityReport_HourlyRange exercises a multi-day custom range so
@@ -531,8 +638,8 @@ func TestGetActivityReport_UsageDedupSubSecondOrder(t *testing.T) {
 	ctx := context.Background()
 	require.NoError(t, d.UpsertModelPricing([]ModelPricing{{
 		ModelPattern:  "claude-sonnet-4-20250514",
-		InputPerMTok:  3.0,
-		OutputPerMTok: 15.0,
+		InputPerMTok:  money.MustParseDollars("3.0"),
+		OutputPerMTok: money.MustParseDollars("15.0"),
 	}}), "UpsertModelPricing")
 
 	insertSession(t, d, "earlier", "proj1", func(s *Session) {
@@ -572,8 +679,8 @@ func TestGetActivityReport_UsageDedupFallsBackToSourceUUID(t *testing.T) {
 	ctx := context.Background()
 	require.NoError(t, d.UpsertModelPricing([]ModelPricing{{
 		ModelPattern:  "claude-sonnet-4-20250514",
-		InputPerMTok:  3.0,
-		OutputPerMTok: 15.0,
+		InputPerMTok:  money.MustParseDollars("3.0"),
+		OutputPerMTok: money.MustParseDollars("15.0"),
 	}}), "UpsertModelPricing")
 
 	insertSession(t, d, "earlier", "proj1", func(s *Session) {
@@ -781,6 +888,12 @@ func TestGetActivityReport_AutomationFilterAndSessionSplit(t *testing.T) {
 // binds too many variables fails exactly as it would on those builds.
 func forceReaderVarLimit(t *testing.T, d *DB, limit int) {
 	t.Helper()
+	if driver.DriverName != "sqlite3" {
+		t.Skipf(
+			"SQLite variable-limit test requires mattn sqlite driver; got %s",
+			driver.DriverName,
+		)
+	}
 	reader := d.rawReader()
 	reader.SetMaxOpenConns(1)
 	reader.SetMaxIdleConns(1)

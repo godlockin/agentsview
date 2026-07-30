@@ -45,7 +45,7 @@ type VersionInfo struct {
 // APIVersion is shared by HTTP version reporting and local daemon discovery.
 // Bump it when a client-visible contract cannot be decoded safely by an older
 // CLI or daemon.
-const APIVersion = 3
+const APIVersion = 4
 
 const daemonService = "agentsview"
 
@@ -107,6 +107,9 @@ type Server struct {
 	// activity would otherwise surface. Called synchronously; it must not
 	// block.
 	sessionMutationNotify func()
+	// recallCorpusMutationNotify, when set, is called after an import adds or
+	// supersedes accepted recall entries so semantic mirrors can refresh.
+	recallCorpusMutationNotify func()
 
 	// pprofEnabled registers net/http/pprof handlers under
 	// /debug/pprof/ so a running daemon can be profiled. Off by
@@ -117,6 +120,7 @@ type Server struct {
 	// build lifecycle routes. Nil (the default) leaves those routes
 	// unregistered, e.g. when semantic search is not configured.
 	embeddingsManager EmbeddingsManager
+	embeddingsStores  map[string]EmbeddingsManager
 
 	// embeddingsUnavailableReason, when non-empty, replaces the generic
 	// "embeddings manager not available" 501 message on the embeddings
@@ -133,6 +137,14 @@ type Server struct {
 	// generation to the daemon's pg push handler. Nil leaves the vector
 	// push phase skipped, e.g. when [vector] is disabled.
 	vectorPushSource postgres.VectorPushSource
+
+	// localSyncRunner, when set, backs the foreground local-sync HTTP handler
+	// with the worker-backed pass instead of running SyncThenRun in process.
+	localSyncRunner LocalSyncRunner
+
+	// localResyncRunner, when set, backs the foreground full-resync HTTP handler
+	// with the worker-backed build-and-swap instead of an in-process resync.
+	localResyncRunner LocalResyncRunner
 
 	ensurePricing func(context.Context, *db.DB) error
 }
@@ -313,17 +325,66 @@ func WithIdleTracker(t *IdleTracker) Option {
 }
 
 // WithSessionMutationNotifier registers fn to run after a route changes a
-// session's lifecycle (trash, restore, permanent delete). fn is called
-// synchronously on the request path and must not block; a non-blocking
-// scheduler signal is the intended shape.
+// session's lifecycle (trash, restore, permanent delete). Multiple options
+// fan out in registration order so independent lifecycle consumers do not
+// suppress one another. Each fn is called synchronously on the request path
+// and must not block; a non-blocking scheduler signal is the intended shape.
 func WithSessionMutationNotifier(fn func()) Option {
-	return func(s *Server) { s.sessionMutationNotify = fn }
+	return func(s *Server) {
+		if fn == nil {
+			return
+		}
+		previous := s.sessionMutationNotify
+		if previous == nil {
+			s.sessionMutationNotify = fn
+			return
+		}
+		s.sessionMutationNotify = func() {
+			previous()
+			fn()
+		}
+	}
+}
+
+// WithRecallCorpusMutationNotifier registers fn to run after a successful
+// import changes the accepted recall corpus. fn must not block; a scheduler's
+// coalescing Notify method is the intended shape.
+func WithRecallCorpusMutationNotifier(fn func()) Option {
+	return func(s *Server) { s.recallCorpusMutationNotify = fn }
 }
 
 // WithPprof enables the net/http/pprof handlers under
 // /debug/pprof/ for live profiling of a running daemon.
 func WithPprof(enabled bool) Option {
 	return func(s *Server) { s.pprofEnabled = enabled }
+}
+
+// LocalSyncRunner runs the daemon's foreground local sync, streaming progress
+// to the optional callback and returning the resulting stats. When injected,
+// the sync HTTP handler routes through it (the worker-backed path) instead of
+// running the archive-scale sync in the daemon process.
+type LocalSyncRunner func(
+	ctx context.Context, progress func(sync.Progress),
+) (sync.SyncStats, error)
+
+// WithLocalSyncRunner injects the worker-backed foreground sync runner. Nil (the
+// default) keeps the in-process SyncThenRun path, which server tests rely on.
+func WithLocalSyncRunner(r LocalSyncRunner) Option {
+	return func(s *Server) { s.localSyncRunner = r }
+}
+
+// LocalResyncRunner runs the daemon's foreground full resync, streaming progress
+// to the optional callback and returning the resulting stats. When injected, the
+// resync HTTP handler routes through it (the worker-backed build-and-swap)
+// instead of running the archive-scale resync in the daemon process.
+type LocalResyncRunner func(
+	ctx context.Context, progress func(sync.Progress),
+) (sync.SyncStats, error)
+
+// WithLocalResyncRunner injects the worker-backed foreground resync runner. Nil
+// (the default) keeps the in-process SyncThenRun resync path.
+func WithLocalResyncRunner(r LocalResyncRunner) Option {
+	return func(s *Server) { s.localResyncRunner = r }
 }
 
 func (s *Server) humaConfig() huma.Config {

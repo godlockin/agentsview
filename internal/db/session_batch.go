@@ -28,9 +28,11 @@ type SessionBatchWrite struct {
 type SessionBatchResult struct {
 	WrittenSessions  int
 	WrittenMessages  int
+	WrittenIndexes   []int
 	ExcludedSessions int
 	ExcludedIDs      []string
 	FailedSessions   int
+	FailedIDs        []string
 	Errors           []error
 }
 
@@ -92,6 +94,7 @@ func (db *DB) WriteSessionBatch(
 			)
 			result.WrittenSessions++
 			result.WrittenMessages += messagesWritten
+			result.WrittenIndexes = append(result.WrittenIndexes, i)
 		case errors.Is(err, ErrSessionExcluded),
 			errors.Is(err, ErrSessionTrashed):
 			if rerr := rollbackSavepoint(tx, savepoint); rerr != nil {
@@ -107,6 +110,7 @@ func (db *DB) WriteSessionBatch(
 				return result, rerr
 			}
 			result.FailedSessions++
+			result.FailedIDs = append(result.FailedIDs, write.Session.ID)
 			result.Errors = append(result.Errors, err)
 		}
 	}
@@ -143,7 +147,7 @@ func (db *DB) WriteSessionBatchAtomic(
 	defer func() { _ = tx.Rollback() }()
 	var pendingRecallRevocations recallEvidenceRevocationEvents
 
-	for _, write := range writes {
+	for i, write := range writes {
 		write = sanitizeSessionBatchWrite(write)
 		messagesWritten, err := writeOneSessionBatchTx(
 			tx,
@@ -153,6 +157,7 @@ func (db *DB) WriteSessionBatchAtomic(
 		if err != nil {
 			result.WrittenSessions = 0
 			result.WrittenMessages = 0
+			result.WrittenIndexes = nil
 			switch {
 			case errors.Is(err, ErrSessionExcluded),
 				errors.Is(err, ErrSessionTrashed):
@@ -169,12 +174,14 @@ func (db *DB) WriteSessionBatchAtomic(
 		}
 		result.WrittenSessions++
 		result.WrittenMessages += messagesWritten
+		result.WrittenIndexes = append(result.WrittenIndexes, i)
 	}
 
 	if len(beforeCommit) > 0 && beforeCommit[0] != nil {
 		if err := beforeCommit[0](); err != nil {
 			result.WrittenSessions = 0
 			result.WrittenMessages = 0
+			result.WrittenIndexes = nil
 			return result, err
 		}
 	}
@@ -302,11 +309,11 @@ func writeOneSessionBatchTx(
 	if excluded == 1 {
 		return 0, ErrSessionExcluded
 	}
-	var deletedAt sql.NullString
+	var deletedAt, deletionCause sql.NullString
 	err = tx.QueryRow(
-		"SELECT deleted_at FROM sessions WHERE id = ?",
+		"SELECT deleted_at, deletion_cause FROM sessions WHERE id = ?",
 		write.Session.ID,
-	).Scan(&deletedAt)
+	).Scan(&deletedAt, &deletionCause)
 	if err != nil && !errors.Is(err, sql.ErrNoRows) {
 		return 0, fmt.Errorf(
 			"checking trash for %s: %w",
@@ -314,11 +321,20 @@ func writeOneSessionBatchTx(
 		)
 	}
 	sessionExists := err == nil
-	if deletedAt.Valid {
+	if deletedAt.Valid &&
+		(!deletionCause.Valid || deletionCause.String != deletionCauseSourceMissing) {
 		return 0, ErrSessionTrashed
 	}
+	replaceMessages := write.ReplaceMessages ||
+		(deletionCause.Valid && deletionCause.String == deletionCauseSourceMissing)
+	queueGenerationBefore, queueExistedBefore, err := artifactExportGenerationTx(
+		tx, write.Session.ID,
+	)
+	if err != nil {
+		return 0, err
+	}
 	replacementTranscriptChanged := false
-	if write.ReplaceMessages && sessionExists {
+	if replaceMessages && sessionExists {
 		stored, err := sessionMessagesTx(
 			context.Background(), tx, write.Session.ID,
 		)
@@ -347,14 +363,14 @@ func writeOneSessionBatchTx(
 		}
 	}
 	if err := replaceSessionUsageEventsTx(
-		tx, write.Session.ID, write.UsageEvents,
+		tx, write.Session.ID, write.UsageEvents, false,
 	); err != nil {
 		return 0, err
 	}
 
 	msgs := write.Messages
 	var pins []savedPin
-	if write.ReplaceMessages && sessionExists {
+	if replaceMessages && sessionExists {
 		pins, err = savePinsTx(tx, write.Session.ID)
 		if err != nil {
 			return 0, err
@@ -370,7 +386,7 @@ func writeOneSessionBatchTx(
 		msgs = messagesAfterOrdinal(msgs, maxOrd)
 	}
 	transcriptChanged := len(msgs) > 0
-	if write.ReplaceMessages && sessionExists {
+	if replaceMessages && sessionExists {
 		transcriptChanged = replacementTranscriptChanged
 	}
 
@@ -393,7 +409,7 @@ func writeOneSessionBatchTx(
 			return 0, err
 		}
 	}
-	if write.ReplaceMessages && sessionExists {
+	if replaceMessages && sessionExists {
 		if err := reconcileRecallEvidenceForSessionTx(
 			context.Background(),
 			tx,
@@ -403,7 +419,7 @@ func writeOneSessionBatchTx(
 			return 0, err
 		}
 	}
-	if write.ReplaceMessages {
+	if replaceMessages {
 		if err := restorePinsTx(tx, write.Session.ID, pins); err != nil {
 			return 0, err
 		}
@@ -441,6 +457,11 @@ func writeOneSessionBatchTx(
 	}
 	if err := replaceSecretFindingsTx(tx, write.Session.ID, write.Findings,
 		write.Signals.SecretLeakCount, write.Signals.SecretsRulesVersion); err != nil {
+		return 0, err
+	}
+	if err := enqueueArtifactExportIfGenerationUnchangedTx(
+		tx, write.Session.ID, queueGenerationBefore, queueExistedBefore,
+	); err != nil {
 		return 0, err
 	}
 

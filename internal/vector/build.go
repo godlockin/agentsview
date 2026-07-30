@@ -22,6 +22,15 @@ var progressInterval = 2 * time.Second
 
 const repairStatusCountTimeout = 2 * time.Second
 
+// CorpusFingerprintParam names the generation parameter whose value identifies
+// the source corpus, independently of the embedding model. A change forces a
+// full mirror reconciliation before the new vector generation is filled.
+const CorpusFingerprintParam = "corpus_fingerprint"
+
+const corpusFingerprintMetaKey = "corpus_fingerprint"
+
+const completedCorpusRevisionMetaKey = "completed_corpus_revision:"
+
 // BuildOptions configures one Build pass.
 type BuildOptions struct {
 	// FullRebuild forces every document to be re-embedded under the target
@@ -48,6 +57,10 @@ type BuildOptions struct {
 	// Concurrency is the number of documents encoded in parallel (config
 	// concurrency). Values <= 0 encode sequentially.
 	Concurrency int
+	// CorpusRevision identifies the source state captured when this build
+	// target was resolved. A successful ordinary build persists it only after
+	// refresh and fill complete, allowing searches to reject newer source data.
+	CorpusRevision string
 	// Progress, if non-nil, is called at most ~every 2s with incremental
 	// embedding progress, plus once more after the run completes.
 	Progress func(BuildProgress)
@@ -119,7 +132,22 @@ func (ix *Index) Build(
 	// then setIncludeAutomatedScope below stamps the key so every later
 	// build compares against a real stored scope again.
 	scopeChanged := !hasScope || storedScope != o.IncludeAutomated
-	full := o.FullRebuild || o.Backstop || firstEver || scopeChanged
+	corpusFingerprint := gen.Params[CorpusFingerprintParam]
+	storedCorpusFingerprint, hasCorpusFingerprint, err := ix.metaGet(
+		ctx, corpusFingerprintMetaKey,
+	)
+	if err != nil {
+		return BuildResult{}, fmt.Errorf("reading corpus fingerprint: %w", err)
+	}
+	corpusChanged := corpusFingerprint != "" &&
+		(!hasCorpusFingerprint || storedCorpusFingerprint != corpusFingerprint)
+	full := o.FullRebuild || o.Backstop || firstEver || scopeChanged || corpusChanged
+	fp := gen.Fingerprint()
+	if full {
+		if err := ix.clearCompletedCorpusRevision(ctx, fp); err != nil {
+			return BuildResult{}, err
+		}
+	}
 	// Report the scanning phase before the mirror refresh: on a large archive
 	// the refresh (and the pending count below) can run for a while with no
 	// chunk totals yet, and without a phase report a progress consumer can
@@ -134,8 +162,12 @@ func (ix *Index) Build(
 	if err := ix.setIncludeAutomatedScope(ctx, o.IncludeAutomated); err != nil {
 		return BuildResult{}, err
 	}
+	if corpusFingerprint != "" {
+		if err := ix.metaSet(ctx, corpusFingerprintMetaKey, corpusFingerprint); err != nil {
+			return BuildResult{}, fmt.Errorf("storing corpus fingerprint: %w", err)
+		}
+	}
 
-	fp := gen.Fingerprint()
 	target, wasBuilding, err := ix.resolveBuildTarget(ctx, gen, fp, o.FullRebuild)
 	if err != nil {
 		return BuildResult{}, err
@@ -154,10 +186,18 @@ func (ix *Index) Build(
 		spec:  ix.spec,
 	}
 	fillStats, fillErr := kitvec.Fill[string, string](ctx, fillStore, target, wrapped, kitvec.FillOptions[string]{
-		Split:         ix.split,
-		Batch:         kitvec.BatchOptions{BatchSize: o.BatchSize, Concurrency: 1},
-		Concurrency:   o.Concurrency,
-		OnEncodeError: skipPermanentEncodeError,
+		Split:       ix.split,
+		Batch:       kitvec.BatchOptions{BatchSize: o.BatchSize, Concurrency: 1},
+		Concurrency: o.Concurrency,
+		// A positive BatchSize packs chunks from several documents into one
+		// encode call, so a permanent rejection arrives without knowing which
+		// document caused it. Permitting isolation lets kit re-encode each
+		// document's slice alone and attribute the failure; without it the
+		// whole fill aborts and one poison document wedges every later build,
+		// which is what OnEncodeError exists to prevent. Transient failures
+		// still abort untouched: they are not worth N extra probe calls.
+		ShouldIsolateBatchError: isPermanentEncodeError,
+		OnEncodeError:           skipPermanentEncodeError,
 	})
 	finish()
 	result.Fill = fillStats
@@ -169,7 +209,17 @@ func (ix *Index) Build(
 	if err != nil {
 		return result, err
 	}
+	if err := ix.clearActiveFullRebuildPending(ctx, target); err != nil {
+		return result, err
+	}
 	result.Activated = activated
+	if o.CorpusRevision != "" {
+		if err := ix.metaSet(
+			ctx, completedCorpusRevisionMetaKey+target, o.CorpusRevision,
+		); err != nil {
+			return result, fmt.Errorf("storing completed corpus revision: %w", err)
+		}
+	}
 	return result, nil
 }
 
@@ -278,13 +328,12 @@ func validatingEncoder(enc kitvec.EncodeFunc) kitvec.EncodeFunc {
 
 // skipPermanentEncodeError implements kitvec.FillOptions.OnEncodeError: a
 // document the embeddings endpoint permanently rejects for input-specific
-// reasons (e.g. a token-window overflow, whitespace-only content some servers
-// refuse, or a content-policy rejection) is skipped — kit stamps it for the
-// generation with no vectors so it stops being pending — instead of aborting
-// the whole fill. Without this, one poison document would wedge every future
-// build at the same doc_key-ordered scan position: later documents would never
-// embed, a first build would never reach Missing==0, and auto-activation would
-// never fire.
+// reasons (e.g. a token-window overflow or a content-policy rejection) is
+// skipped — kit stamps it for the generation with no vectors so it stops being
+// pending — instead of aborting the whole fill. Without this, one poison
+// document would wedge every future build at the same doc_key-ordered scan
+// position: later documents would never embed, a first build would never reach
+// Missing==0, and auto-activation would never fire.
 //
 // Every other failure (5xx, network, timeout, 429 rate-limiting, auth, route,
 // model, media-type, or other config/API failures) still aborts the fill, since
@@ -299,7 +348,17 @@ func skipPermanentEncodeError(doc string, err error) bool {
 	return true
 }
 
+// isPermanentEncodeError reports whether err rejects one specific input in a
+// way retrying can never fix. kitvec.ErrEmptyEmbeddingInput is kit's own
+// pre-flight refusal of blank chunk text; it is raised before any HTTP call
+// and replaces sniffing each provider's wording for the same rejection.
+// Ordinary fills never trigger it — kitvec.Split drops blank windows, so a
+// blank document is stamped with no vectors — but a chunk that reaches an
+// encode call blank is still permanently unembeddable, not a transient fault.
 func isPermanentEncodeError(err error) bool {
+	if errors.Is(err, kitvec.ErrEmptyEmbeddingInput) {
+		return true
+	}
 	var statusErr *HTTPStatusError
 	return errors.As(err, &statusErr) && statusErr != nil && statusErr.Permanent()
 }
@@ -336,7 +395,11 @@ func (ix *Index) resolveBuildTarget(
 
 	if hasActive && active == fp {
 		if fullRebuild {
-			if err := ix.resetGeneration(ctx, fp); err != nil {
+			if err := ix.markActiveFullRebuildPending(ctx, fp); err != nil {
+				return "", false, err
+			}
+			if err := ix.resetGenerationForFullRebuild(ctx, fp); err != nil {
+				_ = ix.clearActiveFullRebuildPending(ctx, fp)
 				return "", false, err
 			}
 		}
@@ -366,11 +429,33 @@ func (ix *Index) resolveBuildTarget(
 		return "", false, err
 	}
 	if fullRebuild && existed {
-		if err := ix.resetGeneration(ctx, target); err != nil {
+		if err := ix.resetGenerationForFullRebuild(ctx, target); err != nil {
 			return "", false, err
 		}
 	}
 	return target, true, nil
+}
+
+// resetGenerationForFullRebuild invalidates the generation's completed corpus
+// revision before removing its vectors and stamps. Clearing first keeps
+// StaleActive fail-closed if either the reset or the subsequent fill fails.
+// Build writes the completed revision again only after fill and activation
+// succeed.
+func (ix *Index) resetGenerationForFullRebuild(ctx context.Context, fp string) error {
+	if err := ix.clearCompletedCorpusRevision(ctx, fp); err != nil {
+		return err
+	}
+	return ix.resetGeneration(ctx, fp)
+}
+
+func (ix *Index) clearCompletedCorpusRevision(ctx context.Context, fp string) error {
+	if _, err := ix.db.ExecContext(ctx,
+		`DELETE FROM `+ix.spec.MetaTable+` WHERE key = ?`,
+		completedCorpusRevisionMetaKey+fp,
+	); err != nil {
+		return fmt.Errorf("clearing completed corpus revision: %w", err)
+	}
+	return nil
 }
 
 // retireAbandonedBuildingGenerations transitions every generation still in
@@ -550,9 +635,59 @@ func (ix *Index) activateGeneration(ctx context.Context, target string) error {
 	); err != nil {
 		return fmt.Errorf("activate generation: %w", err)
 	}
+	if _, err := tx.ExecContext(ctx,
+		`DELETE FROM `+ix.spec.MetaTable+` WHERE key = ? AND value != ?`,
+		activeFullRebuildKey, target,
+	); err != nil {
+		return fmt.Errorf("clear stale active full rebuild marker: %w", err)
+	}
 
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("commit activate generation: %w", err)
+	}
+	return nil
+}
+
+// ActiveFullRebuildPending reports whether fingerprint is the active
+// generation of a same-fingerprint full rebuild that cleared stamps in place
+// and has not completed yet.
+func (ix *Index) ActiveFullRebuildPending(
+	ctx context.Context, fingerprint string,
+) (bool, error) {
+	value, ok, err := ix.metaGet(ctx, activeFullRebuildKey)
+	if err != nil {
+		return false, err
+	}
+	return ok && value == fingerprint, nil
+}
+
+func (ix *Index) markActiveFullRebuildPending(
+	ctx context.Context, fingerprint string,
+) error {
+	if err := ix.requireWritable(); err != nil {
+		return err
+	}
+	if err := ix.metaSet(ctx, activeFullRebuildKey, fingerprint); err != nil {
+		return fmt.Errorf("record active full rebuild: %w", err)
+	}
+	return nil
+}
+
+func (ix *Index) clearActiveFullRebuildPending(
+	ctx context.Context, fingerprint string,
+) error {
+	if err := ix.requireWritable(); err != nil {
+		return err
+	}
+	value, ok, err := ix.metaGet(ctx, activeFullRebuildKey)
+	if err != nil {
+		return fmt.Errorf("read active full rebuild marker: %w", err)
+	}
+	if !ok || value != fingerprint {
+		return nil
+	}
+	if err := ix.metaDelete(ctx, activeFullRebuildKey); err != nil {
+		return fmt.Errorf("clear active full rebuild marker: %w", err)
 	}
 	return nil
 }

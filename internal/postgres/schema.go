@@ -29,6 +29,13 @@ type columnMigration struct {
 
 // coreDDL creates the tables and indexes. It uses unqualified
 // names because Open() sets search_path to the target schema.
+//
+// The sessions table deliberately omits SQLite's machine-local sync
+// bookkeeping cluster (next_ordinal, last_entry_uuid,
+// claude_linear_parse, last_write_incremental): parsers never run
+// against this read-side store, so mirroring those columns would be
+// inert plumbing. Their absence from push SQL and
+// sessionPushFingerprint is intentional.
 const coreDDL = `
 CREATE TABLE IF NOT EXISTS sync_metadata (
     key   TEXT PRIMARY KEY,
@@ -52,6 +59,7 @@ CREATE TABLE IF NOT EXISTS sessions (
     ended_at           TIMESTAMPTZ,
     deleted_at         TIMESTAMPTZ,
     source_deleted_at  TIMESTAMPTZ,
+    deletion_cause     TEXT,
     message_count      INT NOT NULL DEFAULT 0,
     user_message_count INT NOT NULL DEFAULT 0,
     parent_session_id  TEXT,
@@ -136,7 +144,7 @@ CREATE TABLE IF NOT EXISTS usage_events (
     cache_creation_input_tokens INT NOT NULL DEFAULT 0,
     cache_read_input_tokens INT NOT NULL DEFAULT 0,
     reasoning_tokens INT NOT NULL DEFAULT 0,
-    cost_usd DOUBLE PRECISION,
+    cost_microdollars BIGINT,
     cost_status TEXT NOT NULL DEFAULT '',
     cost_source TEXT NOT NULL DEFAULT '',
     occurred_at TIMESTAMPTZ,
@@ -164,8 +172,8 @@ CREATE TABLE IF NOT EXISTS cursor_usage_events (
     output_tokens INT NOT NULL DEFAULT 0,
     cache_write_tokens INT NOT NULL DEFAULT 0,
     cache_read_tokens INT NOT NULL DEFAULT 0,
-    charged_cents DOUBLE PRECISION NOT NULL DEFAULT 0,
-    cursor_token_fee DOUBLE PRECISION NOT NULL DEFAULT 0,
+    charged_microdollars BIGINT NOT NULL DEFAULT 0,
+    cursor_token_fee_microdollars BIGINT NOT NULL DEFAULT 0,
     user_id TEXT NOT NULL DEFAULT '',
     user_email TEXT NOT NULL DEFAULT '',
     is_headless BOOLEAN NOT NULL DEFAULT FALSE,
@@ -228,10 +236,10 @@ CREATE INDEX IF NOT EXISTS idx_pinned_source_uuid
 
 CREATE TABLE IF NOT EXISTS model_pricing (
     model_pattern TEXT PRIMARY KEY,
-    input_per_mtok DOUBLE PRECISION NOT NULL DEFAULT 0,
-    output_per_mtok DOUBLE PRECISION NOT NULL DEFAULT 0,
-    cache_creation_per_mtok DOUBLE PRECISION NOT NULL DEFAULT 0,
-    cache_read_per_mtok DOUBLE PRECISION NOT NULL DEFAULT 0,
+    input_microdollars_per_mtok BIGINT NOT NULL DEFAULT 0,
+    output_microdollars_per_mtok BIGINT NOT NULL DEFAULT 0,
+    cache_creation_microdollars_per_mtok BIGINT NOT NULL DEFAULT 0,
+    cache_read_microdollars_per_mtok BIGINT NOT NULL DEFAULT 0,
     updated_at TEXT NOT NULL DEFAULT ''
 );
 
@@ -425,6 +433,222 @@ CREATE INDEX IF NOT EXISTS idx_daily_usage_rollup_day
     ON daily_usage_rollup (day);
 `
 
+func migrateMoneyColumnsPG(
+	ctx context.Context,
+	conn *sql.DB,
+	existingColumns map[string]map[string]bool,
+) error {
+	legacyColumns := []struct {
+		table  string
+		column string
+		max    string
+		ddl    string
+	}{
+		{"usage_events", "cost_usd", "9223372036854.775", `
+			ALTER TABLE usage_events
+			ALTER COLUMN cost_usd TYPE BIGINT
+			USING CASE WHEN cost_usd IS NULL THEN NULL
+			ELSE ROUND((cost_usd::NUMERIC) * 1000000)::BIGINT END;
+			ALTER TABLE usage_events RENAME COLUMN cost_usd TO cost_microdollars`},
+		{"cursor_usage_events", "charged_cents", "922337203685477.5", `
+			ALTER TABLE cursor_usage_events
+			ALTER COLUMN charged_cents TYPE BIGINT
+			USING ROUND((charged_cents::NUMERIC) * 10000)::BIGINT;
+			ALTER TABLE cursor_usage_events
+			RENAME COLUMN charged_cents TO charged_microdollars`},
+		{"cursor_usage_events", "cursor_token_fee", "922337203685477.5", `
+			ALTER TABLE cursor_usage_events
+			ALTER COLUMN cursor_token_fee TYPE BIGINT
+			USING ROUND((cursor_token_fee::NUMERIC) * 10000)::BIGINT;
+			ALTER TABLE cursor_usage_events
+			RENAME COLUMN cursor_token_fee TO cursor_token_fee_microdollars`},
+		{"model_pricing", "input_per_mtok", "9223372036854.775", `
+			ALTER TABLE model_pricing
+			ALTER COLUMN input_per_mtok TYPE BIGINT
+			USING ROUND((input_per_mtok::NUMERIC) * 1000000)::BIGINT;
+			ALTER TABLE model_pricing RENAME COLUMN input_per_mtok TO input_microdollars_per_mtok`},
+		{"model_pricing", "output_per_mtok", "9223372036854.775", `
+			ALTER TABLE model_pricing
+			ALTER COLUMN output_per_mtok TYPE BIGINT
+			USING ROUND((output_per_mtok::NUMERIC) * 1000000)::BIGINT;
+			ALTER TABLE model_pricing RENAME COLUMN output_per_mtok TO output_microdollars_per_mtok`},
+		{"model_pricing", "cache_creation_per_mtok", "9223372036854.775", `
+			ALTER TABLE model_pricing
+			ALTER COLUMN cache_creation_per_mtok TYPE BIGINT
+			USING ROUND((cache_creation_per_mtok::NUMERIC) * 1000000)::BIGINT;
+			ALTER TABLE model_pricing RENAME COLUMN cache_creation_per_mtok TO cache_creation_microdollars_per_mtok`},
+		{"model_pricing", "cache_read_per_mtok", "9223372036854.775", `
+			ALTER TABLE model_pricing
+			ALTER COLUMN cache_read_per_mtok TYPE BIGINT
+			USING ROUND((cache_read_per_mtok::NUMERIC) * 1000000)::BIGINT;
+			ALTER TABLE model_pricing RENAME COLUMN cache_read_per_mtok TO cache_read_microdollars_per_mtok`},
+	}
+
+	needsMigration := false
+	for _, migration := range legacyColumns {
+		if existingColumns[migration.table][migration.column] {
+			needsMigration = true
+			break
+		}
+	}
+	if !needsMigration {
+		return nil
+	}
+
+	tx, err := conn.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("beginning PG microdollar migration: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	if _, err := tx.ExecContext(ctx, `SELECT pg_advisory_xact_lock(
+		hashtext(current_database()), hashtext(current_schema())
+	)`); err != nil {
+		return fmt.Errorf("locking PG microdollar migration: %w", err)
+	}
+	existingColumns, err = loadExistingColumns(
+		ctx, tx, nil,
+		"usage_events", "cursor_usage_events", "model_pricing",
+	)
+	if err != nil {
+		return err
+	}
+
+	pending := make([]struct {
+		table  string
+		column string
+		max    string
+		ddl    string
+	}, 0, len(legacyColumns))
+	migrateCursorKeys := false
+	for _, migration := range legacyColumns {
+		if !existingColumns[migration.table][migration.column] {
+			continue
+		}
+		pending = append(pending, migration)
+		if migration.table == "cursor_usage_events" {
+			migrateCursorKeys = true
+		}
+	}
+	if len(pending) == 0 {
+		if err := tx.Commit(); err != nil {
+			return fmt.Errorf("committing PG microdollar migration: %w", err)
+		}
+		return nil
+	}
+	for _, migration := range pending {
+		query := fmt.Sprintf(`SELECT EXISTS (
+			SELECT 1 FROM %s WHERE %s IS NOT NULL
+			AND NOT (%s >= 0 AND %s <= %s)
+		)`, migration.table, migration.column,
+			migration.column, migration.column, migration.max)
+		var invalid bool
+		if err := tx.QueryRowContext(ctx, query).Scan(&invalid); err != nil {
+			return fmt.Errorf("validating PG money column %s.%s: %w",
+				migration.table, migration.column, err)
+		}
+		if invalid {
+			return fmt.Errorf("PG money column %s.%s contains a negative, non-finite, or out-of-range value",
+				migration.table, migration.column)
+		}
+		if _, err := tx.ExecContext(ctx, migration.ddl); err != nil {
+			return fmt.Errorf("migrating PG money column %s.%s: %w",
+				migration.table, migration.column, err)
+		}
+	}
+	if migrateCursorKeys {
+		if err := rekeyMigratedCursorUsageEventsPG(ctx, tx); err != nil {
+			return err
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("committing PG microdollar migration: %w", err)
+	}
+	return nil
+}
+
+func rekeyMigratedCursorUsageEventsPG(ctx context.Context, tx *sql.Tx) error {
+	type keyUpdate struct {
+		id  int64
+		key string
+	}
+	if _, err := tx.ExecContext(ctx,
+		`DROP INDEX IF EXISTS idx_cursor_usage_events_dedup`); err != nil {
+		return fmt.Errorf("dropping migrated PG cursor usage index: %w", err)
+	}
+	var lastID int64
+	for {
+		rows, err := tx.QueryContext(ctx, `
+			SELECT id, occurred_at, model, kind,
+				input_tokens, output_tokens, cache_write_tokens, cache_read_tokens,
+				charged_microdollars, cursor_token_fee_microdollars,
+				user_id, user_email, is_headless
+			FROM cursor_usage_events
+			WHERE id > $1
+			ORDER BY id
+			LIMIT 1000`, lastID)
+		if err != nil {
+			return fmt.Errorf("querying migrated PG cursor usage keys: %w", err)
+		}
+		updates := make([]keyUpdate, 0, 1000)
+		for rows.Next() {
+			var id int64
+			var occurredAt time.Time
+			var ev db.CursorUsageEvent
+			if err := rows.Scan(
+				&id, &occurredAt, &ev.Model, &ev.Kind,
+				&ev.InputTokens, &ev.OutputTokens,
+				&ev.CacheWriteTokens, &ev.CacheReadTokens,
+				&ev.Charged.Microdollars, &ev.CursorTokenFee.Microdollars,
+				&ev.UserID, &ev.UserEmail, &ev.IsHeadless,
+			); err != nil {
+				rows.Close()
+				return fmt.Errorf("scanning migrated PG cursor usage key: %w", err)
+			}
+			ev.OccurredAt = occurredAt.UTC().Format(time.RFC3339Nano)
+			updates = append(updates, keyUpdate{
+				id: id, key: db.CursorUsageEventDedupKey(ev),
+			})
+		}
+		if err := rows.Err(); err != nil {
+			rows.Close()
+			return fmt.Errorf("iterating migrated PG cursor usage keys: %w", err)
+		}
+		if err := rows.Close(); err != nil {
+			return fmt.Errorf("closing migrated PG cursor usage keys: %w", err)
+		}
+		if len(updates) == 0 {
+			break
+		}
+		for _, update := range updates {
+			if _, err := tx.ExecContext(ctx,
+				`UPDATE cursor_usage_events SET dedup_key = $1 WHERE id = $2`,
+				update.key, update.id,
+			); err != nil {
+				return fmt.Errorf("updating migrated PG cursor usage key: %w", err)
+			}
+		}
+		lastID = updates[len(updates)-1].id
+	}
+	if _, err := tx.ExecContext(ctx, `
+		DELETE FROM cursor_usage_events
+		WHERE id IN (
+			SELECT id FROM (
+				SELECT id, ROW_NUMBER() OVER (
+					PARTITION BY dedup_key ORDER BY id
+				) AS dedup_rank
+				FROM cursor_usage_events
+				WHERE dedup_key != ''
+			) ranked
+			WHERE dedup_rank > 1
+		);
+		CREATE UNIQUE INDEX idx_cursor_usage_events_dedup
+			ON cursor_usage_events (dedup_key)
+			WHERE dedup_key != ''`); err != nil {
+		return fmt.Errorf("deduplicating migrated PG cursor usage keys: %w", err)
+	}
+	return nil
+}
+
 // EnsureSchema creates the schema (if needed), then runs
 // idempotent CREATE TABLE / ALTER TABLE statements. The schema
 // parameter is the unquoted schema name (e.g. "agentsview").
@@ -492,6 +716,11 @@ func EnsureSchema(
 			"sessions", "source_deleted_at",
 			`source_deleted_at TIMESTAMPTZ`,
 			"adding sessions.source_deleted_at",
+		},
+		{
+			"sessions", "deletion_cause",
+			`deletion_cause TEXT`,
+			"adding sessions.deletion_cause",
 		},
 		{
 			"sessions", "total_output_tokens",
@@ -835,7 +1064,10 @@ func EnsureSchema(
 		},
 	}
 	step = time.Now()
-	existingColumns, err := loadExistingColumns(ctx, db, alters)
+	existingColumns, err := loadExistingColumns(
+		ctx, db, alters,
+		"usage_events", "cursor_usage_events", "model_pricing",
+	)
 	if err != nil {
 		return err
 	}
@@ -843,6 +1075,9 @@ func EnsureSchema(
 		"pg schema: loaded existing columns in %s",
 		time.Since(step).Round(time.Millisecond),
 	)
+	if err := migrateMoneyColumnsPG(ctx, db, existingColumns); err != nil {
+		return err
+	}
 	step = time.Now()
 	tokenCoverageColumnsAdded := false
 	sourceCurationColumnsAdded := false
@@ -1380,11 +1615,23 @@ func batchUpdateAutomatedPG(
 	return nil
 }
 
+type columnQueryer interface {
+	QueryContext(context.Context, string, ...any) (*sql.Rows, error)
+}
+
 func loadExistingColumns(
-	ctx context.Context, db *sql.DB, alters []columnMigration,
+	ctx context.Context, db columnQueryer, alters []columnMigration,
+	extraTables ...string,
 ) (map[string]map[string]bool, error) {
 	tablesSeen := map[string]bool{}
 	var tables []string
+	for _, table := range extraTables {
+		if tablesSeen[table] {
+			continue
+		}
+		tablesSeen[table] = true
+		tables = append(tables, table)
+	}
 	for _, a := range alters {
 		if tablesSeen[a.table] {
 			continue
@@ -1869,7 +2116,7 @@ func CheckSchemaCompat(
 	rows.Close()
 
 	rows, err = db.QueryContext(ctx,
-		`SELECT source_display_name, source_deleted_at
+		`SELECT source_display_name, source_deleted_at, deletion_cause
 		 FROM sessions LIMIT 0`)
 	if err != nil {
 		return fmt.Errorf(
@@ -1991,7 +2238,7 @@ func CheckSchemaCompat(
 	rows.Close()
 
 	rows, err = db.QueryContext(ctx,
-		`SELECT id FROM usage_events LIMIT 0`)
+		`SELECT id, cost_microdollars FROM usage_events LIMIT 0`)
 	if err != nil {
 		return fmt.Errorf(
 			"usage_events table missing required columns: %w",
@@ -1999,6 +2246,23 @@ func CheckSchemaCompat(
 		)
 	}
 	rows.Close()
+
+	rows, err = db.QueryContext(ctx,
+		`SELECT input_microdollars_per_mtok,
+			output_microdollars_per_mtok,
+			cache_creation_microdollars_per_mtok,
+			cache_read_microdollars_per_mtok
+		 FROM model_pricing LIMIT 0`)
+	if err != nil {
+		if !isUndefinedTable(err) {
+			return fmt.Errorf(
+				"model_pricing table missing required columns: %w",
+				err,
+			)
+		}
+	} else {
+		rows.Close()
+	}
 
 	rows, err = db.QueryContext(ctx,
 		`SELECT id, type, date_from, date_to, project, agent,
@@ -2017,7 +2281,7 @@ func CheckSchemaCompat(
 			`SELECT id, occurred_at, model, kind,
 				input_tokens, output_tokens,
 				cache_write_tokens, cache_read_tokens,
-				charged_cents, cursor_token_fee,
+				charged_microdollars, cursor_token_fee_microdollars,
 				user_id, user_email, is_headless, dedup_key
 			 FROM cursor_usage_events LIMIT 0`)
 		if err != nil {

@@ -26,6 +26,7 @@ func newQoderSourceSet(roots []string) JSONLSourceSet {
 		WithParseFile(qoderParseFile),
 		WithForceReplace(),
 		WithCompanionFiles(qoderCompanionFiles),
+		WithCompanionTranscript(qoderCompanionTranscript),
 	)
 }
 
@@ -130,6 +131,11 @@ func qoderCompanionFiles(path string) []string {
 	return nil
 }
 
+func qoderCompanionTranscript(companionPath string) (string, bool) {
+	stem, ok := strings.CutSuffix(companionPath, "-session.json")
+	return stem + ".jsonl", ok
+}
+
 func qoderProviderCapabilities() Capabilities {
 	source := jsonlFileProviderSourceCapabilities()
 	source.MultiSessionSource = CapabilitySupported
@@ -147,6 +153,10 @@ func qoderProviderCapabilities() Capabilities {
 			PerMessageTokenUsage: CapabilitySupported,
 			MalformedLineCount:   CapabilitySupported,
 			Model:                CapabilitySupported,
+		},
+		Sync: ProviderSyncSemantics{
+			FingerprintHashInCacheKey:           true,
+			FingerprintHashRequiredForFreshness: true,
 		},
 	}
 }

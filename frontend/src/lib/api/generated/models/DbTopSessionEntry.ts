@@ -2,10 +2,15 @@
 /* istanbul ignore file */
 /* tslint:disable */
 /* eslint-disable */
+import type { MoneyMoney } from './MoneyMoney';
 export type DbTopSessionEntry = {
   agent: string;
-  cost: number;
+  cacheCreationTokens: number;
+  cacheReadTokens: number;
+  cost: MoneyMoney;
   displayName: string;
+  inputTokens: number;
+  outputTokens: number;
   project: string;
   sessionId: string;
   startedAt: string;

@@ -45,6 +45,23 @@ type errNotImplementedBody struct {
 func (e *errNotImplementedBody) Error() string { return errHTTPNotImplemented.Error() }
 func (e *errNotImplementedBody) Unwrap() error { return errHTTPNotImplemented }
 
+type httpStatusError struct {
+	method     string
+	path       string
+	statusCode int
+	body       []byte
+}
+
+func (e *httpStatusError) Error() string {
+	return fmt.Sprintf(
+		"%s %s: HTTP %d: %s", e.method, e.path, e.statusCode, e.body,
+	)
+}
+
+func (e *httpStatusError) message() string {
+	return notImplementedMessage(e.body)
+}
+
 // notImplementedMessage extracts the {"error": "..."} message huma's error
 // responses carry, falling back to the raw (trimmed) body when it isn't in
 // that shape.
@@ -63,7 +80,17 @@ type httpBackend struct {
 	client            *http.Client
 	longRunningClient *http.Client
 	readOnly          bool
+	recallQueries     bool
 	token             string
+}
+
+const recallNonRecordingAPIVersion = 4
+
+// HTTPServerCapabilities is the subset of version metadata needed to expose
+// client features safely for an explicitly selected daemon.
+type HTTPServerCapabilities struct {
+	ReadOnly   bool `json:"read_only"`
+	APIVersion int  `json:"api_version"`
 }
 
 // NewHTTPBackend constructs a SessionService that proxies to a
@@ -73,14 +100,51 @@ type httpBackend struct {
 // on every request so the backend works against daemons running
 // with require_auth=true.
 func NewHTTPBackend(baseURL, token string, readOnly bool) SessionService {
+	return newHTTPBackend(baseURL, token, readOnly, !readOnly)
+}
+
+// NewHTTPBackendForServer constructs a backend whose advertised capabilities
+// are limited by metadata probed from an explicitly selected daemon.
+func NewHTTPBackendForServer(
+	baseURL, token string, capabilities HTTPServerCapabilities,
+) SessionService {
+	return newHTTPBackend(
+		baseURL,
+		token,
+		capabilities.ReadOnly,
+		!capabilities.ReadOnly &&
+			capabilities.APIVersion >= recallNonRecordingAPIVersion,
+	)
+}
+
+func newHTTPBackend(
+	baseURL, token string, readOnly, recallQueries bool,
+) *httpBackend {
 	return &httpBackend{
 		baseURL:           strings.TrimSuffix(baseURL, "/"),
 		client:            &http.Client{Timeout: 30 * time.Second},
 		longRunningClient: &http.Client{Timeout: 0},
 		readOnly:          readOnly,
+		recallQueries:     recallQueries,
 		token:             token,
 	}
 }
+
+// ProbeHTTPServerCapabilities reads the metadata needed to expose tools safely
+// for an explicit daemon URL. Such callers do not have a local runtime record.
+func ProbeHTTPServerCapabilities(
+	ctx context.Context, baseURL, token string,
+) (HTTPServerCapabilities, error) {
+	b := newHTTPBackend(baseURL, token, false, false)
+	var capabilities HTTPServerCapabilities
+	if err := b.getJSON(ctx, "/api/v1/version", &capabilities); err != nil {
+		return HTTPServerCapabilities{},
+			fmt.Errorf("probing server capabilities: %w", err)
+	}
+	return capabilities, nil
+}
+
+func (b *httpBackend) SupportsRecallQueries() bool { return b.recallQueries }
 
 func (b *httpBackend) Get(
 	ctx context.Context, id string,
@@ -145,6 +209,7 @@ func filterToQuery(f ListFilter) url.Values {
 	setIfNotEmpty("date", f.Date)
 	setIfNotEmpty("date_from", f.DateFrom)
 	setIfNotEmpty("date_to", f.DateTo)
+	setIfNotEmpty("timezone", f.Timezone)
 	setIfNotEmpty("active_since", f.ActiveSince)
 	if f.MinMessages > 0 {
 		q.Set("min_messages", strconv.Itoa(f.MinMessages))
@@ -441,6 +506,7 @@ func (b *httpBackend) SearchContent(
 		"date":            req.Date,
 		"date_from":       req.DateFrom,
 		"date_to":         req.DateTo,
+		"timezone":        req.Timezone,
 		"active_since":    req.ActiveSince,
 		"scope":           req.Scope,
 	} {
@@ -508,6 +574,17 @@ func wrapSemanticUnavailable(message string) error {
 	// reasoned semantic-unavailable error: errors.Is holds without injecting
 	// the sentinel's local-only setup guidance into the server's text.
 	return db.NewSemanticUnavailableError(message)
+}
+
+func wrapSemanticTransient(message string) error {
+	sentinel := db.ErrSemanticTransient.Error()
+	if message == "" || message == sentinel {
+		return db.ErrSemanticTransient
+	}
+	if cause, ok := strings.CutPrefix(message, sentinel); ok {
+		return fmt.Errorf("%w%s", db.ErrSemanticTransient, cause)
+	}
+	return fmt.Errorf("%w: %s", db.ErrSemanticTransient, message)
 }
 
 func (b *httpBackend) UsageSummary(
@@ -695,18 +772,46 @@ func (b *httpBackend) QueryRecallEntries(
 	if req.StrictRecording {
 		return nil, fmt.Errorf("strict recall recording requires a direct backend")
 	}
+	mode := db.NormalizeRecallQuery(db.RecallQuery{Mode: req.Mode}).Mode
+	post := b.postJSON
+	if mode == db.RecallQueryModeVector || mode == db.RecallQueryModeHybrid {
+		post = b.postJSONLong
+	}
 	var out RecallQueryResult
-	if err := b.postJSON(ctx, "/api/v1/recall/query", req, &out); err != nil {
+	if err := post(ctx, "/api/v1/recall/query", req, &out); err != nil {
 		if errors.Is(err, errHTTPNotImplemented) {
+			var notImpl *errNotImplementedBody
+			if (mode == db.RecallQueryModeVector ||
+				mode == db.RecallQueryModeHybrid) &&
+				errors.As(err, &notImpl) &&
+				notImpl.message != "not available in remote mode" {
+				return nil, wrapSemanticUnavailable(notImpl.message)
+			}
 			return nil, fmt.Errorf(
 				"recall query: daemon at %s: %w", b.baseURL, db.ErrReadOnly,
 			)
+		}
+		var statusErr *httpStatusError
+		if (mode == db.RecallQueryModeVector ||
+			mode == db.RecallQueryModeHybrid) &&
+			errors.As(err, &statusErr) &&
+			statusErr.statusCode == http.StatusServiceUnavailable {
+			return nil, wrapSemanticTransient(statusErr.message())
 		}
 		return nil, err
 	}
 	if out.RecallEntries == nil {
 		out.RecallEntries = []db.RecallResult{}
 	}
+	requestedMode := mode
+	returnedMode := db.NormalizeRecallQuery(db.RecallQuery{Mode: out.Mode}).Mode
+	if returnedMode != requestedMode {
+		return nil, fmt.Errorf(
+			"recall query: requested recall mode %s but daemon returned %s",
+			requestedMode, returnedMode,
+		)
+	}
+	out.Mode = returnedMode
 	if req.TrustedOnly {
 		out.TrustedOnly = true
 	}
@@ -996,15 +1101,28 @@ func (b *httpBackend) getJSONWithClient(
 	}
 	if resp.StatusCode != http.StatusOK {
 		msg, _ := io.ReadAll(resp.Body)
-		return fmt.Errorf(
-			"GET %s: HTTP %d: %s", path, resp.StatusCode, msg,
-		)
+		return &httpStatusError{
+			method: http.MethodGet, path: path,
+			statusCode: resp.StatusCode, body: msg,
+		}
 	}
 	return json.NewDecoder(resp.Body).Decode(out)
 }
 
 func (b *httpBackend) postJSON(
 	ctx context.Context, path string, in any, out any,
+) error {
+	return b.postJSONWithClient(ctx, b.client, path, in, out)
+}
+
+func (b *httpBackend) postJSONLong(
+	ctx context.Context, path string, in any, out any,
+) error {
+	return b.postJSONWithClient(ctx, b.longRunningClient, path, in, out)
+}
+
+func (b *httpBackend) postJSONWithClient(
+	ctx context.Context, client *http.Client, path string, in any, out any,
 ) error {
 	body, err := json.Marshal(in)
 	if err != nil {
@@ -1019,7 +1137,7 @@ func (b *httpBackend) postJSON(
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Origin", b.baseURL)
 	b.addAuth(req)
-	resp, err := b.client.Do(req)
+	resp, err := client.Do(req)
 	if err != nil {
 		return err
 	}
@@ -1033,9 +1151,10 @@ func (b *httpBackend) postJSON(
 	}
 	if resp.StatusCode != http.StatusOK {
 		msg, _ := io.ReadAll(resp.Body)
-		return fmt.Errorf(
-			"POST %s: HTTP %d: %s", path, resp.StatusCode, msg,
-		)
+		return &httpStatusError{
+			method: http.MethodPost, path: path,
+			statusCode: resp.StatusCode, body: msg,
+		}
 	}
 	return json.NewDecoder(resp.Body).Decode(out)
 }

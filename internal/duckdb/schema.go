@@ -11,10 +11,10 @@ import (
 )
 
 // SchemaVersion is the version of the DuckDB mirror schema created by
-// createSchema. Mirror schema v4 is create-only: there are no in-place
+// createSchema. Mirror schema v6 is create-only: there are no in-place
 // migrations between versions. A version mismatch means the mirror file
 // must be rebuilt with 'agentsview duckdb push --full'.
-const SchemaVersion = 4
+const SchemaVersion = 6
 
 const schemaVersionMetadataKey = "agentsview_schema_version"
 
@@ -164,6 +164,7 @@ var mirrorTables = []tableSpec{
 			parser_malformed_lines INTEGER NOT NULL DEFAULT 0,
 			is_truncated BOOLEAN NOT NULL DEFAULT FALSE,
 			deleted_at TIMESTAMP,
+			deletion_cause TEXT,
 			created_at TIMESTAMP,
 			termination_status TEXT,
 			secret_leak_count INTEGER NOT NULL DEFAULT 0,
@@ -232,6 +233,7 @@ var mirrorTables = []tableSpec{
 			{"parser_malformed_lines", "parser_malformed_lines INTEGER NOT NULL DEFAULT 0"},
 			{"is_truncated", "is_truncated BOOLEAN NOT NULL DEFAULT FALSE"},
 			{"deleted_at", "deleted_at TIMESTAMP"},
+			{"deletion_cause", "deletion_cause TEXT"},
 			{"created_at", "created_at TIMESTAMP"},
 			{"termination_status", "termination_status TEXT"},
 			{"secret_leak_count", "secret_leak_count INTEGER NOT NULL DEFAULT 0"},
@@ -324,7 +326,7 @@ var mirrorTables = []tableSpec{
 			cache_creation_input_tokens INTEGER NOT NULL DEFAULT 0,
 			cache_read_input_tokens INTEGER NOT NULL DEFAULT 0,
 			reasoning_tokens INTEGER NOT NULL DEFAULT 0,
-			cost_usd DOUBLE,
+			cost_microdollars BIGINT,
 			cost_status TEXT NOT NULL DEFAULT '',
 			cost_source TEXT NOT NULL DEFAULT '',
 			occurred_at TIMESTAMP,
@@ -341,7 +343,7 @@ var mirrorTables = []tableSpec{
 			{"cache_creation_input_tokens", "cache_creation_input_tokens INTEGER NOT NULL DEFAULT 0"},
 			{"cache_read_input_tokens", "cache_read_input_tokens INTEGER NOT NULL DEFAULT 0"},
 			{"reasoning_tokens", "reasoning_tokens INTEGER NOT NULL DEFAULT 0"},
-			{"cost_usd", "cost_usd DOUBLE"},
+			{"cost_microdollars", "cost_microdollars BIGINT"},
 			{"cost_status", "cost_status TEXT NOT NULL DEFAULT ''"},
 			{"cost_source", "cost_source TEXT NOT NULL DEFAULT ''"},
 			{"occurred_at", "occurred_at TIMESTAMP"},
@@ -364,8 +366,8 @@ var mirrorTables = []tableSpec{
 			output_tokens INTEGER NOT NULL DEFAULT 0,
 			cache_write_tokens INTEGER NOT NULL DEFAULT 0,
 			cache_read_tokens INTEGER NOT NULL DEFAULT 0,
-			charged_cents DOUBLE NOT NULL DEFAULT 0,
-			cursor_token_fee DOUBLE NOT NULL DEFAULT 0,
+			charged_microdollars BIGINT NOT NULL DEFAULT 0,
+			cursor_token_fee_microdollars BIGINT NOT NULL DEFAULT 0,
 			user_id TEXT NOT NULL DEFAULT '',
 			user_email TEXT NOT NULL DEFAULT '',
 			is_headless BOOLEAN NOT NULL DEFAULT FALSE,
@@ -380,8 +382,8 @@ var mirrorTables = []tableSpec{
 			{"output_tokens", "output_tokens INTEGER NOT NULL DEFAULT 0"},
 			{"cache_write_tokens", "cache_write_tokens INTEGER NOT NULL DEFAULT 0"},
 			{"cache_read_tokens", "cache_read_tokens INTEGER NOT NULL DEFAULT 0"},
-			{"charged_cents", "charged_cents DOUBLE NOT NULL DEFAULT 0"},
-			{"cursor_token_fee", "cursor_token_fee DOUBLE NOT NULL DEFAULT 0"},
+			{"charged_microdollars", "charged_microdollars BIGINT NOT NULL DEFAULT 0"},
+			{"cursor_token_fee_microdollars", "cursor_token_fee_microdollars BIGINT NOT NULL DEFAULT 0"},
 			{"user_id", "user_id TEXT NOT NULL DEFAULT ''"},
 			{"user_email", "user_email TEXT NOT NULL DEFAULT ''"},
 			{"is_headless", "is_headless BOOLEAN NOT NULL DEFAULT FALSE"},
@@ -397,18 +399,18 @@ var mirrorTables = []tableSpec{
 		name: "model_pricing",
 		create: `CREATE TABLE IF NOT EXISTS model_pricing (
 			model_pattern TEXT PRIMARY KEY,
-			input_per_mtok DOUBLE NOT NULL DEFAULT 0,
-			output_per_mtok DOUBLE NOT NULL DEFAULT 0,
-			cache_creation_per_mtok DOUBLE NOT NULL DEFAULT 0,
-			cache_read_per_mtok DOUBLE NOT NULL DEFAULT 0,
+			input_microdollars_per_mtok BIGINT NOT NULL DEFAULT 0,
+			output_microdollars_per_mtok BIGINT NOT NULL DEFAULT 0,
+			cache_creation_microdollars_per_mtok BIGINT NOT NULL DEFAULT 0,
+			cache_read_microdollars_per_mtok BIGINT NOT NULL DEFAULT 0,
 			updated_at TEXT NOT NULL DEFAULT ''
 		)`,
 		columns: []columnSpec{
 			{"model_pattern", "model_pattern TEXT"},
-			{"input_per_mtok", "input_per_mtok DOUBLE NOT NULL DEFAULT 0"},
-			{"output_per_mtok", "output_per_mtok DOUBLE NOT NULL DEFAULT 0"},
-			{"cache_creation_per_mtok", "cache_creation_per_mtok DOUBLE NOT NULL DEFAULT 0"},
-			{"cache_read_per_mtok", "cache_read_per_mtok DOUBLE NOT NULL DEFAULT 0"},
+			{"input_microdollars_per_mtok", "input_microdollars_per_mtok BIGINT NOT NULL DEFAULT 0"},
+			{"output_microdollars_per_mtok", "output_microdollars_per_mtok BIGINT NOT NULL DEFAULT 0"},
+			{"cache_creation_microdollars_per_mtok", "cache_creation_microdollars_per_mtok BIGINT NOT NULL DEFAULT 0"},
+			{"cache_read_microdollars_per_mtok", "cache_read_microdollars_per_mtok BIGINT NOT NULL DEFAULT 0"},
 			{"updated_at", "updated_at TEXT NOT NULL DEFAULT ''"},
 		},
 	},
@@ -870,9 +872,9 @@ func parseMirrorMetadataInt64(key, value string) (int64, error) {
 }
 
 // CheckSchemaCompat verifies that the local DuckDB mirror file has the
-// required v4 tables, columns, and schema version. It does not mutate the
-// database. Mirror schema v4 is create-only, so a mismatch of any kind means
-// the mirror must be rebuilt rather than migrated in place.
+// required tables, columns, and schema version. It does not mutate the
+// database. The mirror schema is create-only, so a mismatch of any kind
+// means the mirror must be rebuilt rather than migrated in place.
 func CheckSchemaCompat(ctx context.Context, db *sql.DB) error {
 	return checkSchemaShapeCompat(ctx, db, localSchema)
 }

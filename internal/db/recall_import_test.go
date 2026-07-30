@@ -11,6 +11,8 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"go.kenn.io/agentsview/internal/db/driver"
 )
 
 func TestImportAcceptedRecallEntriesJSONLImportsReviewedKeepers(t *testing.T) {
@@ -478,7 +480,7 @@ func TestImportAcceptedRecallEntriesJSONLNeverCommitsStaleEvidenceSnapshot(
 	messages[1].SourceUUID = "source-4"
 	insertMessages(t, d, messages...)
 
-	external, err := sql.Open("sqlite3", makeDSN(d.Path(), false))
+	external, err := sql.Open(driver.DriverName, makeDSN(d.Path(), false))
 	require.NoError(t, err)
 	defer external.Close()
 	_, err = external.Exec(`PRAGMA busy_timeout = 5000`)
@@ -531,14 +533,16 @@ func TestImportAcceptedRecallEntriesJSONLNeverCommitsStaleEvidenceSnapshot(
 			require.FailNow(t, "import did not finish after concurrent rewrite")
 		}
 	}
-	got, getErr := d.GetRecallEntry(context.Background(), "m-race")
-	require.NoError(t, getErr)
 	if outcome.err != nil {
+		got, getErr := d.GetRecallEntry(context.Background(), "m-race")
+		require.NoError(t, getErr)
 		assert.Nil(t, got,
 			"a snapshot-conflicted import must leave no partial entry")
 		return
 	}
 	require.Equal(t, 1, outcome.result.Imported)
+	got, getErr := d.GetRecallEntry(context.Background(), "m-race")
+	require.NoError(t, getErr)
 	require.NotNil(t, got)
 	if !got.ProvenanceOK {
 		return

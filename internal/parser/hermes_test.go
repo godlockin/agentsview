@@ -2,6 +2,7 @@ package parser
 
 import (
 	"database/sql"
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
@@ -11,6 +12,8 @@ import (
 	_ "github.com/mattn/go-sqlite3"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"go.kenn.io/agentsview/internal/money"
 )
 
 // newHermesTestProvider builds a concrete hermesProvider for the given roots so
@@ -361,6 +364,57 @@ func TestWriteHermesSessionJSONL_FallsBackWhenStoredStateDBMissesSession(t *test
 	assert.Contains(t, buf.String(), "state db only has one message")
 }
 
+func TestWriteHermesSessionJSONL_FallsBackToStateMemberWhenStoredSourceMissing(
+	t *testing.T,
+) {
+	missingRoot := t.TempDir()
+	fallbackRoot := t.TempDir()
+	fallbackSessions := filepath.Join(fallbackRoot, "sessions")
+	require.NoError(t, os.MkdirAll(fallbackSessions, 0o755))
+	createHermesStateDB(t, fallbackRoot)
+
+	var buf strings.Builder
+	require.NoError(t, WriteHermesSessionJSONL(
+		&buf,
+		VirtualSourcePath(filepath.Join(missingRoot, "state.db"), "child"),
+		[]string{fallbackSessions},
+		"child",
+	))
+
+	out := buf.String()
+	assert.Contains(t, out, `"role":"session_meta"`)
+	assert.Contains(t, out, "state db only has one message")
+	for line := range strings.SplitSeq(strings.TrimSpace(out), "\n") {
+		var record map[string]any
+		require.NoError(t, json.Unmarshal([]byte(line), &record))
+	}
+}
+
+func TestWriteHermesSessionJSONL_PreservesHashInTranscriptPath(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "state.db#profile")
+	sessionsDir := filepath.Join(root, "sessions")
+	require.NoError(t, os.MkdirAll(sessionsDir, 0o755))
+	body := strings.Join([]string{
+		`{"role":"session_meta","model":"gpt-4","timestamp":"2026-04-03T15:27:00Z"}`,
+		`{"role":"user","content":"hash path transcript","timestamp":"2026-04-03T15:28:00Z"}`,
+		"",
+	}, "\n")
+	require.NoError(t, os.WriteFile(
+		filepath.Join(sessionsDir, "child.jsonl"),
+		[]byte(body),
+		0o644,
+	))
+
+	var buf strings.Builder
+	require.NoError(t, WriteHermesSessionJSONL(
+		&buf,
+		VirtualSourcePath(filepath.Join(t.TempDir(), "state.db"), "child"),
+		[]string{sessionsDir},
+		"child",
+	))
+	assert.Equal(t, body, buf.String())
+}
+
 func TestWriteHermesSessionJSONL_FallsBackToTranscriptWhenStateDBMissesSessionInSameRoot(t *testing.T) {
 	root := t.TempDir()
 	sessionsDir := filepath.Join(root, "sessions")
@@ -606,7 +660,7 @@ func TestBuildHermesStateResultPopulatesSessionAggregateTokens(t *testing.T) {
 func TestHermesUsageEvents_UnknownCostStatusLeavesCostUnpriced(t *testing.T) {
 	// estimated_cost_usd is a literal 0 with cost_status "unknown":
 	// Hermes does not actually know the cost, so the event must leave
-	// CostUSD nil and let agentsview price it from the catalog rather
+	// Cost nil and let agentsview price it from the catalog rather
 	// than asserting a false known $0.
 	events := hermesUsageEvents(hermesStateSession{
 		model:         "gpt-5.5",
@@ -616,7 +670,7 @@ func TestHermesUsageEvents_UnknownCostStatusLeavesCostUnpriced(t *testing.T) {
 		costStatus:    "unknown",
 	}, "hermes:unknown-cost")
 	require.Len(t, events, 1)
-	assert.Nil(t, events[0].CostUSD)
+	assert.Nil(t, events[0].Cost)
 }
 
 func TestHermesUsageEvents_IncludedCostStatusIsKnownZero(t *testing.T) {
@@ -631,14 +685,14 @@ func TestHermesUsageEvents_IncludedCostStatusIsKnownZero(t *testing.T) {
 		costSource:   "provider_models_api",
 	}, "hermes:included-cost")
 	require.Len(t, events, 1)
-	require.NotNil(t, events[0].CostUSD)
-	assert.Equal(t, 0.0, *events[0].CostUSD)
+	require.NotNil(t, events[0].Cost)
+	assert.Equal(t, money.Money{}, *events[0].Cost)
 }
 
 func TestHermesUsageEvents_IncludedWithoutCostSourceLeavesCostUnpriced(t *testing.T) {
 	// Hermes marks models it does not price (e.g. gpt-5.5) cost_status
 	// "included" with cost_source "none". That is a default placeholder,
-	// not a confident free-usage signal, so the event must leave CostUSD
+	// not a confident free-usage signal, so the event must leave Cost
 	// nil and let agentsview price it from the catalog instead of
 	// reporting a false $0.
 	for _, src := range []string{"none", ""} {
@@ -651,7 +705,7 @@ func TestHermesUsageEvents_IncludedWithoutCostSourceLeavesCostUnpriced(t *testin
 			costSource:    src,
 		}, "hermes:included-no-source")
 		require.Len(t, events, 1)
-		assert.Nilf(t, events[0].CostUSD,
+		assert.Nilf(t, events[0].Cost,
 			"cost_source %q must not produce a confident $0", src)
 	}
 }
@@ -665,8 +719,20 @@ func TestHermesUsageEvents_ActualCostTakesPrecedence(t *testing.T) {
 		costStatus:    "unknown",
 	}, "hermes:actual-cost")
 	require.Len(t, events, 1)
-	require.NotNil(t, events[0].CostUSD)
-	assert.Equal(t, 1.23, *events[0].CostUSD)
+	require.NotNil(t, events[0].Cost)
+	assert.Equal(t, money.Money{Microdollars: 1_230_000}, *events[0].Cost)
+}
+
+func TestHermesUsageEvents_InvalidCostPreservesTokenUsage(t *testing.T) {
+	events := hermesUsageEvents(hermesStateSession{
+		model:       "gpt-5.5",
+		inputTokens: 123,
+		actualCost:  sql.NullFloat64{Float64: -0.01, Valid: true},
+	}, "hermes:invalid-cost")
+
+	require.Len(t, events, 1)
+	assert.Equal(t, 123, events[0].InputTokens)
+	assert.Nil(t, events[0].Cost)
 }
 
 func TestHermesUsageEvents_PositiveEstimateUsedWhenStatusEmpty(t *testing.T) {
@@ -677,8 +743,8 @@ func TestHermesUsageEvents_PositiveEstimateUsedWhenStatusEmpty(t *testing.T) {
 		costStatus:    "",
 	}, "hermes:estimate-cost")
 	require.Len(t, events, 1)
-	require.NotNil(t, events[0].CostUSD)
-	assert.Equal(t, 0.5, *events[0].CostUSD)
+	require.NotNil(t, events[0].Cost)
+	assert.Equal(t, money.Money{Microdollars: 500_000}, *events[0].Cost)
 }
 
 func TestBuildHermesStateResultLeavesAggregatesUnsetWhenNoTokens(t *testing.T) {

@@ -1,7 +1,14 @@
 <script lang="ts">
   import { usage, type GroupBy } from "../../stores/usage.svelte.js";
-  import { seriesColorMap } from "../../utils/projectColor.js";
   import { m } from "../../i18n/index.js";
+  import { formatMoney, moneyFromMicrodollars } from "../../money.js";
+  import { sumSelectedTokens } from "../../stores/usageTokenTypes.js";
+
+  interface Props {
+    colorMap: ReadonlyMap<string, string>;
+  }
+
+  let { colorMap }: Props = $props();
 
   const CHART_H = 180;
   const X_LABEL_H = 20;
@@ -12,8 +19,6 @@
   // ascenders do not clip against the SVG viewBox edge.
   const TOP_PAD = 10;
   const MAX_SERIES = 5;
-
-  const OTHER_COLOR = "var(--text-muted)";
 
   let containerEl: HTMLDivElement | undefined = $state();
   let containerWidth = $state(600);
@@ -36,6 +41,16 @@
   }
 
   const groupBy = $derived(usage.toggles.timeSeries.groupBy);
+  const isTokenMode = $derived(usage.mode === "token");
+
+  function breakdownTokens(b: {
+    inputTokens: number;
+    outputTokens: number;
+    cacheCreationTokens: number;
+    cacheReadTokens: number;
+  }): number {
+    return sumSelectedTokens(b, usage.selectedTokenTypes);
+  }
 
   const seriesData = $derived.by((): {
     points: Point[];
@@ -48,27 +63,42 @@
       return { points: [], keys: [], maxY: 0, labels: {} };
     }
 
-    // Sum cost per key across the whole range to find top N.
+    // Sum the selected value per key across the whole range to find top N.
     const totals = new Map<string, number>();
 	const labels: Record<string, string> = {};
     for (const day of daily) {
       if (groupBy === "project" && day.projectBreakdowns) {
         for (const b of day.projectBreakdowns) {
-		  labels[b.project_key] = b.project;
-          totals.set(b.project_key,
-            (totals.get(b.project_key) ?? 0) + b.cost);
+          labels[b.project_key] = b.project;
+          const value = isTokenMode
+            ? breakdownTokens(b)
+            : b.cost.microdollars;
+          totals.set(
+            b.project_key,
+            (totals.get(b.project_key) ?? 0) + value,
+          );
         }
       } else if (groupBy === "model" && day.modelBreakdowns) {
         for (const b of day.modelBreakdowns) {
-          totals.set(b.modelName,
-            (totals.get(b.modelName) ?? 0) + b.cost);
-		  labels[b.modelName] = b.modelName;
+          const value = isTokenMode
+            ? breakdownTokens(b)
+            : b.cost.microdollars;
+          totals.set(
+            b.modelName,
+            (totals.get(b.modelName) ?? 0) + value,
+          );
+          labels[b.modelName] = b.modelName;
         }
       } else if (groupBy === "agent" && day.agentBreakdowns) {
         for (const b of day.agentBreakdowns) {
-          totals.set(b.agent,
-            (totals.get(b.agent) ?? 0) + b.cost);
-		  labels[b.agent] = b.agent;
+          const value = isTokenMode
+            ? breakdownTokens(b)
+            : b.cost.microdollars;
+          totals.set(
+            b.agent,
+            (totals.get(b.agent) ?? 0) + value,
+          );
+          labels[b.agent] = b.agent;
         }
       }
     }
@@ -77,7 +107,11 @@
     if (totals.size === 0) {
       const points = daily.map((d) => ({
         date: d.date,
-        values: { total: d.totalCost },
+        values: {
+          total: isTokenMode
+            ? breakdownTokens(d)
+            : d.totalCost.microdollars,
+        },
       }));
       let maxY = 0;
       for (const pt of points) {
@@ -86,7 +120,7 @@
       return { points, keys: ["total"], maxY: maxY || 1, labels };
     }
 
-    // Pick top N by total cost, group the rest as "Other".
+    // Pick top N by total value, group the rest as "Other".
     const ranked = [...totals.entries()]
       .sort((a, b) => b[1] - a[1]);
     const topKeys = new Set(
@@ -97,34 +131,37 @@
     const points: Point[] = [];
     for (const day of daily) {
       const values: Record<string, number> = {};
-      let items: Array<{ key: string; cost: number }> = [];
+      let items: Array<{ key: string; value: number }> = [];
 
       if (groupBy === "project" && day.projectBreakdowns) {
         items = day.projectBreakdowns.map((b) => ({
-		  key: b.project_key, cost: b.cost,
+          key: b.project_key,
+          value: isTokenMode ? breakdownTokens(b) : b.cost.microdollars,
         }));
       } else if (groupBy === "model" && day.modelBreakdowns) {
         items = day.modelBreakdowns.map((b) => ({
-          key: b.modelName, cost: b.cost,
+          key: b.modelName,
+          value: isTokenMode ? breakdownTokens(b) : b.cost.microdollars,
         }));
       } else if (groupBy === "agent" && day.agentBreakdowns) {
         items = day.agentBreakdowns.map((b) => ({
-          key: b.agent, cost: b.cost,
+          key: b.agent,
+          value: isTokenMode ? breakdownTokens(b) : b.cost.microdollars,
         }));
       }
 
-      for (const { key, cost } of items) {
+      for (const { key, value } of items) {
         if (topKeys.has(key)) {
-          values[key] = (values[key] ?? 0) + cost;
+          values[key] = (values[key] ?? 0) + value;
         } else {
           values["__other__"] =
-            (values["__other__"] ?? 0) + cost;
+            (values["__other__"] ?? 0) + value;
         }
       }
       points.push({ date: day.date, values });
     }
 
-    // Build ordered key list: top N by cost desc, then
+    // Build ordered key list: top N by value desc, then
     // __other__ (displayed as "Other" in legend/labels).
     const keys = ranked
       .slice(0, MAX_SERIES)
@@ -142,12 +179,6 @@
 
     return { points, keys, maxY: maxY || 1, labels };
   });
-
-  const colorMap = $derived(
-    seriesColorMap(
-      seriesData.keys.filter((key) => key !== "__other__").sort(),
-    ),
-  );
 
   const chartWidth = $derived(
     Math.max(containerWidth - Y_LABEL_W - X_LABEL_RIGHT_PAD, 100),
@@ -318,10 +349,15 @@
     return labels;
   });
 
-  function fmtYLabel(v: number): string {
-    if (v >= 100) return `$${v.toFixed(0)}`;
-    if (v >= 1) return `$${v.toFixed(1)}`;
-    return `$${v.toFixed(2)}`;
+  function fmtCostYLabel(v: number): string {
+    return formatMoney(moneyFromMicrodollars(v));
+  }
+
+  function fmtTokenYLabel(v: number): string {
+    if (v >= 1_000_000_000) return `${(v / 1_000_000_000).toFixed(1)}B`;
+    if (v >= 1_000_000) return `${(v / 1_000_000).toFixed(1)}M`;
+    if (v >= 1_000) return `${(v / 1_000).toFixed(1)}K`;
+    return String(Math.round(v));
   }
 
   const yTicks = $derived.by(() => {
@@ -336,7 +372,9 @@
       const val = step * i;
       ticks.push({
         y: scaleY(val, max, CHART_H),
-        label: fmtYLabel(val),
+        label: isTokenMode
+          ? fmtTokenYLabel(val)
+          : fmtCostYLabel(val),
       });
     }
     return ticks;
@@ -349,7 +387,11 @@
 
 <div class="chart-container">
   <div class="chart-header">
-    <h3 class="chart-title">{m.usage_cost_over_time_title()}</h3>
+    <h3 class="chart-title">
+      {isTokenMode
+        ? m.usage_tokens_over_time_title()
+        : m.usage_cost_over_time_title()}
+    </h3>
     <div class="segment-toggle">
       <button
         class="toggle-btn"

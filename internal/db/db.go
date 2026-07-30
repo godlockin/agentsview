@@ -181,7 +181,7 @@ const projectIdentityRemoteScrubCompletedKey = "project_identity_remote_scrub_v1
 // (30: Hermes parser no longer treats cost_status
 // "included" as a confident $0 when cost_source is "none"/empty (its
 // default for models it does not price, e.g. gpt-5.5). Such rows now
-// leave cost_usd nil so they are catalog-priced. Existing Hermes rows
+// leave cost_microdollars nil so they are catalog-priced. Existing Hermes rows
 // need re-parsing so their usage cost reflects the catalog instead of a
 // baked-in $0.)
 //
@@ -310,9 +310,35 @@ const projectIdentityRemoteScrubCompletedKey = "project_identity_remote_scrub_v1
 // (68: Hermes skill_view metadata. Re-parsing populates tool_calls.skill_name
 // for existing Hermes sessions so historical skill usage appears in analytics.)
 // (69: Copilot shutdown events persist the authoritative AI-credit total as
-// reported cost. Re-parsing populates cost_usd and cost_source on existing
-// Copilot rows from session.shutdown totalNanoAiu values.)
-const dataVersion = 69
+// reported cost. Re-parsing populates cost_microdollars and cost_source on
+// existing Copilot rows from session.shutdown totalNanoAiu values.)
+// (70: Grok per-turn usage reparse. turn_completed usage payloads are
+// per-turn measurements, not cumulative snapshots — one event per turn
+// and model replaces the single last-payload event per session, with
+// occurred_at from each turn's timestamp. Existing Grok rows undercount
+// multi-turn sessions and need re-parsing.)
+// (71: OpenCode SQLite cwd/project derivation now prefers a concrete
+// session.directory over the synthetic global project worktree "/". Existing
+// OpenCode rows need re-parsing so unchanged sessions refresh cwd and project.)
+// (72: OpenCode invalid tool calls emit an errored result event. OpenCode
+// records unknown-tool calls as a synthetic "invalid" tool that completes
+// successfully, so existing rows carry no failure signal. Re-parsing attaches
+// the errored event so tool-health failure counts cover historical sessions.)
+// (73: OpenCode bash tool calls emit an errored result event when the tool
+// state records a non-zero metadata.exit. Windows shells produce no "exit
+// status N" output text, so existing rows carry no failure signal. Re-parsing
+// attaches the errored event so tool-health failure counts cover historical
+// OpenCode sessions on every platform.)
+// (74: Claude Code IDE context reparse. Standalone ide_opened_file and
+// ide_selection wrappers are promoted to system metadata so existing
+// VS Code sessions no longer use them as titles or user turns.)
+// (75: Git worktree project attribution reparse. Hosting-oriented worktree
+// paths retain the owning repository after checkout removal, live linked
+// worktrees backed by bare common repositories resolve to the repository
+// instead of the generated checkout leaf, and generic hosting fragments defer
+// to an enclosing live repository. Existing rows need re-parsing so activity
+// is neither fragmented by worktree names nor claimed by nested fixture paths.)
+const dataVersion = 75
 
 const tokenCoverageRepairStatsKey = "token_coverage_repair_v1"
 
@@ -332,18 +358,14 @@ const (
 // the WAL because another connection still had pages pinned.
 var ErrWALCheckpointBusy = errors.New("wal checkpoint busy")
 
-// readerMaxOpenConns is the maximum number of concurrent
-// read-only SQLite connections agentsview allows per
-// database handle. The previous value (4) was the queue
-// ceiling observed during a 50-burst CPU profile: every
-// request above the 4th got serialised behind connMu and
-// spent its time in pthread_cond_wait. SQLite in WAL mode
-// supports an unlimited number of readers, limited only by
-// the kernel file descriptor limit. 16 leaves comfortable
-// headroom for the typical UI burst (sidebar + dashboard
-// queries arriving at once) without bumping into fd limits
-// on a default macOS /proc/sys/fs/file-max of ~25600.
+// readerMaxOpenConns is the maximum number of concurrent read-only SQLite
+// connections agentsview allows per database handle.
 const readerMaxOpenConns = 16
+
+// ErrWriterClosed reports that a write was attempted while the writer pool was
+// intentionally closed for a maintenance pass (a sync-worker handoff). Readers
+// keep serving; the writer returns once ReopenWriter runs.
+var ErrWriterClosed = errors.New("writer closed for maintenance pass")
 
 // DataVersionTooNewError reports that an archive was written by a newer
 // agentsview parser than the current binary understands.
@@ -504,14 +526,24 @@ END;
 // concurrent HTTP handler goroutines can safely read while
 // Reopen/CloseConnections swap the underlying *sql.DB.
 type DB struct {
-	path      string
-	writer    atomic.Pointer[sql.DB]
-	reader    atomic.Pointer[sql.DB]
-	mu        sync.Mutex // serializes writes
-	connMu    sync.RWMutex
-	retired   []*sql.DB // old pools kept open for in-flight reads
-	readOnly  bool
-	dataStale atomic.Bool // set by Open when user_version < dataVersion
+	path    string
+	writer  atomic.Pointer[sql.DB]
+	reader  atomic.Pointer[sql.DB]
+	mu      sync.Mutex // serializes writes
+	connMu  sync.RWMutex
+	retired []*sql.DB // old pools kept open for in-flight reads
+	// undrainedPools holds closed pools whose connections had not drained
+	// when CloseWriter or CloseConnections gave up. They must drain before
+	// a later close reports success, or write ownership could be released
+	// (or the database file replaced) while a connection still holds the
+	// file. Guarded by connMu.
+	undrainedPools []*sql.DB
+	readOnly       bool
+	// writerClosed is set while the writer pool is intentionally closed for a
+	// worker maintenance pass (CloseWriter). It lets write attempts report
+	// ErrWriterClosed instead of the generic read-only error.
+	writerClosed atomic.Bool
+	dataStale    atomic.Bool // set by Open when user_version < dataVersion
 
 	cursorMu     sync.RWMutex
 	cursorSecret []byte
@@ -525,6 +557,7 @@ type DB struct {
 
 	vectorMu       sync.RWMutex
 	vectorSearcher VectorSearcher
+	recallSearcher RecallVectorSearcher
 }
 
 // Reader exposes guarded read-only query operations. It intentionally does
@@ -614,6 +647,9 @@ func (w *writerHandle) current() (*sql.DB, error) {
 	}
 	db := w.owner.writer.Load()
 	if db == nil {
+		if w.owner.writerClosed.Load() {
+			return nil, ErrWriterClosed
+		}
 		return nil, ErrReadOnly
 	}
 	return db, nil
@@ -1335,6 +1371,19 @@ var readOnlyRequiredTables = []string{
 	"recall_query_exposures",
 	"recall_extract_generations",
 	"recall_extract_progress",
+	"artifact_export_queue",
+	"artifact_publications",
+	"artifact_publication_revisions",
+	"artifact_checkpoint_heads",
+	"artifact_checkpoint_floors",
+	"artifact_import_queue",
+	"artifact_import_attempt_generations",
+	"artifact_peer_checkpoint_heads",
+	"artifact_checkpoint_landings",
+	"artifact_checkpoint_landing_sessions",
+	"artifact_checkpoint_stages",
+	"artifact_checkpoint_stage_sessions",
+	"artifact_imported_sessions",
 }
 
 var (
@@ -1625,6 +1674,42 @@ func legacySchemaColumnMigrations() []schemaColumnMigration {
 func schemaColumnMigrations() []schemaColumnMigration {
 	return []schemaColumnMigration{
 		{
+			"artifact_import_queue", "quarantine_pending",
+			"ALTER TABLE artifact_import_queue ADD COLUMN quarantine_pending INTEGER NOT NULL DEFAULT 0",
+		},
+		{
+			"artifact_checkpoint_stages", "pending_count",
+			"ALTER TABLE artifact_checkpoint_stages ADD COLUMN pending_count INTEGER NOT NULL DEFAULT 0",
+		},
+		{
+			"artifact_checkpoint_stages", "decoded_count",
+			"ALTER TABLE artifact_checkpoint_stages ADD COLUMN decoded_count INTEGER NOT NULL DEFAULT 0",
+		},
+		{
+			"artifact_checkpoint_stages", "decode_offset",
+			"ALTER TABLE artifact_checkpoint_stages ADD COLUMN decode_offset INTEGER NOT NULL DEFAULT 0",
+		},
+		{
+			"artifact_checkpoint_stages", "decoder_version",
+			"ALTER TABLE artifact_checkpoint_stages ADD COLUMN decoder_version INTEGER NOT NULL DEFAULT 1",
+		},
+		{
+			"artifact_checkpoint_stage_sessions", "satisfied",
+			"ALTER TABLE artifact_checkpoint_stage_sessions ADD COLUMN satisfied INTEGER NOT NULL DEFAULT 0",
+		},
+		{
+			"artifact_export_queue", "rejected_generation",
+			"ALTER TABLE artifact_export_queue ADD COLUMN rejected_generation INTEGER",
+		},
+		{
+			"artifact_export_queue", "last_error",
+			"ALTER TABLE artifact_export_queue ADD COLUMN last_error TEXT NOT NULL DEFAULT ''",
+		},
+		{
+			"artifact_export_queue", "rejected_at",
+			"ALTER TABLE artifact_export_queue ADD COLUMN rejected_at TEXT",
+		},
+		{
 			"sessions", "display_name",
 			"ALTER TABLE sessions ADD COLUMN display_name TEXT",
 		},
@@ -1635,6 +1720,10 @@ func schemaColumnMigrations() []schemaColumnMigration {
 		{
 			"sessions", "deleted_at",
 			"ALTER TABLE sessions ADD COLUMN deleted_at TEXT",
+		},
+		{
+			"sessions", "deletion_cause",
+			"ALTER TABLE sessions ADD COLUMN deletion_cause TEXT",
 		},
 		{
 			"messages", "is_system",
@@ -1887,6 +1976,14 @@ func schemaColumnMigrations() []schemaColumnMigration {
 			"ALTER TABLE sessions ADD COLUMN last_entry_uuid TEXT",
 		},
 		{
+			// Whether the Claude full parser fell back to linear
+			// processing for this file (NULL = unknown/legacy or
+			// non-Claude). Read by the incremental parser to skip
+			// fork detection on linear-bound transcripts.
+			"sessions", "claude_linear_parse",
+			"ALTER TABLE sessions ADD COLUMN claude_linear_parse INTEGER",
+		},
+		{
 			"messages", "thinking_text",
 			"ALTER TABLE messages ADD COLUMN thinking_text TEXT NOT NULL DEFAULT ''",
 		},
@@ -2090,6 +2187,151 @@ func repairLegacySchemaBeforeInit(w *writerHandle) error {
 	return nil
 }
 
+// artifactSessionQueueTriggerDropsSQL and artifactSessionQueueTriggerCreatesSQL
+// together keep the three sessions-table triggers that populate
+// artifact_export_queue upgradable across releases. They are applied here
+// rather than in schema.sql because the CREATE bodies reference columns added
+// by applySchemaColumnMigrations; running them at schema-init time would fire
+// "no such column" errors against a legacy archive before those columns
+// exist.
+//
+// The drops run BEFORE applySchemaColumnMigrations and the creates run AFTER:
+// a trigger left over from a previous release must not still be attached to
+// the sessions table while column migrations run, because a future
+// migration that rebuilds the table (rather than a plain ALTER TABLE ADD
+// COLUMN) would fail against a trigger body referencing columns mid-rebuild.
+// Splitting the DDL this way keeps the table trigger-free for the duration
+// of the migration step regardless of what a later migration needs to do.
+//
+// Every trigger additionally gates on the presence of an artifact origin
+// (pg_sync_state key artifact_origin_id) so that archives which have never
+// created or adopted an artifact origin never populate the export queue.
+const artifactSessionQueueTriggerDropsSQL = `
+DROP TRIGGER IF EXISTS artifact_sessions_insert_queue;
+DROP TRIGGER IF EXISTS artifact_sessions_update_queue;
+DROP TRIGGER IF EXISTS artifact_sessions_delete_queue;
+`
+
+const artifactSessionQueueTriggerCreatesSQL = `
+CREATE TRIGGER IF NOT EXISTS artifact_sessions_insert_queue
+AFTER INSERT ON sessions WHEN (
+    NEW.machine = 'local' OR EXISTS (
+        SELECT 1 FROM pg_sync_state
+        WHERE key = 'artifact_local_machine_name' AND value = NEW.machine
+    )
+) AND EXISTS (
+    SELECT 1 FROM pg_sync_state WHERE key = 'artifact_origin_id'
+) BEGIN
+    INSERT INTO artifact_export_queue(session_id) VALUES (NEW.id)
+    ON CONFLICT(session_id) DO UPDATE SET
+        enqueued_at = CASE WHEN pending = 0
+            THEN strftime('%Y-%m-%dT%H:%M:%fZ','now') ELSE enqueued_at END,
+        generation = generation + 1,
+        pending = 1,
+        rejected_generation = NULL,
+        last_error = '',
+        rejected_at = NULL;
+END;
+
+CREATE TRIGGER IF NOT EXISTS artifact_sessions_update_queue
+AFTER UPDATE ON sessions
+WHEN (
+    OLD.machine = 'local' OR NEW.machine = 'local' OR EXISTS (
+        SELECT 1 FROM pg_sync_state
+        WHERE key = 'artifact_local_machine_name'
+          AND (value = OLD.machine OR value = NEW.machine)
+    )
+) AND EXISTS (
+    SELECT 1 FROM pg_sync_state WHERE key = 'artifact_origin_id'
+) AND (
+    OLD.project IS NOT NEW.project OR
+    OLD.machine IS NOT NEW.machine OR
+    OLD.agent IS NOT NEW.agent OR
+    OLD.agent_label IS NOT NEW.agent_label OR
+    OLD.entrypoint IS NOT NEW.entrypoint OR
+    OLD.first_message IS NOT NEW.first_message OR
+    OLD.display_name IS NOT NEW.display_name OR
+    OLD.session_name IS NOT NEW.session_name OR
+    OLD.started_at IS NOT NEW.started_at OR
+    OLD.ended_at IS NOT NEW.ended_at OR
+    OLD.message_count IS NOT NEW.message_count OR
+    OLD.user_message_count IS NOT NEW.user_message_count OR
+    OLD.transcript_revision IS NOT NEW.transcript_revision OR
+    OLD.parent_session_id IS NOT NEW.parent_session_id OR
+    OLD.relationship_type IS NOT NEW.relationship_type OR
+    OLD.total_output_tokens IS NOT NEW.total_output_tokens OR
+    OLD.peak_context_tokens IS NOT NEW.peak_context_tokens OR
+    OLD.has_total_output_tokens IS NOT NEW.has_total_output_tokens OR
+    OLD.has_peak_context_tokens IS NOT NEW.has_peak_context_tokens OR
+    OLD.is_automated IS NOT NEW.is_automated OR
+    OLD.tool_failure_signal_count IS NOT NEW.tool_failure_signal_count OR
+    OLD.tool_retry_count IS NOT NEW.tool_retry_count OR
+    OLD.edit_churn_count IS NOT NEW.edit_churn_count OR
+    OLD.consecutive_failure_max IS NOT NEW.consecutive_failure_max OR
+    OLD.outcome IS NOT NEW.outcome OR
+    OLD.outcome_confidence IS NOT NEW.outcome_confidence OR
+    OLD.ended_with_role IS NOT NEW.ended_with_role OR
+    OLD.final_failure_streak IS NOT NEW.final_failure_streak OR
+    OLD.signals_pending_since IS NOT NEW.signals_pending_since OR
+    OLD.compaction_count IS NOT NEW.compaction_count OR
+    OLD.mid_task_compaction_count IS NOT NEW.mid_task_compaction_count OR
+    OLD.context_pressure_max IS NOT NEW.context_pressure_max OR
+    OLD.health_score IS NOT NEW.health_score OR
+    OLD.health_grade IS NOT NEW.health_grade OR
+    OLD.has_tool_calls IS NOT NEW.has_tool_calls OR
+    OLD.has_context_data IS NOT NEW.has_context_data OR
+    OLD.quality_signal_version IS NOT NEW.quality_signal_version OR
+    OLD.short_prompt_count IS NOT NEW.short_prompt_count OR
+    OLD.unstructured_start IS NOT NEW.unstructured_start OR
+    OLD.missing_success_criteria_count IS NOT NEW.missing_success_criteria_count OR
+    OLD.missing_verification_count IS NOT NEW.missing_verification_count OR
+    OLD.duplicate_prompt_count IS NOT NEW.duplicate_prompt_count OR
+    OLD.no_code_context_count IS NOT NEW.no_code_context_count OR
+    OLD.runaway_tool_loop_count IS NOT NEW.runaway_tool_loop_count OR
+    OLD.data_version IS NOT NEW.data_version OR
+    OLD.cwd IS NOT NEW.cwd OR
+    OLD.git_branch IS NOT NEW.git_branch OR
+    OLD.source_session_id IS NOT NEW.source_session_id OR
+    OLD.source_version IS NOT NEW.source_version OR
+    OLD.transcript_fidelity IS NOT NEW.transcript_fidelity OR
+    OLD.parser_malformed_lines IS NOT NEW.parser_malformed_lines OR
+    OLD.is_truncated IS NOT NEW.is_truncated OR
+    OLD.deleted_at IS NOT NEW.deleted_at OR
+    OLD.created_at IS NOT NEW.created_at OR
+    OLD.termination_status IS NOT NEW.termination_status
+) BEGIN
+    INSERT INTO artifact_export_queue(session_id) VALUES (NEW.id)
+    ON CONFLICT(session_id) DO UPDATE SET
+        enqueued_at = CASE WHEN pending = 0
+            THEN strftime('%Y-%m-%dT%H:%M:%fZ','now') ELSE enqueued_at END,
+        generation = generation + 1,
+        pending = 1,
+        rejected_generation = NULL,
+        last_error = '',
+        rejected_at = NULL;
+END;
+
+CREATE TRIGGER IF NOT EXISTS artifact_sessions_delete_queue
+BEFORE DELETE ON sessions WHEN (
+    OLD.machine = 'local' OR EXISTS (
+        SELECT 1 FROM pg_sync_state
+        WHERE key = 'artifact_local_machine_name' AND value = OLD.machine
+    )
+) AND EXISTS (
+    SELECT 1 FROM pg_sync_state WHERE key = 'artifact_origin_id'
+) BEGIN
+    INSERT INTO artifact_export_queue(session_id) VALUES (OLD.id)
+    ON CONFLICT(session_id) DO UPDATE SET
+        enqueued_at = CASE WHEN pending = 0
+            THEN strftime('%Y-%m-%dT%H:%M:%fZ','now') ELSE enqueued_at END,
+        generation = generation + 1,
+        pending = 1,
+        rejected_generation = NULL,
+        last_error = '',
+        rejected_at = NULL;
+END;
+`
+
 // migrateColumns adds columns introduced by this branch to databases created
 // by older releases, then runs the data repairs required by a normal writable
 // startup. Schema-only callers use applySchemaColumnMigrations directly.
@@ -2097,8 +2339,17 @@ func (db *DB) migrateColumns() error {
 	db.mu.Lock()
 	defer db.mu.Unlock()
 	w := db.getWriter()
+	if err := migrateMoneyColumnsLocked(w); err != nil {
+		return err
+	}
+	if _, err := w.Exec(artifactSessionQueueTriggerDropsSQL); err != nil {
+		return fmt.Errorf("dropping artifact session queue triggers: %w", err)
+	}
 	if err := applySchemaColumnMigrations(w.QueryRow, w.Exec); err != nil {
 		return err
+	}
+	if _, err := w.Exec(artifactSessionQueueTriggerCreatesSQL); err != nil {
+		return fmt.Errorf("installing artifact session queue triggers: %w", err)
 	}
 	if err := installSyncMarkerSchemaLocked(w); err != nil {
 		return err
@@ -2261,6 +2512,9 @@ func (db *DB) migrateColumns() error {
 	if err := db.ensureCursorUsageEventsSchemaLocked(w); err != nil {
 		return err
 	}
+	if err := requeueInvalidArtifactPublicationsLocked(w); err != nil {
+		return err
+	}
 
 	runRepair, err := db.shouldRunTokenCoverageRepairLocked(w)
 	if err != nil {
@@ -2274,6 +2528,178 @@ func (db *DB) migrateColumns() error {
 	}
 	if err := db.markTokenCoverageRepairDoneLocked(w); err != nil {
 		return err
+	}
+	return nil
+}
+
+const (
+	bootstrapArtifactExportQueueSQL = `
+		INSERT OR IGNORE INTO artifact_export_queue(session_id)
+		SELECT id FROM sessions
+		WHERE (
+			machine = 'local' OR machine = (
+				SELECT value FROM pg_sync_state
+				WHERE key = 'artifact_local_machine_name'
+			)
+		) AND deleted_at IS NULL`
+	requeueArtifactExportsSQL = `
+		INSERT INTO artifact_export_queue(session_id)
+		SELECT id FROM sessions
+		WHERE (
+			machine = 'local' OR machine = (
+				SELECT value FROM pg_sync_state
+				WHERE key = 'artifact_local_machine_name'
+			)
+		) AND deleted_at IS NULL
+		ON CONFLICT(session_id) DO UPDATE SET
+			enqueued_at = CASE WHEN pending = 0
+				THEN strftime('%Y-%m-%dT%H:%M:%fZ','now') ELSE enqueued_at END,
+			generation = generation + 1,
+			pending = 1,
+			rejected_generation = NULL,
+			last_error = '',
+			rejected_at = NULL`
+	requeueArtifactOriginExportsSQL = `
+		INSERT INTO artifact_export_queue(session_id)
+		SELECT id FROM sessions
+		WHERE (
+			machine = 'local' OR machine = (
+				SELECT value FROM pg_sync_state
+				WHERE key = 'artifact_local_machine_name'
+			)
+		) AND deleted_at IS NULL
+		UNION
+		SELECT session_id FROM artifact_publications
+		WHERE origin = ?
+		ON CONFLICT(session_id) DO UPDATE SET
+			enqueued_at = CASE WHEN pending = 0
+				THEN strftime('%Y-%m-%dT%H:%M:%fZ','now') ELSE enqueued_at END,
+			generation = generation + 1,
+			pending = 1,
+			rejected_generation = NULL,
+			last_error = '',
+			rejected_at = NULL`
+)
+
+func requeueInvalidArtifactPublicationsLocked(w *writerHandle) error {
+	_, err := w.Exec(`
+		INSERT INTO artifact_export_queue(session_id)
+		SELECT session_id
+		FROM artifact_publications
+		WHERE origin = (
+			SELECT value FROM pg_sync_state WHERE key = 'artifact_origin_id'
+		) AND (session_id = '' OR instr(session_id, '~') > 0)
+		ON CONFLICT(session_id) DO UPDATE SET
+			enqueued_at = strftime('%Y-%m-%dT%H:%M:%fZ','now'),
+			generation = artifact_export_queue.generation + 1,
+			pending = 1,
+			rejected_generation = NULL,
+			last_error = '',
+			rejected_at = NULL
+		WHERE artifact_export_queue.pending = 0`)
+	if err != nil {
+		return fmt.Errorf("requeueing invalid artifact publications: %w", err)
+	}
+	return nil
+}
+
+var populateArtifactOriginQueueTx = func(tx *sql.Tx, origin string, requeue bool) error {
+	statement := bootstrapArtifactExportQueueSQL
+	action := "bootstrapping"
+	args := []any(nil)
+	if requeue {
+		statement = requeueArtifactOriginExportsSQL
+		action = "requeueing"
+		args = append(args, origin)
+	}
+	if _, err := tx.Exec(statement, args...); err != nil {
+		return fmt.Errorf("%s artifact export queue: %w", action, err)
+	}
+	return nil
+}
+
+// EnsureArtifactOrigin atomically persists candidate when no origin exists and
+// bootstraps every pre-existing local session into the export queue. A
+// concurrent initializer's committed origin wins and is returned unchanged.
+func (db *DB) EnsureArtifactOrigin(candidate string) (string, error) {
+	return db.setArtifactOrigin(candidate, false)
+}
+
+// AdoptArtifactOrigin atomically persists an authoritative configured origin
+// and populates its export queue. Replacing an established origin re-dirties
+// every live local session so clean rows from the previous origin are
+// published again.
+func (db *DB) AdoptArtifactOrigin(origin string) error {
+	_, err := db.setArtifactOrigin(origin, true)
+	return err
+}
+
+func (db *DB) setArtifactOrigin(origin string, adopt bool) (string, error) {
+	resolved := origin
+	err := db.Update(func(tx *sql.Tx) error {
+		if err := lockArtifactPublicationTx(context.Background(), tx); err != nil {
+			return err
+		}
+		var existing string
+		err := tx.QueryRow(
+			`SELECT value FROM pg_sync_state WHERE key = 'artifact_origin_id'`,
+		).Scan(&existing)
+		if err != nil && !errors.Is(err, sql.ErrNoRows) {
+			return fmt.Errorf("reading artifact origin: %w", err)
+		}
+		if err == nil && existing != "" {
+			if !adopt || existing == origin {
+				resolved = existing
+				return nil
+			}
+		}
+		if _, err := tx.Exec(
+			`INSERT INTO pg_sync_state (key, value)
+			 VALUES ('artifact_origin_id', ?)
+			 ON CONFLICT(key) DO UPDATE SET value = excluded.value`,
+			origin,
+		); err != nil {
+			return fmt.Errorf("persisting artifact origin: %w", err)
+		}
+		if err := populateArtifactOriginQueueTx(tx, origin, true); err != nil {
+			return err
+		}
+		resolved = origin
+		return nil
+	})
+	if err != nil {
+		return "", err
+	}
+	return resolved, nil
+}
+
+// BootstrapArtifactExportQueue enqueues every live locally-owned session
+// once. Called by maintenance and tests that already own origin lifecycle;
+// normal origin initialization uses EnsureArtifactOrigin so the origin and
+// queue commit atomically.
+func (db *DB) BootstrapArtifactExportQueue() error {
+	db.mu.Lock()
+	defer db.mu.Unlock()
+	_, err := db.getWriter().Exec(bootstrapArtifactExportQueueSQL)
+	if err != nil {
+		return fmt.Errorf("bootstrapping artifact export queue: %w", err)
+	}
+	return nil
+}
+
+// RequeueAllArtifactExports forces every live locally-owned session pending
+// with a bumped generation. Called when a divergent artifact origin is
+// adopted: BootstrapArtifactExportQueue is INSERT OR IGNORE, so a session
+// already acknowledged (pending=0) under the previous origin would be skipped
+// and never re-verified under the new origin. This re-dirties the ledger so
+// the new origin publishes every owned session. The ON CONFLICT clause matches
+// the session queue triggers' generation semantics.
+func (db *DB) RequeueAllArtifactExports() error {
+	db.mu.Lock()
+	defer db.mu.Unlock()
+	_, err := db.getWriter().Exec(requeueArtifactExportsSQL)
+	if err != nil {
+		return fmt.Errorf("requeueing artifact export queue: %w", err)
 	}
 	return nil
 }
@@ -2479,19 +2905,56 @@ func (db *DB) createPartialIndexesLocked(w *writerHandle) error {
 		   AND model != '<synthetic>'`,
 		`CREATE INDEX IF NOT EXISTS idx_sessions_has_secret
 		 ON sessions(secret_leak_count) WHERE secret_leak_count > 0`,
-		`CREATE INDEX IF NOT EXISTS idx_sessions_agent_file_path_active
-		 ON sessions(agent, file_path)
-		 WHERE file_path IS NOT NULL AND deleted_at IS NULL`,
 	}
 	for _, ddl := range indexes {
 		if _, err := w.Exec(ddl); err != nil {
 			return fmt.Errorf("creating index: %w", err)
 		}
 	}
+	var sourceIndexColumns sql.NullString
+	if err := w.QueryRow(`
+		SELECT group_concat(name, ',')
+		FROM (
+			SELECT name
+			FROM pragma_index_info('idx_sessions_agent_file_path_active')
+			ORDER BY seqno
+		)`).Scan(&sourceIndexColumns); err != nil {
+		return fmt.Errorf("probing active session source index: %w", err)
+	}
+	var sourceIndexSQL sql.NullString
+	if err := w.QueryRow(`
+		SELECT sql FROM sqlite_master
+		WHERE type = 'index' AND name = 'idx_sessions_agent_file_path_active'
+	`).Scan(&sourceIndexSQL); err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return fmt.Errorf("reading active session source index: %w", err)
+	}
+	normalizedSourceIndexSQL := strings.ToLower(
+		strings.Join(strings.Fields(sourceIndexSQL.String), " "),
+	)
+	if sourceIndexColumns.String != "agent,file_path,id" ||
+		!strings.Contains(normalizedSourceIndexSQL,
+			"where file_path is not null and deleted_at is null") {
+		if _, err := w.Exec(
+			`DROP INDEX IF EXISTS idx_sessions_agent_file_path_active`,
+		); err != nil {
+			return fmt.Errorf("dropping legacy active session source index: %w", err)
+		}
+	}
+	if _, err := w.Exec(`
+		CREATE INDEX IF NOT EXISTS idx_sessions_agent_file_path_active
+		ON sessions(agent, file_path, id)
+		WHERE file_path IS NOT NULL AND deleted_at IS NULL`); err != nil {
+		return fmt.Errorf("creating active session source index: %w", err)
+	}
 	if _, err := w.Exec(
 		`DROP INDEX IF EXISTS idx_messages_usage_timestamp`,
 	); err != nil {
 		return fmt.Errorf("dropping legacy usage index: %w", err)
+	}
+	if _, err := w.Exec(
+		`DROP INDEX IF EXISTS idx_artifact_checkpoint_stage_pending`,
+	); err != nil {
+		return fmt.Errorf("dropping superseded artifact stage index: %w", err)
 	}
 	// Superseded by idx_recall_extract_progress_retry (schema.sql), whose
 	// trailing updated_at column serves the same prefix.
@@ -2798,6 +3261,7 @@ func (db *DB) backfillMessageTokenCoverageLocked(
 	}
 	defer stmt.Close()
 
+	sessions := make(map[string]struct{})
 	for _, candidate := range candidates {
 		if _, err := stmt.Exec(
 			candidate.hasContext, candidate.hasOutput, candidate.id,
@@ -2806,6 +3270,12 @@ func (db *DB) backfillMessageTokenCoverageLocked(
 				"updating message token backfill %d: %w",
 				candidate.id, err,
 			)
+		}
+		sessions[candidate.sessionID] = struct{}{}
+	}
+	for sessionID := range sessions {
+		if err := enqueueArtifactExportTx(tx, sessionID); err != nil {
+			return 0, err
 		}
 	}
 	if err := tx.Commit(); err != nil {
@@ -2821,7 +3291,7 @@ func (db *DB) messageTokenCoverageBackfillCandidatesLocked(
 	w *writerHandle,
 ) ([]messageTokenCoverageBackfillCandidate, error) {
 	rows, err := w.Query(
-		`SELECT id, token_usage, context_tokens, output_tokens,
+		`SELECT id, session_id, token_usage, context_tokens, output_tokens,
 			has_context_tokens, has_output_tokens
 		 FROM messages
 		 WHERE (has_context_tokens = 0 OR has_output_tokens = 0)
@@ -2839,11 +3309,12 @@ func (db *DB) messageTokenCoverageBackfillCandidatesLocked(
 	var candidates []messageTokenCoverageBackfillCandidate
 	for rows.Next() {
 		var id int64
+		var sessionID string
 		var tokenUsage string
 		var contextTokens, outputTokens int
 		var hasContextTokens, hasOutputTokens bool
 		if err := rows.Scan(
-			&id, &tokenUsage, &contextTokens,
+			&id, &sessionID, &tokenUsage, &contextTokens,
 			&outputTokens, &hasContextTokens,
 			&hasOutputTokens,
 		); err != nil {
@@ -2861,6 +3332,7 @@ func (db *DB) messageTokenCoverageBackfillCandidatesLocked(
 		}
 		candidates = append(candidates, messageTokenCoverageBackfillCandidate{
 			id:         id,
+			sessionID:  sessionID,
 			hasContext: hasContext,
 			hasOutput:  hasOutput,
 		})
@@ -2873,6 +3345,7 @@ func (db *DB) messageTokenCoverageBackfillCandidatesLocked(
 
 type messageTokenCoverageBackfillCandidate struct {
 	id         int64
+	sessionID  string
 	hasContext bool
 	hasOutput  bool
 }
@@ -3471,8 +3944,17 @@ func (db *DB) init() error {
 	return nil
 }
 
-// Close closes both writer and reader connections, plus any
-// retired pools left over from previous Reopen calls.
+// Close closes both writer and reader connections, plus any retired pools
+// left over from previous Reopen calls and any pools a failed CloseWriter or
+// CloseConnections left undrained.
+//
+// Like those methods, Close waits (bounded by closeDrainTimeout) for every
+// closed pool to actually drain: callers such as closeWriteDB release the
+// write-owner flock once Close returns, so reporting success while a
+// connection still holds the SQLite file would let another process acquire
+// writer ownership alongside the surviving connection. A drain timeout is an
+// error, and the undrained pools are retained so a retry cannot succeed
+// before they actually drain.
 func (db *DB) Close() error {
 	db.stopWALCheckpointLoop()
 	db.mu.Lock()
@@ -3481,6 +3963,8 @@ func (db *DB) Close() error {
 	r := db.rawReader()
 	retired := db.retired
 	db.retired = nil
+	undrained := db.undrainedPools
+	db.undrainedPools = nil
 	db.connMu.Unlock()
 	db.mu.Unlock()
 
@@ -3488,31 +3972,71 @@ func (db *DB) Close() error {
 	// the final connection closes, and the reader pool is mode=ro so its
 	// close cannot perform that checkpoint.
 	var errs []error
+	closed := make([]*sql.DB, 0, len(retired)+len(undrained)+2)
 	for _, p := range retired {
 		errs = append(errs, p.Close())
+		closed = append(closed, p)
 	}
+	// Pools a failed close left undrained are already closed; they still
+	// hold the file until drained, so Close must wait for them like every
+	// other pool.
+	closed = append(closed, undrained...)
 	if r != nil {
 		errs = append(errs, r.Close())
+		closed = append(closed, r)
 	}
 	if w != nil && w != r {
 		errs = append(errs, w.Close())
+		closed = append(closed, w)
+	}
+	if stillOpen := drainPools(closed); len(stillOpen) > 0 {
+		db.retainUndrainedPools(stillOpen)
+		errs = append(errs, fmt.Errorf(
+			"db connections still in use %v after close; "+
+				"write ownership is not safe to release",
+			closeDrainTimeout))
 	}
 	return errors.Join(errs...)
+}
+
+// closeDrainTimeout bounds how long CloseConnections and CloseWriter wait
+// for in-flight queries to release their pooled connections after the pools
+// are closed. The drain normally completes in microseconds; the bound only
+// limits a pathological stuck query. A variable so tests can exercise the
+// timeout path without waiting out the production bound.
+var closeDrainTimeout = 5 * time.Second
+
+// SetCloseDrainTimeoutForTest overrides closeDrainTimeout so tests outside
+// this package can exercise the drain-timeout failure path without waiting
+// out the production bound. It returns a func restoring the previous value.
+func SetCloseDrainTimeoutForTest(d time.Duration) (restore func()) {
+	prev := closeDrainTimeout
+	closeDrainTimeout = d
+	return func() { closeDrainTimeout = prev }
 }
 
 // CloseConnections closes both connections without reopening,
 // releasing file locks so the database file can be renamed.
 // Also drains any retired pools from previous Reopen calls.
 // Callers must call Reopen afterwards to restore service.
+//
+// sql.DB.Close does not wait for in-use connections: a query started before
+// the close keeps its driver connection (and file handle) until its rows are
+// released. On Windows SQLite opens the database without FILE_SHARE_DELETE,
+// so renaming over the file fails while any such handle survives. Because
+// this method's contract is that the file can be renamed afterwards, it
+// waits (bounded) for every closed pool to drain before returning.
 func (db *DB) CloseConnections() error {
 	if db.readOnly {
 		return ErrReadOnly
 	}
 	db.stopWALCheckpointLoop()
+	// db.mu stays held through the drain: a concurrent Reopen or
+	// ReopenWriter would open fresh handles on the same path, letting this
+	// method return "drained" while new handles still block the rename.
 	db.mu.Lock()
 	defer db.mu.Unlock()
 	db.connMu.Lock()
-	defer db.connMu.Unlock()
 
 	// Close the writer last: SQLite checkpoints and removes the WAL when
 	// the final connection closes, and the reader pool is mode=ro so its
@@ -3520,15 +4044,114 @@ func (db *DB) CloseConnections() error {
 	// WAL file after this returns, so a skipped checkpoint would lose
 	// every write still sitting in the log.
 	var errs []error
+	closed := make([]*sql.DB, 0,
+		len(db.retired)+len(db.undrainedPools)+2)
 	for _, p := range db.retired {
 		errs = append(errs, p.Close())
+		closed = append(closed, p)
 	}
-	errs = append(errs,
-		db.rawReader().Close(),
-		db.rawWriter().Close(),
-	)
+	// Pools a failed close left undrained are already closed; they still
+	// hold the file until drained, so the rename must wait for them like
+	// every other pool.
+	closed = append(closed, db.undrainedPools...)
+	db.undrainedPools = nil
+	r := db.rawReader()
+	errs = append(errs, r.Close())
+	closed = append(closed, r)
+	// The writer pool is nil when a worker maintenance pass has it closed.
+	// Guard the close so this lifecycle path can never nil-deref.
+	w := db.rawWriter()
+	if w != nil {
+		errs = append(errs, w.Close())
+		closed = append(closed, w)
+	}
 	db.retired = nil
+	db.connMu.Unlock()
+
+	// Drain with connMu released: queries racing the close fail fast on
+	// the closed pools instead of blocking behind connMu, and releasing an
+	// in-flight row never needs either lock. A drain timeout is an error:
+	// proceeding would let the caller delete the WAL and rename the
+	// database file while a connection still holds it, which breaks the
+	// swap on Windows and risks discarding uncheckpointed WAL data. The
+	// undrained pools are retained so a retry cannot succeed before they
+	// actually drain.
+	if undrained := drainPools(closed); len(undrained) > 0 {
+		db.retainUndrainedPools(undrained)
+		errs = append(errs, fmt.Errorf(
+			"db connections still in use %v after close; "+
+				"database file is not safe to replace",
+			closeDrainTimeout))
+	}
+
+	// A write barrier (CloseWriter) may have closed the writer pool earlier,
+	// leaving only read-only connections for this close — and a read-only
+	// close cannot perform the final checkpoint. Callers are entitled to
+	// rename the database file and delete its WAL sidecars afterwards, so any
+	// committed writes still sitting in the log must be folded into the main
+	// file before this method reports success.
+	if w == nil && errors.Join(errs...) == nil {
+		if cerr := checkpointWALWithoutWriter(db.path); cerr != nil {
+			errs = append(errs, cerr)
+		}
+	}
 	return errors.Join(errs...)
+}
+
+// checkpointWALWithoutWriter folds any remaining WAL into the main database
+// file via a short-lived writable connection, for a CloseConnections whose
+// writer pool was already closed by a write barrier. Closing the connection
+// afterwards removes the truncated sidecars, restoring the writer-last close
+// posture the method's contract promises.
+func checkpointWALWithoutWriter(path string) error {
+	if _, err := os.Stat(path + "-wal"); err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return fmt.Errorf("stat wal before final checkpoint: %w", err)
+	}
+	conn, err := sql.Open("sqlite3", makeDSN(path, false))
+	if err != nil {
+		return fmt.Errorf("opening final checkpoint connection: %w", err)
+	}
+	defer conn.Close()
+	var busy, logPages, checkpointedPages int
+	if err := conn.QueryRow(
+		"PRAGMA wal_checkpoint(TRUNCATE)",
+	).Scan(&busy, &logPages, &checkpointedPages); err != nil {
+		return fmt.Errorf("final wal checkpoint: %w", err)
+	}
+	if busy != 0 {
+		return fmt.Errorf("final wal checkpoint: %w", ErrWALCheckpointBusy)
+	}
+	return nil
+}
+
+// drainPools waits until every connection in the already-closed pools has
+// been released, so the underlying file handles are gone and the database
+// file can be renamed on every platform. Gives up after closeDrainTimeout
+// and returns the pools that still had connections checked out.
+func drainPools(pools []*sql.DB) []*sql.DB {
+	deadline := time.Now().Add(closeDrainTimeout)
+	var undrained []*sql.DB
+	for _, p := range pools {
+		if !drainPoolUntil(p, deadline) {
+			undrained = append(undrained, p)
+		}
+	}
+	return undrained
+}
+
+// drainPoolUntil waits for every connection in the already-closed pool to be
+// released, reporting false if any survive past the deadline.
+func drainPoolUntil(p *sql.DB, deadline time.Time) bool {
+	for p.Stats().OpenConnections > 0 {
+		if time.Now().After(deadline) {
+			return false
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+	return true
 }
 
 // Reopen closes and reopens both connections to the same
@@ -3576,12 +4199,25 @@ func (db *DB) reopenLocked() error {
 	retired := append([]*sql.DB(nil), db.retired...)
 	oldWriter := db.writer.Swap(writer)
 	oldReader := db.reader.Swap(reader)
+	// Reopen fully restores the writer pool, so clear any writer-closed barrier
+	// a prior CloseWriter set. Without this a resync swap that ran behind the
+	// worker write barrier would reopen the pool yet keep rejecting writes.
+	db.writerClosed.Store(false)
 
 	// Retire the just-swapped pools. Concurrent readers that
 	// loaded the old pointer before the swap may still have
 	// in-flight queries; these pools will be closed on the
-	// next Reopen, CloseConnections, or Close call.
-	db.retired = []*sql.DB{oldWriter, oldReader}
+	// next Reopen, CloseConnections, or Close call. Skip a nil
+	// old writer: a Reopen that follows CloseWriter swaps out a
+	// nil pool, and retiring it would nil-deref on the next close.
+	var freshRetired []*sql.DB
+	if oldWriter != nil {
+		freshRetired = append(freshRetired, oldWriter)
+	}
+	if oldReader != nil {
+		freshRetired = append(freshRetired, oldReader)
+	}
+	db.retired = freshRetired
 	db.connMu.Unlock()
 
 	// Close pools from earlier reopens outside connMu. database/sql
@@ -3597,6 +4233,110 @@ func (db *DB) reopenLocked() error {
 	return nil
 }
 
+// CloseWriter closes the writer pool without touching the reader pool, so
+// read-only queries keep serving while a sync-worker owns the archive for a
+// maintenance pass. Writes attempted while closed return ErrWriterClosed. The
+// reader pool is mode=ro and cannot checkpoint, so it holds the WAL open across
+// the handoff; the worker attaches to the same WAL. Callers must call
+// ReopenWriter to restore write service.
+//
+// Failure posture: the writer pointer is swapped to nil (marking the barrier
+// active) before the old pool is closed, so if the close or drain fails the
+// barrier stays up and the undrained pool is retained. The caller must keep
+// the write-owner flock and must not hand ownership to a worker — a possible
+// double-writer racing the worker over the same archive is worse than a
+// failed pass. Because ownership is never released on this path, the caller
+// may restore write service with ReopenWriter: the surviving connection
+// belongs to this process, and a later CloseWriter must drain the retained
+// pool before it can succeed.
+func (db *DB) CloseWriter() error {
+	if db.readOnly {
+		return ErrReadOnly
+	}
+	db.stopWALCheckpointLoop()
+	db.mu.Lock()
+	defer db.mu.Unlock()
+	db.connMu.Lock()
+	old := db.writer.Swap(nil)
+	db.writerClosed.Store(true)
+	pending := db.undrainedPools
+	db.undrainedPools = nil
+	db.connMu.Unlock()
+
+	if old != nil {
+		if err := old.Close(); err != nil {
+			db.retainUndrainedPools(append(pending, old))
+			return fmt.Errorf("closing writer pool: %w", err)
+		}
+		pending = append(pending, old)
+	}
+	// sql.DB.Close does not wait for checked-out connections: a stats or
+	// git-cache query that snapshotted the writer handle may still hold the
+	// single writer connection. The caller releases write ownership (the
+	// flock) once this returns, so an undrained connection would overlap
+	// with the worker's writes. Per the failure posture above, a drain
+	// timeout is an error: the pools that failed to drain are retained so a
+	// retry cannot report success while their connections survive, and the
+	// caller keeps the flock rather than risking a double writer.
+	if undrained := drainPools(pending); len(undrained) > 0 {
+		db.retainUndrainedPools(undrained)
+		return fmt.Errorf(
+			"writer connection still in use %v after close; "+
+				"keeping write ownership", closeDrainTimeout)
+	}
+	return nil
+}
+
+// retainUndrainedPools records closed-but-undrained pools so a later
+// CloseWriter or CloseConnections drains them before it may succeed.
+func (db *DB) retainUndrainedPools(pools []*sql.DB) {
+	db.connMu.Lock()
+	db.undrainedPools = append(db.undrainedPools, pools...)
+	db.connMu.Unlock()
+}
+
+// ReopenWriter reopens the writer pool after a worker maintenance pass. It
+// re-runs the writer-open half of Reopen (writable DSN, single connection,
+// configureWAL) and restarts the WAL checkpoint loop. The reader pool is left
+// untouched.
+func (db *DB) ReopenWriter() error {
+	if db.readOnly {
+		return ErrReadOnly
+	}
+	db.mu.Lock()
+	defer db.mu.Unlock()
+
+	writer, err := sql.Open("sqlite3", makeDSN(db.path, false))
+	if err != nil {
+		return fmt.Errorf("reopening writer: %w", err)
+	}
+	writer.SetMaxOpenConns(1)
+	if err := configureWAL(writer); err != nil {
+		writer.Close()
+		return fmt.Errorf("configuring reopened wal: %w", err)
+	}
+
+	db.connMu.Lock()
+	old := db.writer.Swap(writer)
+	db.writerClosed.Store(false)
+	db.connMu.Unlock()
+
+	if old != nil {
+		if err := old.Close(); err != nil {
+			log.Printf("warning: closing stale writer pool: %v", err)
+		}
+	}
+	db.startWALCheckpointLoop()
+	return nil
+}
+
+// WriterClosed reports whether the writer pool is currently closed for a
+// maintenance pass. Callers that conditionally own the write barrier check it to
+// avoid double-closing or reopening a barrier an outer owner holds.
+func (db *DB) WriterClosed() bool {
+	return db.writerClosed.Load()
+}
+
 // Update executes fn within a write lock and transaction.
 // The transaction is committed if fn returns nil, rolled back
 // otherwise.
@@ -3604,6 +4344,12 @@ func (db *DB) Update(fn func(tx *sql.Tx) error) error {
 	db.mu.Lock()
 	defer db.mu.Unlock()
 
+	// Fail fast before handing out a raw *sql.Tx: while the writer is closed
+	// for a worker maintenance pass the pool pointer is nil, and a caller must
+	// see ErrWriterClosed rather than a transaction from a torn-down pool.
+	if db.writerClosed.Load() {
+		return ErrWriterClosed
+	}
 	tx, err := db.getWriter().Begin()
 	if err != nil {
 		return fmt.Errorf("beginning transaction: %w", err)
@@ -3660,6 +4406,16 @@ func (db *DB) DeleteSyncStateByPrefix(prefix string) error {
 	_, err := db.getWriter().Exec(
 		"DELETE FROM pg_sync_state WHERE key LIKE ? ESCAPE '\\'",
 		escaped+"%",
+	)
+	return err
+}
+
+// DeleteSyncState removes the pg_sync_state row for exactly key, if present.
+func (db *DB) DeleteSyncState(key string) error {
+	db.mu.Lock()
+	defer db.mu.Unlock()
+	_, err := db.getWriter().Exec(
+		"DELETE FROM pg_sync_state WHERE key = ?", key,
 	)
 	return err
 }

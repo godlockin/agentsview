@@ -11,6 +11,8 @@ import (
 	"time"
 
 	"github.com/tidwall/gjson"
+
+	"go.kenn.io/agentsview/internal/money"
 )
 
 type grokSummaryFields struct {
@@ -191,15 +193,87 @@ func ParseGrokSummary(
 	return result, nil
 }
 
+// Grok Build writes one usage payload per completed turn, and those
+// payloads are per-turn measurements — not cumulative session snapshots
+// (cachedReadTokens is non-monotonic across a session's turns, and
+// modelCalls resets each turn). Emit one event per turn and model so
+// session totals and daily bucketing sum correctly; keeping only the
+// final payload undercounts multi-turn sessions by orders of magnitude
+// and attributes everything to the session's end date (#1227).
 func parseGrokUsageEvents(
 	path, sessionID, summaryModel string,
 	startedAt, endedAt time.Time,
 ) ([]ParsedUsageEvent, error) {
-	var usage gjson.Result
+	sessionFallback := timeString(endedAt, startedAt)
+	var events []ParsedUsageEvent
+	// Last-wins in-memory dedupe: a re-emitted payload for the same turn
+	// and model (retry/replay lines share a prompt_id) is a rewrite of
+	// that turn, and duplicate DedupKeys would violate the DB's unique
+	// (session_id, source, dedup_key) index and roll back the replace.
+	eventIndex := map[string]int{}
+	emit := func(ev ParsedUsageEvent) {
+		if i, ok := eventIndex[ev.DedupKey]; ok {
+			events[i] = ev
+			return
+		}
+		eventIndex[ev.DedupKey] = len(events)
+		events = append(events, ev)
+	}
+	turn := 0
+	var costErr error
 	_, err := readJSONLFrom(path, 0, func(line string) {
-		candidate := gjson.Get(line, "params.update.usage")
-		if candidate.Exists() && candidate.IsObject() {
-			usage = candidate
+		if costErr != nil {
+			return
+		}
+		usage := gjson.Get(line, "params.update.usage")
+		if !usage.Exists() || !usage.IsObject() {
+			return
+		}
+		turn++
+		// prompt_id is unique per turn and stable across re-parses; the
+		// ordinal fallback covers payloads that predate prompt_id.
+		turnKey := gjson.Get(line, "params.update.prompt_id").String()
+		if turnKey == "" {
+			turnKey = fmt.Sprintf("turn-%d", turn)
+		}
+		occurredAt := timeString(
+			hermesUnixTime(gjson.Get(line, "timestamp").Float()), time.Time{},
+		)
+		if occurredAt == "" {
+			occurredAt = sessionFallback
+		}
+		modelUsage := usage.Get("modelUsage")
+		emitted := false
+		if modelUsage.IsObject() {
+			modelUsage.ForEach(func(model, modelData gjson.Result) bool {
+				event, eventErr := grokUsageEvent(
+					sessionID, model.Str, turnKey, modelData, occurredAt,
+				)
+				if eventErr != nil {
+					costErr = eventErr
+					return false
+				}
+				emit(event)
+				emitted = true
+				return true
+			})
+		}
+		if costErr != nil {
+			return
+		}
+		if !emitted {
+			model := summaryModel
+			if model == "" {
+				model = "grok-summary"
+			}
+			event, eventErr := grokUsageEvent(
+				sessionID, model, turnKey, usage, occurredAt,
+			)
+			if eventErr != nil {
+				costErr = eventErr
+				return
+			}
+			emit(event)
 		}
 	})
 	if errors.Is(err, os.ErrNotExist) {
@@ -208,37 +282,21 @@ func parseGrokUsageEvents(
 	if err != nil {
 		return nil, err
 	}
-	if !usage.Exists() {
-		return nil, nil
+	if costErr != nil {
+		return nil, costErr
 	}
-
-	occurredAt := timeString(endedAt, startedAt)
-	modelUsage := usage.Get("modelUsage")
-	var events []ParsedUsageEvent
-	if modelUsage.IsObject() {
-		modelUsage.ForEach(func(model, modelData gjson.Result) bool {
-			events = append(events, grokUsageEvent(
-				sessionID, model.Str, modelData, occurredAt,
-			))
-			return true
-		})
-	}
-	if len(events) > 0 {
-		return events, nil
-	}
-	if summaryModel == "" {
-		summaryModel = "grok-summary"
-	}
-	return []ParsedUsageEvent{grokUsageEvent(
-		sessionID, summaryModel, usage, occurredAt,
-	)}, nil
+	return events, nil
 }
 
 func grokUsageEvent(
-	sessionID, model string, usage gjson.Result, occurredAt string,
-) ParsedUsageEvent {
+	sessionID, model, turnKey string, usage gjson.Result, occurredAt string,
+) (ParsedUsageEvent, error) {
 	input := int(usage.Get("inputTokens").Int())
 	cachedRead := int(usage.Get("cachedReadTokens").Int())
+	cost, err := grokUsageCost(usage)
+	if err != nil {
+		return ParsedUsageEvent{}, err
+	}
 	return ParsedUsageEvent{
 		SessionID:            sessionID,
 		Source:               "session",
@@ -247,19 +305,26 @@ func grokUsageEvent(
 		OutputTokens:         int(usage.Get("outputTokens").Int()),
 		CacheReadInputTokens: cachedRead,
 		ReasoningTokens:      int(usage.Get("reasoningTokens").Int()),
-		CostUSD:              grokUsageCostUSD(usage),
+		Cost:                 cost,
 		OccurredAt:           occurredAt,
-		DedupKey:             "session:" + sessionID + ":" + model,
-	}
+		DedupKey:             "session:" + sessionID + ":" + turnKey + ":" + model,
+	}, nil
 }
 
-func grokUsageCostUSD(usage gjson.Result) *float64 {
+func grokUsageCost(usage gjson.Result) (*money.Money, error) {
 	ticks := usage.Get("costUsdTicks")
 	if !ticks.Exists() {
-		return nil
+		return nil, nil
 	}
-	costUSD := float64(ticks.Int()) / 10_000_000_000
-	return &costUSD
+	if strings.HasPrefix(ticks.Raw, "-") {
+		return nil, fmt.Errorf("parsing Grok cost ticks: %w", money.ErrNegative)
+	}
+	microdollars, err := money.ParseScaledDecimal(ticks.Raw+"e-10", 6)
+	if err != nil {
+		return nil, fmt.Errorf("parsing Grok cost ticks: %w", err)
+	}
+	cost := money.Money{Microdollars: microdollars}
+	return &cost, nil
 }
 
 func parseGrokChatHistory(path string) ([]ParsedMessage, int, error) {

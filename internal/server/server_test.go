@@ -23,6 +23,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/BurntSushi/toml"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -1741,6 +1742,7 @@ func TestSidebarIndexValidatesParams(t *testing.T) {
 		"/api/v1/sessions/sidebar-index?min_user_messages=bad",
 		"/api/v1/sessions/sidebar-index?date=2024-99-99",
 		"/api/v1/sessions/sidebar-index?date_from=2024-06-02&date_to=2024-06-01",
+		"/api/v1/sessions/sidebar-index?timezone=Fake%2FZone",
 		"/api/v1/sessions/sidebar-index?active_since=not-a-timestamp",
 	}
 
@@ -1750,6 +1752,73 @@ func TestSidebarIndexValidatesParams(t *testing.T) {
 			assertStatus(t, w, http.StatusBadRequest)
 		})
 	}
+}
+
+func TestSessionDateFilterUsesRequestedTimezoneAndDefaultsToUTC(t *testing.T) {
+	te := setup(t)
+	te.seedSession(t, "utc-only", "my-app", 2, func(s *db.Session) {
+		s.UserMessageCount = 2
+		s.StartedAt = new("2024-06-16T01:00:00Z")
+		s.EndedAt = new("2024-06-16T02:00:00Z")
+	})
+	te.seedSession(t, "new-york-day", "my-app", 2, func(s *db.Session) {
+		s.UserMessageCount = 2
+		s.StartedAt = new("2024-06-16T05:00:00Z")
+		s.EndedAt = new("2024-06-16T06:00:00Z")
+	})
+
+	w := te.get(t, "/api/v1/sessions?date=2024-06-16")
+	assertStatus(t, w, http.StatusOK)
+	list := decode[sessionListResponse](t, w)
+	listIDs := make([]string, len(list.Sessions))
+	for i, session := range list.Sessions {
+		listIDs[i] = session.ID
+	}
+	assert.ElementsMatch(t, []string{"utc-only", "new-york-day"},
+		listIDs)
+
+	w = te.get(t,
+		"/api/v1/sessions?date=2024-06-16&timezone=America%2FNew_York")
+	assertStatus(t, w, http.StatusOK)
+	list = decode[sessionListResponse](t, w)
+	require.Len(t, list.Sessions, 1)
+	assert.Equal(t, "new-york-day", list.Sessions[0].ID)
+
+	w = te.get(t,
+		"/api/v1/sessions/sidebar-index?date=2024-06-16&timezone=America%2FNew_York")
+	assertStatus(t, w, http.StatusOK)
+	index := decode[db.SidebarSessionIndex](t, w)
+	assert.Equal(t, []string{"new-york-day"},
+		sidebarIndexRowIDs(index.Sessions))
+
+	w = te.get(t, "/api/v1/sessions?timezone=Fake%2FZone")
+	assertStatus(t, w, http.StatusBadRequest)
+	assertBodyContains(t, w, "invalid timezone: Fake/Zone")
+}
+
+func TestContentSearchDateFilterUsesRequestedTimezone(t *testing.T) {
+	te := setup(t)
+	te.seedSession(t, "search-new-york-previous-day", "my-app", 2, func(s *db.Session) {
+		s.StartedAt = new("2024-06-16T01:00:00Z")
+		s.EndedAt = new("2024-06-16T02:00:00Z")
+	})
+	te.seedMessages(t, "search-new-york-previous-day", 1, func(_ int, m *db.Message) {
+		m.Content = "TIMEZONE_NEEDLE"
+	})
+	te.seedSession(t, "search-new-york-requested-day", "my-app", 2, func(s *db.Session) {
+		s.StartedAt = new("2024-06-16T05:00:00Z")
+		s.EndedAt = new("2024-06-16T06:00:00Z")
+	})
+	te.seedMessages(t, "search-new-york-requested-day", 1, func(_ int, m *db.Message) {
+		m.Content = "TIMEZONE_NEEDLE"
+	})
+
+	w := te.get(t, "/api/v1/search/content?pattern=TIMEZONE_NEEDLE"+
+		"&date=2024-06-16&timezone=America%2FNew_York")
+	assertStatus(t, w, http.StatusOK)
+	result := decode[service.ContentSearchResult](t, w)
+	require.Len(t, result.Matches, 1)
+	assert.Equal(t, "search-new-york-requested-day", result.Matches[0].SessionID)
 }
 
 func TestGetSession_Found(t *testing.T) {
@@ -3366,6 +3435,73 @@ func TestGetSettings_UsesGitHubCLIAuthTokenFallback(t *testing.T) {
 	assert.True(t, resp.GithubConfigured)
 }
 
+func TestSettingsChartPaletteRoundTrip(t *testing.T) {
+	te := setup(t)
+	putSettings := func(body string) *httptest.ResponseRecorder {
+		req := httptest.NewRequest(http.MethodPut, "/api/v1/settings",
+			strings.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Origin", "http://127.0.0.1:0")
+		w := httptest.NewRecorder()
+		te.handler.ServeHTTP(w, req)
+		return w
+	}
+
+	w := te.get(t, "/api/v1/settings")
+	assertStatus(t, w, http.StatusOK)
+	var initial struct {
+		ChartPalette config.ChartPalette `json:"chart_palette"`
+	}
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &initial))
+	assert.Equal(t, config.ChartPaletteAgentsview, initial.ChartPalette)
+
+	w = putSettings(`{"chart_palette":"matplotlib"}`)
+	assertStatus(t, w, http.StatusOK)
+	var updated struct {
+		ChartPalette config.ChartPalette `json:"chart_palette"`
+	}
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &updated))
+	assert.Equal(t, config.ChartPaletteMatplotlib, updated.ChartPalette)
+
+	var persisted struct {
+		ChartPalette config.ChartPalette `toml:"chart_palette"`
+	}
+	_, err := toml.DecodeFile(filepath.Join(te.dataDir, "config.toml"), &persisted)
+	require.NoError(t, err)
+	assert.Equal(t, config.ChartPaletteMatplotlib, persisted.ChartPalette)
+}
+
+func TestSettingsRejectInvalidChartPaletteWithoutChangingSelection(t *testing.T) {
+	te := setup(t)
+	putSettings := func(body string) *httptest.ResponseRecorder {
+		req := httptest.NewRequest(http.MethodPut, "/api/v1/settings",
+			strings.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Origin", "http://127.0.0.1:0")
+		w := httptest.NewRecorder()
+		te.handler.ServeHTTP(w, req)
+		return w
+	}
+
+	w := putSettings(`{"chart_palette":"matplotlib"}`)
+	assertStatus(t, w, http.StatusOK)
+
+	w = putSettings(`{"chart_palette":"neon"}`)
+	assertStatus(t, w, http.StatusBadRequest)
+	assertBodyContains(t, w, `chart_palette must be`)
+	w = putSettings(`{"chart_palette":""}`)
+	assertStatus(t, w, http.StatusBadRequest)
+	assertBodyContains(t, w, `chart_palette must be`)
+
+	w = te.get(t, "/api/v1/settings")
+	assertStatus(t, w, http.StatusOK)
+	var got struct {
+		ChartPalette config.ChartPalette `json:"chart_palette"`
+	}
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &got))
+	assert.Equal(t, config.ChartPaletteMatplotlib, got.ChartPalette)
+}
+
 func TestSettingsRemainLockedInPGMode(t *testing.T) {
 	te := setupPGMode(t)
 	te.srv.SetGithubToken("settings-test-token")
@@ -3379,7 +3515,7 @@ func TestSettingsRemainLockedInPGMode(t *testing.T) {
 	assert.True(t, resp.ReadOnly)
 
 	req := httptest.NewRequest(http.MethodPut, "/api/v1/settings",
-		strings.NewReader(`{"require_auth":true}`))
+		strings.NewReader(`{"chart_palette":"matplotlib"}`))
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Origin", "http://127.0.0.1:0")
 	w = httptest.NewRecorder()

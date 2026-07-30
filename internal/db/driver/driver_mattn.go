@@ -1,5 +1,4 @@
-//go:build mattnsqlite
-// +build mattnsqlite
+//go:build !moderncsqlite
 
 // Package driver selects the underlying SQLite driver via build
 // tags. modernc.org/sqlite (pure Go) is the default; the mattn

@@ -1,6 +1,7 @@
 <script lang="ts">
   import { m } from "../../i18n/index.js";
   import { squarify } from "../../utils/treemap.js";
+  import { formatMoney, moneyFromMicrodollars } from "../../money.js";
 
   interface TreemapItem {
     id: string;
@@ -14,9 +15,19 @@
     items: TreemapItem[];
     height?: number;
     onSelect?: (id: string) => void;
+    formatValue?: (value: number) => string;
   }
 
-  const { items, height = 260, onSelect }: Props = $props();
+  function formatCost(value: number): string {
+    return formatMoney(moneyFromMicrodollars(value));
+  }
+
+  const {
+    items,
+    height = 260,
+    onSelect,
+    formatValue = formatCost,
+  }: Props = $props();
 
   let containerEl: HTMLDivElement | undefined = $state();
   let width = $state(600);
@@ -32,11 +43,6 @@
     ro.observe(containerEl);
     return () => ro.disconnect();
   });
-
-  function formatCost(v: number): string {
-    if (v >= 100) return `$${v.toFixed(0)}`;
-    return `$${v.toFixed(2)}`;
-  }
 
   interface Tile {
     id: string;
@@ -136,7 +142,7 @@
           y={tile.y + 30}
           class="tile-value"
         >
-          {formatCost(tile.value)}
+          {formatValue(tile.value)}
         </text>
         {#if tile.meta}
           <text

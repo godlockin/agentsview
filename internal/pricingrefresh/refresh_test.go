@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"path/filepath"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -11,6 +12,7 @@ import (
 	"github.com/stretchr/testify/require"
 	"go.kenn.io/agentsview/internal/db"
 	"go.kenn.io/agentsview/internal/dbtest"
+	"go.kenn.io/agentsview/internal/money"
 	"go.kenn.io/agentsview/internal/pricing"
 )
 
@@ -31,8 +33,8 @@ func TestEnsureSeedsFallbackAndFetchedModel(t *testing.T) {
 	database := testDB(t)
 	fetcher := &fetchRecorder{rows: []pricing.ModelPricing{{
 		ModelPattern:  "new-model",
-		InputPerMTok:  2,
-		OutputPerMTok: 8,
+		InputPerMTok:  money.MustParseDollars("2"),
+		OutputPerMTok: money.MustParseDollars("8"),
 	}}}
 
 	refreshed, err := Ensure(
@@ -48,7 +50,7 @@ func TestEnsureSeedsFallbackAndFetchedModel(t *testing.T) {
 	fetched, err := database.GetModelPricing("new-model")
 	require.NoError(t, err)
 	require.NotNil(t, fetched)
-	assert.Equal(t, 8.0, fetched.OutputPerMTok)
+	assert.Equal(t, money.MustParseDollars("8"), fetched.OutputPerMTok)
 }
 
 func TestRefreshIfStaleFreshAttemptSkipsFetch(t *testing.T) {
@@ -73,8 +75,8 @@ func TestRefreshIfStaleStaleTriggersFetch(t *testing.T) {
 	seedPricingAttempt(t, database, now, 2*time.Hour)
 	fetcher := &fetchRecorder{rows: []pricing.ModelPricing{{
 		ModelPattern:  "new-model",
-		InputPerMTok:  1.25,
-		OutputPerMTok: 10,
+		InputPerMTok:  money.MustParseDollars("1.25"),
+		OutputPerMTok: money.MustParseDollars("10"),
 	}}}
 
 	refreshed, err := RefreshIfStale(
@@ -86,7 +88,7 @@ func TestRefreshIfStaleStaleTriggersFetch(t *testing.T) {
 	price, err := database.GetModelPricing("new-model")
 	require.NoError(t, err)
 	require.NotNil(t, price)
-	assert.Equal(t, 10.0, price.OutputPerMTok)
+	assert.Equal(t, money.MustParseDollars("10"), price.OutputPerMTok)
 	assertPricingAttemptMeta(t, database, now.Format(time.RFC3339))
 }
 
@@ -147,8 +149,8 @@ func TestEnsureSkipsFetchWithinCooldown(t *testing.T) {
 	seedPricingAttempt(t, database, now, 10*time.Minute)
 	fetcher := &fetchRecorder{rows: []pricing.ModelPricing{{
 		ModelPattern:  "network-only-model",
-		InputPerMTok:  1,
-		OutputPerMTok: 1,
+		InputPerMTok:  money.MustParseDollars("1"),
+		OutputPerMTok: money.MustParseDollars("1"),
 	}}}
 
 	refreshed, err := Ensure(database, false, fetcher.fetch, now)
@@ -205,6 +207,103 @@ func TestEnsureCurrentCancellationAllowsImmediateRetry(t *testing.T) {
 
 	require.NoError(t, err)
 	assert.Equal(t, 1, retryCalls)
+}
+
+func TestRefreshCurrentFetchesDespiteRecentAttempt(t *testing.T) {
+	database := testDB(t)
+	now := pricingTestNow()
+	seedPricingAttempt(t, database, now, 10*time.Minute)
+
+	err := refreshCurrent(context.Background(), database, func(
+		context.Context,
+	) ([]pricing.ModelPricing, error) {
+		return []pricing.ModelPricing{{
+			ModelPattern: "scheduled-model",
+		}}, nil
+	}, now)
+
+	require.NoError(t, err)
+	price, err := database.GetModelPricing("scheduled-model")
+	require.NoError(t, err)
+	require.NotNil(t, price)
+	assertPricingAttemptMeta(t, database, now.Format(time.RFC3339))
+}
+
+func TestRefreshCurrentSkipsWhileEnsureCurrentInFlight(t *testing.T) {
+	database := testDB(t)
+	now := pricingTestNow()
+	ensureFetchStarted := make(chan struct{})
+	releaseEnsureFetch := make(chan struct{}, 1)
+	ensureDone := make(chan error, 1)
+
+	go func() {
+		ensureDone <- ensureCurrent(context.Background(), database, func(
+			context.Context,
+		) ([]pricing.ModelPricing, error) {
+			close(ensureFetchStarted)
+			<-releaseEnsureFetch
+			return []pricing.ModelPricing{{
+				ModelPattern: "ensure-model",
+			}}, nil
+		}, now)
+	}()
+	defer func() {
+		releaseEnsureFetch <- struct{}{}
+	}()
+
+	require.Eventually(t, func() bool {
+		select {
+		case <-ensureFetchStarted:
+			return true
+		default:
+			return false
+		}
+	}, time.Second, time.Millisecond)
+
+	var refreshFetchCalls atomic.Int32
+	refreshDone := make(chan error, 1)
+	go func() {
+		refreshDone <- refreshCurrent(
+			context.Background(), database, func(
+				context.Context,
+			) ([]pricing.ModelPricing, error) {
+				refreshFetchCalls.Add(1)
+				return []pricing.ModelPricing{{
+					ModelPattern: "scheduled-model",
+				}}, nil
+			}, now.Add(time.Minute),
+		)
+	}()
+
+	var refreshErr error
+	require.Eventually(t, func() bool {
+		select {
+		case refreshErr = <-refreshDone:
+			return true
+		default:
+			return false
+		}
+	}, time.Second, time.Millisecond)
+	require.NoError(t, refreshErr)
+	assert.Zero(t, refreshFetchCalls.Load())
+	scheduledPrice, err := database.GetModelPricing("scheduled-model")
+	require.NoError(t, err)
+	assert.Nil(t, scheduledPrice)
+
+	releaseEnsureFetch <- struct{}{}
+	var ensureErr error
+	require.Eventually(t, func() bool {
+		select {
+		case ensureErr = <-ensureDone:
+			return true
+		default:
+			return false
+		}
+	}, time.Second, time.Millisecond)
+	require.NoError(t, ensureErr)
+	ensuredPrice, err := database.GetModelPricing("ensure-model")
+	require.NoError(t, err)
+	require.NotNil(t, ensuredPrice)
 }
 
 func testDB(t *testing.T) *db.DB {

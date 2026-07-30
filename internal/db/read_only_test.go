@@ -12,6 +12,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"go.kenn.io/agentsview/internal/db/driver"
+	"go.kenn.io/agentsview/internal/money"
 )
 
 func tempDBPath(t *testing.T, name string) string {
@@ -95,10 +96,10 @@ func requireReadOnlyOp(t *testing.T, name string, op func() error) {
 func testModelPricing(pattern string) ModelPricing {
 	return ModelPricing{
 		ModelPattern:         pattern,
-		InputPerMTok:         1,
-		OutputPerMTok:        2,
-		CacheCreationPerMTok: 3,
-		CacheReadPerMTok:     4,
+		InputPerMTok:         money.MustParseDollars("1"),
+		OutputPerMTok:        money.MustParseDollars("2"),
+		CacheCreationPerMTok: money.MustParseDollars("3"),
+		CacheReadPerMTok:     money.MustParseDollars("4"),
 	}
 }
 
@@ -269,8 +270,15 @@ func TestOpenReadOnlyWriteMethodsReturnErrReadOnly(t *testing.T) {
 
 func TestOpenReadOnlyRejectsMissingMigratedColumn(t *testing.T) {
 	path := createClosedTestDB(t, tempDBPath(t, "sessions.db"), nil)
-	execRawSQLite(t, path, "ALTER TABLE sessions DROP COLUMN display_name")
-	requireOpenReadOnlyFails(t, path, "schema missing sessions.display_name")
+	// deletion_cause has no index and is deliberately excluded from the
+	// artifact_sessions_update_queue trigger's change-detection list (it is
+	// sync bookkeeping, not export-relevant), so SQLite's trigger/index-aware
+	// column-drop guard does not block removing it here. A column that the
+	// trigger references (e.g. display_name) or that is indexed (e.g.
+	// local_modified_at) cannot be dropped with DROP COLUMN while that
+	// trigger or index exists.
+	execRawSQLite(t, path, "ALTER TABLE sessions DROP COLUMN deletion_cause")
+	requireOpenReadOnlyFails(t, path, "schema missing sessions.deletion_cause")
 }
 
 func TestReadOnlySchemaCompatibilityRejectsMissingReadColumn(t *testing.T) {

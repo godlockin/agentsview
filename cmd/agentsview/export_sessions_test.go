@@ -19,6 +19,7 @@ import (
 	"go.kenn.io/agentsview/internal/db"
 	"go.kenn.io/agentsview/internal/dbtest"
 	"go.kenn.io/agentsview/internal/export"
+	"go.kenn.io/agentsview/internal/money"
 	"go.kenn.io/agentsview/internal/pricing"
 )
 
@@ -49,7 +50,7 @@ func TestExportSessionsJSONEmitsOneDocument(t *testing.T) {
 	assert.Empty(t, stderr)
 
 	doc := decodeExportSessionsDocument(t, stdout)
-	assert.Equal(t, 2, doc.SchemaVersion)
+	assert.Equal(t, export.SessionSummarySchemaVersion, doc.SchemaVersion)
 	assert.NotEmpty(t, doc.DatabaseID)
 	assert.NotNil(t, doc.Pricing)
 	assert.NotNil(t, doc.Projects)
@@ -69,7 +70,7 @@ func TestExportSessionsJSONAliasEmitsOneDocument(t *testing.T) {
 	assert.Empty(t, stderr)
 
 	doc := decodeExportSessionsDocument(t, stdout)
-	assert.Equal(t, 2, doc.SchemaVersion)
+	assert.Equal(t, export.SessionSummarySchemaVersion, doc.SchemaVersion)
 	assert.Len(t, doc.Sessions, 2)
 	assert.Empty(t, strings.TrimSpace(decoderRemainder(t, stdout)),
 		"--json must emit exactly one JSON document")
@@ -115,7 +116,7 @@ func TestExportSessionsNDJSONEmitsMetaThenRows(t *testing.T) {
 	require.Len(t, lines, 3)
 	meta := decodeExportSessionsDocument(t, lines[0])
 	assert.Equal(t, "meta", meta.Type)
-	assert.Equal(t, 2, meta.SchemaVersion)
+	assert.Equal(t, export.SessionSummarySchemaVersion, meta.SchemaVersion)
 	assert.NotEmpty(t, meta.DatabaseID)
 	assert.NotNil(t, meta.Pricing)
 	assert.NotNil(t, meta.Projects)
@@ -174,7 +175,7 @@ func TestExportSessionsAllJSONPreservesCostOnlyReportedPricingAcrossPages(
 	require.NoError(t, database.SetDatabaseIDForTest(
 		context.Background(), "cost-only-reported-export-db"))
 	require.NoError(t, database.UpsertModelPricing([]db.ModelPricing{{
-		ModelPattern: "computed-model", InputPerMTok: 1,
+		ModelPattern: "computed-model", InputPerMTok: money.MustParseDollars("1"),
 	}}))
 	insertExportSessionsTestSession(t, database, db.Session{
 		ID: "computed", Project: "alpha", Machine: "local", Agent: "codex",
@@ -193,11 +194,11 @@ func TestExportSessionsAllJSONPreservesCostOnlyReportedPricingAcrossPages(
 		EndedAt:      dbtest.Ptr("2026-06-16T10:10:00Z"),
 		MessageCount: 2, UserMessageCount: 2,
 	})
-	reportedCost := 0.03
+	reportedCost := money.MustParseDollars("0.03")
 	require.NoError(t, database.ReplaceSessionUsageEvents(
 		"cost-only-reported", []db.UsageEvent{{
 			Source: "shutdown", Model: "copilot-cost-only",
-			CostUSD: &reportedCost, CostStatus: "exact",
+			Cost: &reportedCost, CostStatus: "exact",
 			CostSource: db.CopilotReportedCostSource,
 			OccurredAt: "2026-06-16T10:10:00Z", DedupKey: "final",
 		}},
@@ -216,7 +217,7 @@ func TestExportSessionsAllJSONPreservesCostOnlyReportedPricingAcrossPages(
 	assert.Equal(t, string(export.CostSourceMixed), doc.Pricing["cost_source"])
 	require.NotNil(t, doc.Sessions[1].ModelUsage)
 	assert.Equal(t, "cost-only-reported", doc.Sessions[1].ID)
-	assert.InDelta(t, reportedCost, doc.Sessions[1].ModelUsage.CostUSD, 1e-12)
+	assert.Equal(t, reportedCost, doc.Sessions[1].ModelUsage.Cost)
 }
 
 func TestBuildExportSessionsOutputMarksCrossPageProjectConflictAmbiguous(t *testing.T) {
@@ -248,15 +249,15 @@ func TestMergeExportSessionsPricingTreatsOnlyComputedNoModelPagesAsNeutral(
 ) {
 	noModels := &export.PricingBlock{
 		CostSource: export.CostSourceComputed,
-		Models:     map[string]export.EffectiveModelRate{},
+		Models:     map[string]export.ModelPricingProvenance{},
 	}
 	mixedNoModels := &export.PricingBlock{
 		CostSource: export.CostSourceMixed,
-		Models:     map[string]export.EffectiveModelRate{},
+		Models:     map[string]export.ModelPricingProvenance{},
 	}
 	reported := &export.PricingBlock{
 		CostSource: export.CostSourceReported,
-		Models: map[string]export.EffectiveModelRate{
+		Models: map[string]export.ModelPricingProvenance{
 			"reported-model": {
 				CostSource: export.CostSourceReported,
 			},
@@ -277,6 +278,53 @@ func TestMergeExportSessionsPricingTreatsOnlyComputedNoModelPagesAsNeutral(
 
 	got = mergeExportSessionsPricing(mixedNoModels, noModels)
 	assert.Equal(t, export.CostSourceMixed, got.CostSource)
+}
+
+func TestMergeExportSessionsPricingCombinesReportedModelResolutions(t *testing.T) {
+	base := &export.PricingBlock{
+		CostSource: export.CostSourceComputed,
+		Models: map[string]export.ModelPricingProvenance{
+			"kimi-for-coding": {
+				CostSource: export.CostSourceComputed,
+				Resolutions: []export.EffectiveModelRate{{
+					PricedModel: "kimi-k3",
+					CostSource:  export.CostSourceComputed,
+				}},
+			},
+		},
+	}
+	next := &export.PricingBlock{
+		CostSource: export.CostSourceMixed,
+		Models: map[string]export.ModelPricingProvenance{
+			"kimi-for-coding": {
+				CostSource: export.CostSourceMixed,
+				Resolutions: []export.EffectiveModelRate{
+					{
+						PricedModel: "moonshot/kimi-k2.6",
+						CostSource:  export.CostSourceComputed,
+					},
+					{
+						PricedModel: "kimi-k3",
+						CostSource:  export.CostSourceReported,
+					},
+				},
+			},
+		},
+	}
+
+	got := mergeExportSessionsPricing(base, next)
+
+	require.Contains(t, got.Models, "kimi-for-coding")
+	provenance := got.Models["kimi-for-coding"]
+	assert.Equal(t, export.CostSourceMixed, provenance.CostSource)
+	require.Len(t, provenance.Resolutions, 2)
+	assert.Equal(t, "kimi-k3", provenance.Resolutions[0].PricedModel)
+	assert.Equal(t, export.CostSourceMixed,
+		provenance.Resolutions[0].CostSource)
+	assert.Equal(t, "moonshot/kimi-k2.6",
+		provenance.Resolutions[1].PricedModel)
+	assert.Equal(t, export.CostSourceComputed,
+		provenance.Resolutions[1].CostSource)
 }
 
 func TestExportSessionsAllNDJSONCursorNextEmpty(t *testing.T) {
@@ -666,7 +714,7 @@ func TestExportSessionsJSONGolden(t *testing.T) {
 	assert.NotContains(t, stdout, `"machine":"golden-host"`)
 	assert.NotContains(t, stdout, `"root_path":"/`)
 
-	assertGoldenBytes(t, "session_export_v2.json", []byte(stdout))
+	assertGoldenBytes(t, "session_export_v4.json", []byte(stdout))
 }
 
 func TestExportSessionsNDJSONGolden(t *testing.T) {
@@ -681,7 +729,7 @@ func TestExportSessionsNDJSONGolden(t *testing.T) {
 	require.NoError(t, err, "export sessions ndjson golden")
 	require.Empty(t, stderr)
 
-	assertGoldenBytes(t, "session_export_v2.ndjson", []byte(stdout))
+	assertGoldenBytes(t, "session_export_v4.ndjson", []byte(stdout))
 }
 
 func firstExportSessionsCursor(t *testing.T) string {
@@ -745,7 +793,7 @@ func TestExportSessionsFallbackPricingOnUnseededArchive(t *testing.T) {
 	require.NotNil(t, usage, "model usage")
 	assert.True(t, usage.HasCost,
 		"fallback-priced model %s should have cost", model)
-	assert.Greater(t, usage.CostUSD, 0.0, "fallback-priced cost")
+	assert.Positive(t, usage.Cost.Microdollars, "fallback-priced cost")
 
 	fallback, ok := doc.Pricing["fallback"].(map[string]any)
 	require.True(t, ok, "pricing fallback block")
@@ -763,7 +811,7 @@ func exactFallbackPricedModel(t *testing.T) string {
 		if strings.ContainsAny(p.ModelPattern, "*/_") {
 			continue
 		}
-		if p.InputPerMTok > 0 && p.OutputPerMTok > 0 {
+		if p.InputPerMTok.Microdollars > 0 && p.OutputPerMTok.Microdollars > 0 {
 			return p.ModelPattern
 		}
 	}

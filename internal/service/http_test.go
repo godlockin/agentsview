@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -112,6 +113,18 @@ func (readOnlyHTTPStore) ReadOnly() bool { return true }
 
 type recallUnavailableHTTPStore struct {
 	readOnlyHTTPStore
+}
+
+type recallTransientHTTPStore struct {
+	*db.DB
+}
+
+func (recallTransientHTTPStore) QueryRecallEntries(
+	context.Context, db.RecallQuery,
+) (db.RecallPage, error) {
+	return db.RecallPage{}, fmt.Errorf(
+		"%w: embedding endpoint unavailable", db.ErrSemanticTransient,
+	)
 }
 
 func (recallUnavailableHTTPStore) GetRecallEntry(
@@ -376,6 +389,28 @@ func TestHTTPBackend_QueryRecallEntriesIncludesSourceEpisodeID(t *testing.T) {
 	})
 
 	require.NoError(t, err)
+}
+
+func TestHTTPBackend_QueryRecallEntriesTransportsSkipRecording(t *testing.T) {
+	t.Parallel()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var got service.RecallQuery
+		require.NoError(t, json.NewDecoder(r.Body).Decode(&got))
+		assert.True(t, got.SkipRecording)
+		w.Header().Set("Content-Type", "application/json")
+		require.NoError(t, json.NewEncoder(w).Encode(service.RecallQueryResult{
+			Mode: db.RecallQueryModeLexical, RecallEntries: []db.RecallResult{},
+		}))
+	}))
+	t.Cleanup(srv.Close)
+
+	svc := service.NewHTTPBackend(srv.URL, "", false)
+	result, err := svc.QueryRecallEntries(context.Background(), service.RecallQuery{
+		Query: "read only recall", SkipRecording: true,
+	})
+
+	require.NoError(t, err)
+	assert.Empty(t, result.QueryID)
 }
 
 func TestHTTPBackend_QueryRecallEntriesRejectsNegativeContextMaxBytesLocally(t *testing.T) {
@@ -798,6 +833,64 @@ func TestHTTPBackend_RecallReads_RemoteReadOnly(t *testing.T) {
 	}
 }
 
+func TestHTTPBackend_QueryRecallVector501PreservesSemanticCause(t *testing.T) {
+	t.Parallel()
+	body := service.ErrSemanticUnavailable.Error() + ": recall index is stale"
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusNotImplemented)
+		require.NoError(t, json.NewEncoder(w).Encode(map[string]string{
+			"error": body,
+		}))
+	}))
+	t.Cleanup(srv.Close)
+
+	be := service.NewHTTPBackend(srv.URL, "", false)
+	_, err := be.QueryRecallEntries(context.Background(), service.RecallQuery{
+		Query: "retry policy",
+		Mode:  "VECTOR",
+	})
+	require.Error(t, err)
+	assert.ErrorIs(t, err, service.ErrSemanticUnavailable)
+	assert.Equal(t, body, err.Error())
+}
+
+func TestHTTPBackend_QueryRecallVector503PreservesTransientCause(t *testing.T) {
+	env := newHTTPBackendEnv(t, withHTTPStore(func(d *db.DB) db.Store {
+		return recallTransientHTTPStore{DB: d}
+	}))
+
+	_, err := env.Backend("", false).QueryRecallEntries(
+		context.Background(),
+		service.RecallQuery{Query: "retry policy", Mode: db.RecallQueryModeVector},
+	)
+
+	require.Error(t, err)
+	assert.ErrorIs(t, err, db.ErrSemanticTransient)
+	assert.Contains(t, err.Error(), "embedding endpoint unavailable")
+}
+
+func TestHTTPBackend_QueryRecallRejectsResponseModeMismatch(t *testing.T) {
+	t.Parallel()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		require.NoError(t, json.NewEncoder(w).Encode(service.RecallQueryResult{
+			Mode:          db.RecallQueryModeLexical,
+			RecallEntries: []db.RecallResult{},
+		}))
+	}))
+	t.Cleanup(srv.Close)
+
+	be := service.NewHTTPBackend(srv.URL, "", false)
+	_, err := be.QueryRecallEntries(context.Background(), service.RecallQuery{
+		Query: "retry policy", Mode: db.RecallQueryModeHybrid,
+	})
+
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "requested recall mode hybrid")
+	assert.Contains(t, err.Error(), "returned lexical")
+}
+
 func TestHTTPBackend_Watch_ReceivesSessionUpdated(t *testing.T) {
 	const watchPoll = 25 * time.Millisecond
 	t.Cleanup(sessionwatch.SetTimingsForTest(
@@ -858,13 +951,16 @@ func TestHTTPSearchContent(t *testing.T) {
 			if r.URL.Query().Get("pattern") != "needle" {
 				t.Errorf("pattern = %s", r.URL.Query().Get("pattern"))
 			}
+			if r.URL.Query().Get("timezone") != "America/New_York" {
+				t.Errorf("timezone = %s", r.URL.Query().Get("timezone"))
+			}
 			w.Header().Set("Content-Type", "application/json")
 			_, _ = w.Write([]byte(`{"matches":[{"session_id":"s1","location":"message"}],"next_cursor":0}`))
 		}))
 	defer srv.Close()
 	be := service.NewHTTPBackend(srv.URL, "", true)
 	res, err := be.SearchContent(context.Background(), service.ContentSearchRequest{
-		Pattern: "needle", Limit: 50,
+		Pattern: "needle", Timezone: "America/New_York", Limit: 50,
 	})
 	require.NoError(t, err)
 	require.Len(t, res.Matches, 1)

@@ -53,6 +53,8 @@ func NewReadOnlyBackend(d db.Store) SessionService {
 	return &directBackend{db: d}
 }
 
+func (b *directBackend) SupportsRecallQueries() bool { return b.local != nil }
+
 func (b *directBackend) Get(
 	ctx context.Context, id string,
 ) (*SessionDetail, error) {
@@ -137,6 +139,11 @@ func (b *directBackend) List(
 			"list: invalid active_since %q: use RFC3339", f.ActiveSince,
 		)
 	}
+	timezone, err := db.NormalizeSessionTimezone(f.Timezone)
+	if err != nil {
+		return nil, fmt.Errorf("list: %w", err)
+	}
+	f.Timezone = timezone
 	if _, err := db.ParseSortSpec(f.OrderBy); err != nil {
 		return nil, fmt.Errorf(
 			"list: invalid sort %q: %v (valid keys: %s)",
@@ -178,6 +185,7 @@ func listFilterToDB(f ListFilter) db.SessionFilter {
 		Date:                 f.Date,
 		DateFrom:             f.DateFrom,
 		DateTo:               f.DateTo,
+		Timezone:             f.Timezone,
 		ActiveSince:          f.ActiveSince,
 		MinMessages:          f.MinMessages,
 		MaxMessages:          f.MaxMessages,
@@ -690,7 +698,10 @@ func (b *directBackend) UsageSummary(
 	if err != nil {
 		return nil, err
 	}
-	summary := buildUsageSummary(f, result)
+	summary, err := buildUsageSummary(f, result)
+	if err != nil {
+		return nil, err
+	}
 	if parser.AgentFilterLacksPerMessageTokenData(f.Agent) &&
 		db.NoTokenData(result.Totals) {
 		matchingSessions, err := b.db.GetUsageMatchingSessionCount(ctx, f)
@@ -738,7 +749,10 @@ func (b *directBackend) UsagePairwiseComparison(
 		}
 	}
 
-	out := BuildUsagePairwiseComparisonResult(leftResult, rightResult)
+	out, err := BuildUsagePairwiseComparisonResult(leftResult, rightResult)
+	if err != nil {
+		return nil, err
+	}
 	return &out, nil
 }
 
@@ -774,6 +788,11 @@ func (b *directBackend) SearchContent(
 	if req.Context > maxContentSearchContext {
 		return nil, &db.SearchInputError{Msg: "context: maximum is 10"}
 	}
+	timezone, err := db.NormalizeSessionTimezone(req.Timezone)
+	if err != nil {
+		return nil, &db.SearchInputError{Msg: "search: " + err.Error()}
+	}
+	req.Timezone = timezone
 	page, err := b.db.SearchContent(ctx, db.ContentSearchFilter{
 		Pattern:          req.Pattern,
 		Mode:             req.Mode,
@@ -787,6 +806,7 @@ func (b *directBackend) SearchContent(
 		Date:             req.Date,
 		DateFrom:         req.DateFrom,
 		DateTo:           req.DateTo,
+		Timezone:         req.Timezone,
 		ActiveSince:      req.ActiveSince,
 		IncludeChildren:  req.IncludeChildren,
 		IncludeAutomated: req.IncludeAutomated,

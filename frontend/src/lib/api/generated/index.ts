@@ -137,6 +137,7 @@ export type { EmbeddingsGenerationActionRequest } from './models/EmbeddingsGener
 export type { EmbeddingsGenerationsResponse } from './models/EmbeddingsGenerationsResponse';
 export type { EmptyTrashResponse } from './models/EmptyTrashResponse';
 export type { ExportEffectiveModelRate } from './models/ExportEffectiveModelRate';
+export type { ExportModelPricingProvenance } from './models/ExportModelPricingProvenance';
 export type { ExportPricingBlock } from './models/ExportPricingBlock';
 export type { ExportPricingFallback } from './models/ExportPricingFallback';
 export type { ExportProjectIdentity } from './models/ExportProjectIdentity';
@@ -149,6 +150,7 @@ export type { InsightCannedSessionFilters } from './models/InsightCannedSessionF
 export type { InsightsResponse } from './models/InsightsResponse';
 export type { MachinesResponse } from './models/MachinesResponse';
 export type { ModelTotal } from './models/ModelTotal';
+export type { MoneyMoney } from './models/MoneyMoney';
 export type { Opener } from './models/Opener';
 export type { OpenersResponse } from './models/OpenersResponse';
 export type { OpenRequest } from './models/OpenRequest';

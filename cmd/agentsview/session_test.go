@@ -224,7 +224,7 @@ func remoteUsageJSON(spec remoteUsageSpec) string {
 		"total_output_tokens": %d,
 		"peak_context_tokens": 2048,
 		"has_token_data": true,
-		"cost_usd": 0.5,
+		"cost": {"microdollars": 500000},
 		"has_cost": true,
 		"models": ["gpt-5.1"],
 		"unpriced_models": []%s
@@ -1279,7 +1279,7 @@ func TestSessionUsage_UsesDiscoveredDaemon(t *testing.T) {
 				"total_output_tokens": 42,
 				"peak_context_tokens": 2048,
 				"has_token_data": true,
-				"cost_usd": 0.5,
+				"cost": {"microdollars": 500000},
 				"has_cost": true,
 				"models": ["gpt-5.1"],
 				"unpriced_models": []
@@ -1349,7 +1349,7 @@ func TestTokenUse_UsesDiscoveredDaemon(t *testing.T) {
 				"total_output_tokens": 42,
 				"peak_context_tokens": 2048,
 				"has_token_data": true,
-				"cost_usd": 0.5,
+				"cost": {"microdollars": 500000},
 				"has_cost": true,
 				"models": ["gpt-5.1"],
 				"unpriced_models": []
@@ -1512,6 +1512,31 @@ func TestSessionUsage_ServerTokenSendsBearer(t *testing.T) {
 		"session", "usage", "remote-session",
 		"--server", ts.URL,
 		"--server-token-file", tokenFile)
+
+	out, _, err := sessionUsageDataForCommand(cmd, "remote-session")
+	require.NoError(t, err)
+	require.NotNil(t, out)
+}
+
+func TestSessionUsage_ServerTokenFileExpandsHome(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("USERPROFILE", home)
+	tokenFile := filepath.Join(home, "remote-token")
+	require.NoError(t, os.WriteFile(
+		tokenFile, []byte("remote-secret\n"), 0o600,
+	))
+
+	ts, _ := newRemoteUsageServer(t, remoteUsageSpec{
+		canonicalID:   "remote-session",
+		bearer:        "remote-secret",
+		serverRunning: true,
+	})
+
+	cmd := sessionUsageCommand(t,
+		"session", "usage", "remote-session",
+		"--server", ts.URL,
+		"--server-token-file", "~/remote-token")
 
 	out, _, err := sessionUsageDataForCommand(cmd, "remote-session")
 	require.NoError(t, err)

@@ -27,6 +27,7 @@ import (
 	_ "go.kenn.io/agentsview/internal/db/driver"
 	dbdriver "go.kenn.io/agentsview/internal/db/driver"
 	"go.kenn.io/agentsview/internal/export"
+	"go.kenn.io/agentsview/internal/money"
 )
 
 func reflectedFieldValue(v any, name string) reflect.Value {
@@ -457,6 +458,83 @@ func Ptr[T any](v T) *T { return new(v) }
 
 // insertSession creates and upserts a session with sensible
 // defaults. Override any field via the opts functions.
+// seedOneSession inserts a single session so reader queries have a row to
+// return across a writer handoff.
+func seedOneSession(t *testing.T, d *DB) {
+	t.Helper()
+	insertSession(t, d, "writer-handoff-seed", "handoff")
+}
+
+// writeOneSession attempts a single write through the writer pool. It returns
+// the write error unchanged so callers can assert on ErrWriterClosed.
+func writeOneSession(d *DB) error {
+	return d.UpsertSession(Session{
+		ID:      "writer-handoff-write",
+		Project: "handoff",
+		Machine: defaultMachine,
+		Agent:   defaultAgent,
+	})
+}
+
+func TestCloseWriterKeepsReadersServing(t *testing.T) {
+	database := testDB(t)
+	seedOneSession(t, database)
+
+	require.NoError(t, database.CloseWriter())
+
+	rows, err := database.ListSessionsModifiedBetween(
+		context.Background(), "", "", nil, nil,
+	)
+	assert.NoError(t, err, "readers must survive a writer handoff")
+	assert.NotEmpty(t, rows, "seeded session must still be readable")
+
+	err = writeOneSession(database)
+	require.Error(t, err, "writes must fail cleanly while the writer is closed")
+	assert.ErrorIs(t, err, ErrWriterClosed)
+
+	require.NoError(t, database.ReopenWriter())
+	assert.NoError(t, writeOneSession(database),
+		"writer must accept writes again after ReopenWriter")
+}
+
+// TestCloseWriterFailsEveryWritePathCleanly proves the write barrier covers
+// every writer access, not just the writerHandle facade: the Update transaction
+// path and the real star/delete session mutations must all return
+// ErrWriterClosed without panicking while the writer is closed.
+func TestCloseWriterFailsEveryWritePathCleanly(t *testing.T) {
+	database := testDB(t)
+	insertSession(t, database, "barrier-session", "handoff")
+
+	require.NoError(t, database.CloseWriter())
+	t.Cleanup(func() { require.NoError(t, database.ReopenWriter()) })
+
+	t.Run("Update", func(t *testing.T) {
+		err := database.Update(func(tx *sql.Tx) error {
+			_, execErr := tx.Exec(
+				"UPDATE sessions SET first_message = ? WHERE id = ?",
+				"x", "barrier-session",
+			)
+			return execErr
+		})
+		require.ErrorIs(t, err, ErrWriterClosed)
+	})
+
+	t.Run("StarSession", func(t *testing.T) {
+		_, err := database.StarSession("barrier-session")
+		require.ErrorIs(t, err, ErrWriterClosed)
+	})
+
+	t.Run("DeleteSession", func(t *testing.T) {
+		err := database.DeleteSession("barrier-session")
+		require.ErrorIs(t, err, ErrWriterClosed)
+	})
+
+	t.Run("RestoreSession", func(t *testing.T) {
+		_, err := database.RestoreSession("barrier-session")
+		require.ErrorIs(t, err, ErrWriterClosed)
+	})
+}
+
 func insertSession(
 	t *testing.T, d *DB, id, project string,
 	opts ...func(*Session),
@@ -933,9 +1011,9 @@ func TestMigration_ToolResultEventsTable(t *testing.T) {
 		"expected tool_result_events table after reopen")
 }
 
-func TestCurrentDataVersionCopilotReportedCost(t *testing.T) {
-	assert.Equal(t, 69, CurrentDataVersion(),
-		"Copilot reported-cost parsing requires a data version bump")
+func TestCurrentDataVersionGitWorktreeProjectAttribution(t *testing.T) {
+	assert.Equal(t, 75, CurrentDataVersion(),
+		"final git worktree project attribution requires a data version bump")
 }
 
 func TestInsertMessages_PreservesToolResultEvents(t *testing.T) {
@@ -3446,6 +3524,115 @@ func TestWriteSessionIncrementalBlocksLinkedResultContent(t *testing.T) {
 	assert.Equal(t, "2", *idempotent.TranscriptRevision)
 }
 
+// A result-only link (empty SubagentSessionID, HasResult set) carries a
+// tool_result appended after its tool_use was stored. It must update
+// the stored call's result fields without touching an existing
+// subagent linkage, and no-op for unknown tool_use ids.
+func TestWriteSessionIncrementalResultOnlyLink(t *testing.T) {
+	d := testDB(t)
+	insertSession(t, d, "s1", "proj")
+	insertMessages(t, d, Message{
+		SessionID:  "s1",
+		Ordinal:    0,
+		Role:       "assistant",
+		HasToolUse: true,
+		ToolCalls: []ToolCall{{
+			SessionID:         "s1",
+			ToolName:          "Task",
+			Category:          "Task",
+			ToolUseID:         "toolu_linked",
+			SubagentSessionID: "agent-existing",
+		}, {
+			SessionID: "s1",
+			ToolName:  "Bash",
+			Category:  "Bash",
+			ToolUseID: "toolu_bash",
+		}},
+	})
+
+	update := IncrementalSessionUpdate{
+		MsgCount:    1,
+		NextOrdinal: 1,
+		SubagentLinks: []ToolCallSubagentLink{{
+			ToolUseID:        "toolu_bash",
+			ResultContent:    "late result",
+			ResultContentLen: len("late result"),
+			HasResult:        true,
+		}, {
+			ToolUseID:        "toolu_unknown",
+			ResultContent:    "orphan result",
+			ResultContentLen: len("orphan result"),
+			HasResult:        true,
+		}},
+	}
+	require.NoError(t, d.WriteSessionIncremental("s1", nil, update))
+
+	var subagent, content string
+	var contentLen int
+	require.NoError(t, d.Reader().QueryRow(`
+		SELECT COALESCE(subagent_session_id, ''), result_content_length,
+		       COALESCE(result_content, '')
+		FROM tool_calls
+		WHERE session_id = ? AND tool_use_id = ?`,
+		"s1", "toolu_bash",
+	).Scan(&subagent, &contentLen, &content))
+	assert.Empty(t, subagent)
+	assert.Equal(t, len("late result"), contentLen)
+	assert.Equal(t, "late result", content)
+
+	require.NoError(t, d.Reader().QueryRow(`
+		SELECT COALESCE(subagent_session_id, '')
+		FROM tool_calls
+		WHERE session_id = ? AND tool_use_id = ?`,
+		"s1", "toolu_linked",
+	).Scan(&subagent))
+	assert.Equal(t, "agent-existing", subagent,
+		"result-only link must not disturb other calls")
+}
+
+// claude_linear_parse round-trips through upsert and the incremental
+// lookup, stays NULL for legacy rows, and survives an upsert that
+// carries no verdict.
+func TestClaudeLinearParseRoundTrip(t *testing.T) {
+	d := testDB(t)
+
+	linear := true
+	sess := Session{
+		ID:                "s-linear",
+		Project:           "proj",
+		Machine:           "local",
+		Agent:             "claude",
+		FilePath:          new("/tmp/s-linear.jsonl"),
+		ClaudeLinearParse: &linear,
+	}
+	require.NoError(t, d.UpsertSession(sess))
+
+	info, ok := d.GetSessionForIncremental("/tmp/s-linear.jsonl")
+	require.True(t, ok)
+	require.NotNil(t, info.ClaudeLinearParse)
+	assert.True(t, *info.ClaudeLinearParse)
+
+	sess.ClaudeLinearParse = nil
+	require.NoError(t, d.UpsertSession(sess))
+	info, ok = d.GetSessionForIncremental("/tmp/s-linear.jsonl")
+	require.True(t, ok)
+	require.NotNil(t, info.ClaudeLinearParse,
+		"verdict-free upsert must keep the stored flag")
+	assert.True(t, *info.ClaudeLinearParse)
+
+	legacy := Session{
+		ID:       "s-legacy",
+		Project:  "proj",
+		Machine:  "local",
+		Agent:    "claude",
+		FilePath: new("/tmp/s-legacy.jsonl"),
+	}
+	require.NoError(t, d.UpsertSession(legacy))
+	info, ok = d.GetSessionForIncremental("/tmp/s-legacy.jsonl")
+	require.True(t, ok)
+	assert.Nil(t, info.ClaudeLinearParse)
+}
+
 func TestFTSBackfill(t *testing.T) {
 	dCheck := testDB(t)
 	requireFTS(t, dCheck)
@@ -3819,6 +4006,301 @@ func TestRepeatedReopenBoundsRetiredPools(t *testing.T) {
 	assert.NotNil(t, s, "session s1 missing after repeated Reopen")
 }
 
+func TestCloseConnectionsWaitsForInFlightReads(t *testing.T) {
+	d := testDB(t)
+	insertSession(t, d, "s1", "proj")
+
+	rows, err := d.Reader().Query("SELECT id FROM sessions")
+	require.NoError(t, err, "Query")
+
+	closeDone := make(chan error, 1)
+	go func() { closeDone <- d.CloseConnections() }()
+
+	// The open rows hold a reader connection with a live file
+	// handle. CloseConnections promises the database file can be
+	// renamed afterwards, which fails on Windows while any handle
+	// survives, so it must not return before the rows are released.
+	select {
+	case err := <-closeDone:
+		require.Failf(t, "CloseConnections returned early",
+			"returned while rows were still open: %v", err)
+	case <-time.After(150 * time.Millisecond):
+	}
+
+	require.NoError(t, rows.Err(), "rows.Err")
+	require.NoError(t, rows.Close(), "rows.Close")
+
+	select {
+	case err := <-closeDone:
+		require.NoError(t, err, "CloseConnections")
+	case <-time.After(2 * time.Second):
+		require.Fail(t,
+			"CloseConnections did not return after rows were released")
+	}
+
+	require.NoError(t, d.Reopen(), "Reopen")
+	s, err := d.GetSession(context.Background(), "s1")
+	require.NoError(t, err, "GetSession after Reopen")
+	assert.NotNil(t, s, "session s1 missing after Reopen")
+}
+
+func TestCloseConnectionsBlocksConcurrentReopen(t *testing.T) {
+	d := testDB(t)
+	insertSession(t, d, "s1", "proj")
+
+	rows, err := d.Reader().Query("SELECT id FROM sessions")
+	require.NoError(t, err, "Query")
+
+	closeDone := make(chan error, 1)
+	go func() { closeDone <- d.CloseConnections() }()
+
+	// Once new reads fail fast the pools are closed, so
+	// CloseConnections holds db.mu and is draining the open rows.
+	require.Eventually(t, func() bool {
+		probe, err := d.Reader().Query("SELECT 1")
+		if err != nil {
+			return true
+		}
+		probe.Close()
+		return false
+	}, 2*time.Second, 5*time.Millisecond, "pools never closed")
+
+	reopenDone := make(chan error, 1)
+	go func() { reopenDone <- d.Reopen() }()
+
+	// Reopen must serialize behind the drain: fresh handles opened
+	// mid-drain would let CloseConnections return while the database
+	// file is still unrenameable on Windows.
+	select {
+	case err := <-reopenDone:
+		require.Failf(t, "Reopen returned early",
+			"returned while CloseConnections was draining: %v", err)
+	case <-time.After(150 * time.Millisecond):
+	}
+
+	require.NoError(t, rows.Close(), "rows.Close")
+
+	select {
+	case err := <-closeDone:
+		require.NoError(t, err, "CloseConnections")
+	case <-time.After(2 * time.Second):
+		require.Fail(t,
+			"CloseConnections did not return after rows were released")
+	}
+	select {
+	case err := <-reopenDone:
+		require.NoError(t, err, "Reopen")
+	case <-time.After(2 * time.Second):
+		require.Fail(t,
+			"Reopen did not return after CloseConnections finished")
+	}
+
+	s, err := d.GetSession(context.Background(), "s1")
+	require.NoError(t, err, "GetSession after Reopen")
+	assert.NotNil(t, s, "session s1 missing after Reopen")
+}
+
+func TestCloseWriterWaitsForInFlightWriterQuery(t *testing.T) {
+	d := testDB(t)
+	insertSession(t, d, "s1", "proj")
+
+	rows, err := d.getWriter().Query("SELECT id FROM sessions")
+	require.NoError(t, err, "Query")
+
+	closeDone := make(chan error, 1)
+	go func() { closeDone <- d.CloseWriter() }()
+
+	// The open rows hold the single writer connection. CloseWriter's
+	// caller releases the write-ownership flock once it returns, so it
+	// must not return while that connection survives.
+	select {
+	case err := <-closeDone:
+		require.Failf(t, "CloseWriter returned early",
+			"returned while writer rows were still open: %v", err)
+	case <-time.After(150 * time.Millisecond):
+	}
+
+	require.NoError(t, rows.Close(), "rows.Close")
+
+	select {
+	case err := <-closeDone:
+		require.NoError(t, err, "CloseWriter")
+	case <-time.After(2 * time.Second):
+		require.Fail(t,
+			"CloseWriter did not return after rows were released")
+	}
+
+	require.NoError(t, d.ReopenWriter(), "ReopenWriter")
+	s, err := d.GetSession(context.Background(), "s1")
+	require.NoError(t, err, "GetSession after ReopenWriter")
+	assert.NotNil(t, s, "session s1 missing after ReopenWriter")
+}
+
+func TestCloseWriterDrainTimeoutIsAnError(t *testing.T) {
+	d := testDB(t)
+	insertSession(t, d, "s1", "proj")
+
+	prev := closeDrainTimeout
+	closeDrainTimeout = 100 * time.Millisecond
+	t.Cleanup(func() { closeDrainTimeout = prev })
+
+	rows, err := d.getWriter().Query("SELECT id FROM sessions")
+	require.NoError(t, err, "Query")
+	defer rows.Close()
+
+	// A connection that never drains must surface as an error so the
+	// caller keeps the flock instead of releasing write ownership while
+	// the connection is live.
+	err = d.CloseWriter()
+	require.Error(t, err,
+		"CloseWriter must fail while a writer connection is held")
+	assert.Contains(t, err.Error(), "still in use")
+
+	// A retry sees a nil writer pointer, but the undrained pool is
+	// retained: success here would release the flock while the original
+	// connection still holds the file.
+	err = d.CloseWriter()
+	require.Error(t, err,
+		"retried CloseWriter must keep failing while the connection is held")
+
+	// Once the connection is released the retry drains and succeeds.
+	require.NoError(t, rows.Close(), "rows.Close")
+	require.NoError(t, d.CloseWriter(),
+		"CloseWriter after release must drain the retained pool")
+	require.NoError(t, d.ReopenWriter(), "ReopenWriter")
+}
+
+// TestReopenWriterAfterFailedCloseRestoresWrites pins same-process recovery
+// from a drain-timeout CloseWriter failure. Ownership was never handed off
+// (the caller keeps the flock and launches no worker), so reopening the writer
+// restores service; the undrained pool stays retained, and a later CloseWriter
+// still refuses to succeed until that connection actually drains.
+func TestReopenWriterAfterFailedCloseRestoresWrites(t *testing.T) {
+	d := testDB(t)
+	insertSession(t, d, "s1", "proj")
+
+	prev := closeDrainTimeout
+	closeDrainTimeout = 100 * time.Millisecond
+	t.Cleanup(func() { closeDrainTimeout = prev })
+
+	rows, err := d.getWriter().Query("SELECT id FROM sessions")
+	require.NoError(t, err, "Query")
+	defer rows.Close()
+
+	require.Error(t, d.CloseWriter(),
+		"CloseWriter must fail while a writer connection is held")
+	require.ErrorIs(t, d.Update(func(*sql.Tx) error { return nil }),
+		ErrWriterClosed, "the barrier stays active after the failed close")
+
+	require.NoError(t, d.ReopenWriter(), "ReopenWriter")
+	insertSession(t, d, "s2", "proj")
+
+	// The retained pool still holds a live connection: a later CloseWriter
+	// must keep failing so ownership is never released alongside it.
+	require.Error(t, d.CloseWriter(),
+		"CloseWriter must not succeed while the retained pool is undrained")
+	require.NoError(t, d.ReopenWriter(), "ReopenWriter after retried close")
+
+	require.NoError(t, rows.Close(), "rows.Close")
+	require.NoError(t, d.CloseWriter(),
+		"CloseWriter succeeds once the retained connection drained")
+	require.NoError(t, d.ReopenWriter(), "final ReopenWriter")
+}
+
+func TestCloseConnectionsDrainTimeoutIsAnError(t *testing.T) {
+	d := testDB(t)
+	insertSession(t, d, "s1", "proj")
+
+	prev := closeDrainTimeout
+	closeDrainTimeout = 100 * time.Millisecond
+	t.Cleanup(func() { closeDrainTimeout = prev })
+
+	rows, err := d.Reader().Query("SELECT id FROM sessions")
+	require.NoError(t, err, "Query")
+	defer rows.Close()
+
+	// A connection that never drains must surface as an error: the resync
+	// swap deletes the WAL and renames the database file right after this
+	// returns, which is unsafe while a connection still holds the file.
+	err = d.CloseConnections()
+	require.Error(t, err,
+		"CloseConnections must fail while a reader connection is held")
+	assert.Contains(t, err.Error(), "still in use")
+
+	// The undrained pool is retained, so a retry keeps failing until the
+	// connection is actually released.
+	err = d.CloseConnections()
+	require.Error(t, err,
+		"retried CloseConnections must keep failing while the connection is held")
+
+	require.NoError(t, rows.Close(), "rows.Close")
+	require.NoError(t, d.CloseConnections(),
+		"CloseConnections after release must drain the retained pool")
+	require.NoError(t, d.Reopen(), "Reopen")
+
+	s, err := d.GetSession(context.Background(), "s1")
+	require.NoError(t, err, "GetSession after Reopen")
+	assert.NotNil(t, s, "session s1 missing after Reopen")
+}
+
+func TestCloseDrainsUndrainedPoolsBeforeSuccess(t *testing.T) {
+	d := testDB(t)
+	insertSession(t, d, "s1", "proj")
+
+	prev := closeDrainTimeout
+	closeDrainTimeout = 100 * time.Millisecond
+	t.Cleanup(func() { closeDrainTimeout = prev })
+
+	rows, err := d.getWriter().Query("SELECT id FROM sessions")
+	require.NoError(t, err, "Query")
+	defer rows.Close()
+
+	// The open rows hold the single writer connection, so CloseWriter
+	// times out and retains the undrained writer pool.
+	err = d.CloseWriter()
+	require.Error(t, err,
+		"CloseWriter must fail while a writer connection is held")
+
+	// The final Close must not report success while the retained pool
+	// still holds the SQLite file: closeWriteDB releases the write-owner
+	// flock on a nil error, and another process could then acquire writer
+	// ownership alongside the surviving connection.
+	err = d.Close()
+	require.Error(t, err,
+		"Close must fail while the undrained writer pool survives")
+	assert.Contains(t, err.Error(), "still in use")
+
+	// Once the connection is released, the retained pool drains and the
+	// final Close succeeds.
+	require.NoError(t, rows.Close(), "rows.Close")
+	require.NoError(t, d.Close(),
+		"Close after release must drain the retained pool")
+}
+
+func TestCloseDrainTimeoutIsAnError(t *testing.T) {
+	d := testDB(t)
+	insertSession(t, d, "s1", "proj")
+
+	prev := closeDrainTimeout
+	closeDrainTimeout = 100 * time.Millisecond
+	t.Cleanup(func() { closeDrainTimeout = prev })
+
+	rows, err := d.Reader().Query("SELECT id FROM sessions")
+	require.NoError(t, err, "Query")
+	defer rows.Close()
+
+	// Close's own pools need the same drain guarantee as pools retained
+	// from earlier failed closes: a connection checked out by in-flight
+	// rows survives sql.DB.Close until it is returned to the pool.
+	err = d.Close()
+	require.Error(t, err,
+		"Close must fail while a reader connection is held")
+	assert.Contains(t, err.Error(), "still in use")
+
+	require.NoError(t, rows.Close(), "rows.Close")
+	require.NoError(t, d.Close(), "Close after release must succeed")
+}
+
 func TestCloseAfterCloseConnectionsReopen(t *testing.T) {
 	d := testDB(t)
 	insertSession(t, d, "s1", "proj")
@@ -3948,10 +4430,10 @@ func TestCopyModelPricingFrom(t *testing.T) {
 	require.NoError(t, srcDB.UpsertModelPricing([]ModelPricing{
 		{
 			ModelPattern:         "claude-opus-4-8",
-			InputPerMTok:         15,
-			OutputPerMTok:        75,
-			CacheCreationPerMTok: 18.75,
-			CacheReadPerMTok:     1.5,
+			InputPerMTok:         money.MustParseDollars("15"),
+			OutputPerMTok:        money.MustParseDollars("75"),
+			CacheCreationPerMTok: money.MustParseDollars("18.75"),
+			CacheReadPerMTok:     money.MustParseDollars("1.5"),
 		},
 	}), "UpsertModelPricing")
 	require.NoError(t,
@@ -3964,7 +4446,7 @@ func TestCopyModelPricingFrom(t *testing.T) {
 	dstDB := testDBAtPath(t, dstPath, "dst")
 	defer dstDB.Close()
 	require.NoError(t, dstDB.UpsertModelPricing([]ModelPricing{
-		{ModelPattern: "claude-opus-4-8", InputPerMTok: 1},
+		{ModelPattern: "claude-opus-4-8", InputPerMTok: money.MustParseDollars("1")},
 	}), "UpsertModelPricing stale row")
 
 	require.NoError(t, dstDB.CopyModelPricingFrom(srcPath),
@@ -3973,9 +4455,9 @@ func TestCopyModelPricingFrom(t *testing.T) {
 	copied, err := dstDB.GetModelPricing("claude-opus-4-8")
 	require.NoError(t, err, "GetModelPricing")
 	require.NotNil(t, copied, "copied pattern present")
-	assert.Equal(t, 15.0, copied.InputPerMTok,
+	assert.Equal(t, money.MustParseDollars("15.0"), copied.InputPerMTok,
 		"source row replaces stale destination row")
-	assert.Equal(t, 75.0, copied.OutputPerMTok, "output rate")
+	assert.Equal(t, money.MustParseDollars("75.0"), copied.OutputPerMTok, "output rate")
 
 	meta, err := dstDB.GetPricingMeta("_fallback_version")
 	require.NoError(t, err, "GetPricingMeta")
@@ -3997,8 +4479,8 @@ func TestCopySessionMetadataFrom_PreservesCursorUsageEvents(t *testing.T) {
 			OutputTokens:     567,
 			CacheWriteTokens: 12,
 			CacheReadTokens:  34,
-			ChargedCents:     15.66,
-			CursorTokenFee:   3.32,
+			Charged:          money.MustParseDollars("0.1566"),
+			CursorTokenFee:   money.MustParseDollars("0.0332"),
 			UserID:           "152683922",
 			UserEmail:        "member@example.com",
 			DedupKey:         "first",
@@ -4009,8 +4491,8 @@ func TestCopySessionMetadataFrom_PreservesCursorUsageEvents(t *testing.T) {
 			Kind:           "USAGE_EVENT_KIND_USAGE_BASED",
 			InputTokens:    80,
 			OutputTokens:   20,
-			ChargedCents:   1.25,
-			CursorTokenFee: 0.5,
+			Charged:        money.MustParseDollars("0.0125"),
+			CursorTokenFee: money.MustParseDollars("0.005"),
 			UserID:         "777",
 			UserEmail:      "next@example.com",
 			IsHeadless:     true,
@@ -4026,11 +4508,11 @@ func TestCopySessionMetadataFrom_PreservesCursorUsageEvents(t *testing.T) {
 	dstDB := testDBAtPath(t, dstPath, "dst")
 	defer dstDB.Close()
 	require.NoError(t, dstDB.InsertCursorUsageEvents([]CursorUsageEvent{{
-		OccurredAt:   "2026-01-01T00:00:00Z",
-		Model:        "stale-model",
-		Kind:         "USAGE_EVENT_KIND_USAGE_BASED",
-		ChargedCents: 99,
-		DedupKey:     "stale",
+		OccurredAt: "2026-01-01T00:00:00Z",
+		Model:      "stale-model",
+		Kind:       "USAGE_EVENT_KIND_USAGE_BASED",
+		Charged:    money.MustParseDollars("0.99"),
+		DedupKey:   "stale",
 	}}), "InsertCursorUsageEvents dst")
 
 	require.NoError(t, dstDB.CopySessionMetadataFrom(srcPath), "CopySessionMetadataFrom")
@@ -5082,10 +5564,15 @@ func TestCopySyncStateFrom_OnlyCopiesDurablePGKeys(t *testing.T) {
 	srcDB := testDBAtPath(t, srcPath, "src")
 	require.NoError(t, srcDB.SetSyncState("pg_push_marker_id", "marker-123"),
 		"seed source marker")
+	require.NoError(t, srcDB.SetSyncState("artifact_origin_id", "laptop-a1b2c3"),
+		"seed source artifact origin")
 	require.NoError(t, srcDB.SetSyncState("last_sync_started_at", "old-start"),
 		"seed source started")
 	require.NoError(t, srcDB.SetSyncState("last_sync_finished_at", "old-finish"),
 		"seed source finished")
+	require.NoError(t, srcDB.UpsertSession(Session{
+		ID: "queued-session", Project: "p", Machine: "local", Agent: "claude",
+	}), "seed source queued session")
 	require.NoError(t, srcDB.Close(), "Close src")
 
 	dstPath := filepath.Join(dir, "dst.db")
@@ -5102,6 +5589,14 @@ func TestCopySyncStateFrom_OnlyCopiesDurablePGKeys(t *testing.T) {
 	gotMarker, err := dstDB.GetSyncState("pg_push_marker_id")
 	require.NoError(t, err, "GetSyncState pg_push_marker_id")
 	assert.Equal(t, "marker-123", gotMarker)
+
+	gotOrigin, err := dstDB.GetSyncState("artifact_origin_id")
+	require.NoError(t, err, "GetSyncState artifact_origin_id")
+	assert.Equal(t, "laptop-a1b2c3", gotOrigin,
+		"artifact_% sync-state keys must survive the copy")
+
+	assert.Contains(t, artifactExportQueueIDs(t, dstDB), "queued-session",
+		"artifact export queue rows must survive the copy")
 
 	gotStarted, err := dstDB.GetSyncState("last_sync_started_at")
 	require.NoError(t, err, "GetSyncState last_sync_started_at")
@@ -5396,6 +5891,41 @@ func TestSoftDeleteSessions(t *testing.T) {
 	n, err = d.SoftDeleteSessions(nil)
 	require.NoError(t, err, "SoftDeleteSessions nil")
 	assert.Equal(t, 0, n, "empty: rows=")
+}
+
+func TestSoftDeleteConvertsSourceMissingTombstonesToUserTrash(t *testing.T) {
+	d := testDB(t)
+	ctx := t.Context()
+	paths := map[string]string{
+		"single": filepath.Join(t.TempDir(), "single.jsonl"),
+		"batch":  filepath.Join(t.TempDir(), "batch.jsonl"),
+	}
+	for id, path := range paths {
+		insertSession(t, d, id, "proj", func(s *Session) {
+			s.Agent = "claude"
+			s.FilePath = &path
+		})
+		baselineSessionSource(t, d, defaultMachine, "claude", path)
+		changed, err := d.SoftDeleteSessionSourceOwnership(
+			ctx, defaultMachine, "claude", id, path,
+		)
+		require.NoError(t, err)
+		require.True(t, changed)
+	}
+
+	require.NoError(t, d.SoftDeleteSession("single"))
+	count, err := d.SoftDeleteSessions([]string{"batch"})
+	require.NoError(t, err)
+	assert.Equal(t, 1, count)
+
+	for id := range paths {
+		full, err := d.GetSessionFull(ctx, id)
+		require.NoError(t, err)
+		require.NotNil(t, full)
+		assert.Nil(t, full.DeletionCause,
+			"an explicit user deletion must replace the recoverable source tombstone")
+		assert.True(t, d.IsSessionTrashed(id))
+	}
 }
 
 func TestMetadataQueriesExcludeTrashed(t *testing.T) {
@@ -6863,10 +7393,13 @@ func TestMigration_TerminationStatusColumn(t *testing.T) {
 	requireNoError(t, err, "raw open")
 
 	// SQLite supports DROP COLUMN as of 3.35; the in-tree driver is
-	// recent enough. Drop the index first since SQLite blocks
-	// dropping a column referenced by an index.
+	// recent enough. Drop the index and the trigger that references the
+	// column first since SQLite blocks dropping a column referenced by an
+	// index or a trigger.
 	_, err = conn.Exec(`DROP INDEX IF EXISTS idx_sessions_termination_status`)
 	requireNoError(t, err, "drop termination_status index")
+	_, err = conn.Exec(`DROP TRIGGER IF EXISTS artifact_sessions_update_queue`)
+	requireNoError(t, err, "drop artifact_sessions_update_queue trigger")
 	_, err = conn.Exec(`ALTER TABLE sessions DROP COLUMN termination_status`)
 	requireNoError(t, err, "drop termination_status column")
 

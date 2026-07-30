@@ -17,31 +17,33 @@ import (
 	"slices"
 	"strings"
 	"time"
+
+	"go.kenn.io/agentsview/internal/money"
 )
 
 // rooCodeHistoryItem mirrors the HistoryItem in history_item.json.
 type rooCodeHistoryItem struct {
-	ID                      string   `json:"id"`
-	RootTaskID              string   `json:"rootTaskId,omitempty"`
-	ParentTaskID            string   `json:"parentTaskId,omitempty"`
-	Number                  int      `json:"number"`
-	Timestamp               int64    `json:"ts"`
-	Task                    string   `json:"task"`
-	TokensIn                int      `json:"tokensIn"`
-	TokensOut               int      `json:"tokensOut"`
-	CacheWrites             int      `json:"cacheWrites,omitempty"`
-	CacheReads              int      `json:"cacheReads,omitempty"`
-	TotalCost               *float64 `json:"totalCost"`
-	Size                    int64    `json:"size,omitempty"`
-	Workspace               string   `json:"workspace,omitempty"`
-	Mode                    string   `json:"mode,omitempty"`
-	APIConfigName           string   `json:"apiConfigName,omitempty"`
-	Status                  string   `json:"status,omitempty"`
-	DelegatedToID           string   `json:"delegatedToId,omitempty"`
-	ChildIDs                []string `json:"childIds,omitempty"`
-	AwaitingChildID         string   `json:"awaitingChildId,omitempty"`
-	CompletedByChildID      string   `json:"completedByChildId,omitempty"`
-	CompletionResultSummary string   `json:"completionResultSummary,omitempty"`
+	ID                      string       `json:"id"`
+	RootTaskID              string       `json:"rootTaskId,omitempty"`
+	ParentTaskID            string       `json:"parentTaskId,omitempty"`
+	Number                  int          `json:"number"`
+	Timestamp               int64        `json:"ts"`
+	Task                    string       `json:"task"`
+	TokensIn                int          `json:"tokensIn"`
+	TokensOut               int          `json:"tokensOut"`
+	CacheWrites             int          `json:"cacheWrites,omitempty"`
+	CacheReads              int          `json:"cacheReads,omitempty"`
+	TotalCost               *json.Number `json:"totalCost"`
+	Size                    int64        `json:"size,omitempty"`
+	Workspace               string       `json:"workspace,omitempty"`
+	Mode                    string       `json:"mode,omitempty"`
+	APIConfigName           string       `json:"apiConfigName,omitempty"`
+	Status                  string       `json:"status,omitempty"`
+	DelegatedToID           string       `json:"delegatedToId,omitempty"`
+	ChildIDs                []string     `json:"childIds,omitempty"`
+	AwaitingChildID         string       `json:"awaitingChildId,omitempty"`
+	CompletedByChildID      string       `json:"completedByChildId,omitempty"`
+	CompletionResultSummary string       `json:"completionResultSummary,omitempty"`
 }
 
 // rooCodeMessage mirrors the ClineMessage in ui_messages.json.
@@ -292,13 +294,23 @@ func parseRooCodeSession(
 		if historyItem.CacheWrites > 0 {
 			event.CacheCreationInputTokens = historyItem.CacheWrites
 		}
-		// Set CostUSD whenever totalCost is present, including an
+		// Set Cost whenever totalCost is present, including an
 		// explicit zero. A reported cost of 0 (free tier, local model)
 		// is authoritative and must override catalog-based pricing;
 		// treating it as absent would misprice token-bearing sessions.
 		if historyItem.TotalCost != nil {
-			cost := *historyItem.TotalCost
-			event.CostUSD = &cost
+			cost, err := money.ParseDollars(historyItem.TotalCost.String())
+			if err != nil {
+				return nil, nil, fmt.Errorf(
+					"parsing RooCode total cost: %w", err,
+				)
+			}
+			if cost.Microdollars < 0 {
+				return nil, nil, fmt.Errorf(
+					"parsing RooCode total cost: %w", money.ErrNegative,
+				)
+			}
+			event.Cost = &cost
 		}
 		sess.UsageEvents = []ParsedUsageEvent{event}
 	}
@@ -1345,41 +1357,6 @@ func parseRooCodeToolCall(text string, ordinal int) *ParsedToolCall {
 		tc.SkillName = inferToolSkillName(toolName, tc.InputJSON)
 	}
 	return tc
-}
-
-// discoverRooCodeSessions finds all task directories under a RooCode root.
-// root is the globalStorage directory (e.g. ~/Library/.../rooveterinaryinc.roo-cline).
-// Sessions live under <root>/tasks/<taskId>/.
-func discoverRooCodeSessions(root string) []rooCodeSessionDir {
-	tasksDir := filepath.Join(root, "tasks")
-	entries, err := os.ReadDir(tasksDir)
-	if err != nil {
-		return nil
-	}
-
-	var dirs []rooCodeSessionDir
-	for _, entry := range entries {
-		if !entry.IsDir() {
-			continue
-		}
-		// Skip the _index.json file directory marker.
-		if strings.HasPrefix(entry.Name(), "_") {
-			continue
-		}
-		taskDir := filepath.Join(tasksDir, entry.Name())
-		if !IsRegularFile(filepath.Join(taskDir, "history_item.json")) {
-			continue
-		}
-		dirs = append(dirs, rooCodeSessionDir{
-			Path: taskDir,
-		})
-	}
-	return dirs
-}
-
-// rooCodeSessionDir holds a discovered RooCode task directory path.
-type rooCodeSessionDir struct {
-	Path string
 }
 
 // rooCodeFingerprintSource computes a composite fingerprint from

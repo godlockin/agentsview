@@ -31,6 +31,26 @@ func writeTraeSyncDB(t *testing.T, path, reply string) {
 	require.NoError(t, err)
 }
 
+func writeTraeSyncDBWithoutStorageKey(t *testing.T, path string) {
+	t.Helper()
+	require.NoError(t, os.MkdirAll(filepath.Dir(path), 0o755))
+	db, err := sql.Open("sqlite3", path)
+	require.NoError(t, err)
+	defer db.Close()
+	require.NoError(t, db.Ping())
+	_, err = db.Exec(`CREATE TABLE ItemTable (key TEXT PRIMARY KEY, value TEXT)`)
+	require.NoError(t, err)
+	_, err = db.Exec(`INSERT INTO ItemTable(key, value) VALUES (?, ?)`, "memento/unrelated-chat-storage", `{"list":[{"sessionId":"ignored","messages":[{"role":"user","content":"wrong"}]}]}`)
+	require.NoError(t, err)
+}
+
+func writeTraeSyncModularData(t *testing.T, root string) {
+	t.Helper()
+	path := filepath.Join(filepath.Dir(root), "ModularData", "ai-agent", "database.db")
+	require.NoError(t, os.MkdirAll(filepath.Dir(path), 0o755))
+	require.NoError(t, os.WriteFile(path, []byte("encrypted header"), 0o644))
+}
+
 func rewriteTraeSyncDB(t *testing.T, path, reply string, mtime time.Time) {
 	t.Helper()
 	db, err := sql.Open("sqlite3", path)
@@ -85,6 +105,65 @@ func traeSyncSession(id, reply string) map[string]any {
 			map[string]any{"role": "user", "content": "same prompt"},
 			map[string]any{"role": "assistant", "content": reply},
 		},
+	}
+}
+
+func TestTraeEncryptedLayoutReportsUnsupportedSource(t *testing.T) {
+	tests := []struct {
+		name  string
+		setup func(t *testing.T, path string)
+	}{
+		{
+			name: "empty stub",
+			setup: func(t *testing.T, path string) {
+				require.NoError(t, os.MkdirAll(filepath.Dir(path), 0o755))
+				db, err := sql.Open("sqlite3", path)
+				require.NoError(t, err)
+				defer db.Close()
+				_, err = db.Exec(`CREATE TABLE ItemTable (key TEXT PRIMARY KEY, value TEXT)`)
+				require.NoError(t, err)
+				value, err := json.Marshal(map[string]any{"list": []any{map[string]any{
+					"sessionId": "stub",
+					"messages":  []any{},
+				}}})
+				require.NoError(t, err)
+				_, err = db.Exec(`INSERT INTO ItemTable(key, value) VALUES (?, ?)`, "memento/icube-ai-agent-storage", value)
+				require.NoError(t, err)
+			},
+		},
+		{
+			name: "missing storage key",
+			setup: func(t *testing.T, path string) {
+				writeTraeSyncDBWithoutStorageKey(t, path)
+			},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			root := filepath.Join(t.TempDir(), "Trae", "User")
+			path := filepath.Join(root, "globalStorage", "state.vscdb")
+			test.setup(t, path)
+			writeTraeSyncModularData(t, root)
+
+			database := dbtest.OpenTestDB(t)
+			engine := NewEngine(database, EngineConfig{
+				AgentDirs: map[parser.AgentType][]string{parser.AgentTrae: {root}},
+				Machine:   "devbox",
+			})
+			res := engine.processFile(context.Background(), parser.DiscoveredFile{
+				Path:  path,
+				Agent: parser.AgentTrae,
+			})
+			require.NoError(t, res.err)
+			assert.True(t, res.skip)
+			assert.False(t, res.forceReplace)
+			assert.Empty(t, res.results)
+
+			var stats SyncStats
+			engine.anomalies.applyTo(&stats)
+			assert.Equal(t, 1, stats.Anomalies.UnsupportedSourceLayoutsTotal)
+			assert.Equal(t, 1, stats.Anomalies.UnsupportedSourceLayoutsByAgent[string(parser.AgentTrae)])
+		})
 	}
 }
 
@@ -246,7 +325,10 @@ func TestProcessFileProviderTraeWALWatcherEventDropsUnchangedSibling(t *testing.
 		traeSyncSession("steady", "steady reply"),
 	}, info.ModTime())
 
-	classified := engine.classifyPaths([]string{path + "-wal"})
+	classified, err := engine.classifyPaths(
+		context.Background(), []string{path + "-wal"},
+	)
+	require.NoError(t, err)
 	require.Len(t, classified, 1)
 	assert.Equal(t, path, classified[0].Path)
 	assert.Equal(t, parser.AgentTrae, classified[0].Agent)
@@ -284,7 +366,10 @@ func TestProcessFileProviderTraeRemovedWALSidecarDoesNotForceParse(t *testing.T)
 	require.Equal(t, 1, written)
 	require.Equal(t, 0, failed)
 
-	classified := engine.classifyPaths([]string{path + "-wal"})
+	classified, err := engine.classifyPaths(
+		context.Background(), []string{path + "-wal"},
+	)
+	require.NoError(t, err)
 	require.Len(t, classified, 1)
 	assert.Equal(t, path, classified[0].Path)
 	assert.False(t, classified[0].ForceParse)

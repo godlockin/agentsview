@@ -18,6 +18,8 @@ import (
 
 	"github.com/tidwall/gjson"
 	_ "go.kenn.io/agentsview/internal/db/driver"
+
+	"go.kenn.io/agentsview/internal/money"
 )
 
 type hermesStateSession struct {
@@ -801,27 +803,50 @@ func readHermesStateMessagesForSession(
 func writeHermesStateSessionJSONL(
 	w io.Writer, stateDB, rawSessionID string,
 ) error {
+	ss, messages, selectedPath, err := readHermesStateSessionSource(
+		stateDB, rawSessionID,
+	)
+	if err != nil {
+		return err
+	}
+	if selectedPath != stateDB {
+		return copyHermesTranscriptFile(w, selectedPath)
+	}
+	return encodeHermesStateSessionJSONL(w, ss, messages)
+}
+
+func readHermesStateSessionSource(
+	stateDB, rawSessionID string,
+) (hermesStateSession, []hermesStateMessage, string, error) {
 	conn, err := sql.Open("sqlite3", "file:"+sqliteURIPath(stateDB)+"?mode=ro")
 	if err != nil {
-		return hermesStateLookupError{
+		return hermesStateSession{}, nil, "", hermesStateLookupError{
 			err: fmt.Errorf("open hermes state db: %w", err),
 		}
 	}
 	defer conn.Close()
+	return readHermesStateSessionSourceConn(conn, stateDB, rawSessionID)
+}
 
+// readHermesStateSessionSourceConn is readHermesStateSessionSource on an
+// already-open connection, so per-pass callers can reuse one state.db open
+// across every member instead of opening the database per session.
+func readHermesStateSessionSourceConn(
+	conn *sql.DB, stateDB, rawSessionID string,
+) (hermesStateSession, []hermesStateMessage, string, error) {
 	ss, found, err := readHermesStateSession(conn, rawSessionID)
 	if err != nil {
-		return hermesStateLookupError{err: err}
+		return hermesStateSession{}, nil, "", hermesStateLookupError{err: err}
 	}
 	if !found {
-		return fmt.Errorf(
+		return hermesStateSession{}, nil, "", fmt.Errorf(
 			"hermes session %s not found in %s: %w",
 			rawSessionID, stateDB, os.ErrNotExist,
 		)
 	}
 	messages, err := readHermesStateMessagesForSession(conn, rawSessionID)
 	if err != nil {
-		return hermesStateLookupError{err: err}
+		return hermesStateSession{}, nil, "", hermesStateLookupError{err: err}
 	}
 	selectedPath, _, _, _ := chooseHermesStateSessionSource(
 		ss,
@@ -831,10 +856,7 @@ func writeHermesStateSessionJSONL(
 		"",
 		"",
 	)
-	if selectedPath != stateDB {
-		return copyHermesTranscriptFile(w, selectedPath)
-	}
-	return encodeHermesStateSessionJSONL(w, ss, messages)
+	return ss, messages, selectedPath, nil
 }
 
 func copyHermesTranscriptFile(w io.Writer, path string) error {
@@ -1054,17 +1076,21 @@ func hermesUsageEvents(
 	// price (e.g. gpt-5.5), which is NOT a confident $0 and must fall
 	// through to catalog pricing. Likewise "unknown"/empty with a 0
 	// estimate is not a real figure and must not masquerade as $0.
-	var cost *float64
+	var cost *money.Money
 	switch {
 	case ss.actualCost.Valid:
-		v := ss.actualCost.Float64
-		cost = &v
+		v, err := money.FromFloatDollars(ss.actualCost.Float64)
+		if err == nil {
+			cost = &v
+		}
 	case ss.costStatus == "included" && hermesHasCostSource(ss.costSource):
-		zero := 0.0
+		zero := money.Money{}
 		cost = &zero
 	case ss.estimatedCost.Valid && ss.estimatedCost.Float64 > 0:
-		v := ss.estimatedCost.Float64
-		cost = &v
+		v, err := money.FromFloatDollars(ss.estimatedCost.Float64)
+		if err == nil {
+			cost = &v
+		}
 	}
 	return []ParsedUsageEvent{{
 		SessionID:                sessionID,
@@ -1075,7 +1101,7 @@ func hermesUsageEvents(
 		CacheCreationInputTokens: max(ss.cacheWriteTokens, 0),
 		CacheReadInputTokens:     max(ss.cacheReadTokens, 0),
 		ReasoningTokens:          max(ss.reasoningTokens, 0),
-		CostUSD:                  cost,
+		Cost:                     cost,
 		CostStatus:               ss.costStatus,
 		CostSource:               ss.costSource,
 		OccurredAt:               timeString(ss.endedAt, ss.startedAt),

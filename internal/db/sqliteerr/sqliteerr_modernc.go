@@ -1,5 +1,4 @@
-//go:build !mattnsqlite
-// +build !mattnsqlite
+//go:build moderncsqlite
 
 package sqliteerr
 

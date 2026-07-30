@@ -118,7 +118,7 @@ func TestVectorPushSourceMissingFile(t *testing.T) {
 	require.NotNil(t, src)
 	closePushSource(t, src)
 
-	_, ok, err := src.Generation(context.Background())
+	_, ok, err := src.BeginExport(context.Background(), nil)
 	require.NoError(t, err)
 	assert.False(t, ok) // no vectors.db yet -> nothing to push, not an error
 }
@@ -134,18 +134,19 @@ func TestVectorPushSourceMissingFileThenBuilt(t *testing.T) {
 	require.NotNil(t, src)
 	closePushSource(t, src)
 
-	_, ok, err := src.Generation(ctx)
+	_, ok, err := src.BeginExport(ctx, nil)
 	require.NoError(t, err)
 	require.False(t, ok, "no vectors.db yet -> nothing to push")
 
 	buildTestVectorsDB(t, cfg)
 
-	gen, ok, err := src.Generation(ctx)
+	export, ok, err := src.BeginExport(ctx, nil)
 	require.NoError(t, err)
 	require.True(t, ok, "same adapter must pick up a later build")
-	assert.Equal(t, "fake-model", gen.Model)
+	defer export.Close()
+	assert.Equal(t, "fake-model", export.Generation().Model)
 
-	hashes, err := src.SessionDocHashes(ctx)
+	hashes, err := export.SessionDocHashes(ctx, nil)
 	require.NoError(t, err)
 	assert.Len(t, hashes, 2)
 }
@@ -183,7 +184,51 @@ func TestVectorPushSourceNotReadyDuringRebuild(t *testing.T) {
 	require.NotNil(t, src)
 	closePushSource(t, src)
 
-	_, ok, err := src.Generation(ctx)
+	_, ok, err := src.BeginExport(ctx, []string{"session-1"})
+	require.Error(t, err)
+	assert.ErrorIs(t, err, postgres.ErrVectorSourceNotReady)
+	assert.False(t, ok)
+}
+
+// TestVectorPushSourceScopedGenerationIgnoresOutOfScopePendingDocs pins the
+// follow-up optimization behind issue #1244: a scoped push may ignore missing
+// docs outside its candidate sessions, while a generation-wide push against the
+// same active generation still blocks until the pending docs are embedded.
+func TestVectorPushSourceScopedGenerationIgnoresOutOfScopePendingDocs(t *testing.T) {
+	ctx := context.Background()
+	cfg := enabledVectorConfig(t)
+	buildTestVectorsDB(t, cfg)
+
+	ix, err := vector.Open(
+		ctx, cfg.Vector.ResolvedDBPath(cfg.DataDir), false,
+		cfg.Vector.Embeddings.MaxInputChars,
+	)
+	require.NoError(t, err)
+	failingEncoder := func(_ context.Context, _ []string) ([][]float32, error) {
+		return nil, errors.New("embeddings endpoint down")
+	}
+	expanded := testPushUnitSource()
+	expanded.units = append(expanded.units, db.EmbeddableUnit{
+		SessionID: "session-3", Kind: "user", SourceUUID: "u3", Content: "later",
+	})
+	_, err = ix.Build(ctx, expanded, failingEncoder,
+		kitvec.Generation{Model: "fake-model", Dimensions: 4},
+		vector.BuildOptions{},
+	)
+	require.Error(t, err, "incremental build must abort on encoder failure")
+	require.NoError(t, ix.Close())
+
+	src := newVectorPushSource(cfg)
+	require.NotNil(t, src)
+	closePushSource(t, src)
+
+	export, ok, err := src.BeginExport(ctx, []string{"session-1"})
+	require.NoError(t, err)
+	require.True(t, ok, "out-of-scope pending docs must not block a scoped push")
+	assert.Equal(t, "fake-model", export.Generation().Model)
+	require.NoError(t, export.Close())
+
+	_, ok, err = src.BeginExport(ctx, nil)
 	require.Error(t, err)
 	assert.ErrorIs(t, err, postgres.ErrVectorSourceNotReady)
 	assert.False(t, ok)
@@ -198,14 +243,15 @@ func TestVectorPushSourceRoundTrip(t *testing.T) {
 	require.NotNil(t, src)
 	closePushSource(t, src)
 
-	gen, ok, err := src.Generation(ctx)
+	export, ok, err := src.BeginExport(ctx, nil)
 	require.NoError(t, err)
 	require.True(t, ok)
-	assert.NotEmpty(t, gen.Fingerprint)
-	assert.Equal(t, "fake-model", gen.Model)
-	assert.Equal(t, 4, gen.Dimension)
+	defer export.Close()
+	assert.NotEmpty(t, export.Generation().Fingerprint)
+	assert.Equal(t, "fake-model", export.Generation().Model)
+	assert.Equal(t, 4, export.Generation().Dimension)
 
-	hashes, err := src.SessionDocHashes(ctx)
+	hashes, err := export.SessionDocHashes(ctx, nil)
 	require.NoError(t, err)
 	require.Len(t, hashes, 2)
 	assert.Contains(t, hashes, "session-1")
@@ -228,7 +274,7 @@ func TestVectorPushSourceRoundTrip(t *testing.T) {
 	assert.Equal(t, hashes["session-1"], wantHash,
 		"export hash must match the delta-scan aggregate for an unchanged index")
 
-	docs, gotHash, err := src.SessionDocs(ctx, "session-1")
+	docs, gotHash, err := export.SessionDocs(ctx, "session-1")
 	require.NoError(t, err)
 	assert.Equal(t, wantHash, gotHash)
 	require.Len(t, docs, len(want))
@@ -264,9 +310,10 @@ func TestCloseVectorPushSource(t *testing.T) {
 	require.NotNil(t, src)
 
 	ctx := context.Background()
-	_, ok, err := src.Generation(ctx)
+	export, ok, err := src.BeginExport(ctx, nil)
 	require.NoError(t, err)
 	require.True(t, ok)
+	defer export.Close()
 	adapter := src.(*vectorPushSource)
 	require.NotNil(t, adapter.ix, "Generation memoizes the open handle")
 
@@ -274,8 +321,9 @@ func TestCloseVectorPushSource(t *testing.T) {
 	assert.Nil(t, adapter.ix, "close releases the memoized handle")
 	closeVectorPushSource(src) // idempotent
 
-	_, ok, err = src.Generation(ctx)
+	export, ok, err = src.BeginExport(ctx, nil)
 	require.NoError(t, err)
 	assert.True(t, ok, "a closed adapter reopens lazily")
+	require.NoError(t, export.Close())
 	closePushSource(t, src)
 }

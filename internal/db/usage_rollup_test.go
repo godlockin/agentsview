@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"testing"
 
+	"go.kenn.io/agentsview/internal/money"
+
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -32,10 +34,10 @@ func TestRecomputeDailyUsageRollup_ParityWithGetDailyUsage(t *testing.T) {
 
 	require.NoError(t, d.UpsertModelPricing([]ModelPricing{{
 		ModelPattern:         "claude-sonnet-4-20250514",
-		InputPerMTok:         3.0,
-		OutputPerMTok:        15.0,
-		CacheCreationPerMTok: 3.75,
-		CacheReadPerMTok:     0.30,
+		InputPerMTok:         money.MustParseDollars("3"),
+		OutputPerMTok:        money.MustParseDollars("15"),
+		CacheCreationPerMTok: money.MustParseDollars("3.75"),
+		CacheReadPerMTok:     money.MustParseDollars("0.30"),
 	}}), "UpsertModelPricing")
 
 	insertSession(t, d, "sessR", "projR", func(s *Session) {

@@ -5,11 +5,15 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"github.com/tidwall/gjson"
+
+	"go.kenn.io/agentsview/internal/money"
 )
 
 func writeGrokFixtureFile(t *testing.T, path, body string) {
@@ -306,6 +310,110 @@ func TestParseGrokChatHistoryDropsOrphanReasoning(t *testing.T) {
 	}
 }
 
+// A followed cwd- or session-directory symlink whose target cannot be
+// resolved must surface incomplete streaming discovery rather than reading as
+// absent: reconciliation treats a clean DiscoverEach as authoritative and
+// would tombstone every session beneath the symlink.
+func TestGrokProviderStreamingDiscoveryPropagatesDirectorySymlinkErrors(t *testing.T) {
+	discoverEach := func(t *testing.T, root string) ([]string, error) {
+		t.Helper()
+		provider := newGrokTestProvider(t, root)
+		discoverer, ok := provider.(StreamingDiscoverer)
+		require.True(t, ok)
+		var yielded []string
+		err := discoverer.DiscoverEach(t.Context(), func(source SourceRef) error {
+			yielded = append(yielded, source.DisplayPath)
+			return nil
+		})
+		return yielded, err
+	}
+	writeHealthySession := func(t *testing.T, root string) string {
+		t.Helper()
+		path := grokSummaryPath(root, "cwd-key", "sess-1")
+		writeGrokFixtureFile(t, path, `{"summary":"Healthy"}`)
+		return path
+	}
+
+	t.Run("dangling cwd symlink", func(t *testing.T) {
+		root := t.TempDir()
+		healthy := writeHealthySession(t, root)
+		target := filepath.Join(t.TempDir(), "linked-cwd")
+		require.NoError(t, os.MkdirAll(target, 0o755))
+		link := filepath.Join(root, "linked")
+		if err := os.Symlink(target, link); err != nil {
+			t.Skipf("symlink not supported: %v", err)
+		}
+		require.NoError(t, os.RemoveAll(target))
+
+		_, err := discoverEach(t, root)
+
+		require.Error(t, err)
+		assert.ErrorIs(t, err, os.ErrNotExist)
+		var incomplete DiscoveryIncompleteError
+		assert.ErrorAs(t, err, &incomplete)
+
+		require.NoError(t, os.Remove(link))
+		yielded, err := discoverEach(t, root)
+		require.NoError(t, err)
+		assert.Equal(t, []string{healthy}, yielded)
+	})
+
+	t.Run("dangling session symlink", func(t *testing.T) {
+		root := t.TempDir()
+		healthy := writeHealthySession(t, root)
+		target := filepath.Join(t.TempDir(), "linked-session")
+		require.NoError(t, os.MkdirAll(target, 0o755))
+		link := filepath.Join(root, "cwd-key", "sess-linked")
+		if err := os.Symlink(target, link); err != nil {
+			t.Skipf("symlink not supported: %v", err)
+		}
+		require.NoError(t, os.RemoveAll(target))
+
+		_, err := discoverEach(t, root)
+
+		require.Error(t, err)
+		assert.ErrorIs(t, err, os.ErrNotExist)
+		var incomplete DiscoveryIncompleteError
+		assert.ErrorAs(t, err, &incomplete)
+
+		require.NoError(t, os.Remove(link))
+		yielded, err := discoverEach(t, root)
+		require.NoError(t, err)
+		assert.Equal(t, []string{healthy}, yielded)
+	})
+
+	t.Run("unstatable cwd symlink target", func(t *testing.T) {
+		if runtime.GOOS == "windows" {
+			t.Skip("directory read permissions are not enforced on Windows")
+		}
+		if os.Geteuid() == 0 {
+			t.Skip("root bypasses directory permissions")
+		}
+		root := t.TempDir()
+		healthy := writeHealthySession(t, root)
+		targetParent := t.TempDir()
+		target := filepath.Join(targetParent, "linked-cwd")
+		require.NoError(t, os.MkdirAll(target, 0o755))
+		if err := os.Symlink(target, filepath.Join(root, "linked")); err != nil {
+			t.Skipf("symlink not supported: %v", err)
+		}
+		require.NoError(t, os.Chmod(targetParent, 0o000))
+		t.Cleanup(func() { _ = os.Chmod(targetParent, 0o755) })
+
+		_, err := discoverEach(t, root)
+
+		require.Error(t, err)
+		assert.ErrorIs(t, err, os.ErrPermission)
+		var incomplete DiscoveryIncompleteError
+		assert.ErrorAs(t, err, &incomplete)
+
+		require.NoError(t, os.Chmod(targetParent, 0o755))
+		yielded, err := discoverEach(t, root)
+		require.NoError(t, err)
+		assert.Equal(t, []string{healthy}, yielded)
+	})
+}
+
 func TestGrokProviderSummarySource(t *testing.T) {
 	root := t.TempDir()
 	writeGrokFixtureFile(t, grokSummaryPath(root, "cwd-key", "sess-1"), `{
@@ -418,21 +526,83 @@ func parseGrokUsageFixtureWithSummary(
 	return result
 }
 
-func TestGrokProviderLatestUsageSnapshot(t *testing.T) {
+func TestGrokProviderPerTurnUsageEvents(t *testing.T) {
+	// Usage payloads are per-turn measurements, not cumulative snapshots:
+	// every turn must produce its own event, and cachedReadTokens moving
+	// down between turns (10 -> 13 with a lower input) must be preserved
+	// as-is rather than treated as a snapshot to overwrite.
 	result := parseGrokUsageFixture(t, strings.Join([]string{
 		`{"params":{"update":{"usage":{"inputTokens":100,"outputTokens":20,"cachedReadTokens":10,"reasoningTokens":4}}}}`,
 		`{"params":{"update":{"usage":{"inputTokens":8,"outputTokens":3,"cachedReadTokens":13,"reasoningTokens":1}}}}`,
 		`not json`,
 	}, "\n"))
 
+	require.Len(t, result.UsageEvents, 2)
+	first, second := result.UsageEvents[0], result.UsageEvents[1]
+	assert.Equal(t, 90, first.InputTokens)
+	assert.Equal(t, 10, first.CacheReadInputTokens)
+	assert.Equal(t, 20, first.OutputTokens)
+	assert.Equal(t, 4, first.ReasoningTokens)
+	assert.Equal(t, "session:grok:sess-1:turn-1:grok-summary", first.DedupKey)
+	assert.Equal(t, 0, second.InputTokens)
+	assert.Equal(t, 13, second.CacheReadInputTokens)
+	assert.Equal(t, 3, second.OutputTokens)
+	assert.Equal(t, 1, second.ReasoningTokens)
+	assert.Equal(t, "session:grok:sess-1:turn-2:grok-summary", second.DedupKey)
+	assert.Equal(t, 23, result.Session.TotalOutputTokens)
+}
+
+func TestGrokProviderPerTurnUsageDedupsByPromptID(t *testing.T) {
+	result := parseGrokUsageFixture(t, strings.Join([]string{
+		`{"timestamp":1784575476,"params":{"update":{"sessionUpdate":"turn_completed","prompt_id":"p-aaa","usage":{"modelUsage":{"grok-4.5":{"inputTokens":1100,"outputTokens":10,"cachedReadTokens":1000}}}}}}`,
+		`{"timestamp":1784575500,"params":{"update":{"sessionUpdate":"turn_completed","prompt_id":"p-bbb","usage":{"modelUsage":{"grok-4.5":{"inputTokens":200,"outputTokens":20,"cachedReadTokens":128},"grok-4.5-build":{"inputTokens":50,"outputTokens":5,"cachedReadTokens":0}}}}}}`,
+	}, "\n"))
+
+	require.Len(t, result.UsageEvents, 3)
+	keys := make([]string, 0, len(result.UsageEvents))
+	for _, event := range result.UsageEvents {
+		keys = append(keys, event.DedupKey)
+	}
+	assert.ElementsMatch(t, []string{
+		"session:grok:sess-1:p-aaa:grok-4.5",
+		"session:grok:sess-1:p-bbb:grok-4.5",
+		"session:grok:sess-1:p-bbb:grok-4.5-build",
+	}, keys)
+}
+
+func TestGrokProviderPerTurnUsageLastWinsOnDuplicatePromptID(t *testing.T) {
+	// Retry/replay lines re-emit a turn's payload under the same
+	// prompt_id. They must collapse to a single event (the DB enforces a
+	// unique (session_id, source, dedup_key) index — a duplicate would
+	// roll back the whole usage replace), keeping the last payload.
+	result := parseGrokUsageFixture(t, strings.Join([]string{
+		`{"timestamp":1784575476,"params":{"update":{"sessionUpdate":"turn_completed","prompt_id":"p-aaa","usage":{"modelUsage":{"grok-4.5":{"inputTokens":1100,"outputTokens":10,"cachedReadTokens":1000}}}}}}`,
+		`{"timestamp":1784575480,"params":{"update":{"sessionUpdate":"turn_completed","prompt_id":"p-aaa","usage":{"modelUsage":{"grok-4.5":{"inputTokens":1200,"outputTokens":15,"cachedReadTokens":1000}}}}}}`,
+	}, "\n"))
+
 	require.Len(t, result.UsageEvents, 1)
 	event := result.UsageEvents[0]
-	assert.Equal(t, 0, event.InputTokens)
-	assert.Equal(t, 13, event.CacheReadInputTokens)
-	assert.Equal(t, 3, event.OutputTokens)
-	assert.Equal(t, 1, event.ReasoningTokens)
-	assert.Equal(t, "grok-summary", event.Model)
-	assert.Equal(t, "session:grok:sess-1:grok-summary", event.DedupKey)
+	assert.Equal(t, "session:grok:sess-1:p-aaa:grok-4.5", event.DedupKey)
+	assert.Equal(t, 200, event.InputTokens)
+	assert.Equal(t, 15, event.OutputTokens)
+	assert.Equal(t, "2026-07-20T19:24:40Z", event.OccurredAt)
+	assert.Equal(t, 15, result.Session.TotalOutputTokens)
+}
+
+func TestGrokProviderPerTurnUsageDatesByTurnTimestamp(t *testing.T) {
+	// A session spanning several days must bucket each turn's usage on
+	// the day the turn happened, not the session's end date.
+	result := parseGrokUsageFixture(t, strings.Join([]string{
+		`{"timestamp":1779735600,"params":{"update":{"usage":{"inputTokens":10,"outputTokens":1}}}}`,
+		`{"timestamp":1779822000,"params":{"update":{"usage":{"inputTokens":20,"outputTokens":2}}}}`,
+		`{"params":{"update":{"usage":{"inputTokens":30,"outputTokens":3}}}}`,
+	}, "\n"))
+
+	require.Len(t, result.UsageEvents, 3)
+	assert.Equal(t, "2026-05-25T19:00:00Z", result.UsageEvents[0].OccurredAt)
+	assert.Equal(t, "2026-05-26T19:00:00Z", result.UsageEvents[1].OccurredAt)
+	// No per-turn timestamp: falls back to the session window (updatedAt).
+	assert.Equal(t, "2026-07-08T10:30:00Z", result.UsageEvents[2].OccurredAt)
 }
 
 func TestGrokProviderUpdatesWithoutUsageEmitNoEvents(t *testing.T) {
@@ -470,10 +640,10 @@ func TestGrokProviderUpdatesUsageByModel(t *testing.T) {
 	}
 	assert.Equal(t, 2, models["grok-a"].OutputTokens)
 	assert.Equal(t, 3, models["grok-b"].OutputTokens)
-	require.NotNil(t, models["grok-a"].CostUSD)
-	require.NotNil(t, models["grok-b"].CostUSD)
-	assert.InDelta(t, 1.0, *models["grok-a"].CostUSD, 1e-12)
-	assert.InDelta(t, 0.25, *models["grok-b"].CostUSD, 1e-12)
+	require.NotNil(t, models["grok-a"].Cost)
+	require.NotNil(t, models["grok-b"].Cost)
+	assert.Equal(t, money.Money{Microdollars: 1_000_000}, *models["grok-a"].Cost)
+	assert.Equal(t, money.Money{Microdollars: 250_000}, *models["grok-b"].Cost)
 	assert.NotContains(t, models, "grok-summary")
 }
 
@@ -483,8 +653,11 @@ func TestGrokProviderUpdatesUsageTopLevelFallback(t *testing.T) {
 	require.Len(t, result.UsageEvents, 1)
 	assert.Equal(t, "grok-summary", result.UsageEvents[0].Model)
 	assert.Equal(t, 12, result.UsageEvents[0].InputTokens)
-	require.NotNil(t, result.UsageEvents[0].CostUSD)
-	assert.InDelta(t, 0.0424128, *result.UsageEvents[0].CostUSD, 1e-12)
+	require.NotNil(t, result.UsageEvents[0].Cost)
+	assert.Equal(t,
+		money.Money{Microdollars: 42_413},
+		*result.UsageEvents[0].Cost,
+	)
 }
 
 func TestGrokProviderUpdatesUsageTopLevelFallbackWithoutSummaryModel(t *testing.T) {
@@ -498,15 +671,21 @@ func TestGrokProviderUpdatesUsageTopLevelFallbackWithoutSummaryModel(t *testing.
 	require.Len(t, result.UsageEvents, 1)
 	assert.Equal(t, "grok-summary", result.UsageEvents[0].Model)
 	assert.Equal(t, 12, result.UsageEvents[0].InputTokens)
-	assert.Nil(t, result.UsageEvents[0].CostUSD)
+	assert.Nil(t, result.UsageEvents[0].Cost)
 }
 
 func TestGrokProviderUpdatesUsageReportedZeroCost(t *testing.T) {
 	result := parseGrokUsageFixture(t, `{"params":{"update":{"usage":{"inputTokens":12,"outputTokens":4,"costUsdTicks":0,"modelUsage":{}}}}}`)
 
 	require.Len(t, result.UsageEvents, 1)
-	require.NotNil(t, result.UsageEvents[0].CostUSD)
-	assert.Equal(t, 0.0, *result.UsageEvents[0].CostUSD)
+	require.NotNil(t, result.UsageEvents[0].Cost)
+	assert.Equal(t, money.Money{}, *result.UsageEvents[0].Cost)
+}
+
+func TestGrokUsageCostRejectsNegativeCharge(t *testing.T) {
+	_, err := grokUsageCost(gjson.Parse(`{"costUsdTicks":-1}`))
+	require.Error(t, err)
+	assert.ErrorIs(t, err, money.ErrNegative)
 }
 
 func TestGrokProviderCurrentBuildSummarySchema(t *testing.T) {

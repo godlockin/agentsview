@@ -3,6 +3,8 @@ package pricing
 import (
 	"testing"
 
+	"go.kenn.io/agentsview/internal/money"
+
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -45,16 +47,16 @@ func TestParseOpenRouterPricing_TextGenerationOnly(t *testing.T) {
 	// Prefixed row keeps the OpenRouter id verbatim.
 	got := prices[0]
 	assert.Equal(t, "MiniMax/MiniMax-M3", got.ModelPattern)
-	assert.InDelta(t, 5.0, got.InputPerMTok, 1e-9, "input")
-	assert.InDelta(t, 25.0, got.OutputPerMTok, 1e-9, "output")
-	assert.InDelta(t, 0.5, got.CacheReadPerMTok, 1e-9, "cache_read")
-	assert.InDelta(t, 6.25, got.CacheCreationPerMTok, 1e-9, "cache_creation")
+	assert.Equal(t, int64(5_000_000), got.InputPerMTok.Microdollars, "input")
+	assert.Equal(t, int64(25_000_000), got.OutputPerMTok.Microdollars, "output")
+	assert.Equal(t, int64(500_000), got.CacheReadPerMTok.Microdollars, "cache_read")
+	assert.Equal(t, int64(6_250_000), got.CacheCreationPerMTok.Microdollars, "cache_creation")
 
 	// Bare alias so sessions that record just "MiniMax-M3" resolve.
 	alias := prices[1]
 	assert.Equal(t, "MiniMax-M3", alias.ModelPattern)
-	assert.InDelta(t, 5.0, alias.InputPerMTok, 1e-9, "alias input")
-	assert.InDelta(t, 25.0, alias.OutputPerMTok, 1e-9, "alias output")
+	assert.Equal(t, int64(5_000_000), alias.InputPerMTok.Microdollars, "alias input")
+	assert.Equal(t, int64(25_000_000), alias.OutputPerMTok.Microdollars, "alias output")
 }
 
 // TestParseOpenRouterPricing_MultimodalInputProducingText verifies
@@ -143,24 +145,24 @@ func TestParseOpenRouterPricing_AmbiguousBareSuffixSuppressed(t *testing.T) {
 func TestMergePricing_FirstNonZeroWins(t *testing.T) {
 	sources := map[string][]ModelPricing{
 		"a": {
-			{ModelPattern: "shared", InputPerMTok: 3, OutputPerMTok: 15},
-			{ModelPattern: "only-a", InputPerMTok: 1, OutputPerMTok: 2},
+			{ModelPattern: "shared", InputPerMTok: money.Money{Microdollars: 3}, OutputPerMTok: money.Money{Microdollars: 15}},
+			{ModelPattern: "only-a", InputPerMTok: money.Money{Microdollars: 1}, OutputPerMTok: money.Money{Microdollars: 2}},
 		},
 		"b": {
-			{ModelPattern: "shared", InputPerMTok: 99, OutputPerMTok: 99,
-				CacheCreationPerMTok: 4},
-			{ModelPattern: "only-b", InputPerMTok: 7, OutputPerMTok: 8},
+			{ModelPattern: "shared", InputPerMTok: money.Money{Microdollars: 99}, OutputPerMTok: money.Money{Microdollars: 99},
+				CacheCreationPerMTok: money.Money{Microdollars: 4}},
+			{ModelPattern: "only-b", InputPerMTok: money.Money{Microdollars: 7}, OutputPerMTok: money.Money{Microdollars: 8}},
 		},
 	}
 	merged := MergePricing(sources)
 
 	require.Len(t, merged, 3, "expected 3 distinct patterns")
-	assert.Equal(t, 3.0, merged["shared"].InputPerMTok, "a wins input")
-	assert.Equal(t, 15.0, merged["shared"].OutputPerMTok, "a wins output")
-	assert.Equal(t, 4.0, merged["shared"].CacheCreationPerMTok,
+	assert.Equal(t, int64(3), merged["shared"].InputPerMTok.Microdollars, "a wins input")
+	assert.Equal(t, int64(15), merged["shared"].OutputPerMTok.Microdollars, "a wins output")
+	assert.Equal(t, int64(4), merged["shared"].CacheCreationPerMTok.Microdollars,
 		"b fills the zero field")
-	assert.Equal(t, 1.0, merged["only-a"].InputPerMTok)
-	assert.Equal(t, 7.0, merged["only-b"].InputPerMTok)
+	assert.Equal(t, int64(1), merged["only-a"].InputPerMTok.Microdollars)
+	assert.Equal(t, int64(7), merged["only-b"].InputPerMTok.Microdollars)
 }
 
 // TestDefaultPricingSources_OrderIsStable makes sure the

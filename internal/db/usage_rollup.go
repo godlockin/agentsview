@@ -147,8 +147,11 @@ func (db *DB) aggregateRollupBuckets(
 			seen[key] = struct{}{}
 		}
 
-		inputTok, outputTok, cacheCrTok, cacheRdTok, _, _ :=
+		inputTok, outputTok, cacheCrTok, cacheRdTok, _, _, priceErr :=
 			dailyUsageAmounts(r, rateResolver)
+		if priceErr != nil {
+			return nil, fmt.Errorf("pricing rollup row: %w", priceErr)
+		}
 
 		k := rollupKey{
 			day:     date,

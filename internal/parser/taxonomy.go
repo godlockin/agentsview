@@ -48,6 +48,33 @@ func NormalizeToolCategory(rawName string) string {
 	case "search_files", "grep", "grep_search":
 		return "Grep"
 
+	// Kilo (legacy) / RooCode (Cline-family) camelCase tool names.
+	// Read-family verbs (appliedDiff → Edit) and list/search share
+	// an embedded "content" payload field; kilo_legacy.go and
+	// roocode.go strip that field before building InputJSON so the
+	// payload stays a clean argument object.
+	case "appliedDiff", "searchAndReplace",
+		"editedExistingFile", "deleteFile":
+		return "Edit"
+	case "insertContent":
+		return "Write"
+	case "readFile", "listFiles", "listCodeDefinitionNames",
+		"listFilesTopLevel", "listFilesRecursive":
+		return "Read"
+	case "searchFiles", "codebaseSearch":
+		return "Grep"
+	case "writeToFile", "createFile", "newFileCreated":
+		return "Write"
+	case "executeCommand":
+		return "Bash"
+	case "useMcpTool", "use_mcp_tool", "search":
+		return "Tool"
+	case "newTask":
+		return "Task"
+	case "fetchInstructions", "updateTodoList", "finishTask",
+		"switchMode":
+		return "Tool"
+
 	// Antigravity tools
 	case "view_file", "read_url_content":
 		return "Read"
@@ -218,28 +245,6 @@ func NormalizeToolCategory(rawName string) string {
 	case "explore":
 		return "Task"
 
-	// RooCode / Cline tools
-	case "readFile":
-		return "Read"
-	case "writeToFile":
-		return "Write"
-	case "insertContent":
-		return "Write"
-	case "searchAndReplace":
-		return "Edit"
-	case "appliedDiff":
-		return "Edit"
-	case "listFiles", "listFilesTopLevel", "listFilesRecursive":
-		return "Read"
-	case "listCodeDefinitionNames":
-		return "Read"
-	case "searchFiles":
-		return "Grep"
-	case "newTask":
-		return "Task"
-	case "search":
-		return "Tool"
-
 	// Warp tools
 	case "read_files":
 		return "Read"
@@ -257,6 +262,12 @@ func NormalizeToolCategory(rawName string) string {
 		return "Read"
 	case "use_computer":
 		return "Tool"
+
+	// Poolside tools (only tools not already covered above)
+	case "todo_action", "switch_mode", "question", "exit":
+		return "Tool"
+	case "shell_kill", "shell_status", "shell_tail":
+		return "Bash"
 
 	default:
 		// MCP tools may carry a server prefix (e.g.

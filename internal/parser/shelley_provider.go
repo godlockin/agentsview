@@ -1,10 +1,10 @@
 package parser
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"path/filepath"
-	"strings"
 )
 
 // Shelley stores every conversation in one shared SQLite database
@@ -21,6 +21,7 @@ func newShelleyProviderFactory(def AgentDef) ProviderFactory {
 				AgentShelley,
 				cfg.Roots,
 				WithContainerDiscovery(shelleyDiscoverContainers),
+				WithStreamingSourceDiscovery(shelleyDiscoverEach),
 				WithWatchRoots(shelleyWatchRoots),
 				WithChangedPathClassifier(shelleyClassifyPath),
 				WithMemberLookup(shelleyFindMember),
@@ -33,6 +34,25 @@ func newShelleyProviderFactory(def AgentDef) ProviderFactory {
 			)
 		},
 	)
+}
+
+func shelleyDiscoverEach(
+	ctx context.Context, root string, yield func(multiSessionMatch) error,
+) error {
+	dbPath := shelleyDBPath(root)
+	if dbPath == "" {
+		return nil
+	}
+	conn, err := OpenShelleyDB(dbPath)
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
+	return ForEachShelleyConversationMeta(ctx, conn, dbPath, func(meta ShelleyConversationMeta) error {
+		return yield(multiSessionMatch{
+			Path: meta.VirtualPath, Container: dbPath, MemberID: meta.RawID,
+		})
+	})
 }
 
 func shelleyDiscoverContainers(root string) []string {
@@ -63,28 +83,9 @@ func shelleyWatchRoots(roots []string) []WatchRoot {
 func shelleyClassifyPath(
 	root, path string, allowMissing bool,
 ) (multiSessionMatch, bool) {
-	root = filepath.Clean(root)
-	path = filepath.Clean(path)
-	requireRegular := !allowMissing
-	if dbPath, conversationID, ok := parseShelleyVirtualPath(path); ok {
-		if !shelleyDBUnderRoot(root, dbPath, requireRegular) {
-			return multiSessionMatch{}, false
-		}
-		return multiSessionMatch{
-			Path:      path,
-			Container: dbPath,
-			MemberID:  conversationID,
-		}, true
-	}
-	if shelleyDBUnderRoot(root, path, requireRegular) {
-		return multiSessionMatch{Path: path, Container: path}, true
-	}
-	if allowMissing {
-		if dbPath, ok := shelleyDBPathForEvent(root, path); ok {
-			return multiSessionMatch{Path: dbPath, Container: dbPath}, true
-		}
-	}
-	return multiSessionMatch{}, false
+	return classifySQLiteContainerPath(
+		root, path, shelleyDBName, allowMissing, false, parseShelleyVirtualPath,
+	)
 }
 
 // shelleyFindMember resolves a raw conversation ID to its virtual source path
@@ -118,7 +119,9 @@ func shelleyFingerprintSource(src multiSessionSource) (SourceFingerprint, error)
 		MTimeNS: info.ModTime().UnixNano(),
 	}
 	if src.MemberID == "" {
-		if compositeMtime, err := sqliteDBCompositeMtime(src.Container); err == nil {
+		if compositeMtime, err := sqliteDBCompositeMtime(
+			src.Container, sqliteDBJournalSuffixes,
+		); err == nil {
 			fingerprint.MTimeNS = compositeMtime
 		}
 		fingerprint.Hash, err = hashJSONLSourceFile(src.Container)
@@ -133,14 +136,13 @@ func shelleyFingerprintSource(src multiSessionSource) (SourceFingerprint, error)
 		return SourceFingerprint{}, err
 	}
 	defer conn.Close()
-	metas, err := ListShelleyConversationMetas(conn, src.Container)
+	meta, found, err := ShelleyConversationMetaByID(
+		context.Background(), conn, src.Container, src.MemberID,
+	)
 	if err != nil {
 		return SourceFingerprint{}, err
 	}
-	for _, meta := range metas {
-		if meta.RawID != src.MemberID {
-			continue
-		}
+	if found {
 		fingerprint.MTimeNS = meta.FileMtime
 		fingerprint.Hash = meta.Fingerprint
 		return fingerprint, nil
@@ -232,31 +234,6 @@ func shelleyDBPath(root string) string {
 	return path
 }
 
-func shelleyDBUnderRoot(root, dbPath string, requireRegular bool) bool {
-	root = filepath.Clean(root)
-	dbPath = filepath.Clean(dbPath)
-	rel, ok := relUnder(root, dbPath)
-	if !ok || filepath.ToSlash(rel) != shelleyDBName {
-		return false
-	}
-	return !requireRegular || IsRegularFile(dbPath)
-}
-
-func shelleyDBPathForEvent(root, path string) (string, bool) {
-	root = filepath.Clean(root)
-	path = filepath.Clean(path)
-	rel, ok := relUnder(root, path)
-	if !ok {
-		return "", false
-	}
-	if filepath.ToSlash(rel) == shelleyDBName ||
-		(filepath.Dir(rel) == "." &&
-			strings.HasPrefix(filepath.Base(rel), shelleyDBName+"-")) {
-		return filepath.Join(root, shelleyDBName), true
-	}
-	return "", false
-}
-
 // parseShelleyVirtualPath splits a Shelley virtual source path into its
 // physical shelley.db path and raw conversation ID. The container basename
 // must be shelley.db and the conversation ID must be non-empty.
@@ -265,11 +242,13 @@ func parseShelleyVirtualPath(path string) (string, string, bool) {
 }
 
 func shelleyProviderCapabilities() Capabilities {
+	source := multiSessionContainerSourceCapabilities(
+		CapabilitySupported,
+		CapabilitySupported,
+	)
+	source.PersistentArchive = CapabilitySupported
 	return Capabilities{
-		Source: multiSessionContainerSourceCapabilities(
-			CapabilitySupported,
-			CapabilitySupported,
-		),
+		Source: source,
 		Content: ContentCapabilities{
 			FirstMessage:         CapabilitySupported,
 			SessionName:          CapabilitySupported,
@@ -280,6 +259,9 @@ func shelleyProviderCapabilities() Capabilities {
 			ToolResults:          CapabilitySupported,
 			PerMessageTokenUsage: CapabilitySupported,
 			Model:                CapabilitySupported,
+		},
+		Sync: ProviderSyncSemantics{
+			UnchangedResults: UnchangedResultMTimeAndHash,
 		},
 	}
 }

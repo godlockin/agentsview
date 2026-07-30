@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"log"
@@ -25,6 +26,7 @@ import (
 	"github.com/gofrs/flock"
 	"github.com/spf13/pflag"
 	"go.kenn.io/agentsview/internal/parser"
+	"go.kenn.io/agentsview/internal/pathutil"
 )
 
 // TerminalConfig holds terminal launch preferences.
@@ -102,13 +104,18 @@ var pgConfigKeys = map[string]struct{}{
 
 // DuckDBConfig holds DuckDB mirror and Quack connection settings.
 type DuckDBConfig struct {
-	Path            string   `toml:"path" json:"path"`
-	URL             string   `toml:"url" json:"url"`
-	Token           string   `toml:"token" json:"token,omitempty"`
-	MachineName     string   `toml:"machine_name" json:"machine_name"`
-	AllowInsecure   bool     `toml:"allow_insecure" json:"allow_insecure"`
-	Projects        []string `toml:"projects" json:"projects,omitempty"`
-	ExcludeProjects []string `toml:"exclude_projects" json:"exclude_projects,omitempty"`
+	Path          string `toml:"path" json:"path"`
+	URL           string `toml:"url" json:"url"`
+	Token         string `toml:"token" json:"token,omitempty"`
+	MachineName   string `toml:"machine_name" json:"machine_name"`
+	AllowInsecure bool   `toml:"allow_insecure" json:"allow_insecure"`
+	// AttachTimeout bounds how long a remote Quack ATTACH (and its cheap TCP
+	// preflight) may run before the client gives up, so an unresponsive
+	// endpoint fails fast instead of hanging forever. Zero selects the
+	// package default; a negative value disables the guard.
+	AttachTimeout   time.Duration `toml:"attach_timeout" json:"attach_timeout,omitempty"`
+	Projects        []string      `toml:"projects" json:"projects,omitempty"`
+	ExcludeProjects []string      `toml:"exclude_projects" json:"exclude_projects,omitempty"`
 }
 
 // VectorConfig holds settings for the optional local semantic-search
@@ -274,6 +281,9 @@ type VectorEmbedConfig struct {
 	// RunAfterSync enables debounced embedding of sync deltas.
 	// Defaults to true when unset; read it via RunAfterSyncEnabled.
 	RunAfterSync *bool `toml:"run_after_sync" json:"run_after_sync,omitempty"`
+	// Recall explicitly permits automatic Recall embedding. It defaults to
+	// false because Recall entries may contain distilled private content.
+	Recall bool `toml:"recall" json:"recall"`
 	// BackstopInterval is a parseable duration string for a periodic
 	// full rescan. Default "24h"; a negative duration disables it.
 	BackstopInterval string `toml:"backstop_interval" json:"backstop_interval"`
@@ -408,10 +418,10 @@ type AgentConfig struct {
 }
 
 type CustomModelRate struct {
-	Input         float64 `json:"input" toml:"input"`
-	Output        float64 `json:"output" toml:"output"`
-	CacheCreation float64 `json:"cache_creation,omitempty" toml:"cache_creation"`
-	CacheRead     float64 `json:"cache_read,omitempty" toml:"cache_read"`
+	InputMicrodollarsPerMTok         int64 `json:"input_microdollars_per_mtok" toml:"input_microdollars_per_mtok"`
+	OutputMicrodollarsPerMTok        int64 `json:"output_microdollars_per_mtok" toml:"output_microdollars_per_mtok"`
+	CacheCreationMicrodollarsPerMTok int64 `json:"cache_creation_microdollars_per_mtok,omitempty" toml:"cache_creation_microdollars_per_mtok"`
+	CacheReadMicrodollarsPerMTok     int64 `json:"cache_read_microdollars_per_mtok,omitempty" toml:"cache_read_microdollars_per_mtok"`
 }
 
 type RemoteTransport string
@@ -422,6 +432,27 @@ const (
 	RemoteTransportSSH  RemoteTransport = "ssh"
 	RemoteTransportHTTP RemoteTransport = "http"
 )
+
+type ChartPalette string
+
+const (
+	ChartPaletteAgentsview ChartPalette = "agentsview"
+	ChartPaletteMatplotlib ChartPalette = "matplotlib"
+	DefaultChartPalette                 = ChartPaletteAgentsview
+)
+
+func ParseChartPalette(value string) (ChartPalette, error) {
+	palette := ChartPalette(value)
+	switch palette {
+	case ChartPaletteAgentsview, ChartPaletteMatplotlib:
+		return palette, nil
+	default:
+		return "", fmt.Errorf(
+			`chart_palette must be "agentsview" or "matplotlib" (got %q)`,
+			value,
+		)
+	}
+}
 
 // RemoteHost describes one target for config-driven `agentsview sync`
 // fan-out. Host is required. Deprecated SSH remotes may set User and Port
@@ -442,6 +473,7 @@ type RemoteHost struct {
 type Config struct {
 	Host                 string                 `json:"host" toml:"host"`
 	Port                 int                    `json:"port" toml:"port"`
+	ChartPalette         ChartPalette           `json:"chart_palette" toml:"chart_palette"`
 	DataDir              string                 `json:"data_dir" toml:"data_dir"`
 	DBPath               string                 `json:"-" toml:"-"`
 	PublicURL            string                 `json:"public_url,omitempty" toml:"public_url"`
@@ -517,6 +549,13 @@ type Config struct {
 	HostExplicit bool `json:"-" toml:"-"`
 
 	pgEnvOverrides pgEnvOverrides
+}
+
+func (c Config) ResolvedChartPalette() ChartPalette {
+	if c.ChartPalette == "" {
+		return DefaultChartPalette
+	}
+	return c.ChartPalette
 }
 
 type dirSource int
@@ -719,6 +758,7 @@ func Default() (Config, error) {
 	return Config{
 		Host:                           "127.0.0.1",
 		Port:                           9765,
+		ChartPalette:                   DefaultChartPalette,
 		DataDir:                        dataDir,
 		DBPath:                         filepath.Join(dataDir, "sessions.db"),
 		WriteTimeout:                   30 * time.Second,
@@ -834,6 +874,9 @@ func loadPGServeBase() (Config, error) {
 		return cfg, err
 	}
 	cfg.loadEnv()
+	if err := expandDataDir(&cfg); err != nil {
+		return cfg, err
+	}
 	if err := cfg.loadFile(); err != nil {
 		return cfg, fmt.Errorf("loading config file: %w", err)
 	}
@@ -866,6 +909,9 @@ func LoadMinimal() (Config, error) {
 		return cfg, err
 	}
 	cfg.loadEnv()
+	if err := expandDataDir(&cfg); err != nil {
+		return cfg, err
+	}
 
 	if err := cfg.loadFile(); err != nil {
 		return cfg, fmt.Errorf("loading config file: %w", err)
@@ -889,6 +935,9 @@ func LoadReadOnly() (Config, error) {
 		return cfg, err
 	}
 	cfg.loadEnv()
+	if err := expandDataDir(&cfg); err != nil {
+		return cfg, err
+	}
 
 	if err := cfg.loadFileReadOnly(); err != nil {
 		return cfg, fmt.Errorf("loading config file: %w", err)
@@ -1008,6 +1057,7 @@ func (c *Config) applyConfigTOML(data string) error {
 		CursorAdminUserID              string                     `toml:"cursor_admin_user_id"`
 		Host                           string                     `toml:"host"`
 		Port                           int                        `toml:"port"`
+		ChartPalette                   ChartPalette               `toml:"chart_palette"`
 		PublicURL                      string                     `toml:"public_url"`
 		PublicOrigins                  []string                   `toml:"public_origins"`
 		Proxy                          ProxyConfig                `toml:"proxy"`
@@ -1035,6 +1085,15 @@ func (c *Config) applyConfigTOML(data string) error {
 	if err != nil {
 		return fmt.Errorf("parsing config: %w", err)
 	}
+	for _, key := range meta.Undecoded() {
+		if len(key) != 3 || key[0] != "custom_model_pricing" {
+			continue
+		}
+		return fmt.Errorf(
+			"%s: unsupported pricing field; use input_microdollars_per_mtok, output_microdollars_per_mtok, cache_creation_microdollars_per_mtok, or cache_read_microdollars_per_mtok",
+			key.String(),
+		)
+	}
 	var raw map[string]any
 	if _, err := toml.Decode(data, &raw); err != nil {
 		return fmt.Errorf("parsing config raw: %w", err)
@@ -1059,6 +1118,13 @@ func (c *Config) applyConfigTOML(data string) error {
 	}
 	if file.Port != 0 {
 		c.Port = file.Port
+	}
+	if meta.IsDefined("chart_palette") {
+		palette, err := ParseChartPalette(string(file.ChartPalette))
+		if err != nil {
+			return err
+		}
+		c.ChartPalette = palette
 	}
 	if file.PublicURL != "" {
 		c.PublicURL = file.PublicURL
@@ -1140,6 +1206,9 @@ func (c *Config) applyConfigTOML(data string) error {
 	if file.DuckDB.AllowInsecure {
 		c.DuckDB.AllowInsecure = true
 	}
+	if file.DuckDB.AttachTimeout != 0 && c.DuckDB.AttachTimeout == 0 {
+		c.DuckDB.AttachTimeout = file.DuckDB.AttachTimeout
+	}
 	if file.DuckDB.Projects != nil && c.DuckDB.Projects == nil {
 		c.DuckDB.Projects = file.DuckDB.Projects
 	}
@@ -1188,6 +1257,9 @@ func (c *Config) applyConfigTOML(data string) error {
 	if file.Vector.Embed.RunAfterSync != nil {
 		c.Vector.Embed.RunAfterSync = file.Vector.Embed.RunAfterSync
 	}
+	if meta.IsDefined("vector", "embed", "recall") {
+		c.Vector.Embed.Recall = file.Vector.Embed.Recall
+	}
 	if file.Vector.Embed.BackstopInterval != "" {
 		c.Vector.Embed.BackstopInterval = file.Vector.Embed.BackstopInterval
 	}
@@ -1224,6 +1296,14 @@ func (c *Config) applyConfigTOML(data string) error {
 		}
 	}
 	if len(file.CustomModelPricing) > 0 {
+		for model, rate := range file.CustomModelPricing {
+			if rate.InputMicrodollarsPerMTok < 0 ||
+				rate.OutputMicrodollarsPerMTok < 0 ||
+				rate.CacheCreationMicrodollarsPerMTok < 0 ||
+				rate.CacheReadMicrodollarsPerMTok < 0 {
+				return fmt.Errorf("custom_model_pricing.%s: rates must not be negative", model)
+			}
+		}
 		c.CustomModelPricing = file.CustomModelPricing
 	}
 	if len(file.RemoteHosts) > 0 {
@@ -1417,6 +1497,16 @@ func (c *Config) loadEnv() {
 	}
 	if v := os.Getenv("AGENTSVIEW_DUCKDB_MACHINE"); v != "" {
 		c.DuckDB.MachineName = v
+	}
+	if v := os.Getenv("AGENTSVIEW_DUCKDB_ATTACH_TIMEOUT"); v != "" {
+		if d, err := time.ParseDuration(v); err == nil {
+			c.DuckDB.AttachTimeout = d
+		} else {
+			log.Printf(
+				"warning: invalid AGENTSVIEW_DUCKDB_ATTACH_TIMEOUT %q: %v",
+				v, err,
+			)
+		}
 	}
 	if v := os.Getenv("AGENTSVIEW_DISABLE_UPDATE_CHECK"); v != "" {
 		c.DisableUpdateCheck = v == "1" || v == "true"
@@ -1675,6 +1765,9 @@ func splitFlagList(value string) []string {
 
 func finalize(cfg *Config) error {
 	var err error
+	if err := expandLocalPaths(cfg); err != nil {
+		return err
+	}
 	if strings.TrimSpace(cfg.LocalMachineName) == "" {
 		return fmt.Errorf("identify local sync machine: hostname is empty")
 	}
@@ -2057,6 +2150,9 @@ func ResolveDataDir() (string, error) {
 	if v := dataDirFromEnv(); v != "" {
 		cfg.DataDir = v
 	}
+	if err := expandDataDir(&cfg); err != nil {
+		return "", err
+	}
 	return cfg.DataDir, nil
 }
 
@@ -2322,6 +2418,10 @@ func (c *Config) ResolveDuckDB() (DuckDBConfig, error) {
 		if err != nil {
 			return duck, fmt.Errorf("expanding path: %w", err)
 		}
+		expanded, err = pathutil.ExpandHome(expanded)
+		if err != nil {
+			return duck, fmt.Errorf("expanding path: %w", err)
+		}
 		duck.Path = expanded
 	}
 	if duck.URL != "" {
@@ -2424,6 +2524,13 @@ func expandBracedEnv(s string) (string, error) {
 
 // SaveTerminalConfig persists terminal settings to the config file.
 func (c *Config) SaveTerminalConfig(tc TerminalConfig) error {
+	live := tc
+	expanded, err := pathutil.ExpandHome(live.CustomBin)
+	if err != nil {
+		return fmt.Errorf("expanding terminal custom binary: %w", err)
+	}
+	live.CustomBin = expanded
+
 	return c.withConfigLock(func() error {
 		existing, err := c.readConfigMap()
 		if err != nil {
@@ -2434,7 +2541,7 @@ func (c *Config) SaveTerminalConfig(tc TerminalConfig) error {
 		if err := c.writeConfigMap(existing); err != nil {
 			return err
 		}
-		c.Terminal = tc
+		c.Terminal = live
 		return nil
 	})
 }
@@ -2443,6 +2550,15 @@ func (c *Config) SaveTerminalConfig(tc TerminalConfig) error {
 // The patch map contains config keys mapped to their new values. Only
 // the keys present in patch are written; other config keys are preserved.
 func (c *Config) SaveSettings(patch map[string]any) error {
+	if value, ok := patch["chart_palette"]; ok {
+		palette, ok := value.(ChartPalette)
+		if !ok {
+			return fmt.Errorf("chart_palette must use the typed configuration value")
+		}
+		if _, err := ParseChartPalette(string(palette)); err != nil {
+			return err
+		}
+	}
 	return c.withConfigLock(func() error {
 		existing, err := c.readConfigMap()
 		if err != nil {
@@ -2492,6 +2608,11 @@ func (c *Config) SaveSettings(patch map[string]any) error {
 				c.RequireAuth = b
 			}
 		}
+		if v, ok := patch["chart_palette"]; ok {
+			if palette, ok := v.(ChartPalette); ok {
+				c.ChartPalette = palette
+			}
+		}
 		return nil
 	})
 }
@@ -2524,6 +2645,32 @@ func (c *Config) EnsureAuthToken() error {
 		c.AuthToken = token
 		return nil
 	})
+}
+
+// ValidateArtifactOriginID checks the persisted single-writer origin prefix.
+func ValidateArtifactOriginID(origin string) error {
+	if origin == "" {
+		return errors.New("artifact origin is required")
+	}
+	if origin != strings.TrimSpace(origin) {
+		return fmt.Errorf("invalid artifact origin %q", origin)
+	}
+	if origin == "local" {
+		return fmt.Errorf("invalid artifact origin %q", origin)
+	}
+	if strings.ContainsAny(origin, `/\`) || filepath.Base(origin) != origin {
+		return fmt.Errorf("invalid artifact origin %q", origin)
+	}
+	if strings.HasPrefix(origin, "-") || strings.HasSuffix(origin, "-") {
+		return fmt.Errorf("invalid artifact origin %q", origin)
+	}
+	for _, r := range origin {
+		if r >= 'a' && r <= 'z' || r >= '0' && r <= '9' || r == '-' {
+			continue
+		}
+		return fmt.Errorf("invalid artifact origin %q", origin)
+	}
+	return nil
 }
 
 // SaveGithubToken persists the GitHub token to the config file.

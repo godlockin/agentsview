@@ -9,7 +9,10 @@ import { mount, tick, unmount } from "svelte";
 import { router } from "../../stores/router.svelte.js";
 import { sessions } from "../../stores/sessions.svelte.js";
 import { usage } from "../../stores/usage.svelte.js";
+import { settings } from "../../stores/settings.svelte.js";
 import { yokedDates } from "../../stores/yokedDates.svelte.js";
+import { testMoney } from "../../test/money.js";
+import type { UsageSummaryResponse } from "../../api/types/usage.js";
 import source from "./UsagePage.svelte?raw";
 import UsagePage from "./UsagePage.svelte";
 
@@ -30,7 +33,7 @@ function usageSummaryWithUnsupported(kind?: string) {
       outputTokens: 0,
       cacheCreationTokens: 0,
       cacheReadTokens: 0,
-      totalCost: 0,
+      totalCost: testMoney(0),
     },
     daily: [],
     projectTotals: [],
@@ -47,9 +50,60 @@ function usageSummaryWithUnsupported(kind?: string) {
       uncachedInputTokens: 0,
       outputTokens: 0,
       hitRate: 0,
-      savingsVsUncached: 0,
+      savingsVsUncached: testMoney(0),
     },
     ...(kind ? { unsupportedUsage: { kind } } : {}),
+  };
+}
+
+function tenModelUsageSummary(): UsageSummaryResponse {
+  const models = [
+    "model-alpha",
+    "model-bravo",
+    "model-charlie",
+    "model-delta",
+    "model-echo",
+    "model-foxtrot",
+    "model-golf",
+    "model-hotel",
+    "model-india",
+    "model-zulu",
+  ];
+  return {
+    ...usageSummaryWithUnsupported(),
+    totals: {
+      inputTokens: 100,
+      outputTokens: 50,
+      cacheCreationTokens: 0,
+      cacheReadTokens: 0,
+      totalCost: testMoney(55),
+    },
+    daily: [{
+      date: "2026-07-01",
+      inputTokens: 100,
+      outputTokens: 50,
+      cacheCreationTokens: 0,
+      cacheReadTokens: 0,
+      totalCost: testMoney(55),
+      modelsUsed: models,
+      modelBreakdowns: models.map((modelName, index) => ({
+        modelName,
+        inputTokens: 10,
+        outputTokens: 5,
+        cacheCreationTokens: 0,
+        cacheReadTokens: 0,
+        cost: testMoney(index + 1),
+      })),
+    }],
+    modelTotals: models.map((model, index) => ({
+      model,
+      inputTokens: 10,
+      outputTokens: 5,
+      cacheCreationTokens: 0,
+      cacheReadTokens: 0,
+      cost: testMoney(index + 1),
+    })),
+    sessionCounts: { total: 10, byProject: {}, byAgent: {} },
   };
 }
 
@@ -65,19 +119,191 @@ afterEach(() => {
   router.route = "sessions";
   router.params = {};
   router.sessionId = null;
+  window.history.replaceState(null, "", "/");
   usage.summary = null;
   usage.topSessions = null;
   usage.errors.summary = null;
+  usage.errors.topSessions = null;
+  usage.mode = "cost";
+  usage.setSelectedTokenTypes([
+    "input",
+    "cache_write",
+    "cache_read",
+    "output",
+  ]);
   usage.isPinned = false;
   usage.windowDays = 30;
   usage.from = "";
   usage.to = "";
+  usage.toggles.timeSeries.groupBy = "project";
+  usage.toggles.attribution.groupBy = "project";
+  usage.toggles.attribution.view = "treemap";
+  settings.chartPalette = "agentsview";
   sessions.projects = [];
   yokedDates.setEnabled(false);
   localStorage.clear();
 });
 
 describe("UsagePage refresh behavior", () => {
+  it("hydrates token mode from the canonical URL before fetching", async () => {
+    vi.stubGlobal(
+      "ResizeObserver",
+      class {
+        observe() {}
+        disconnect() {}
+      },
+    );
+    const fetchAll = vi.spyOn(usage, "fetchAll").mockResolvedValue();
+    vi.spyOn(sessions, "loadAgents").mockResolvedValue();
+    router.route = "usage";
+    router.params = { view: "tokens", project: "demo" };
+
+    component = mount(UsagePage, { target: document.body });
+    await flushEffects();
+
+    expect(usage.mode).toBe("token");
+    expect(document.querySelector(
+      '[role="radiogroup"][aria-label="Usage metric"] '
+        + '[role="radio"][aria-checked="true"]',
+    )?.textContent?.trim()).toBe("Tokens");
+    expect(fetchAll).toHaveBeenCalled();
+  });
+
+  it("hydrates and renders an Output-only token selection", async () => {
+    vi.stubGlobal(
+      "ResizeObserver",
+      class {
+        observe() {}
+        disconnect() {}
+      },
+    );
+    vi.spyOn(usage, "fetchAll").mockResolvedValue();
+    vi.spyOn(sessions, "loadAgents").mockResolvedValue();
+    router.route = "usage";
+    router.params = {
+      view: "tokens",
+      token_types: "output",
+      project: "demo",
+    };
+
+    component = mount(UsagePage, { target: document.body });
+    await flushEffects();
+
+    expect(usage.selectedTokenTypes).toEqual(["output"]);
+    expect(document.querySelector(
+      'button[aria-label="Token types: Output"]',
+    )).not.toBeNull();
+    expect(router.params).toEqual(expect.objectContaining({
+      view: "tokens",
+      token_types: "output",
+      project: "demo",
+    }));
+  });
+
+  it("switches metrics without dropping filters", async () => {
+    vi.stubGlobal(
+      "ResizeObserver",
+      class {
+        observe() {}
+        disconnect() {}
+      },
+    );
+    vi.spyOn(usage, "fetchAll").mockResolvedValue();
+    vi.spyOn(sessions, "loadAgents").mockResolvedValue();
+    const fetchTopSessions = vi.spyOn(usage, "fetchTopSessions")
+      .mockResolvedValue("ok");
+    const replaceParams = vi.spyOn(router, "replaceParams");
+    window.history.replaceState(
+      null,
+      "",
+      "/usage?view=tokens&project=demo&window_days=90",
+    );
+    router.route = "usage";
+    router.params = {
+      view: "tokens",
+      project: "demo",
+      window_days: "90",
+    };
+    usage.mode = "token";
+
+    component = mount(UsagePage, { target: document.body });
+    await flushEffects();
+    const costOption = document.querySelector<HTMLButtonElement>(
+      '[role="radiogroup"][aria-label="Usage metric"] '
+        + '[role="radio"]:first-child',
+    );
+    expect(costOption).not.toBeNull();
+
+    costOption!.click();
+    await flushEffects();
+
+    expect(usage.mode).toBe("cost");
+    expect(replaceParams).toHaveBeenLastCalledWith(
+      expect.objectContaining({
+        project: "demo",
+        window_days: "90",
+      }),
+    );
+    expect(replaceParams.mock.lastCall?.[0]).not.toHaveProperty("view");
+    expect(fetchTopSessions).toHaveBeenCalledOnce();
+  });
+
+  it("normalizes the legacy token route while retaining filters", async () => {
+    vi.stubGlobal(
+      "ResizeObserver",
+      class {
+        observe() {}
+        disconnect() {}
+      },
+    );
+    vi.spyOn(usage, "fetchAll").mockResolvedValue();
+    vi.spyOn(sessions, "loadAgents").mockResolvedValue();
+    const replace = vi.spyOn(router, "replace");
+    window.history.replaceState(
+      null,
+      "",
+      "/token-usage?project=demo&window_days=90",
+    );
+    router.route = "token-usage";
+    router.params = {
+      project: "demo",
+      window_days: "90",
+    };
+
+    component = mount(UsagePage, { target: document.body });
+    await flushEffects();
+
+    expect(replace).toHaveBeenCalledWith("usage", {
+      project: "demo",
+      window_days: "90",
+      view: "tokens",
+    });
+    expect(router.route).toBe("usage");
+    expect(usage.mode).toBe("token");
+  });
+
+  it("removes an unsupported metric value from the canonical URL", async () => {
+    vi.stubGlobal(
+      "ResizeObserver",
+      class {
+        observe() {}
+        disconnect() {}
+      },
+    );
+    vi.spyOn(usage, "fetchAll").mockResolvedValue();
+    vi.spyOn(sessions, "loadAgents").mockResolvedValue();
+    const replaceParams = vi.spyOn(router, "replaceParams");
+    router.route = "usage";
+    router.params = { view: "unknown", project: "demo" };
+
+    component = mount(UsagePage, { target: document.body });
+    await flushEffects();
+
+    expect(usage.mode).toBe("cost");
+    expect(replaceParams).toHaveBeenCalled();
+    expect(replaceParams.mock.lastCall?.[0]).not.toHaveProperty("view");
+  });
+
   it("materializes rolling bounds before fetching a returned bare page", async () => {
     const fetchStates: Array<{
       isPinned: boolean;
@@ -179,6 +405,41 @@ describe("UsagePage refresh behavior", () => {
     expect(document.body.textContent).toContain(
       "Copilot sessions matched this range",
     );
+  });
+
+  it("shares full-universe model colors across Usage panels and palette changes", async () => {
+    vi.stubGlobal(
+      "ResizeObserver",
+      class {
+        observe() {}
+        disconnect() {}
+      },
+    );
+    vi.spyOn(usage, "fetchAll").mockResolvedValue();
+    vi.spyOn(sessions, "loadAgents").mockResolvedValue();
+    router.route = "usage";
+    router.params = {};
+    usage.summary = tenModelUsageSummary();
+    usage.toggles.timeSeries.groupBy = "model";
+    usage.toggles.attribution.groupBy = "model";
+    usage.toggles.attribution.view = "list";
+    settings.chartPalette = "agentsview";
+
+    component = mount(UsagePage, { target: document.body });
+    await flushEffects();
+
+    const firstPath = () => document.querySelector<SVGPathElement>(
+      "path[opacity='0.7']",
+    );
+    const firstDot = () => document.querySelector<HTMLElement>(".list-dot");
+    expect(firstPath()?.getAttribute("fill")).toBe("var(--accent-sky)");
+    expect(firstDot()?.style.background).toBe("var(--accent-sky)");
+
+    settings.chartPalette = "matplotlib";
+    await tick();
+
+    expect(firstPath()?.getAttribute("fill")).toBe("#c5b0d5");
+    expect(firstDot()?.style.background).toBe("rgb(197, 176, 213)");
   });
 
   it("loads agent metadata on mount for the Agent dropdown", async () => {

@@ -1,4 +1,4 @@
-//go:build !mattnsqlite
+//go:build moderncsqlite
 
 package driver
 

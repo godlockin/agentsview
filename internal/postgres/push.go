@@ -96,6 +96,27 @@ type PushProgress struct {
 	VectorChunksPushed  int
 }
 
+// PushOptions controls a single push. The zero value matches Push's
+// historical behavior.
+type PushOptions struct {
+	// Full bypasses unchanged-fingerprint and unchanged-hash skips so
+	// every session is resent.
+	Full bool
+	// ScopeVectorsToChangedSessions limits the vector phase's local
+	// hash read and PG state read to this push's changed relational
+	// sessions, instead of reconciling the whole generation. Ignored
+	// when the push runs (or is internally promoted to run) full, so
+	// reset recovery and backfills keep generation-wide reconciliation.
+	ScopeVectorsToChangedSessions bool
+	// LastReconciledVectorGeneration is the PG generation id the caller
+	// last reconciled generation-wide. When a scoped push resolves a
+	// different active generation id, the vector phase promotes itself to a
+	// generation-wide read so a newly active or recreated generation is
+	// never left partially populated (see pushVectors). Zero on the first
+	// push, which the reconcile bit already forces generation-wide.
+	LastReconciledVectorGeneration int64
+}
+
 // Push syncs local sessions and messages to PostgreSQL.
 // The onProgress callback, if non-nil, is called after each
 // batch with current totals.
@@ -103,6 +124,15 @@ func (s *Sync) Push(
 	ctx context.Context, full bool,
 	onProgress func(PushProgress),
 ) (PushResult, error) {
+	return s.PushWithOptions(ctx, PushOptions{Full: full}, onProgress)
+}
+
+// PushWithOptions is Push with per-push options; see PushOptions.
+func (s *Sync) PushWithOptions(
+	ctx context.Context, opts PushOptions,
+	onProgress func(PushProgress),
+) (PushResult, error) {
+	full := opts.Full
 	start := time.Now()
 	var result PushResult
 	state := s.effectiveSyncState()
@@ -388,6 +418,15 @@ func (s *Sync) Push(
 		return sessions[i].ID < sessions[j].ID
 	})
 
+	// Non-nil only for change-scoped pushes: sessionByID now holds
+	// exactly this push's changed relational sessions, and the vector
+	// phase reads state only for them. full is the effective value —
+	// a promoted full push keeps generation-wide reconciliation.
+	var vectorScope []string
+	if opts.ScopeVectorsToChangedSessions && !full {
+		vectorScope = mapKeys(sessionByID)
+	}
+
 	if len(sessions) == 0 {
 		if s.isFiltered() {
 			// Filtered pushes use filter-scoped sync state, so
@@ -432,7 +471,10 @@ func (s *Sync) Push(
 		if err := s.syncProjectIdentityObservations(ctx, full); err != nil {
 			return result, err
 		}
-		result.Vectors, err = s.runVectorPushPhase(ctx, full, nil, onProgress)
+		result.Vectors, err = s.runVectorPushPhase(
+			ctx, full, vectorScope,
+			opts.LastReconciledVectorGeneration, nil, onProgress,
+		)
 		if err != nil {
 			return result, err
 		}
@@ -552,7 +594,10 @@ func (s *Sync) Push(
 			result.Errors,
 		)
 	}
-	result.Vectors, err = s.runVectorPushPhase(ctx, full, failedSessions, onProgress)
+	result.Vectors, err = s.runVectorPushPhase(
+		ctx, full, vectorScope,
+		opts.LastReconciledVectorGeneration, failedSessions, onProgress,
+	)
 	if err != nil {
 		return result, err
 	}
@@ -568,16 +613,23 @@ func (s *Sync) Push(
 // failedSessions names sessions whose session-phase push failed; their vectors
 // are deferred so pgvector data never runs ahead of the sessions/messages rows.
 // full bypasses the unchanged-hash skip so a --full push also repairs vector
-// rows whose push state wrongly reports them current. onProgress, when
-// non-nil, receives Phase "vectors" reports as the delta scan advances.
+// rows whose push state wrongly reports them current. scope, when non-nil,
+// limits reconciliation to those session IDs (empty means no vector work);
+// nil keeps the generation-wide read. onProgress, when non-nil, receives
+// Phase "vectors" reports as the delta scan advances.
 func (s *Sync) runVectorPushPhase(
-	ctx context.Context, full bool, failedSessions map[string]struct{},
+	ctx context.Context, full bool, scope []string,
+	lastReconciledGeneration int64,
+	failedSessions map[string]struct{},
 	onProgress func(PushProgress),
 ) (VectorPushResult, error) {
 	if s.vectorSource == nil {
 		return VectorPushResult{Skipped: true}, nil
 	}
-	res, err := s.pushVectors(ctx, full, failedSessions, onProgress)
+	res, err := s.pushVectors(
+		ctx, full, scope, lastReconciledGeneration,
+		failedSessions, onProgress,
+	)
 	if err != nil {
 		return res, fmt.Errorf("vector push: %w", err)
 	}
@@ -1562,6 +1614,7 @@ func sessionPushFingerprint(
 		stringValue(sess.StartedAt),
 		stringValue(sess.EndedAt),
 		stringValue(sess.DeletedAt),
+		stringValue(sess.DeletionCause),
 		fmt.Sprintf("%d", sess.MessageCount),
 		fmt.Sprintf("%d", sess.UserMessageCount),
 		fmt.Sprintf("%t", sess.IsAutomated),
@@ -1748,7 +1801,7 @@ func (s *Sync) pushSession(
 			id, machine, owner_marker, project, agent,
 			first_message, display_name, source_display_name,
 			session_name, created_at, started_at, ended_at,
-			deleted_at, source_deleted_at,
+			deleted_at, source_deleted_at, deletion_cause,
 			message_count, user_message_count,
 			total_output_tokens, peak_context_tokens,
 			has_total_output_tokens, has_peak_context_tokens,
@@ -1778,20 +1831,20 @@ func (s *Sync) pushSession(
 			)
 			SELECT
 				$1, $2, $3, $4, $5, $6, $7, $8,
-				$9, $10, $11, $12, $13, $14,
-				$15, $16, $17, $18,
-			$19, $20, $21, $22,
-			$23, $24, $25, $26, $27, $28, $29,
-			$30, $31,
-			$32, $33, $34, $35,
-			$36, $37, $38, $39,
-			$40,
-			$41, $42,
-			$43,
-			$44, $45, $46, $47,
-			$48, $49,
-				$50, $51, $52, $53, $54, $55, $56, $57, $58, $59,
-				$60, $61,
+				$9, $10, $11, $12, $13, $14, $15,
+				$16, $17, $18, $19,
+			$20, $21, $22, $23,
+			$24, $25, $26, $27, $28, $29, $30,
+			$31, $32,
+			$33, $34, $35, $36,
+			$37, $38, $39, $40,
+			$41,
+			$42, $43,
+			$44,
+			$45, $46, $47, $48,
+			$49, $50,
+				$51, $52, $53, $54, $55, $56, $57, $58, $59, $60,
+				$61, $62,
 				NOW()
 			WHERE NOT EXISTS (
 				SELECT 1 FROM excluded_sessions WHERE id = $1
@@ -1818,6 +1871,11 @@ func (s *Sync) pushSession(
 				WHEN sessions.deleted_at IS DISTINCT FROM
 					sessions.source_deleted_at THEN sessions.deleted_at
 				ELSE EXCLUDED.deleted_at
+			END,
+			deletion_cause = CASE
+				WHEN sessions.deleted_at IS DISTINCT FROM
+					sessions.source_deleted_at THEN sessions.deletion_cause
+				ELSE EXCLUDED.deletion_cause
 			END,
 			source_deleted_at = EXCLUDED.deleted_at,
 			message_count = EXCLUDED.message_count,
@@ -1872,7 +1930,7 @@ func (s *Sync) pushSession(
 					OR sessions.machine = 'local'
 					OR sessions.machine = ''
 					OR sessions.machine IN (
-					SELECT jsonb_array_elements_text($62::jsonb)
+						SELECT jsonb_array_elements_text($63::jsonb)
 					))
 			)
 			OR sessions.owner_marker = EXCLUDED.owner_marker)
@@ -1894,6 +1952,7 @@ func (s *Sync) pushSession(
 			OR sessions.started_at IS DISTINCT FROM EXCLUDED.started_at
 			OR sessions.ended_at IS DISTINCT FROM EXCLUDED.ended_at
 			OR sessions.source_deleted_at IS DISTINCT FROM EXCLUDED.deleted_at
+			OR sessions.deletion_cause IS DISTINCT FROM EXCLUDED.deletion_cause
 			OR sessions.message_count IS DISTINCT FROM EXCLUDED.message_count
 			OR sessions.user_message_count IS DISTINCT FROM EXCLUDED.user_message_count
 			OR sessions.total_output_tokens IS DISTINCT FROM EXCLUDED.total_output_tokens
@@ -1951,6 +2010,7 @@ func (s *Sync) pushSession(
 		nilStrTS(sess.EndedAt),
 		nilStrTS(sess.DeletedAt),
 		nilStrTS(sess.DeletedAt),
+		nilStr(sess.DeletionCause),
 		sess.MessageCount, sess.UserMessageCount,
 		sess.TotalOutputTokens, sess.PeakContextTokens,
 		sess.HasTotalOutputTokens, sess.HasPeakContextTokens,
@@ -2812,7 +2872,7 @@ func pgUsageEventFingerprint(
 		`SELECT message_ordinal, source, model,
 			input_tokens, output_tokens,
 			cache_creation_input_tokens, cache_read_input_tokens,
-			reasoning_tokens, cost_usd, cost_status, cost_source,
+			reasoning_tokens, cost_microdollars, cost_status, cost_source,
 			occurred_at, dedup_key
 		 FROM usage_events
 		 WHERE session_id = $1
@@ -2831,7 +2891,7 @@ func pgUsageEventFingerprint(
 		var inputTokens, outputTokens int
 		var cacheCreationInputTokens, cacheReadInputTokens int
 		var reasoningTokens int
-		var cost sql.NullFloat64
+		var cost sql.NullInt64
 		var occurredAt sql.NullTime
 		var dedupKey sql.NullString
 		if err := rows.Scan(
@@ -2848,7 +2908,7 @@ func pgUsageEventFingerprint(
 			occurred = FormatISO8601(occurredAt.Time)
 		}
 		fmt.Fprintf(&b,
-			"%t|%d|%d:%s|%d:%s|%d|%d|%d|%d|%d|%t|%g|%d:%s|%d:%s|%d:%s|%d:%s;",
+			"%t|%d|%d:%s|%d:%s|%d|%d|%d|%d|%d|%t|%d|%d:%s|%d:%s|%d:%s|%d:%s;",
 			ordinal.Valid,
 			ordinal.Int64,
 			len(source), source,
@@ -2859,7 +2919,7 @@ func pgUsageEventFingerprint(
 			cacheReadInputTokens,
 			reasoningTokens,
 			cost.Valid,
-			cost.Float64,
+			cost.Int64,
 			len(costStatus), costStatus,
 			len(costSource), costSource,
 			len(occurred), occurred,
@@ -2965,7 +3025,7 @@ func bulkInsertUsageEvents(
 			session_id, message_ordinal, source, model,
 			input_tokens, output_tokens,
 			cache_creation_input_tokens, cache_read_input_tokens,
-			reasoning_tokens, cost_usd, cost_status, cost_source,
+			reasoning_tokens, cost_microdollars, cost_status, cost_source,
 			occurred_at, dedup_key) VALUES `)
 		args := make([]any, 0, len(batch)*14)
 		for j, ev := range batch {
@@ -2989,8 +3049,8 @@ func bulkInsertUsageEvents(
 				ordinal = *ev.MessageOrdinal
 			}
 			var cost any
-			if ev.CostUSD != nil {
-				cost = *ev.CostUSD
+			if ev.Cost != nil {
+				cost = ev.Cost.Microdollars
 			}
 			args = append(args,
 				ev.SessionID,
@@ -3034,7 +3094,7 @@ func bulkInsertCursorUsageEvents(
 			occurred_at, model, kind,
 			input_tokens, output_tokens,
 			cache_write_tokens, cache_read_tokens,
-			charged_cents, cursor_token_fee,
+			charged_microdollars, cursor_token_fee_microdollars,
 			user_id, user_email, is_headless, dedup_key
 		) VALUES `)
 		args := make([]any, 0, len(batch)*13)
@@ -3060,8 +3120,8 @@ func bulkInsertCursorUsageEvents(
 				ev.OutputTokens,
 				ev.CacheWriteTokens,
 				ev.CacheReadTokens,
-				ev.ChargedCents,
-				ev.CursorTokenFee,
+				ev.Charged.Microdollars,
+				ev.CursorTokenFee.Microdollars,
 				sanitizePG(ev.UserID),
 				sanitizePG(ev.UserEmail),
 				ev.IsHeadless,

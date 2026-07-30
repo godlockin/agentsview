@@ -69,8 +69,8 @@ const duckPricingUpsertBatch = 100
 func duckPricingUpsertStatement(prices []db.ModelPricing) (string, []any) {
 	var b strings.Builder
 	b.WriteString(`INSERT INTO model_pricing (
-		model_pattern, input_per_mtok, output_per_mtok,
-		cache_creation_per_mtok, cache_read_per_mtok, updated_at
+		model_pattern, input_microdollars_per_mtok, output_microdollars_per_mtok,
+		cache_creation_microdollars_per_mtok, cache_read_microdollars_per_mtok, updated_at
 	) VALUES `)
 	args := make([]any, 0, len(prices)*6)
 	for i, p := range prices {
@@ -80,19 +80,19 @@ func duckPricingUpsertStatement(prices []db.ModelPricing) (string, []any) {
 		b.WriteString("(?, ?, ?, ?, ?, ?)")
 		args = append(args,
 			p.ModelPattern,
-			p.InputPerMTok,
-			p.OutputPerMTok,
-			p.CacheCreationPerMTok,
-			p.CacheReadPerMTok,
+			p.InputPerMTok.Microdollars,
+			p.OutputPerMTok.Microdollars,
+			p.CacheCreationPerMTok.Microdollars,
+			p.CacheReadPerMTok.Microdollars,
 			p.UpdatedAt,
 		)
 	}
 	b.WriteString(`
 	ON CONFLICT(model_pattern) DO UPDATE SET
-		input_per_mtok = excluded.input_per_mtok,
-		output_per_mtok = excluded.output_per_mtok,
-		cache_creation_per_mtok = excluded.cache_creation_per_mtok,
-		cache_read_per_mtok = excluded.cache_read_per_mtok,
+		input_microdollars_per_mtok = excluded.input_microdollars_per_mtok,
+		output_microdollars_per_mtok = excluded.output_microdollars_per_mtok,
+		cache_creation_microdollars_per_mtok = excluded.cache_creation_microdollars_per_mtok,
+		cache_read_microdollars_per_mtok = excluded.cache_read_microdollars_per_mtok,
 		updated_at = excluded.updated_at`)
 	return b.String(), args
 }
@@ -100,9 +100,9 @@ func duckPricingUpsertStatement(prices []db.ModelPricing) (string, []any) {
 func (s *Sync) listDuckModelPricing(ctx context.Context) ([]db.ModelPricing, error) {
 	rows, err := s.duck.QueryContext(
 		ctx,
-		`SELECT model_pattern, input_per_mtok,
-			output_per_mtok, cache_creation_per_mtok,
-			cache_read_per_mtok, updated_at
+		`SELECT model_pattern, input_microdollars_per_mtok,
+			output_microdollars_per_mtok, cache_creation_microdollars_per_mtok,
+			cache_read_microdollars_per_mtok, updated_at
 		 FROM model_pricing`,
 	)
 	if err != nil {
@@ -821,14 +821,14 @@ func (s *Sync) upsertSession(
 			duplicate_prompt_count, no_code_context_count,
 			runaway_tool_loop_count, data_version,
 			cwd, git_branch, source_session_id, source_version, transcript_fidelity,
-			parser_malformed_lines, is_truncated, deleted_at, created_at,
+			parser_malformed_lines, is_truncated, deleted_at, deletion_cause, created_at,
 			termination_status, secret_leak_count, secrets_rules_version,
 			agentsview_push_fingerprint
 		) VALUES (
 			?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
 			?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
 			?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-			?, ?, ?, ?, ?, ?, ?, ?, ?
+			?, ?, ?, ?, ?, ?, ?, ?, ?, ?
 		)`
 	query += `
 		ON CONFLICT(id) DO UPDATE SET
@@ -892,6 +892,7 @@ func (s *Sync) upsertSession(
 			parser_malformed_lines = excluded.parser_malformed_lines,
 			is_truncated = excluded.is_truncated,
 			deleted_at = excluded.deleted_at,
+			deletion_cause = excluded.deletion_cause,
 			created_at = excluded.created_at,
 			termination_status = excluded.termination_status,
 			secret_leak_count = excluded.secret_leak_count,
@@ -936,7 +937,7 @@ func sessionInsertArgs(sess db.Session, machine, fingerprint string) []any {
 		sess.DataVersion,
 		sess.Cwd, sess.GitBranch, sess.SourceSessionID,
 		sess.SourceVersion, sess.TranscriptFidelity, sess.ParserMalformedLines,
-		sess.IsTruncated, nilTime(sess.DeletedAt),
+		sess.IsTruncated, nilTime(sess.DeletedAt), nilString(sess.DeletionCause),
 		timeValue(sess.CreatedAt), nilString(sess.TerminationStatus),
 		sess.SecretLeakCount, sess.SecretsRulesVersion,
 		nilEmpty(fingerprint),
@@ -1080,7 +1081,7 @@ func insertUsageEvent(
 			id, session_id, message_ordinal, source, model,
 			input_tokens, output_tokens,
 			cache_creation_input_tokens, cache_read_input_tokens,
-			reasoning_tokens, cost_usd, cost_status, cost_source,
+			reasoning_tokens, cost_microdollars, cost_status, cost_source,
 			occurred_at, dedup_key
 		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		ev.ID, ev.SessionID, ordinal, ev.Source, ev.Model,
@@ -1110,7 +1111,7 @@ func (s *Sync) bulkInsertCursorUsageEvents(
 			occurred_at, model, kind,
 			input_tokens, output_tokens,
 			cache_write_tokens, cache_read_tokens,
-			charged_cents, cursor_token_fee,
+			charged_microdollars, cursor_token_fee_microdollars,
 			user_id, user_email, is_headless, dedup_key
 		) VALUES `)
 		args := make([]any, 0, len(batch)*13)
@@ -1131,8 +1132,8 @@ func (s *Sync) bulkInsertCursorUsageEvents(
 				ev.OutputTokens,
 				ev.CacheWriteTokens,
 				ev.CacheReadTokens,
-				ev.ChargedCents,
-				ev.CursorTokenFee,
+				ev.Charged.Microdollars,
+				ev.CursorTokenFee.Microdollars,
 				db.SanitizeUTF8(ev.UserID),
 				db.SanitizeUTF8(ev.UserEmail),
 				ev.IsHeadless,
@@ -1153,8 +1154,8 @@ func usageEventNullableValues(ev db.UsageEvent) (any, any, any) {
 		ordinal = *ev.MessageOrdinal
 	}
 	var cost any
-	if ev.CostUSD != nil {
-		cost = *ev.CostUSD
+	if ev.Cost != nil {
+		cost = ev.Cost.Microdollars
 	}
 	var occurredAt any
 	if ev.OccurredAt != "" {

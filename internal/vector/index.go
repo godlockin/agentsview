@@ -46,6 +46,26 @@ CREATE TABLE IF NOT EXISTS vector_meta (
 );
 `
 
+const recallMirrorDDL = `
+CREATE TABLE IF NOT EXISTS vector_recall_entries (
+    doc_key      TEXT PRIMARY KEY,
+    session_id   TEXT NOT NULL,
+    source_uuid  TEXT NOT NULL DEFAULT '',
+    ordinal      INTEGER NOT NULL,
+    ordinal_end  INTEGER NOT NULL,
+    subordinate  INTEGER NOT NULL DEFAULT 0,
+    offsets      TEXT NOT NULL DEFAULT '[]',
+    content      TEXT NOT NULL,
+    content_hash TEXT NOT NULL,
+    embed_gen    TEXT
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_vector_recall_entries_identity
+    ON vector_recall_entries(session_id, ordinal);
+CREATE TABLE IF NOT EXISTS vector_recall_meta (
+    key TEXT PRIMARY KEY, value TEXT NOT NULL
+);
+`
+
 // mirrorSchemaVersionKey is the metadata-table key holding a spec's
 // MirrorSchemaVersion.
 const mirrorSchemaVersionKey = "mirror_schema_version"
@@ -61,6 +81,10 @@ const mirrorSchemaVersionKey = "mirror_schema_version"
 type IndexSpec struct {
 	// Name identifies the store for CLI selection and display ("messages").
 	Name string
+	// SupportsAutomatedScope reports whether IncludeAutomated changes this
+	// store's source corpus. It defaults to false so new stores cannot inherit
+	// message-specific scope behavior accidentally.
+	SupportsAutomatedScope bool
 	// DocsTable is the store's mirror documents table.
 	DocsTable string
 	// MetaTable is the store's own key/value metadata table (schema
@@ -77,6 +101,13 @@ type IndexSpec struct {
 	// MirrorSchemaVersion versions the mirror's DDL shape and its
 	// document-identity scheme; see prepareMirrorSchema.
 	MirrorSchemaVersion string
+}
+
+// NormalizeIncludeAutomated applies the store's scope capability to a build
+// request. Stores whose sources are not session-filtered always use false so
+// alternating build entry points cannot churn their stored scope metadata.
+func (s IndexSpec) NormalizeIncludeAutomated(value bool) bool {
+	return s.SupportsAutomatedScope && value
 }
 
 func (s IndexSpec) schema() sqlitevec.Schema {
@@ -105,12 +136,27 @@ func (s IndexSpec) repairQueueTable() string { return s.VectorsPrefix + "_repair
 // messages) with no DDL change.
 func MessageIndexSpec() IndexSpec {
 	return IndexSpec{
-		Name:                "messages",
-		DocsTable:           "vector_messages",
-		MetaTable:           "vector_meta",
-		VectorsPrefix:       "message_vectors",
-		MirrorDDL:           messageMirrorDDL,
-		MirrorSchemaVersion: "3",
+		Name:                   "messages",
+		SupportsAutomatedScope: true,
+		DocsTable:              "vector_messages",
+		MetaTable:              "vector_meta",
+		VectorsPrefix:          "message_vectors",
+		MirrorDDL:              messageMirrorDDL,
+		MirrorSchemaVersion:    "3",
+	}
+}
+
+// RecallIndexSpec is the distilled recall-entry embedding store. It shares
+// vectors.db with the message store but owns disjoint mirror, metadata, and
+// kit-managed vector tables.
+func RecallIndexSpec() IndexSpec {
+	return IndexSpec{
+		Name:                "recall",
+		DocsTable:           "vector_recall_entries",
+		MetaTable:           "vector_recall_meta",
+		VectorsPrefix:       "recall_vectors",
+		MirrorDDL:           recallMirrorDDL,
+		MirrorSchemaVersion: "1",
 	}
 }
 
@@ -169,6 +215,40 @@ func ChunkOverlap(maxInputChars int) int {
 // Open opens the message-store index; see OpenSpec.
 func Open(ctx context.Context, path string, readOnly bool, maxInputChars int) (*Index, error) {
 	return OpenSpec(ctx, path, MessageIndexSpec(), readOnly, maxInputChars)
+}
+
+// StoreExists reports whether vectors.db contains any tables owned by spec.
+// It probes sqlite_master without constructing sqlitevec's store, because
+// sqlitevec initializes missing bookkeeping tables and cannot do that through
+// a read-only connection. A partially present store counts as existing so its
+// normal open path can surface corruption or schema-version errors.
+func StoreExists(
+	ctx context.Context, path string, spec IndexSpec,
+) (bool, error) {
+	if _, err := os.Stat(path); err != nil {
+		if os.IsNotExist(err) {
+			return false, nil
+		}
+		return false, err
+	}
+	database, err := sql.Open(vectorDriverName, vectorDSN(path, true))
+	if err != nil {
+		return false, fmt.Errorf("opening vectors.db store probe: %w", err)
+	}
+	defer database.Close()
+	var exists bool
+	err = database.QueryRowContext(ctx, `
+		SELECT EXISTS (
+			SELECT 1 FROM sqlite_master
+			WHERE type = 'table'
+			  AND (name IN (?, ?) OR substr(name, 1, ?) = ?)
+		)`, spec.DocsTable, spec.MetaTable,
+		len(spec.VectorsPrefix), spec.VectorsPrefix,
+	).Scan(&exists)
+	if err != nil {
+		return false, fmt.Errorf("probing vectors.db store %s: %w", spec.Name, err)
+	}
+	return exists, nil
 }
 
 // OpenSpec opens (creating when rw) vectors.db and the kit sqlitevec store
@@ -410,6 +490,16 @@ ON CONFLICT(key) DO UPDATE SET value = excluded.value`,
 	return nil
 }
 
+// metaDelete deletes one key from the spec's metadata table.
+func (ix *Index) metaDelete(ctx context.Context, key string) error {
+	if _, err := ix.db.ExecContext(ctx,
+		`DELETE FROM `+ix.spec.MetaTable+` WHERE key = ?`, key,
+	); err != nil {
+		return fmt.Errorf("deleting %s key %s: %w", ix.spec.MetaTable, key, err)
+	}
+	return nil
+}
+
 // EnsureGeneration registers gen (a model + dimension configuration) with
 // kit's store under its own fingerprint as the gen_key, creating its vec0
 // table on first use, and records the model's display name in the spec's
@@ -543,6 +633,45 @@ func (ix *Index) GenerationByID(ctx context.Context, id int64) (GenerationInfo, 
 		return GenerationInfo{}, err
 	}
 	return info, nil
+}
+
+// MissingEmbeddedDocs returns how many current mirror docs are still missing
+// from genOrdinal's embedded set. A nil sessionIDs slice counts the whole
+// mirror; a non-nil slice limits the count to those sessions, which lets
+// change-scoped PG pushes bound the readiness read to their candidate set.
+func (ix *Index) MissingEmbeddedDocs(
+	ctx context.Context, genOrdinal int64, sessionIDs []string,
+) (int64, error) {
+	if ix.versionMismatch {
+		return 0, ErrMirrorVersionMismatch
+	}
+	if sessionIDs != nil && len(sessionIDs) == 0 {
+		return 0, nil
+	}
+	query := missingEmbeddedDocsQuery(ix.spec)
+	if sessionIDs == nil {
+		var missing int64
+		if err := ix.db.QueryRowContext(ctx, query, genOrdinal).Scan(&missing); err != nil {
+			return 0, fmt.Errorf("count generation missing docs: %w", err)
+		}
+		return missing, nil
+	}
+	var total int64
+	if err := chunkKeys(sessionIDs, func(chunk []string) error {
+		placeholders, args := inPlaceholders(chunk)
+		var missing int64
+		if err := ix.db.QueryRowContext(ctx,
+			query+` AND d.session_id IN `+placeholders,
+			append([]any{genOrdinal}, args...)...,
+		).Scan(&missing); err != nil {
+			return fmt.Errorf("count scoped generation missing docs: %w", err)
+		}
+		total += missing
+		return nil
+	}); err != nil {
+		return 0, err
+	}
+	return total, nil
 }
 
 // genInfoScanner is the subset of *sql.Row / *sql.Rows Scan needs, letting
