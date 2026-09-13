@@ -78,7 +78,7 @@ func retentionRunOnce(
 		}
 	}
 
-	result, err := runRetentionTick(ctx, cfg, database, time.Now(), os.Stdout)
+	result, err := runRetentionTick(ctx, cfg, database, runner, time.Now(), os.Stdout)
 	if err != nil {
 		log.Printf("retention: %v", err)
 		return
@@ -94,11 +94,12 @@ func runRetentionTick(
 	ctx context.Context,
 	cfg config.Config,
 	database *db.DB,
+	runner pricingRefreshExclusiveRunner,
 	now time.Time,
 	out io.Writer,
 ) (retentionResult, error) {
 	rc := cfg.Retention
-	days, err := parseRetentionAge(rc.OlderThan)
+	days, err := parseAgeDuration(rc.OlderThan)
 	if err != nil {
 		return retentionResult{}, err
 	}

@@ -9,12 +9,11 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"time"
 
 	"go.kenn.io/agentsview/internal/config"
 	"go.kenn.io/agentsview/internal/db"
 	"go.kenn.io/agentsview/internal/dbtest"
-	"go.kenn.io/agentsview/internal/trash"
-	"time"
 )
 
 func TestRunRetentionTickDryRunDeletesNothing(t *testing.T) {
@@ -33,7 +32,7 @@ func TestRunRetentionTickDryRunDeletesNothing(t *testing.T) {
 	}
 	var out bytes.Buffer
 	result, err := runRetentionTick(
-		context.Background(), cfg, d, nowFix(), &out)
+		context.Background(), cfg, d, nil, nowFix(), &out)
 	require.NoError(t, err)
 
 	assert.True(t, result.DryRun)
@@ -65,7 +64,7 @@ func TestRunRetentionTickWetRunPrunesAndTrashes(t *testing.T) {
 	}
 	var out bytes.Buffer
 	result, err := runRetentionTick(
-		context.Background(), cfg, d, nowFix(), &out)
+		context.Background(), cfg, d, nil, nowFix(), &out)
 	require.NoError(t, err)
 
 	assert.False(t, result.DryRun)
@@ -91,7 +90,7 @@ func TestRunRetentionTickRecentSessionsUntouched(t *testing.T) {
 		Retention: config.RetentionConfig{Enabled: true, OlderThan: "30d"},
 	}
 	result, err := runRetentionTick(
-		context.Background(), cfg, d, nowFix(), &bytes.Buffer{})
+		context.Background(), cfg, d, nil, nowFix(), &bytes.Buffer{})
 	require.NoError(t, err)
 	assert.Equal(t, 0, result.WouldPrune, "recent session not selected")
 }
