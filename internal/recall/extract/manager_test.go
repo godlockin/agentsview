@@ -3,7 +3,7 @@ package extract
 import (
 	"context"
 	"database/sql"
-	"encoding/json"
+	"encoding/json/v2"
 	"errors"
 	"fmt"
 	"net/http"
@@ -19,6 +19,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"go.kenn.io/agentsview/internal/config"
 	"go.kenn.io/agentsview/internal/db"
 	"go.kenn.io/agentsview/internal/secrets"
 )
@@ -126,6 +127,89 @@ func growSession(t *testing.T, d *db.DB, id string, msgs []db.Message, startOrdi
 	settleSessionWrite()
 }
 
+// eligibleExtractableSession returns a *db.Session that passes every
+// extractableSession predicate on its own, so each subtest below need only
+// break the one predicate it is proving.
+func eligibleExtractableSession() *db.Session {
+	ended := "2026-09-08T17:00:00Z"
+	return &db.Session{
+		MessageCount:        1,
+		SecretsRulesVersion: secrets.RulesVersion(),
+		EndedAt:             &ended,
+	}
+}
+
+// TestExtractableSession_BackfilledEndedAtNoLongerRejectsLiveHermesSession
+// is proof row 10, a named intended consequence of the hermes state.db
+// EndedAt back-fill (internal/parser/hermes.go): explicit Recall extraction
+// no longer rejects a live hermes session with "has not ended" once its
+// EndedAt is back-filled from the newest message, matching what every other
+// provider's live sessions already pass. Every other predicate in the
+// switch must keep firing on its own terms.
+func TestExtractableSession_BackfilledEndedAtNoLongerRejectsLiveHermesSession(t *testing.T) {
+	t.Run("set EndedAt is eligible", func(t *testing.T) {
+		assert.NoError(t, extractableSession("hermes:open1", eligibleExtractableSession()))
+	})
+
+	t.Run("nil EndedAt is still rejected as not ended", func(t *testing.T) {
+		s := eligibleExtractableSession()
+		s.EndedAt = nil
+		err := extractableSession("hermes:open1", s)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "has not ended")
+	})
+
+	t.Run("empty-string EndedAt is still rejected as not ended", func(t *testing.T) {
+		s := eligibleExtractableSession()
+		empty := ""
+		s.EndedAt = &empty
+		err := extractableSession("hermes:open1", s)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "has not ended")
+	})
+
+	t.Run("trashed still fires ahead of EndedAt", func(t *testing.T) {
+		s := eligibleExtractableSession()
+		deleted := "2026-09-08T18:00:00Z"
+		s.DeletedAt = &deleted
+		err := extractableSession("hermes:open1", s)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "is trashed")
+	})
+
+	t.Run("automated still fires", func(t *testing.T) {
+		s := eligibleExtractableSession()
+		s.IsAutomated = true
+		err := extractableSession("hermes:open1", s)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "automated")
+	})
+
+	t.Run("secret findings still fire", func(t *testing.T) {
+		s := eligibleExtractableSession()
+		s.SecretLeakCount = 1
+		err := extractableSession("hermes:open1", s)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "secret findings")
+	})
+
+	t.Run("stale scan version still fires", func(t *testing.T) {
+		s := eligibleExtractableSession()
+		s.SecretsRulesVersion = "stale-version"
+		err := extractableSession("hermes:open1", s)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "secret scan")
+	})
+
+	t.Run("zero messages still fires", func(t *testing.T) {
+		s := eligibleExtractableSession()
+		s.MessageCount = 0
+		err := extractableSession("hermes:open1", s)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "no messages")
+	})
+}
+
 func turnMessages(pairs ...string) []db.Message {
 	msgs := make([]db.Message, 0, len(pairs))
 	for i, content := range pairs {
@@ -185,7 +269,7 @@ func modelServer(
 					Content string `json:"content"`
 				} `json:"messages"`
 			}
-			if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+			if err := json.UnmarshalRead(r.Body, &payload); err != nil {
 				t.Errorf("decoding request: %v", err)
 			}
 			text := payload.Messages[len(payload.Messages)-1].Content
@@ -983,6 +1067,7 @@ func TestManagerTryPassDropsWhenBusy(t *testing.T) {
 	}()
 	// The first model call proves the background pass holds the pass lock.
 	<-inFlight
+	require.ErrorIs(t, m.Activate(ctx), ErrPassRunning)
 	started, _, err := m.TryPass(ctx, PassOptions{})
 	if err != nil {
 		t.Fatalf("TryPass: %v", err)
@@ -2880,4 +2965,148 @@ func TestManagerRunPassDiscardsEntriesWhenRevisitFindsSecrets(t *testing.T) {
 	require.True(t, found)
 	assert.Equal(t, db.ExtractProgressFailed, progress.State)
 	assert.Contains(t, progress.LastError, "secrets scan --backfill")
+}
+
+func TestManagerAllowCandidateFindingsExtractsCandidateOnlySessions(t *testing.T) {
+	d := newTestArchive(t)
+	ctx := context.Background()
+	server, log := modelServer(t, alwaysEntries(t, "x"))
+	// A full scan recorded only a candidate-confidence match (a high-entropy
+	// path, a JWT-shaped identifier): leak count zero. With
+	// candidate_findings = "allow" that must not keep the session out.
+	seedSession(t, d, "sess-candidate", turnMessages("a", "b"), nil)
+	if err := d.ReplaceSessionSecretFindings(
+		"sess-candidate",
+		[]db.SecretFinding{{
+			SessionID:     "sess-candidate",
+			RuleName:      "high-entropy-assignment",
+			Confidence:    "candidate",
+			LocationKind:  "message",
+			RedactedMatch: "…AHm",
+		}},
+		0, secrets.RulesVersion(),
+	); err != nil {
+		t.Fatal(err)
+	}
+	m := newManager(t, d, server.URL, func(c *ManagerConfig) {
+		c.AllowCandidateFindings = true
+	})
+
+	result, err := m.RunPass(ctx, PassOptions{})
+	if err != nil {
+		t.Fatalf("RunPass: %v", err)
+	}
+	if result.Sessions != 1 || result.Failed != 0 || log.count() == 0 {
+		t.Fatalf("candidate-only session must be extracted when candidate "+
+			"findings are allowed: %+v, %d calls", result, log.count())
+	}
+	if _, err := m.RunPass(ctx, PassOptions{SessionID: "sess-candidate"}); err != nil {
+		t.Fatalf("explicit run on a candidate-only session must be accepted: %v", err)
+	}
+}
+
+func TestManagerAllowCandidateFindingsStillRefusesDefinite(t *testing.T) {
+	d := newTestArchive(t)
+	ctx := context.Background()
+	server, log := modelServer(t, alwaysEntries(t, "x"))
+	// The relaxed policy narrows the gate to definite findings; it must not
+	// open it. A definite finding (leak count 1) keeps the session out.
+	seedSession(t, d, "sess-definite", turnMessages("a", "b"), nil)
+	if err := d.ReplaceSessionSecretFindings(
+		"sess-definite",
+		[]db.SecretFinding{{
+			SessionID:     "sess-definite",
+			RuleName:      "aws-access-key-id",
+			Confidence:    "definite",
+			LocationKind:  "message",
+			RedactedMatch: "AKIA…",
+		}},
+		1, secrets.RulesVersion(),
+	); err != nil {
+		t.Fatal(err)
+	}
+	m := newManager(t, d, server.URL, func(c *ManagerConfig) {
+		c.AllowCandidateFindings = true
+	})
+
+	result, err := m.RunPass(ctx, PassOptions{})
+	if err != nil {
+		t.Fatalf("RunPass: %v", err)
+	}
+	if result.Sessions != 0 || log.count() != 0 {
+		t.Fatalf("definite finding must still exclude the session: %+v, "+
+			"%d calls", result, log.count())
+	}
+	if _, err := m.RunPass(ctx, PassOptions{SessionID: "sess-definite"}); err == nil {
+		t.Fatal("explicit run on a session with a definite finding must be refused")
+	}
+	if log.count() != 0 {
+		t.Fatal("refusal must happen before any model call")
+	}
+}
+
+func TestManagerAllowCandidateFindingsPreSendScanIgnoresCandidateText(t *testing.T) {
+	d := newTestArchive(t)
+	ctx := context.Background()
+	server, log := modelServer(t, alwaysEntries(t, "x"))
+	// The transcript itself contains candidate-tier material (a high-entropy
+	// assignment) that the pre-send re-scan would normally reject "despite a
+	// current scan stamp". Under the relaxed policy the re-scan applies
+	// definite rules only, so the unit reaches the model.
+	seedSession(t, d, "sess-entropy", turnMessages(
+		"set GDRIVE_FOLDER=1a4UzQ9x7LmP3nR8vT2wY5bC6dE0fG1hJ4kL7mNAHm and sync",
+		"done",
+	), nil)
+	if err := d.ReplaceSessionSecretFindings(
+		"sess-entropy", nil, 0, secrets.RulesVersion(),
+	); err != nil {
+		t.Fatal(err)
+	}
+	m := newManager(t, d, server.URL, func(c *ManagerConfig) {
+		c.AllowCandidateFindings = true
+	})
+
+	result, err := m.RunPass(ctx, PassOptions{})
+	if err != nil {
+		t.Fatalf("RunPass: %v", err)
+	}
+	if result.Failed != 0 || result.Sessions != 1 || log.count() == 0 {
+		t.Fatalf("candidate-tier text must not fail the pre-send scan when "+
+			"candidate findings are allowed: %+v, %d calls", result, log.count())
+	}
+}
+
+func TestManagerArchiveContentBeforeModelCall(t *testing.T) {
+	for _, scheduled := range []bool{false, true} {
+		for _, policy := range []config.ArchiveContent{
+			config.ArchiveContentFull, config.ArchiveContentTranscripts, config.ArchiveContentUsage,
+		} {
+			t.Run(fmt.Sprintf("scheduled=%t/%s", scheduled, policy), func(t *testing.T) {
+				d := newTestArchive(t)
+				seedSession(t, d, "stored-session", turnMessages("fix the test", "pinned the clock"), nil)
+				server, calls := modelServer(t, alwaysEntries(t, "clock decision"))
+				manager := newManager(t, d, server.URL, nil)
+				// Changing policy leaves old transcript rows until the archive rebuild.
+				d.SetArchiveContent(policy)
+				var result PassResult
+				var err error
+				if scheduled {
+					var started bool
+					started, result, err = manager.TryPass(context.Background(), PassOptions{})
+					assert.True(t, started)
+				} else {
+					result, err = manager.RunPass(context.Background(), PassOptions{SessionID: "stored-session"})
+				}
+				if policy.UsageOnly() {
+					assert.ErrorIs(t, err, db.ErrArchiveContentExcluded)
+					assert.Zero(t, calls.count(), "no stored transcript may reach the model")
+					assert.Zero(t, result.Units)
+				} else {
+					require.NoError(t, err)
+					assert.Equal(t, 2, calls.count())
+					assert.Equal(t, 2, result.Entries)
+				}
+			})
+		}
+	}
 }

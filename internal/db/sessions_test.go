@@ -2,6 +2,7 @@ package db
 
 import (
 	"context"
+	"database/sql"
 	"testing"
 	"time"
 
@@ -287,6 +288,47 @@ func TestUpsertSessionDoesNotAdvanceDataVersion(t *testing.T) {
 		"after re-upsert, data_version (must be preserved across UpsertSession)")
 }
 
+func TestSetSessionDataVersionsIsAtomic(t *testing.T) {
+	d := testDB(t)
+	for _, id := range []string{"source-main", "source-fork"} {
+		require.NoError(t, d.UpsertSession(Session{
+			ID: id, Project: "p", Machine: "m", Agent: "claude",
+		}))
+		require.NoError(t, d.SetSessionDataVersion(id, 1))
+	}
+
+	raw, err := sql.Open("sqlite3", d.Path())
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, raw.Close()) })
+	_, err = raw.Exec(`
+		CREATE TRIGGER fail_fork_promotion
+		BEFORE UPDATE OF data_version ON sessions
+		WHEN NEW.id = 'source-fork' AND NEW.data_version > OLD.data_version
+		BEGIN
+			SELECT RAISE(FAIL, 'injected fork promotion failure');
+		END;
+	`)
+	require.NoError(t, err)
+
+	err = d.SetSessionDataVersions(
+		[]string{"source-main", "source-fork"}, CurrentDataVersion(),
+	)
+	require.ErrorContains(t, err, "injected fork promotion failure")
+	assert.Equal(t, 1, d.GetSessionDataVersion("source-main"),
+		"a later member failure must roll back an earlier promotion")
+	assert.Equal(t, 1, d.GetSessionDataVersion("source-fork"))
+
+	_, err = raw.Exec(`DROP TRIGGER fail_fork_promotion`)
+	require.NoError(t, err)
+	require.NoError(t, d.SetSessionDataVersions(
+		[]string{"source-main", "source-fork"}, CurrentDataVersion(),
+	))
+	assert.Equal(t, CurrentDataVersion(),
+		d.GetSessionDataVersion("source-main"))
+	assert.Equal(t, CurrentDataVersion(),
+		d.GetSessionDataVersion("source-fork"))
+}
+
 func TestSessionTranscriptFidelityRoundTrips(t *testing.T) {
 	d := testDB(t)
 	ctx := context.Background()
@@ -557,6 +599,7 @@ func TestSessionIdentity(t *testing.T) {
 		s.Agent = "claude"
 		s.AgentLabel = "Claude Triage"
 		s.Entrypoint = "sdk-cli"
+		s.SessionKind = "bg"
 		s.SessionName = Ptr("Agent Title")
 		s.StartedAt = Ptr("2024-06-15T08:00:00Z")
 		s.EndedAt = Ptr("2024-06-15T09:00:00Z")
@@ -572,6 +615,7 @@ func TestSessionIdentity(t *testing.T) {
 	assert.Equal(t, "sqlite-identity", index.Sessions[0].ID)
 	assert.Equal(t, "Claude Triage", index.Sessions[0].AgentLabel)
 	assert.Equal(t, "sdk-cli", index.Sessions[0].Entrypoint)
+	assert.Equal(t, "bg", index.Sessions[0].SessionKind)
 	require.NotNil(t, index.Sessions[0].DisplayName)
 	assert.Equal(t, "Agent Title", *index.Sessions[0].DisplayName)
 }
@@ -599,6 +643,64 @@ func TestSessionIdentityAbsent(t *testing.T) {
 	require.Len(t, index.Sessions, 1)
 	assert.Equal(t, "", index.Sessions[0].AgentLabel)
 	assert.Equal(t, "", index.Sessions[0].Entrypoint)
+	assert.Equal(t, "", index.Sessions[0].SessionKind)
+}
+
+func TestSessionKindAndPromptSourcePersist(t *testing.T) {
+	d := testDB(t)
+	ctx := context.Background()
+
+	insertSession(t, d, "sk-persist", "sk-persist", func(s *Session) {
+		s.Agent = "claude"
+		s.Entrypoint = "sdk-cli"
+		s.SessionKind = "bg"
+		s.MessageCount = 2
+		s.UserMessageCount = 2
+	})
+	insertMessages(t, d,
+		Message{
+			SessionID: "sk-persist", Ordinal: 0, Role: "user",
+			Content: "first", PromptSource: "typed",
+		},
+		Message{
+			SessionID: "sk-persist", Ordinal: 1, Role: "user",
+			Content: "second", PromptSource: "queued",
+		},
+	)
+
+	session, err := d.GetSession(ctx, "sk-persist")
+	require.NoError(t, err)
+	assert.Equal(t, "bg", session.SessionKind)
+	assert.Equal(t, "sdk-cli", session.Entrypoint)
+
+	msgs, err := d.GetMessages(ctx, "sk-persist", 0, 10, true)
+	require.NoError(t, err)
+	require.Len(t, msgs, 2)
+	assert.Equal(t, "typed", msgs[0].PromptSource)
+	assert.Equal(t, "queued", msgs[1].PromptSource)
+}
+
+func TestSessionKindAndPromptSourceDefaultEmpty(t *testing.T) {
+	d := testDB(t)
+	ctx := context.Background()
+
+	// A session/message written without the new fields reads back empty,
+	// so historical rows and other agents are unaffected.
+	insertSession(t, d, "sk-default", "sk-default", func(s *Session) {
+		s.Agent = "codex"
+	})
+	insertMessages(t, d, Message{
+		SessionID: "sk-default", Ordinal: 0, Role: "user", Content: "x",
+	})
+
+	session, err := d.GetSession(ctx, "sk-default")
+	require.NoError(t, err)
+	assert.Equal(t, "", session.SessionKind)
+
+	msgs, err := d.GetMessages(ctx, "sk-default", 0, 10, true)
+	require.NoError(t, err)
+	require.Len(t, msgs, 1)
+	assert.Equal(t, "", msgs[0].PromptSource)
 }
 
 func TestGetSessionName(t *testing.T) {

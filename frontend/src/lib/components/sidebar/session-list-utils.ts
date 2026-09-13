@@ -1,11 +1,8 @@
-import type {
-  SessionGroup,
-  SessionGroupInput,
-} from "../../stores/sessions.svelte.js";
+import type { SessionGroup, SessionGroupInput } from "../../stores/sessions.svelte.js";
 
 export const ITEM_HEIGHT = 42;
-export const CHILD_ITEM_HEIGHT = 34;
-export const TEAM_HEADER_HEIGHT = 28;
+const CHILD_ITEM_HEIGHT = 34;
+const TEAM_HEADER_HEIGHT = 28;
 export const HEADER_HEIGHT = 28;
 export const OVERSCAN = 10;
 export const STORAGE_KEY = "agentsview-group-by-agent";
@@ -27,6 +24,10 @@ export interface DisplayItem {
   label: string;
   count: number;
   group?: SessionGroup;
+  /** Session groups represented by a collapsible section header. */
+  sectionGroups?: SessionGroup[];
+  /** Sessions represented by a collapsible child-group header. */
+  memberSessionIds?: string[];
   /** For child items within an expanded continuation chain. */
   session?: SessionGroupInput;
   /** True when this is a child session inside an expanded group. */
@@ -61,14 +62,9 @@ export function getInitialGroupMode(): GroupMode {
  * prefer the root session (matching the group key), otherwise
  * pick the most recently active session.
  */
-export function selectPrimaryId(
-  sessions: SessionGroupInput[],
-  groupKey: string,
-): string {
+export function selectPrimaryId(sessions: SessionGroupInput[], groupKey: string): string {
   if (sessions.length === 0) return groupKey;
-  const hasSubagents = sessions.some(
-    (s) => s.relationship_type === "subagent",
-  );
+  const hasSubagents = sessions.some((s) => s.relationship_type === "subagent");
   if (hasSubagents) {
     const root = sessions.find((s) => s.id === groupKey);
     return root ? root.id : sessions[0]!.id;
@@ -91,16 +87,11 @@ export function selectPrimaryId(
  * Groups by agent name or project depending on mode.
  * Returns empty array when mode is "none".
  */
-export function buildGroupSections(
-  groups: SessionGroup[],
-  mode: GroupMode,
-): GroupSection[] {
+export function buildGroupSections(groups: SessionGroup[], mode: GroupMode): GroupSection[] {
   if (mode === "none") return [];
   const map = new Map<string, SessionGroup[]>();
   for (const g of groups) {
-    const primary =
-      g.sessions.find((s) => s.id === g.primarySessionId) ??
-      g.sessions[0];
+    const primary = g.sessions.find((s) => s.id === g.primarySessionId) ?? g.sessions[0];
     if (!primary) continue;
     const key = mode === "agent" ? primary.agent : primary.project;
     let list = map.get(key);
@@ -116,19 +107,9 @@ export function buildGroupSections(
     .map(([label, groups]) => ({ label, groups }));
 }
 
-/** @deprecated Use buildGroupSections */
-export function buildAgentSections(
-  groups: SessionGroup[],
-  groupByAgent: boolean,
-): GroupSection[] {
-  return buildGroupSections(groups, groupByAgent ? "agent" : "none");
-}
-
 /** Check if a session is a teammate (received a <teammate-message>). */
 function isTeammateByMessage(s: SessionGroupInput): boolean {
-  return s.is_teammate
-    ?? s.first_message?.includes("<teammate-message")
-    ?? false;
+  return s.is_teammate ?? s.first_message?.includes("<teammate-message") ?? false;
 }
 
 /**
@@ -137,10 +118,7 @@ function isTeammateByMessage(s: SessionGroupInput): boolean {
  * `<teammate-message>` tag themselves, but they belong to the
  * same teammate chain.
  */
-function isTeammate(
-  s: SessionGroupInput,
-  allSessions: SessionGroupInput[],
-): boolean {
+function isTeammate(s: SessionGroupInput, allSessions: SessionGroupInput[]): boolean {
   if (isTeammateByMessage(s)) return true;
   // Walk up the parent chain within the group to inherit.
   if (s.parent_session_id) {
@@ -182,9 +160,7 @@ export function isSubagentDescendant(
   let cur: SessionGroupInput | undefined = s;
   while (cur?.parent_session_id && !visited.has(cur.id)) {
     visited.add(cur.id);
-    const parent = groupSessions.find(
-      (p) => p.id === cur!.parent_session_id,
-    );
+    const parent = groupSessions.find((p) => p.id === cur!.parent_session_id);
     if (!parent) break;
     if (isSubagent(parent)) return true;
     cur = parent;
@@ -297,6 +273,7 @@ function emitGroupItems(
       label: "Subagents",
       count: subagents.length,
       group: g,
+      memberSessionIds: subagents.map((session) => session.id),
       depth: 1,
       isLastChild: depth1Idx === depth1Count - 1,
       height: TEAM_HEADER_HEIGHT,
@@ -337,6 +314,7 @@ function emitGroupItems(
       label: "Team",
       count: teammates.length,
       group: g,
+      memberSessionIds: teammates.map((session) => session.id),
       depth: 1,
       isLastChild: depth1Idx === depth1Count - 1,
       height: TEAM_HEADER_HEIGHT,
@@ -397,6 +375,7 @@ export function buildDisplayItems(
       type: "header",
       label: section.label,
       count: section.groups.length,
+      sectionGroups: section.groups,
       height: HEADER_HEIGHT,
       top: y.value,
     });
@@ -409,6 +388,58 @@ export function buildDisplayItems(
     }
   }
   return items;
+}
+
+function displaySessionId(item: DisplayItem): string | null {
+  if (item.type !== "session") return null;
+  if (item.isChild) return item.session?.id ?? null;
+  return item.group?.primarySessionId ?? null;
+}
+
+/**
+ * Find the next rendered session row. When a collapsed lineage or section
+ * hides the active session, treat its visible representative as the current
+ * position.
+ */
+export function adjacentVisibleSessionId(
+  displayItems: DisplayItem[],
+  activeSessionId: string | null,
+  delta: number,
+): string | null {
+  if (!activeSessionId) return null;
+
+  let current = displayItems.findIndex((item) => displaySessionId(item) === activeSessionId);
+  if (current < 0) {
+    current = displayItems.findIndex((item) => item.memberSessionIds?.includes(activeSessionId));
+  }
+  if (current < 0) {
+    current = displayItems.findIndex(
+      (item) =>
+        item.type === "session" &&
+        item.group?.sessions.some((session) => session.id === activeSessionId),
+    );
+  }
+  if (current < 0) {
+    current = displayItems.findIndex(
+      (item) =>
+        item.type === "header" &&
+        item.sectionGroups?.some((group) =>
+          group.sessions.some((session) => session.id === activeSessionId),
+        ),
+    );
+  }
+
+  if (current < 0) {
+    const rows = displayItems.filter((item) => item.type === "session");
+    const edge = delta > 0 ? rows[0] : rows[rows.length - 1];
+    return edge ? displaySessionId(edge) : null;
+  }
+
+  for (let next = current + delta; next >= 0 && next < displayItems.length; next += delta) {
+    const id = displaySessionId(displayItems[next]!);
+    if (id) return id;
+  }
+  return null;
 }
 
 /**
@@ -425,10 +456,7 @@ export function computeTotalSize(displayItems: DisplayItem[]): number {
  * scrollY position.  Accounts for OVERSCAN rows before the
  * viewport.
  */
-export function findStart(
-  displayItems: DisplayItem[],
-  scrollY: number,
-): number {
+export function findStart(displayItems: DisplayItem[], scrollY: number): number {
   const target = scrollY - OVERSCAN * ITEM_HEIGHT;
   let lo = 0;
   let hi = displayItems.length - 1;

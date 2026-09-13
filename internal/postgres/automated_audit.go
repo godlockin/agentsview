@@ -18,14 +18,18 @@ type automatedAuditPGProgress struct {
 
 const fullAutomationCandidatesPG = `SELECT
 	s.id,
+	s.agent,
+	s.session_kind,
 	s.first_message,
 	s.user_message_count,
 	s.is_automated,
+	s.prompt_evidence_discarded,
 	(
 		SELECT m.content
 		FROM messages m
 		WHERE m.session_id = s.id
 		  AND m.role = 'user'
+		  AND COALESCE(m.source_subtype, '') <> 'tool_result'
 		  AND COALESCE(m.is_system, false) = false
 		  AND btrim(m.content) <> ''
 		ORDER BY m.ordinal
@@ -120,13 +124,21 @@ func auditAutomatedMatchingHashPG(
 	classifier db.AutomationClassifier,
 	progress *automatedAuditPGProgress,
 ) (setIDs, clearIDs []string, err error) {
+	// Fetch bytea prefixes because the classifier's evidence limit is bytes,
+	// not characters. This also avoids affected PostgreSQL minors rejecting
+	// valid multibyte text when text substring operates on compressed TOAST.
 	rows, err := pg.QueryContext(ctx,
 		`SELECT
 			s.id,
+			s.agent,
+			s.session_kind,
 			s.user_message_count,
 			s.is_automated,
+			s.prompt_evidence_discarded,
 			CASE WHEN s.user_message_count <= 1
-				THEN left(first_user.content, $1)
+				THEN substring(
+					convert_to(first_user.content, 'UTF8') FROM 1 FOR $1
+				)
 			END AS first_user_prefix,
 			CASE WHEN s.user_message_count <= 1
 				THEN octet_length(first_user.content)
@@ -134,7 +146,9 @@ func auditAutomatedMatchingHashPG(
 			CASE
 				WHEN s.user_message_count <= 1
 				 AND s.first_message IS NOT NULL
-				THEN left(s.first_message, $1)
+				THEN substring(
+					convert_to(s.first_message, 'UTF8') FROM 1 FOR $1
+				)
 			END AS first_message_prefix,
 			CASE
 				WHEN s.user_message_count <= 1
@@ -147,6 +161,7 @@ func auditAutomatedMatchingHashPG(
 			FROM messages m
 			WHERE m.session_id = s.id
 			  AND m.role = 'user'
+			  AND COALESCE(m.source_subtype, '') <> 'tool_result'
 			  AND COALESCE(m.is_system, false) = false
 			  AND btrim(m.content) <> ''
 			ORDER BY m.ordinal
@@ -163,18 +178,24 @@ func auditAutomatedMatchingHashPG(
 	var unresolved []string
 	for rows.Next() {
 		var (
-			id                 string
-			userMessageCount   int
-			rowAutomated       bool
-			firstUserPrefix    sql.NullString
-			firstUserLength    sql.NullInt64
-			firstMessagePrefix sql.NullString
-			firstMessageLength sql.NullInt64
+			id                      string
+			agent                   string
+			sessionKind             string
+			userMessageCount        int
+			rowAutomated            bool
+			promptEvidenceDiscarded bool
+			firstUserPrefix         []byte
+			firstUserLength         sql.NullInt64
+			firstMessagePrefix      []byte
+			firstMessageLength      sql.NullInt64
 		)
 		if err := rows.Scan(
 			&id,
+			&agent,
+			&sessionKind,
 			&userMessageCount,
 			&rowAutomated,
+			&promptEvidenceDiscarded,
 			&firstUserPrefix,
 			&firstUserLength,
 			&firstMessagePrefix,
@@ -186,6 +207,18 @@ func auditAutomatedMatchingHashPG(
 			)
 		}
 		progress.RowsPrefetched++
+		if db.IsAutomatedSessionMetadata(agent, sessionKind) {
+			setIDs, clearIDs = appendAutomationFlagChangePG(
+				setIDs, clearIDs, id, rowAutomated, true,
+			)
+			continue
+		}
+
+		// Usage-only archives discard both text candidates. With at most
+		// one prompt, missing text cannot disprove the stored verdict.
+		if promptEvidenceDiscarded && userMessageCount <= 1 && firstUserLength.Int64 == 0 && firstMessageLength.Int64 == 0 {
+			continue
+		}
 
 		want, conclusive := classifier.VerdictFromEvidence(
 			userMessageCount,
@@ -249,21 +282,31 @@ func scanFullAutomationCandidatesPG(
 ) (setIDs, clearIDs []string, count int, err error) {
 	for rows.Next() {
 		var (
-			id           string
-			firstMessage sql.NullString
-			firstUser    sql.NullString
-			userCount    int
-			rowAutomated bool
+			id                      string
+			agent                   string
+			sessionKind             string
+			firstMessage            sql.NullString
+			firstUser               sql.NullString
+			userCount               int
+			rowAutomated            bool
+			promptEvidenceDiscarded bool
 		)
 		if err := rows.Scan(
-			&id, &firstMessage, &userCount, &rowAutomated, &firstUser,
+			&id, &agent, &sessionKind,
+			&firstMessage, &userCount, &rowAutomated, &promptEvidenceDiscarded, &firstUser,
 		); err != nil {
 			return nil, nil, count, fmt.Errorf(
 				"scanning PG automated audit candidate: %w", err,
 			)
 		}
 		count++
-		want := classifier.IsAutomatedFromTextCandidates(
+		want := db.IsAutomatedSessionMetadata(agent, sessionKind)
+		// Match the bounded audit: retain the verdict when classification
+		// needs prompt text that the source archive no longer stores.
+		if promptEvidenceDiscarded && !want && userCount <= 1 && firstUser.String == "" && firstMessage.String == "" {
+			continue
+		}
+		want = want || classifier.IsAutomatedFromTextCandidates(
 			userCount, firstUser, firstMessage,
 		)
 		setIDs, clearIDs = appendAutomationFlagChangePG(
@@ -277,11 +320,11 @@ func scanFullAutomationCandidatesPG(
 }
 
 func automationEvidencePG(
-	prefix sql.NullString,
+	prefix []byte,
 	fullByteLength sql.NullInt64,
 ) db.AutomationTextEvidence {
 	return db.AutomationTextEvidence{
-		Prefix:         []byte(prefix.String),
+		Prefix:         prefix,
 		FullByteLength: fullByteLength.Int64,
 		Valid:          fullByteLength.Valid,
 	}

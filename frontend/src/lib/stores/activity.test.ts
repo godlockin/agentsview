@@ -4,31 +4,37 @@ import { testMoney } from "../test/money.js";
 
 const api = vi.hoisted(() => ({
   getActivityReport: vi.fn(),
+  getActivitySessions: vi.fn(),
   getProjects: vi.fn(),
   getAgents: vi.fn(),
   getMachines: vi.fn(),
 }));
 
 const apiRuntimeMocks = vi.hoisted(() => ({
-  callGenerated: vi.fn(
-    (request: () => Promise<unknown>, _signal?: AbortSignal) => request(),
-  ),
+  callGenerated: vi.fn((request: () => Promise<unknown>, _signal?: AbortSignal) => request()),
+}));
+
+const eventBus = vi.hoisted(() => ({
+  subscribe: vi.fn(),
 }));
 
 vi.mock("../api/generated/index", () => ({
-  ActivityService: { getApiV1ActivityReport: api.getActivityReport },
   MetadataService: {
     getApiV1Projects: api.getProjects,
     getApiV1Agents: api.getAgents,
     getApiV1Machines: api.getMachines,
   },
 }));
+vi.mock("../api/activity-report.js", () => ({
+  fetchActivityReport: api.getActivityReport,
+  fetchActivitySessions: api.getActivitySessions,
+}));
 vi.mock("../api/runtime.js", () => ({
-  configureGeneratedClient: vi.fn(),
   callGenerated: apiRuntimeMocks.callGenerated,
   isAbortError: vi.fn(() => false),
 }));
 vi.mock("./sync.svelte.js", () => ({ sync: { onSyncComplete: vi.fn() } }));
+vi.mock("./events.svelte.js", () => ({ events: { subscribe: eventBus.subscribe } }));
 vi.mock("./router.svelte.js", () => ({
   router: { params: {}, replaceParams: vi.fn(), route: "activity" },
 }));
@@ -41,6 +47,9 @@ import * as routerMod from "./router.svelte.js";
 // callback now, before beforeEach resets the recorded call, so the
 // sync-refresh tests can invoke it directly.
 const syncCallback = vi.mocked(sync.onSyncComplete).mock.calls[0]?.[0];
+const eventsCallback = eventBus.subscribe.mock.calls[0]?.[0] as
+  | ((event: { scope: "messages" | "sessions" | "sync" }) => void)
+  | undefined;
 
 function makeReport(overrides: Partial<Report> = {}): Report {
   return {
@@ -71,7 +80,8 @@ function makeReport(overrides: Partial<Report> = {}): Report {
     by_model: [],
     by_agent: [],
     by_session: [],
-    intervals: [],
+    sessions_total: 0,
+    projects: {},
     ...overrides,
   } as Report;
 }
@@ -82,6 +92,7 @@ let detach: (() => void) | null = null;
 
 beforeEach(() => {
   api.getActivityReport.mockReset();
+  api.getActivitySessions.mockReset();
   api.getProjects.mockReset();
   api.getAgents.mockReset();
   api.getMachines.mockReset();
@@ -93,6 +104,7 @@ beforeEach(() => {
   api.getAgents.mockResolvedValue({ agents: [] });
   api.getMachines.mockResolvedValue({ machines: [] });
   activity.report = null;
+  activity.reportGeneration = 0;
   activity.loading = false;
   activity.error = null;
   activity.lastUpdatedAt = null;
@@ -110,9 +122,8 @@ beforeEach(() => {
   activity.invalidateFilterOptions();
   // Restore a fresh router.replaceParams spy. The writeUrl test reassigns it,
   // so reset here to keep that reassignment from leaking into later tests.
-  (
-    routerMod.router as unknown as { replaceParams: ReturnType<typeof vi.fn> }
-  ).replaceParams = vi.fn();
+  (routerMod.router as unknown as { replaceParams: ReturnType<typeof vi.fn> }).replaceParams =
+    vi.fn();
 });
 afterEach(() => {
   // Release any ActivityPage attachment so the singleton's attach count does
@@ -122,17 +133,53 @@ afterEach(() => {
 });
 
 describe("load", () => {
+  it("advances the report generation when the same report ID reloads", async () => {
+    api.getActivityReport.mockResolvedValue(makeReport({ report_id: "stable-report" }));
+
+    await activity.load();
+    expect(activity.reportGeneration).toBe(1);
+    await activity.load();
+    expect(activity.reportGeneration).toBe(2);
+  });
+
+  it("builds one query object covering the full report scope", async () => {
+    activity.setCustomRange("2026-06-10", "2026-06-16");
+    activity.setProject("source-project");
+    activity.setAgent("codex");
+    activity.setMachine("remote.example");
+    activity.setAutomation("automated");
+    activity.bucket = "1h";
+
+    const params = activity.queryParams();
+    api.getActivityReport.mockResolvedValue(makeReport());
+    await activity.load();
+
+    expect(api.getActivityReport).toHaveBeenCalledWith(
+      params,
+      expect.any(AbortSignal),
+      expect.any(Function),
+    );
+    expect(params).toEqual({
+      preset: "custom",
+      date: "2026-06-10",
+      from: new Date("2026-06-10T00:00:00").toISOString(),
+      to: new Date("2026-06-17T00:00:00").toISOString(),
+      timezone: activity.timezone,
+      bucket: "1h",
+      project: "source-project",
+      agent: "codex",
+      machine: "remote.example",
+      automation: "automated",
+    });
+  });
+
   it("aborts the obsolete report when a replacement starts", async () => {
     const signals: AbortSignal[] = [];
-    apiRuntimeMocks.callGenerated.mockImplementation((
-      request: () => Promise<unknown>,
-      signal?: AbortSignal,
-    ) => {
-      signals.push(signal as AbortSignal);
-      return request();
-    });
     api.getActivityReport
-      .mockImplementationOnce(() => new Promise(() => {}))
+      .mockImplementationOnce((_query, signal) => {
+        signals.push(signal);
+        return new Promise(() => {});
+      })
       .mockResolvedValueOnce(makeReport());
 
     void activity.load();
@@ -144,14 +191,10 @@ describe("load", () => {
 
   it("aborts the visible report on teardown", async () => {
     const signals: AbortSignal[] = [];
-    apiRuntimeMocks.callGenerated.mockImplementation((
-      request: () => Promise<unknown>,
-      signal?: AbortSignal,
-    ) => {
-      signals.push(signal as AbortSignal);
-      return request();
+    api.getActivityReport.mockImplementationOnce((_query, signal) => {
+      signals.push(signal);
+      return new Promise(() => {});
     });
-    api.getActivityReport.mockImplementationOnce(() => new Promise(() => {}));
 
     void activity.load();
     await Promise.resolve();
@@ -194,9 +237,7 @@ describe("load", () => {
     api.getActivityReport.mockResolvedValue(makeReport());
     activity.setAutomation("automated");
     await activity.load();
-    expect(api.getActivityReport.mock.calls.at(-1)![0].automation).toBe(
-      "automated",
-    );
+    expect(api.getActivityReport.mock.calls.at(-1)![0].automation).toBe("automated");
   });
 
   it("ignores a stale response when params change mid-flight", async () => {
@@ -259,8 +300,7 @@ describe("load", () => {
     try {
       vi.setSystemTime(new Date("2026-06-19T12:00:00"));
       activity.setCustomRange("2026-05-21", "2026-06-19", 30);
-      const replaceParams =
-        routerMod.router.replaceParams as ReturnType<typeof vi.fn>;
+      const replaceParams = routerMod.router.replaceParams as ReturnType<typeof vi.fn>;
       replaceParams.mockClear();
       api.getActivityReport.mockResolvedValue(makeReport());
 
@@ -268,12 +308,8 @@ describe("load", () => {
       await activity.load({ background: true });
 
       const arg = api.getActivityReport.mock.calls.at(-1)![0];
-      expect(arg.from).toBe(
-        new Date("2026-05-22T00:00:00").toISOString(),
-      );
-      expect(arg.to).toBe(
-        new Date("2026-06-21T00:00:00").toISOString(),
-      );
+      expect(arg.from).toBe(new Date("2026-05-22T00:00:00").toISOString());
+      expect(arg.to).toBe(new Date("2026-06-21T00:00:00").toISOString());
       expect(activity.from).toBe("2026-05-22");
       expect(activity.to).toBe("2026-06-20");
       expect(replaceParams.mock.calls.at(-1)?.[0]).toMatchObject({
@@ -306,6 +342,64 @@ describe("load", () => {
   });
 });
 
+describe("session paging", () => {
+  it("replaces the embedded page with a server-filtered bucket range", async () => {
+    activity.report = makeReport({
+      report_id: "signed-report",
+      sessions_total: 301,
+    });
+    api.getActivitySessions.mockResolvedValue({
+      report_id: "signed-report",
+      sessions: [{ session_id: "active" }],
+      next_cursor: "next-page",
+      total: 1,
+    });
+
+    await activity.loadSessionPage({
+      bucketRange: { start: 7, end: 9 },
+      sort: "cost",
+      direction: "asc",
+    });
+
+    expect(api.getActivitySessions).toHaveBeenCalledWith(
+      "signed-report",
+      {
+        limit: 200,
+        cursor: undefined,
+        sort: "cost",
+        direction: "asc",
+        bucketRange: { start: 7, end: 9 },
+      },
+      expect.any(AbortSignal),
+    );
+    expect(activity.report?.by_session).toEqual([{ session_id: "active" }]);
+    expect(activity.report?.sessions_total).toBe(1);
+    expect(activity.sessionsBucketRange).toEqual({ start: 7, end: 9 });
+  });
+
+  it("cancels a stale bucket range page when a newer selection starts", async () => {
+    activity.report = makeReport({ report_id: "signed-report" });
+    const signals: AbortSignal[] = [];
+    api.getActivitySessions
+      .mockImplementationOnce((_id, _options, signal: AbortSignal) => {
+        signals.push(signal);
+        return new Promise(() => {});
+      })
+      .mockResolvedValueOnce({
+        report_id: "signed-report",
+        sessions: [],
+        total: 0,
+      });
+
+    void activity.loadSessionPage({ bucketRange: { start: 1, end: 2 } });
+    await Promise.resolve();
+    await activity.loadSessionPage({ bucketRange: { start: 4, end: 6 } });
+
+    expect(signals[0]?.aborted).toBe(true);
+    expect(activity.sessionsBucketRange).toEqual({ start: 4, end: 6 });
+  });
+});
+
 describe("loadFilterOptions", () => {
   it("fetches options with one-shot + automated included and stores them", async () => {
     api.getProjects.mockResolvedValueOnce({
@@ -320,10 +414,10 @@ describe("loadFilterOptions", () => {
 
     await activity.loadFilterOptions();
 
-    const full = { includeOneShot: true, includeAutomated: true };
-    expect(api.getProjects).toHaveBeenCalledWith(full);
-    expect(api.getAgents).toHaveBeenCalledWith(full);
-    expect(api.getMachines).toHaveBeenCalledWith(full);
+    const full = { include_one_shot: true, include_automated: true };
+    expect(api.getProjects.mock.lastCall?.[0]).toEqual(full);
+    expect(api.getAgents.mock.lastCall?.[0]).toEqual(full);
+    expect(api.getMachines.mock.lastCall?.[0]).toEqual(full);
 
     expect(activity.projects).toEqual([{ name: "proj-a", count: 1 }]);
     expect(activity.agents).toEqual([{ name: "claude", count: 2 }]);
@@ -451,6 +545,49 @@ describe("sync refresh hook", () => {
   });
 });
 
+describe("live project metadata refresh", () => {
+  it("replaces cached filters after a sessions event without reloading the report", async () => {
+    api.getProjects
+      .mockResolvedValueOnce({ projects: [{ name: "old-project", count: 1 }] })
+      .mockResolvedValueOnce({ projects: [{ name: "new-project", count: 1 }] });
+    api.getAgents.mockResolvedValue({ agents: [] });
+    api.getMachines.mockResolvedValue({ machines: [] });
+
+    detach = activity.attach();
+    await activity.loadFilterOptions();
+    expect(activity.projects).toEqual([{ name: "old-project", count: 1 }]);
+
+    eventsCallback?.({ scope: "messages" });
+    expect(api.getProjects).toHaveBeenCalledTimes(1);
+
+    eventsCallback?.({ scope: "sessions" });
+    await vi.waitFor(() => {
+      expect(activity.projects).toEqual([{ name: "new-project", count: 1 }]);
+    });
+    expect(api.getProjects).toHaveBeenCalledTimes(2);
+    expect(api.getActivityReport).not.toHaveBeenCalled();
+  });
+
+  it("invalidates while detached and refetches on the next visit", async () => {
+    api.getProjects
+      .mockResolvedValueOnce({ projects: [{ name: "old-project", count: 1 }] })
+      .mockResolvedValueOnce({ projects: [{ name: "new-project", count: 1 }] });
+    api.getAgents.mockResolvedValue({ agents: [] });
+    api.getMachines.mockResolvedValue({ machines: [] });
+
+    await activity.loadFilterOptions();
+    expect(activity.projects).toEqual([{ name: "old-project", count: 1 }]);
+
+    eventsCallback?.({ scope: "sessions" });
+    expect(api.getProjects).toHaveBeenCalledTimes(1);
+
+    detach = activity.attach();
+    await activity.loadFilterOptions();
+    expect(activity.projects).toEqual([{ name: "new-project", count: 1 }]);
+    expect(api.getProjects).toHaveBeenCalledTimes(2);
+  });
+});
+
 describe("freshness state", () => {
   it("stamps lastUpdatedAt and clears new-data hints on a load", async () => {
     vi.useFakeTimers({ toFake: ["Date"] });
@@ -460,9 +597,7 @@ describe("freshness state", () => {
 
       expect(activity.lastUpdatedAt).toBeNull();
       await activity.load();
-      expect(activity.lastUpdatedAt).toBe(
-        new Date("2026-06-16T12:00:00Z").getTime(),
-      );
+      expect(activity.lastUpdatedAt).toBe(new Date("2026-06-16T12:00:00Z").getTime());
       expect(activity.hasNewData).toBe(false);
 
       activity.markNewData();
@@ -470,9 +605,7 @@ describe("freshness state", () => {
 
       vi.setSystemTime(new Date("2026-06-16T12:05:00Z"));
       await activity.load();
-      expect(activity.lastUpdatedAt).toBe(
-        new Date("2026-06-16T12:05:00Z").getTime(),
-      );
+      expect(activity.lastUpdatedAt).toBe(new Date("2026-06-16T12:05:00Z").getTime());
       expect(activity.hasNewData).toBe(false);
     } finally {
       vi.useRealTimers();
@@ -503,7 +636,10 @@ describe("freshness state", () => {
 describe("url state", () => {
   it("hydrates preset/date/filters from params", () => {
     activity.hydrateFromUrl({
-      preset: "week", date: "2026-06-16", project: "p1", agent: "claude",
+      preset: "week",
+      date: "2026-06-16",
+      project: "p1",
+      agent: "claude",
     });
     expect(activity.preset).toBe("week");
     expect(activity.date).toBe("2026-06-16");
@@ -545,8 +681,7 @@ describe("url state", () => {
     activity.setDate("2026-06-01");
     activity.setProject("");
     // Replace router.replaceParams with a spy for this test.
-    (routerMod.router as unknown as { replaceParams: typeof spy }).replaceParams =
-      spy;
+    (routerMod.router as unknown as { replaceParams: typeof spy }).replaceParams = spy;
     activity.writeUrl();
     expect(spy).toHaveBeenCalledTimes(1);
     const written = spy.mock.calls[0]![0] as Record<string, string>;

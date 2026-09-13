@@ -6,7 +6,7 @@ import (
 	"crypto/sha256"
 	"database/sql"
 	"encoding/base64"
-	"encoding/json"
+	"encoding/json/v2"
 	"fmt"
 	"strings"
 	"sync"
@@ -42,14 +42,13 @@ type Store struct {
 	semanticUnavailableReason string
 }
 
-// pgSessionCols is the column list for standard PG session
-// queries. PG has no local file metadata columns; transcript_revision
-// carries the backend-neutral content revision pushed from SQLite.
-const pgSessionCols = `id, project, machine, agent,
-	agent_label, entrypoint,
+// pgSessionBaseCols is the column list for PG session queries that do not
+// expose source paths.
+const pgSessionBaseCols = `id, project, machine, agent,
+	agent_label, entrypoint, session_kind,
 	first_message, COALESCE(display_name, session_name) AS display_name, created_at, started_at,
 	ended_at, message_count, user_message_count,
-	parent_session_id, relationship_type,
+	parent_session_id, parser_parent_session_id, relationship_type,
 	total_output_tokens, peak_context_tokens,
 	has_total_output_tokens, has_peak_context_tokens,
 	is_automated,
@@ -72,6 +71,12 @@ const pgSessionCols = `id, project, machine, agent,
 	transcript_fidelity, parser_malformed_lines, is_truncated,
 	secret_leak_count, secrets_rules_version,
 	deleted_at, deletion_cause, termination_status, transcript_revision`
+
+// pgSessionCols is the column list for full PG session queries.
+// PostgreSQL retains the source file path used by read-side session
+// functionality while omitting volatile local fingerprint metadata.
+const pgSessionCols = pgSessionBaseCols + `,
+	file_path`
 
 // paramBuilder generates numbered PostgreSQL placeholders.
 type paramBuilder struct {
@@ -199,16 +204,22 @@ func pgTerminationPred(status string, pb *paramBuilder) string {
 func scanPGSession(
 	rs interface{ Scan(...any) error },
 ) (db.Session, error) {
+	return scanPGSessionWithSource(rs, true)
+}
+
+func scanPGSessionWithSource(
+	rs interface{ Scan(...any) error }, includeSource bool,
+) (db.Session, error) {
 	var s db.Session
 	var createdAt *time.Time
 	var startedAt, endedAt, deletedAt *time.Time
-	err := rs.Scan(
+	targets := []any{
 		&s.ID, &s.Project, &s.Machine, &s.Agent,
-		&s.AgentLabel, &s.Entrypoint,
+		&s.AgentLabel, &s.Entrypoint, &s.SessionKind,
 		&s.FirstMessage, &s.DisplayName,
 		&createdAt, &startedAt, &endedAt,
 		&s.MessageCount, &s.UserMessageCount,
-		&s.ParentSessionID, &s.RelationshipType,
+		&s.ParentSessionID, &s.ParserParentSessionID, &s.RelationshipType,
 		&s.TotalOutputTokens, &s.PeakContextTokens,
 		&s.HasTotalOutputTokens, &s.HasPeakContextTokens,
 		&s.IsAutomated,
@@ -232,7 +243,11 @@ func scanPGSession(
 		&s.TranscriptFidelity, &s.ParserMalformedLines, &s.IsTruncated,
 		&s.SecretLeakCount, &s.SecretsRulesVersion,
 		&deletedAt, &s.DeletionCause, &s.TerminationStatus, &s.TranscriptRevision,
-	)
+	}
+	if includeSource {
+		targets = append(targets, &s.FilePath)
+	}
+	err := rs.Scan(targets...)
 	if err != nil {
 		return s, err
 	}
@@ -292,9 +307,15 @@ func (s *Store) FindSessionIDsByPartial(
 func scanPGSessionRows(
 	rows *sql.Rows,
 ) ([]db.Session, error) {
+	return scanPGSessionRowsWithSource(rows, true)
+}
+
+func scanPGSessionRowsWithSource(
+	rows *sql.Rows, includeSource bool,
+) ([]db.Session, error) {
 	sessions := []db.Session{}
 	for rows.Next() {
-		s, err := scanPGSession(rows)
+		s, err := scanPGSessionWithSource(rows, includeSource)
 		if err != nil {
 			return nil, fmt.Errorf(
 				"scanning session: %w", err,
@@ -460,7 +481,11 @@ func (s *Store) ListSessions(
 		)
 	}
 
-	query := "SELECT " + pgSessionCols +
+	columns := pgSessionBaseCols
+	if f.IncludeSource {
+		columns = pgSessionCols
+	}
+	query := "SELECT " + columns +
 		" FROM sessions WHERE " + cursorWhere + " " +
 		pageBuilder.OrderByClause(rs, f) + " " +
 		pageBuilder.Limit(f.Limit+1)
@@ -475,7 +500,7 @@ func (s *Store) ListSessions(
 	}
 	defer rows.Close()
 
-	sessions, err := scanPGSessionRows(rows)
+	sessions, err := scanPGSessionRowsWithSource(rows, f.IncludeSource)
 	if err != nil {
 		return db.SessionPage{}, err
 	}
@@ -508,6 +533,21 @@ func (s *Store) GetSidebarSessionIndex(
 	}
 
 	f.Cursor = ""
+	rootFilter := f
+	rootFilter.IncludeChildren = false
+	rootWhere, rootArgs := buildPGSessionBaseFilter(rootFilter)
+	canonicalRootWhere := db.BuildCanonicalRootWhere(
+		db.PostgresQueryDialect(), "sessions", f.IncludeOrphans,
+	)
+	var total int
+	countQuery := "SELECT COUNT(*) FROM sessions WHERE " +
+		rootWhere + " AND " + canonicalRootWhere
+	if err := s.pg.QueryRowContext(
+		ctx, countQuery, rootArgs...,
+	).Scan(&total); err != nil {
+		return db.SidebarSessionIndex{},
+			fmt.Errorf("counting sidebar roots: %w", err)
+	}
 
 	where, args := buildPGSessionFilter(f)
 	query := `
@@ -520,6 +560,7 @@ func (s *Store) GetSidebarSessionIndex(
 			agent,
 			agent_label,
 			entrypoint,
+			session_kind,
 			COALESCE(display_name, session_name) AS display_name,
 			started_at,
 			ended_at,
@@ -549,7 +590,7 @@ func (s *Store) GetSidebarSessionIndex(
 	}
 	index := db.SidebarSessionIndex{
 		Sessions: sessions,
-		Total:    len(sessions),
+		Total:    total,
 	}
 
 	return index, nil
@@ -759,6 +800,7 @@ func (s *Store) getSidebarSessionIndexPage(
 			s.agent,
 			s.agent_label,
 			s.entrypoint,
+			s.session_kind,
 			COALESCE(s.display_name, s.session_name) AS display_name,
 			s.started_at,
 			s.ended_at,
@@ -806,6 +848,7 @@ func scanPGSidebarSessionIndexRows(
 			&row.Agent,
 			&row.AgentLabel,
 			&row.Entrypoint,
+			&row.SessionKind,
 			&row.DisplayName,
 			&startedAt,
 			&endedAt,
@@ -975,20 +1018,12 @@ func (s *Store) GetStats(
 	if excludeAutomated {
 		filter += " AND is_automated = FALSE"
 	}
-	query := fmt.Sprintf(`
-		SELECT
-			(SELECT COUNT(*) FROM sessions
-			 WHERE %s),
-			(SELECT COALESCE(SUM(message_count), 0)
-			 FROM sessions WHERE %s),
-			(SELECT COUNT(DISTINCT project) FROM sessions
-			 WHERE %s),
-			(SELECT COUNT(DISTINCT machine) FROM sessions
-			 WHERE %s),
-			(SELECT MIN(COALESCE(started_at, created_at))
-			 FROM sessions
-			 WHERE %s)`,
-		filter, filter, filter, filter, filter)
+	// Sidebar polling needs all totals for the same rows. Aggregate them
+	// together so each refresh visits the filtered sessions only once.
+	query := `SELECT COUNT(*), COALESCE(SUM(message_count), 0),
+		COUNT(DISTINCT project), COUNT(DISTINCT machine),
+		MIN(COALESCE(started_at, created_at))
+		FROM sessions WHERE ` + filter
 
 	var st db.Stats
 	var earliest *time.Time

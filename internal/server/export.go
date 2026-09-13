@@ -2,7 +2,7 @@ package server
 
 import (
 	"context"
-	"encoding/json"
+	"encoding/json/v2"
 	"fmt"
 	"html"
 	"html/template"
@@ -101,7 +101,7 @@ func createGistWithURL(
 	}
 
 	var result gistResponse
-	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+	if err := json.UnmarshalRead(resp.Body, &result); err != nil {
 		return nil, fmt.Errorf("parsing github response: %w", err)
 	}
 	return &result, nil
@@ -162,7 +162,7 @@ func validateGithubTokenWithURL(
 	var user struct {
 		Login string `json:"login"`
 	}
-	if err := json.NewDecoder(resp.Body).Decode(&user); err != nil {
+	if err := json.UnmarshalRead(resp.Body, &user); err != nil {
 		return "", fmt.Errorf("parsing user response: %w", err)
 	}
 	return user.Login, nil
@@ -643,7 +643,7 @@ func generateExportHTML(
 		Messages:     make([]exportMessage, len(msgs)),
 	}
 
-	focusedVisible := focusedExportOrdinals(msgs)
+	focusedVisible := focusedExportOrdinals(msgs, session.Agent)
 	for i, m := range msgs {
 		roleClass := "unknown"
 		if m.Role == "user" || m.Role == "assistant" {
@@ -744,7 +744,12 @@ func isThinkingOnly(content string) bool {
 	return strings.TrimSpace(without) == ""
 }
 
-func focusedExportOrdinals(msgs []db.Message) map[int]bool {
+func focusedExportOrdinals(
+	msgs []db.Message, agent string,
+) map[int]bool {
+	keepAnswerBeforeTrailingTools := parser.AgentHasPostAnswerToolWork(
+		parser.AgentType(agent),
+	)
 	visible := make(map[int]bool, len(msgs))
 	pendingOrdinal := 0
 	hasPendingAssistant := false
@@ -771,7 +776,7 @@ func focusedExportOrdinals(msgs []db.Message) map[int]bool {
 		}
 
 		if isExportToolOnly(m) {
-			if hasPendingAssistant {
+			if hasPendingAssistant && !keepAnswerBeforeTrailingTools {
 				toolAfterPendingAssistant = true
 			}
 			continue

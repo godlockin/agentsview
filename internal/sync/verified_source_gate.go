@@ -1,7 +1,9 @@
 package sync
 
 import (
+	"encoding/binary"
 	"errors"
+	"hash/fnv"
 	"os"
 	"path/filepath"
 	"strings"
@@ -24,6 +26,10 @@ type verifiedSourceSignature struct {
 	sidecarInode      int64
 	sidecarDevice     int64
 	sidecarChangeTime int64
+	// sidecarAliases digests the stat signatures of every alias-home
+	// session_index.jsonl that title lookups merge with the primary index.
+	// Zero when no alias index exists.
+	sidecarAliases uint64
 }
 
 // verifiedSourceRecord deliberately combines trust, invalidation, and pass
@@ -36,11 +42,16 @@ type verifiedSourceRecord struct {
 	trusted         bool
 }
 
+type verifiedSourceKey struct {
+	agent parser.AgentType
+	path  string
+}
+
 // verifiedSourceCapture binds a pre-verification signature to the path's
 // invalidation coordinates. Promotion succeeds only if neither coordinate
 // changed while content verification was in flight.
 type verifiedSourceCapture struct {
-	path         string
+	key          verifiedSourceKey
 	signature    verifiedSourceSignature
 	epoch        uint64
 	invalidation uint64
@@ -50,24 +61,26 @@ type verifiedSourceCapture struct {
 // invalidation coordinates before verification, and reports whether the same
 // signature was previously promoted.
 func (e *Engine) captureVerifiedSource(
+	agent parser.AgentType,
 	path string,
 	signature verifiedSourceSignature,
 ) (verifiedSourceCapture, bool) {
-	if path == "" {
+	if agent == "" || path == "" {
 		return verifiedSourceCapture{}, false
 	}
+	key := verifiedSourceKey{agent: agent, path: path}
 	e.verifiedSourceMu.Lock()
 	defer e.verifiedSourceMu.Unlock()
 	if e.verifiedSources == nil {
-		e.verifiedSources = make(map[string]verifiedSourceRecord)
+		e.verifiedSources = make(map[verifiedSourceKey]verifiedSourceRecord)
 	}
-	record := e.verifiedSources[path]
+	record := e.verifiedSources[key]
 	if e.verifiedSourceActivePass != 0 {
 		record.lastSeenPass = e.verifiedSourceActivePass
 	}
-	e.verifiedSources[path] = record
+	e.verifiedSources[key] = record
 	return verifiedSourceCapture{
-		path:         path,
+		key:          key,
 		signature:    signature,
 		epoch:        e.verifiedSourceEpoch,
 		invalidation: record.invalidationGen,
@@ -77,12 +90,12 @@ func (e *Engine) captureVerifiedSource(
 // promoteVerifiedSource trusts a capture only when no path invalidation,
 // global clear, or completed-pass pruning landed after capture.
 func (e *Engine) promoteVerifiedSource(capture verifiedSourceCapture) {
-	if capture.path == "" {
+	if capture.key.agent == "" || capture.key.path == "" {
 		return
 	}
 	e.verifiedSourceMu.Lock()
 	defer e.verifiedSourceMu.Unlock()
-	record, ok := e.verifiedSources[capture.path]
+	record, ok := e.verifiedSources[capture.key]
 	if !ok ||
 		capture.epoch != e.verifiedSourceEpoch ||
 		capture.invalidation != record.invalidationGen {
@@ -90,28 +103,29 @@ func (e *Engine) promoteVerifiedSource(capture verifiedSourceCapture) {
 	}
 	record.signature = capture.signature
 	record.trusted = true
-	e.verifiedSources[capture.path] = record
+	e.verifiedSources[capture.key] = record
 }
 
 // invalidateVerifiedSource drops one path's trust and advances its generation.
 // During an active full pass the invalidation record is marked seen so pruning
 // cannot erase the generation before a stale in-flight promotion observes it.
-func (e *Engine) invalidateVerifiedSource(path string) {
-	if path == "" {
+func (e *Engine) invalidateVerifiedSource(agent parser.AgentType, path string) {
+	if agent == "" || path == "" {
 		return
 	}
+	key := verifiedSourceKey{agent: agent, path: path}
 	e.verifiedSourceMu.Lock()
 	defer e.verifiedSourceMu.Unlock()
 	if e.verifiedSources == nil {
-		e.verifiedSources = make(map[string]verifiedSourceRecord)
+		e.verifiedSources = make(map[verifiedSourceKey]verifiedSourceRecord)
 	}
-	record := e.verifiedSources[path]
+	record := e.verifiedSources[key]
 	record.trusted = false
 	record.invalidationGen++
 	if e.verifiedSourceActivePass != 0 {
 		record.lastSeenPass = e.verifiedSourceActivePass
 	}
-	e.verifiedSources[path] = record
+	e.verifiedSources[key] = record
 }
 
 // clearVerifiedSources invalidates every trusted source and vetoes all
@@ -148,9 +162,9 @@ func (e *Engine) finishVerifiedSourcePass(pass uint64, complete bool) {
 		return
 	}
 	if complete {
-		for path, record := range e.verifiedSources {
+		for key, record := range e.verifiedSources {
 			if record.lastSeenPass != pass {
-				delete(e.verifiedSources, path)
+				delete(e.verifiedSources, key)
 			}
 		}
 	}
@@ -166,7 +180,7 @@ func (e *Engine) verifiedProviderSourceState(
 	source parser.SourceRef,
 	file parser.DiscoveredFile,
 ) (verifiedSourceCapture, int64, bool, bool) {
-	if e.forceParse || file.ForceParse || e.pathRewriter != nil ||
+	if e.forceParseRequested(file) || e.pathRewriter != nil ||
 		provider.Capabilities().Source.VerifiedLocalStat !=
 			parser.CapabilitySupported {
 		return verifiedSourceCapture{}, 0, false, false
@@ -187,33 +201,16 @@ func (e *Engine) verifiedProviderSourceState(
 	inode, device := getFileIdentity(path, info)
 	mtime := info.ModTime().UnixNano()
 	sidecar := verifiedSourceSignature{}
+	latestIndexMtime := int64(0)
 	if provider.Definition().Type == parser.AgentCodex {
-		indexPath := parser.CodexSessionIndexPath(path)
-		if indexPath != "" {
-			indexInfo, indexErr := os.Stat(indexPath)
-			switch {
-			case indexErr == nil:
-				if !indexInfo.Mode().IsRegular() {
-					return verifiedSourceCapture{}, 0, false, false
-				}
-				indexChangeTime, reliable := fileChangeTime(
-					indexPath, indexInfo,
-				)
-				if !reliable {
-					return verifiedSourceCapture{}, 0, false, false
-				}
-				indexInode, indexDevice := getFileIdentity(indexPath, indexInfo)
-				sidecar.sidecarSize = indexInfo.Size()
-				sidecar.sidecarMtime = indexInfo.ModTime().UnixNano()
-				sidecar.sidecarInode = indexInode
-				sidecar.sidecarDevice = indexDevice
-				sidecar.sidecarChangeTime = indexChangeTime
-			case !errors.Is(indexErr, os.ErrNotExist):
-				return verifiedSourceCapture{}, 0, false, false
-			}
+		var ok bool
+		sidecar, latestIndexMtime, ok = codexSidecarSignature(path, e.codexMetadata())
+		if !ok {
+			return verifiedSourceCapture{}, 0, false, false
 		}
 	}
-	capture, fresh := e.captureVerifiedSource(path, verifiedSourceSignature{
+	agent := provider.Definition().Type
+	capture, fresh := e.captureVerifiedSource(agent, path, verifiedSourceSignature{
 		size:              info.Size(),
 		mtime:             mtime,
 		inode:             inode,
@@ -224,9 +221,14 @@ func (e *Engine) verifiedProviderSourceState(
 		sidecarInode:      sidecar.sidecarInode,
 		sidecarDevice:     sidecar.sidecarDevice,
 		sidecarChangeTime: sidecar.sidecarChangeTime,
+		sidecarAliases:    sidecar.sidecarAliases,
 	})
-	if sidecar.sidecarMtime > mtime {
-		mtime = sidecar.sidecarMtime
+	// Stored rows carry CodexEffectiveMtime, the newest of the transcript
+	// and every index it reads, so the trusted mtime must use the same
+	// rule or an alias index that is newer than the primary would reject
+	// warm trust on every sync.
+	if latestIndexMtime > mtime {
+		mtime = latestIndexMtime
 	}
 	return capture, mtime, fresh, true
 }
@@ -236,6 +238,7 @@ func (e *Engine) verifiedProviderSourceState(
 // hide a missing active row, forced file-metadata reset, old parser data
 // version, or project value that the current parser knows how to repair.
 func (e *Engine) verifiedProviderSourceFreshInDB(
+	agent parser.AgentType,
 	source parser.SourceRef,
 	wantSize, wantMtime int64,
 ) bool {
@@ -244,7 +247,7 @@ func (e *Engine) verifiedProviderSourceFreshInDB(
 		return false
 	}
 	project, dataVersion, storedSize, storedMtime, ok :=
-		e.db.GetSourceRepairStateByPath(path)
+		e.db.GetSourceRepairStateByAgentPath(path, string(agent))
 	if !ok || parser.NeedsProjectReparse(project) {
 		return false
 	}
@@ -260,22 +263,23 @@ func (e *Engine) verifiedLocalStatSupported(agent parser.AgentType) bool {
 			parser.CapabilitySupported
 }
 
-func (e *Engine) markVerifiedSourceSeen(path string) {
-	if path == "" {
+func (e *Engine) markVerifiedSourceSeen(agent parser.AgentType, path string) {
+	if agent == "" || path == "" {
 		return
 	}
 	path = filepath.Clean(path)
+	key := verifiedSourceKey{agent: agent, path: path}
 	e.verifiedSourceMu.Lock()
 	defer e.verifiedSourceMu.Unlock()
 	if e.verifiedSourceActivePass == 0 {
 		return
 	}
-	record, ok := e.verifiedSources[path]
+	record, ok := e.verifiedSources[key]
 	if !ok {
 		return
 	}
 	record.lastSeenPass = e.verifiedSourceActivePass
-	e.verifiedSources[path] = record
+	e.verifiedSources[key] = record
 }
 
 // markVerifiedDiscoveredSources preserves trusted records for gateable sources
@@ -287,7 +291,7 @@ func (e *Engine) markVerifiedDiscoveredSources(files []parser.DiscoveredFile) {
 	}
 	for _, file := range files {
 		if e.verifiedLocalStatSupported(file.Agent) {
-			e.markVerifiedSourceSeen(file.Path)
+			e.markVerifiedSourceSeen(file.Agent, file.Path)
 		}
 	}
 }
@@ -299,5 +303,60 @@ func (e *Engine) invalidateVerifiedDiscoveredSource(file parser.DiscoveredFile) 
 	if e.pathRewriter != nil || !e.verifiedLocalStatSupported(file.Agent) {
 		return
 	}
-	e.invalidateVerifiedSource(filepath.Clean(file.Path))
+	e.invalidateVerifiedSource(file.Agent, filepath.Clean(file.Path))
+}
+
+// codexSidecarSignature stats every session_index.jsonl that a Codex
+// transcript's title lookup reads. The primary index fills the sidecar
+// fields directly; alias-home indexes fold into one digest so a title
+// written in a second home invalidates the trusted source like a rename in
+// the primary home. A missing index contributes nothing; an index that is
+// not a regular file or has no reliable change time fails closed. The
+// second result is the newest mtime across every index, matching
+// parser.CodexEffectiveMtime.
+func codexSidecarSignature(path string, metadata parser.CodexMetadata) (verifiedSourceSignature, int64, bool) {
+	sig := verifiedSourceSignature{}
+	indexPaths := metadata.IndexPaths(path)
+	if len(indexPaths) == 0 {
+		return sig, 0, true
+	}
+	aliasDigest := fnv.New64a()
+	aliasSeen := false
+	latest := int64(0)
+	for i, indexPath := range indexPaths {
+		info, err := os.Stat(indexPath)
+		if errors.Is(err, os.ErrNotExist) {
+			continue
+		}
+		if err != nil || !info.Mode().IsRegular() {
+			return verifiedSourceSignature{}, 0, false
+		}
+		changeTime, reliable := fileChangeTime(indexPath, info)
+		if !reliable {
+			return verifiedSourceSignature{}, 0, false
+		}
+		inode, device := getFileIdentity(indexPath, info)
+		latest = max(latest, info.ModTime().UnixNano())
+		if i == 0 {
+			sig.sidecarSize = info.Size()
+			sig.sidecarMtime = info.ModTime().UnixNano()
+			sig.sidecarInode = inode
+			sig.sidecarDevice = device
+			sig.sidecarChangeTime = changeTime
+			continue
+		}
+		aliasSeen = true
+		var buf [8 * 5]byte
+		for j, v := range []int64{
+			info.Size(), info.ModTime().UnixNano(), inode, device, changeTime,
+		} {
+			binary.LittleEndian.PutUint64(buf[j*8:], uint64(v))
+		}
+		_, _ = aliasDigest.Write([]byte(indexPath))
+		_, _ = aliasDigest.Write(buf[:])
+	}
+	if aliasSeen {
+		sig.sidecarAliases = aliasDigest.Sum64()
+	}
+	return sig, latest, true
 }

@@ -69,6 +69,10 @@ func resolvePGServeVectorState(
 func wirePGVectorSearch(
 	ctx context.Context, appCfg config.Config, store *postgres.Store, label string,
 ) error {
+	if appCfg.ArchiveContent.UsageOnly() {
+		store.SetSemanticUnavailableReason("vector search is unavailable for usage-only archives")
+		return nil
+	}
 	if !appCfg.Vector.Enabled {
 		_, reason := resolvePGServeVectorState(false, false, "", "")
 		store.SetSemanticUnavailableReason(reason)
@@ -116,7 +120,7 @@ func wirePGVectorSearch(
 	}
 	encodeQuery := func(ctx context.Context, text string) ([]float32, error) {
 		vecs, err := kitvec.EncodeBatched(ctx, enc,
-			[]kitvec.Chunk{{Index: 0, Text: text}}, kitvec.BatchOptions{})
+			[]kitvec.Chunk{{Index: 0, Text: text}})
 		if err != nil {
 			return nil, err
 		}

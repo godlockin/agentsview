@@ -6,7 +6,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
-	"encoding/json"
+	"encoding/json/v2"
 	"errors"
 	"fmt"
 	"io"
@@ -229,6 +229,9 @@ func filterToQuery(f ListFilter) url.Values {
 	if f.IncludeChildren {
 		q.Set("include_children", "true")
 	}
+	if f.IncludeSource {
+		q.Set("include_source", "true")
+	}
 	setIfNotEmpty("outcome", f.Outcome)
 	setIfNotEmpty("health_grade", f.HealthGrade)
 	setIfNotEmpty("termination", f.Termination)
@@ -347,7 +350,7 @@ func (b *httpBackend) Sync(
 		)
 	}
 	var detail SessionDetail
-	if err := json.NewDecoder(resp.Body).Decode(&detail); err != nil {
+	if err := json.UnmarshalRead(resp.Body, &detail); err != nil {
 		return nil, err
 	}
 	return &detail, nil
@@ -451,6 +454,12 @@ func (b *httpBackend) Search(
 	if req.Project != "" {
 		q.Set("project", req.Project)
 	}
+	if req.DateFrom != "" {
+		q.Set("date_from", req.DateFrom)
+	}
+	if req.DateTo != "" {
+		q.Set("date_to", req.DateTo)
+	}
 	if req.Sort != "" {
 		q.Set("sort", req.Sort)
 	}
@@ -523,6 +532,11 @@ func (b *httpBackend) SearchContent(
 	if req.IncludeOneShot {
 		q.Set("include_one_shot", "true")
 	}
+	for _, id := range req.ExcludeSessionIDs {
+		if id = strings.TrimSpace(id); id != "" {
+			q.Add("exclude_session", id)
+		}
+	}
 	if req.Limit > 0 {
 		q.Set("limit", strconv.Itoa(req.Limit))
 	}
@@ -540,8 +554,7 @@ func (b *httpBackend) SearchContent(
 		})
 	}
 	if err := b.getJSONLong(ctx, "/api/v1/search/content?"+q.Encode(), &out, opts...); err != nil {
-		var notImpl *errNotImplementedBody
-		if errors.As(err, &notImpl) {
+		if notImpl, ok := errors.AsType[*errNotImplementedBody](err); ok {
 			return nil, wrapSemanticUnavailable(notImpl.message)
 		}
 		return nil, err
@@ -1106,7 +1119,7 @@ func (b *httpBackend) getJSONWithClient(
 			statusCode: resp.StatusCode, body: msg,
 		}
 	}
-	return json.NewDecoder(resp.Body).Decode(out)
+	return json.UnmarshalRead(resp.Body, out)
 }
 
 func (b *httpBackend) postJSON(
@@ -1156,7 +1169,7 @@ func (b *httpBackend) postJSONWithClient(
 			statusCode: resp.StatusCode, body: msg,
 		}
 	}
-	return json.NewDecoder(resp.Body).Decode(out)
+	return json.UnmarshalRead(resp.Body, out)
 }
 
 func (b *httpBackend) postRaw(
@@ -1193,5 +1206,5 @@ func (b *httpBackend) postRaw(
 			"POST %s: HTTP %d: %s", path, resp.StatusCode, msg,
 		)
 	}
-	return json.NewDecoder(resp.Body).Decode(out)
+	return json.UnmarshalRead(resp.Body, out)
 }

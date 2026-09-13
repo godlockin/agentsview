@@ -11,7 +11,6 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	"go.kenn.io/agentsview/internal/db/driver"
 	"go.kenn.io/agentsview/internal/money"
 )
 
@@ -26,7 +25,7 @@ func createClosedTestDB(
 	seed func(*DB),
 ) string {
 	t.Helper()
-	d, err := openCopiedTestDB(path)
+	d, err := openCopiedTestDB(t, path)
 	require.NoError(t, err)
 	if seed != nil {
 		seed(d)
@@ -66,7 +65,7 @@ func openReadOnlyTestDB(t *testing.T, path string) *DB {
 
 func execRawSQLite(t *testing.T, path, query string, args ...any) {
 	t.Helper()
-	raw, err := sql.Open(driver.DriverName, path)
+	raw, err := sql.Open("sqlite3", path)
 	require.NoError(t, err)
 	_, err = raw.Exec(query, args...)
 	require.NoError(t, err)
@@ -83,6 +82,7 @@ func requireOpenReadOnlyFails(
 	require.Error(t, err)
 	require.Nil(t, readonly)
 	assert.Contains(t, err.Error(), contains)
+	assert.True(t, IsSchemaUpgradeRequired(err))
 }
 
 func requireReadOnlyOp(t *testing.T, name string, op func() error) {
@@ -281,6 +281,20 @@ func TestOpenReadOnlyRejectsMissingMigratedColumn(t *testing.T) {
 	requireOpenReadOnlyFails(t, path, "schema missing sessions.deletion_cause")
 }
 
+func TestOpenReadOnlyRejectsMissingUsageCacheIndexes(t *testing.T) {
+	for _, index := range []string{
+		"idx_messages_usage_timestamp",
+		"idx_messages_usage_session_covering",
+		"idx_messages_activity_timestamp",
+	} {
+		t.Run(index, func(t *testing.T) {
+			path := createClosedTestDB(t, tempDBPath(t, "sessions.db"), nil)
+			execRawSQLite(t, path, "DROP INDEX "+index)
+			requireOpenReadOnlyFails(t, path, "schema missing index "+index)
+		})
+	}
+}
+
 func TestReadOnlySchemaCompatibilityRejectsMissingReadColumn(t *testing.T) {
 	tests := []struct {
 		name   string
@@ -302,6 +316,9 @@ func TestReadOnlySchemaCompatibilityRejectsMissingReadColumn(t *testing.T) {
 		{"worktree mapping", "worktree_project_mappings", "updated_at"},
 		{"pg sync state", "pg_sync_state", "value"},
 		{"model pricing", "model_pricing", "updated_at"},
+		{"pricing 1h rate", "model_pricing", "cache_creation_1h_microdollars_per_mtok"},
+		{"pricing band", "model_pricing_bands", "input_microdollars_per_mtok"},
+		{"GenAI pricing", "genai_pricing", "data_json"},
 		{"secret finding", "secret_findings", "rules_version"},
 		{"recall entry", "recall_entries", "uncertainty"},
 		{"recall evidence", "recall_evidence", "snippet"},
@@ -333,6 +350,8 @@ func TestOpenReadOnlyRejectsMissingReadTable(t *testing.T) {
 		{"secret_findings", "id"},
 		{"pg_sync_state", "key"},
 		{"model_pricing", "model_pattern"},
+		{"model_pricing_bands", "model_pattern"},
+		{"genai_pricing", "singleton"},
 		{"recall_query_events", "id"},
 		{"recall_query_exposures", "query_id"},
 		{"recall_extract_generations", "fingerprint"},
@@ -352,7 +371,7 @@ func TestReadOnlyRequiredSchemaDerivedFromSchemaDDL(t *testing.T) {
 	required, err := readOnlyRequiredSchema()
 	require.NoError(t, err)
 
-	conn, err := sql.Open(driver.DriverName, ":memory:")
+	conn, err := sql.Open("sqlite3", ":memory:")
 	require.NoError(t, err)
 	t.Cleanup(func() { require.NoError(t, conn.Close()) })
 	_, err = conn.Exec(schemaSQL)
@@ -390,7 +409,7 @@ func readOnlyTableColumns(
 
 func openReadOnlySchemaProbe(t *testing.T) *sql.DB {
 	t.Helper()
-	conn, err := sql.Open(driver.DriverName, ":memory:")
+	conn, err := sql.Open("sqlite3", ":memory:")
 	require.NoError(t, err)
 	t.Cleanup(func() { require.NoError(t, conn.Close()) })
 	_, err = conn.Exec(schemaSQL)

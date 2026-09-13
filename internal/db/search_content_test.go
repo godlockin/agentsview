@@ -85,16 +85,61 @@ func TestSearchContentRedactsStraddlingSecret(t *testing.T) {
 		"reveal snippet should show raw bytes")
 }
 
-// TestCaseInsensitiveIndexUnicodeOffset pins that the returned offset indexes
+// TestCaseInsensitiveSpanUnicodeOffset pins that the returned offsets index
 // the original string, not strings.ToLower(s). The Kelvin sign U+212A is three
 // bytes but lowercases to one ('k'), so a ToLower-based index would report a
 // byte offset shifted left of the real match position.
-func TestCaseInsensitiveIndexUnicodeOffset(t *testing.T) {
+func TestCaseInsensitiveSpanUnicodeOffset(t *testing.T) {
 	body := strings.Repeat("K", 5) + "match here"
-	got := CaseInsensitiveIndex(body, "MATCH")
+	start, end, ok := CaseInsensitiveSpan(body, "MATCH")
+	require.True(t, ok, "CaseInsensitiveSpan did not find the match")
 	want := strings.Index(body, "match") // real offset into the original string
-	assert.Equal(t, want, got,
-		"CaseInsensitiveIndex offset into original body")
+	assert.Equal(t, want, start,
+		"CaseInsensitiveSpan start into original body")
+	assert.Equal(t, want+len("match"), end,
+		"CaseInsensitiveSpan end into original body")
+}
+
+// TestCaseInsensitiveSpanEndTracksMatchedBytes pins that the end offset is
+// taken from the matched bytes rather than from the pattern. U+212A KELVIN
+// SIGN is three bytes and folds to the one-byte "k", so start+len(pattern)
+// lands inside a rune of the body when the body carries the long form and
+// overshoots the match when the pattern does. snippetBounds snaps only its
+// padding edges and leaves the span alone, so a span that is not rune-aligned
+// reaches the slice unrepaired.
+func TestCaseInsensitiveSpanEndTracksMatchedBytes(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		body    string
+		pattern string
+		match   string
+	}{
+		{"body rune longer than pattern", "a\u212Ab", "k", "\u212A"},
+		{"body rune shorter than pattern", "akb", "\u212A", "k"},
+		{"multi rune phrase", "the Key word", "key", "Key"},
+		{"ascii unaffected", "the key word", "KEY", "key"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			start, end, ok := CaseInsensitiveSpan(tc.body, tc.pattern)
+			require.True(t, ok, "no match for %q in %q", tc.pattern, tc.body)
+			assert.Equal(t, tc.match, tc.body[start:end],
+				"span does not cover exactly the matched bytes")
+			assert.True(t, utf8.ValidString(tc.body[start:end]),
+				"span splits a rune: %d..%d of %q", start, end, tc.body)
+		})
+	}
+}
+
+// TestFTSSnippetRangeRuneAligned pins the same guarantee for the shared
+// snippet-centering helper every backend calls (SQLite, the PostgreSQL keyword
+// and hybrid legs, DuckDB).
+func TestFTSSnippetRangeRuneAligned(t *testing.T) {
+	body := "prefix a\u212Ab suffix"
+	start, end := FTSSnippetRange("k", body)
+	assert.Equal(t, "\u212A", body[start:end],
+		"FTS snippet range does not cover the matched bytes")
+	assert.True(t, utf8.RuneStart(body[end]),
+		"FTS snippet range end %d splits a rune in %q", end, body)
 }
 
 // TestSubstringSnippetUnicodeOffset guards against the snippet panic and
@@ -608,14 +653,14 @@ func TestFTSSnippetCentersOnPhrase(t *testing.T) {
 
 	t.Run("phrase present centers on phrase", func(t *testing.T) {
 		f := ContentSearchFilter{Pattern: `"error handler"`, Mode: "fts"}
-		assert.Contains(t, f.ftsSnippet(body), "error handler",
+		assert.Contains(t, f.ftsSnippet(body, ""), "error handler",
 			"snippet did not center on the phrase")
 	})
 	t.Run("phrase absent falls back to first token", func(t *testing.T) {
 		// No contiguous "error handler" substring, so centering falls back to
 		// the first token "error", windowing its early occurrence.
 		f := ContentSearchFilter{Pattern: `"error nonexistent"`, Mode: "fts"}
-		assert.Contains(t, f.ftsSnippet(body), "error in the early",
+		assert.Contains(t, f.ftsSnippet(body, ""), "error in the early",
 			"fallback snippet not centered on first token")
 	})
 }
@@ -947,4 +992,50 @@ func TestSearchContentFTSDerivedRange(t *testing.T) {
 		assert.Equal(t, [2]int{1, 2}, m.OrdinalRange, "derived run range")
 		assert.False(t, m.Subordinate, "top-level run")
 	}
+}
+
+func TestNormalizeExcludeSessionIDs(t *testing.T) {
+	assert.Nil(t, NormalizeExcludeSessionIDs(nil))
+	assert.Nil(t, NormalizeExcludeSessionIDs([]string{"", "  "}))
+	assert.Equal(t, []string{"keep", "other"},
+		NormalizeExcludeSessionIDs([]string{" keep ", "", "keep", "other"}))
+}
+
+func TestAppendExcludeSessionIDs(t *testing.T) {
+	where, args := AppendExcludeSessionIDs("message_count > 0", nil, "id", nil)
+	assert.Equal(t, "message_count > 0", where)
+	assert.Nil(t, args)
+
+	where, args = AppendExcludeSessionIDs("message_count > 0", []any{"p"}, "id",
+		[]string{"live", "live", " other "})
+	assert.Equal(t, "message_count > 0 AND id NOT IN (?,?)", where)
+	assert.Equal(t, []any{"p", "live", "other"}, args)
+}
+
+func TestSearchContentExcludeSessionIDs(t *testing.T) {
+	d := testDB(t)
+	seedSearchSession(t, d, "keep", "proj", [][2]string{
+		{"user", "needle in keep"},
+		{"assistant", "ok"},
+	})
+	seedSearchSession(t, d, "drop", "proj", [][2]string{
+		{"user", "needle in drop"},
+		{"assistant", "ok"},
+	})
+
+	all, err := d.SearchContent(context.Background(), ContentSearchFilter{
+		Pattern: "needle", Mode: "substring",
+		Sources: []string{"messages"}, Limit: 50,
+	})
+	require.NoError(t, err)
+	require.Len(t, all.Matches, 2)
+
+	got, err := d.SearchContent(context.Background(), ContentSearchFilter{
+		Pattern: "needle", Mode: "substring",
+		Sources: []string{"messages"}, Limit: 1,
+		ExcludeSessionIDs: []string{"drop", " drop "},
+	})
+	require.NoError(t, err)
+	require.Len(t, got.Matches, 1, "excluded id must not consume the page")
+	assert.Equal(t, "keep", got.Matches[0].SessionID)
 }

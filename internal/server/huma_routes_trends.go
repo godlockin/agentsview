@@ -10,7 +10,7 @@ import (
 func (s *Server) registerTrendsRoutes() {
 	group := newRouteGroup(s.api, "/api/v1/trends", "Trends")
 
-	get(s, group, "/terms", "Get trend terms", s.humaTrendsTerms)
+	s.get(group, "/terms", "Get trend terms", s.humaTrendsTerms)
 }
 
 type trendsTermsInput struct {
@@ -23,7 +23,7 @@ func (s *Server) humaTrendsTerms(
 	ctx context.Context,
 	in *trendsTermsInput,
 ) (*jsonOutput[db.TrendsTermsResponse], error) {
-	f, err := analyticsFilterFromInput(in.AnalyticsFilterInput)
+	f, err := s.analyticsFilterFromInput(ctx, in.AnalyticsFilterInput)
 	if err != nil {
 		return nil, err
 	}

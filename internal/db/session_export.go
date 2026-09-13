@@ -7,7 +7,7 @@ import (
 	"database/sql"
 	"encoding/base64"
 	"encoding/hex"
-	"encoding/json"
+	"encoding/json/v2"
 	"errors"
 	"fmt"
 	"path/filepath"
@@ -15,6 +15,7 @@ import (
 	"strings"
 	"time"
 
+	"go.kenn.io/agentsview/internal/activity"
 	"go.kenn.io/agentsview/internal/export"
 	"go.kenn.io/agentsview/internal/money"
 )
@@ -43,6 +44,8 @@ type SessionExportOptions struct {
 
 type SessionExportResult struct {
 	SchemaVersion int                               `json:"schema_version"`
+	ArchiveID     string                            `json:"archive_id"`
+	DatabaseID    string                            `json:"database_id"`
 	Rows          []SessionSummaryRow               `json:"rows"`
 	NextCursor    string                            `json:"next_cursor,omitempty"`
 	Pricing       *export.PricingBlock              `json:"pricing,omitempty"`
@@ -51,6 +54,8 @@ type SessionExportResult struct {
 
 type SessionSummaryRow struct {
 	ID                    string                       `json:"id"`
+	TranscriptRevision    string                       `json:"transcript_revision"`
+	LocalModifiedAt       *string                      `json:"local_modified_at"`
 	Project               string                       `json:"-"`
 	ProjectReference      export.ProjectReference      `json:"project"`
 	Machine               string                       `json:"-"`
@@ -297,6 +302,13 @@ func (db *DB) exportSessionSummariesTx(
 			ErrSessionExportCursorReset, cursor.DatabaseID, databaseID,
 		)
 	}
+	archiveID, err := sessionExportMetadataValue(
+		ctx, tx, archiveMetadataArchiveIDKey, ErrArchiveIDMissing,
+		"archive id",
+	)
+	if err != nil {
+		return SessionExportResult{}, err
+	}
 
 	watermark := cursor.Watermark
 	watermarkSort := cursor.WatermarkSort
@@ -309,6 +321,8 @@ func (db *DB) exportSessionSummariesTx(
 	if watermark == "" {
 		return SessionExportResult{
 			SchemaVersion: export.SessionSummarySchemaVersion,
+			ArchiveID:     archiveID,
+			DatabaseID:    databaseID,
 			Rows:          []SessionSummaryRow{},
 			Projects:      map[string]export.ProjectMapEntry{},
 		}, nil
@@ -398,13 +412,6 @@ func (db *DB) exportSessionSummariesTx(
 	if err != nil {
 		return SessionExportResult{}, err
 	}
-	archiveID, err := sessionExportMetadataValue(
-		ctx, tx, archiveMetadataArchiveIDKey, ErrArchiveIDMissing,
-		"archive id",
-	)
-	if err != nil {
-		return SessionExportResult{}, err
-	}
 	archiveSalt, err := sessionExportMetadataValue(
 		ctx, tx, archiveMetadataArchiveSaltKey, ErrArchiveSaltMissing,
 		"archive salt",
@@ -447,6 +454,8 @@ func (db *DB) exportSessionSummariesTx(
 	}
 	return SessionExportResult{
 		SchemaVersion: export.SessionSummarySchemaVersion,
+		ArchiveID:     archiveID,
+		DatabaseID:    databaseID,
 		Rows:          resultRows,
 		NextCursor:    next,
 		Pricing:       pricing,
@@ -644,6 +653,8 @@ func (db *DB) querySessionExportRows(
 	query := `
 SELECT
 	id,
+	transcript_revision,
+	local_modified_at,
 	project,
 	machine,
 	agent,
@@ -682,10 +693,13 @@ LIMIT ?`
 	for sqlRows.Next() {
 		var row SessionSummaryRow
 		var startedAt, endedAt sql.NullString
+		var localModifiedAt sql.NullString
 		var parentID, relationship sql.NullString
 		var automated bool
 		if err := sqlRows.Scan(
 			&row.ID,
+			&row.TranscriptRevision,
+			&localModifiedAt,
 			&row.Project,
 			&row.Machine,
 			&row.Agent,
@@ -709,6 +723,7 @@ LIMIT ?`
 			return nil, fmt.Errorf("scanning session summary export: %w", err)
 		}
 		row.StartedAt = nullStringPtr(startedAt)
+		row.LocalModifiedAt = nullStringPtr(localModifiedAt)
 		row.EndedAt = nullStringPtr(endedAt)
 		row.DurationSeconds = sessionExportDurationSeconds(
 			row.StartedAt, row.EndedAt, row.LastActivityAt)
@@ -747,18 +762,42 @@ func (db *DB) attachSessionExportUsage(
 	}
 
 	query, args := sessionExportUsageQuery(sessionExportIDs(rows))
-	sqlRows, err := q.QueryContext(ctx, query, args...)
+	usageRows, err := querySessionExportUsageRows(ctx, q, query, args)
 	if err != nil {
-		return nil, fmt.Errorf("querying session export usage: %w", err)
+		return nil, err
 	}
-	defer sqlRows.Close()
+	peers, err := sessionExportClaudeSnapshotPeers(
+		ctx, q, usageRows, sessionExportIDs(rows),
+	)
+	if err != nil {
+		return nil, err
+	}
+	usageRows = append(usageRows, peers...)
 
-	for sqlRows.Next() {
-		r, err := scanUsageRow(sqlRows)
-		if err != nil {
-			return nil, fmt.Errorf("scanning session export usage: %w", err)
+	snapshotRows := make([]activity.UsageRow, len(usageRows))
+	for i, r := range usageRows {
+		_, outputTok, _, _, _ := sessionExportUsageTokens(r)
+		ordinal := int64(-1)
+		if r.messageOrdinal.Valid {
+			ordinal = r.messageOrdinal.Int64
 		}
-		a := accum[r.sessionID]
+		snapshotRows[i] = activity.UsageRow{
+			SessionID:         r.sessionID,
+			Timestamp:         r.ts,
+			MessageOrdinal:    ordinal,
+			OutputTokens:      outputTok,
+			WebSearchRequests: usageRowWebSearchRequests(r.usageSource, r.tokenJSON),
+			ClaudeMessageID:   r.claudeMessageID,
+			ClaudeRequestID:   r.claudeRequestID,
+		}
+	}
+	snapshotMask, snapshotAttribution, snapshotWebSearchRequests :=
+		activity.ClaudeSnapshotSurvivorSelection(snapshotRows)
+	for i, r := range usageRows {
+		if !snapshotMask[i] {
+			continue
+		}
+		a := accum[snapshotAttribution[i]]
 		if a == nil {
 			continue
 		}
@@ -782,7 +821,8 @@ func (db *DB) attachSessionExportUsage(
 			costRow.cost = sql.NullInt64{}
 			resolver.RecordUnattributedReported()
 		}
-		cost, priced, contributes, priceErr := sessionRowCost(costRow, resolver)
+		cost, priced, contributes, priceErr := sessionRowCostWithWebSearchRequests(
+			costRow, snapshotWebSearchRequests[i], resolver)
 		if priceErr != nil {
 			return nil, priceErr
 		}
@@ -830,9 +870,6 @@ func (db *DB) attachSessionExportUsage(
 		} else {
 			ma.allPriced = false
 		}
-	}
-	if err := sqlRows.Err(); err != nil {
-		return nil, fmt.Errorf("iterating session export usage: %w", err)
 	}
 	for _, a := range accum {
 		if a == nil || a.authoritativeCost == nil {
@@ -899,6 +936,95 @@ func sessionExportUsageQuery(sessionIDs []string) (string, []any) {
 	AND u.session_id IN (` + strings.Join(placeholders, ",") + `)
 	ORDER BY u.session_id ASC, u.ts ASC, COALESCE(u.message_ordinal, -1) ASC`
 	return query, args
+}
+
+func querySessionExportUsageRows(
+	ctx context.Context, q sessionExportQuerier, query string, args []any,
+) ([]usageScanRow, error) {
+	sqlRows, err := q.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, fmt.Errorf("querying session export usage: %w", err)
+	}
+	defer sqlRows.Close()
+
+	usageRows := []usageScanRow{}
+	for sqlRows.Next() {
+		r, scanErr := scanUsageRow(sqlRows)
+		if scanErr != nil {
+			return nil, fmt.Errorf("scanning session export usage: %w", scanErr)
+		}
+		usageRows = append(usageRows, r)
+	}
+	if err := sqlRows.Err(); err != nil {
+		return nil, fmt.Errorf("iterating session export usage: %w", err)
+	}
+	return usageRows, nil
+}
+
+func sessionExportClaudeSnapshotPeers(
+	ctx context.Context,
+	q sessionExportQuerier,
+	pageRows []usageScanRow,
+	pageSessionIDs []string,
+) ([]usageScanRow, error) {
+	type snapshotKey struct {
+		messageID string
+		requestID string
+	}
+	keySet := make(map[snapshotKey]struct{})
+	for _, row := range pageRows {
+		if row.claudeMessageID == "" || row.claudeRequestID == "" {
+			continue
+		}
+		keySet[snapshotKey{
+			messageID: row.claudeMessageID,
+			requestID: row.claudeRequestID,
+		}] = struct{}{}
+	}
+	keys := make([]snapshotKey, 0, len(keySet))
+	for key := range keySet {
+		keys = append(keys, key)
+	}
+	sort.Slice(keys, func(i, j int) bool {
+		if keys[i].messageID != keys[j].messageID {
+			return keys[i].messageID < keys[j].messageID
+		}
+		return keys[i].requestID < keys[j].requestID
+	})
+	pageIDs := make(map[string]struct{}, len(pageSessionIDs))
+	for _, id := range pageSessionIDs {
+		pageIDs[id] = struct{}{}
+	}
+
+	peers := []usageScanRow{}
+	const snapshotKeyChunk = maxSQLVars / 2
+	for i := 0; i < len(keys); i += snapshotKeyChunk {
+		end := min(i+snapshotKeyChunk, len(keys))
+		predicates := make([]string, 0, end-i)
+		args := make([]any, 0, (end-i)*2)
+		for _, key := range keys[i:end] {
+			predicates = append(predicates,
+				"(m.claude_message_id = ? AND m.claude_request_id = ?)")
+			args = append(args, key.messageID, key.requestID)
+		}
+		rowsSQL := usageRowsSQLWithWhere(
+			usageMessageEligibility+" AND ("+strings.Join(predicates, " OR ")+")",
+			usageEventEligibility+" AND 1 = 0")
+		query := usageRowSelectFromRows(rowsSQL) + `
+			ORDER BY u.session_id ASC, u.ts ASC,
+				COALESCE(u.message_ordinal, -1) ASC`
+		matching, err := querySessionExportUsageRows(ctx, q, query, args)
+		if err != nil {
+			return nil, fmt.Errorf("loading Claude snapshot peers: %w", err)
+		}
+		for _, row := range matching {
+			if _, pageOwned := pageIDs[row.sessionID]; pageOwned {
+				continue
+			}
+			peers = append(peers, row)
+		}
+	}
+	return peers, nil
 }
 
 func sessionExportUsageTokens(

@@ -26,9 +26,10 @@ func (s *Store) GetMessages(
 	rows, err := s.queryContext(ctx, `
 		SELECT id, session_id, ordinal, role, content, thinking_text,
 			timestamp, has_thinking, has_tool_use, content_length,
-			is_system, model, token_usage, context_tokens, output_tokens,
+			is_system, model, reasoning_effort, token_usage, context_tokens, output_tokens,
+			provider_id,
 			has_context_tokens, has_output_tokens, claude_message_id,
-			claude_request_id, source_type, source_subtype, source_uuid,
+			claude_request_id, source_type, source_subtype, prompt_source, source_uuid,
 			source_parent_uuid, is_sidechain, is_compact_boundary
 		FROM messages
 		WHERE session_id = ? AND ordinal `+op+` ?
@@ -89,9 +90,10 @@ func (s *Store) getMessagesLinearRoleFiltered(
 	query := `
 		SELECT id, session_id, ordinal, role, content, thinking_text,
 			timestamp, has_thinking, has_tool_use, content_length,
-			is_system, model, token_usage, context_tokens, output_tokens,
+			is_system, model, reasoning_effort, token_usage, context_tokens, output_tokens,
+			provider_id,
 			has_context_tokens, has_output_tokens, claude_message_id,
-			claude_request_id, source_type, source_subtype, source_uuid,
+			claude_request_id, source_type, source_subtype, prompt_source, source_uuid,
 			source_parent_uuid, is_sidechain, is_compact_boundary
 		FROM messages
 		WHERE session_id = ? AND ordinal ` + op + ` ?` + roleClause + `
@@ -126,9 +128,10 @@ func (s *Store) getMessagesAroundAnchor(
 	beforeQuery := `
 		SELECT id, session_id, ordinal, role, content, thinking_text,
 			timestamp, has_thinking, has_tool_use, content_length,
-			is_system, model, token_usage, context_tokens, output_tokens,
+			is_system, model, reasoning_effort, token_usage, context_tokens, output_tokens,
+			provider_id,
 			has_context_tokens, has_output_tokens, claude_message_id,
-			claude_request_id, source_type, source_subtype, source_uuid,
+			claude_request_id, source_type, source_subtype, prompt_source, source_uuid,
 			source_parent_uuid, is_sidechain, is_compact_boundary
 		FROM messages
 		WHERE session_id = ? AND ordinal < ?` + roleClause + `
@@ -144,9 +147,10 @@ func (s *Store) getMessagesAroundAnchor(
 	anchorQuery := `
 		SELECT id, session_id, ordinal, role, content, thinking_text,
 			timestamp, has_thinking, has_tool_use, content_length,
-			is_system, model, token_usage, context_tokens, output_tokens,
+			is_system, model, reasoning_effort, token_usage, context_tokens, output_tokens,
+			provider_id,
 			has_context_tokens, has_output_tokens, claude_message_id,
-			claude_request_id, source_type, source_subtype, source_uuid,
+			claude_request_id, source_type, source_subtype, prompt_source, source_uuid,
 			source_parent_uuid, is_sidechain, is_compact_boundary
 		FROM messages WHERE session_id = ? AND ordinal = ?`
 	anchorMsgs, err := s.queryMessageRows(ctx, anchorQuery, sessionID, anchor)
@@ -157,9 +161,10 @@ func (s *Store) getMessagesAroundAnchor(
 	afterQuery := `
 		SELECT id, session_id, ordinal, role, content, thinking_text,
 			timestamp, has_thinking, has_tool_use, content_length,
-			is_system, model, token_usage, context_tokens, output_tokens,
+			is_system, model, reasoning_effort, token_usage, context_tokens, output_tokens,
+			provider_id,
 			has_context_tokens, has_output_tokens, claude_message_id,
-			claude_request_id, source_type, source_subtype, source_uuid,
+			claude_request_id, source_type, source_subtype, prompt_source, source_uuid,
 			source_parent_uuid, is_sidechain, is_compact_boundary
 		FROM messages
 		WHERE session_id = ? AND ordinal > ?` + roleClause + `
@@ -213,9 +218,10 @@ func (s *Store) GetAllMessages(ctx context.Context, sessionID string) ([]db.Mess
 	rows, err := s.queryContext(ctx, `
 		SELECT id, session_id, ordinal, role, content, thinking_text,
 			timestamp, has_thinking, has_tool_use, content_length,
-			is_system, model, token_usage, context_tokens, output_tokens,
+			is_system, model, reasoning_effort, token_usage, context_tokens, output_tokens,
+			provider_id,
 			has_context_tokens, has_output_tokens, claude_message_id,
-			claude_request_id, source_type, source_subtype, source_uuid,
+			claude_request_id, source_type, source_subtype, prompt_source, source_uuid,
 			source_parent_uuid, is_sidechain, is_compact_boundary
 		FROM messages
 		WHERE session_id = ?
@@ -276,17 +282,23 @@ func scanMessages(rows *sql.Rows) ([]db.Message, error) {
 		if err := rows.Scan(
 			&m.ID, &m.SessionID, &m.Ordinal, &m.Role, &m.Content,
 			&m.ThinkingText, &ts, &m.HasThinking, &m.HasToolUse,
-			&m.ContentLength, &m.IsSystem, &m.Model, &tokenUsage,
+			&m.ContentLength, &m.IsSystem, &m.Model, &m.ReasoningEffort, &tokenUsage,
 			&m.ContextTokens, &m.OutputTokens,
+			&m.ProviderID,
 			&m.HasContextTokens, &m.HasOutputTokens,
 			&m.ClaudeMessageID, &m.ClaudeRequestID,
-			&m.SourceType, &m.SourceSubtype, &m.SourceUUID,
+			&m.SourceType, &m.SourceSubtype, &m.PromptSource, &m.SourceUUID,
 			&m.SourceParentUUID, &m.IsSidechain, &m.IsCompactBoundary,
 		); err != nil {
 			return nil, fmt.Errorf("scanning duckdb message: %w", err)
 		}
 		m.Timestamp = formatDBTime(ts)
-		m.TokenUsage = []byte(tokenUsage)
+		// This assigned []byte(tokenUsage) unconditionally, so the ""
+		// nearly every row holds became a non-nil, zero-length
+		// jsontext.Value and every duckdb serve response failed to
+		// marshal. Validation happens only here, on read (see
+		// db.DecodeStoredTokenUsage).
+		m.TokenUsage = db.DecodeStoredTokenUsage(tokenUsage)
 		msgs = append(msgs, m)
 	}
 	return msgs, rows.Err()
@@ -342,7 +354,13 @@ func (s *Store) attachToolCalls(ctx context.Context, msgs []db.Message) error {
 	if err := rows.Err(); err != nil {
 		return err
 	}
-	return s.attachToolResultEvents(ctx, msgs, index, sessionID)
+	if err := s.attachToolResultEvents(ctx, msgs, index, sessionID); err != nil {
+		return err
+	}
+	// Mirrors the SQLite load boundary: a summary the call's single result
+	// event already carries is not stored, so refill it here.
+	db.RestoreMessageResultContent(msgs)
+	return nil
 }
 
 func (s *Store) attachToolResultEvents(
@@ -424,7 +442,9 @@ func (s *Store) GetSessionActivity(ctx context.Context, sessionID string) (*db.S
 		row := populated[idx]
 		switch msg.Role {
 		case "user":
-			row.userCount++
+			if msg.SourceSubtype != "tool_result" {
+				row.userCount++
+			}
 		case "assistant":
 			row.asstCount++
 		}
@@ -525,8 +545,33 @@ func (s *Store) queryCallRows(
 		SELECT tc.message_id, COALESCE(tc.tool_use_id, ''),
 			tc.tool_name, tc.category, tc.skill_name,
 			tc.subagent_session_id, COALESCE(tc.input_json, ''),
+			(
+				SELECT tre.timestamp
+				FROM tool_result_events tre
+				WHERE tre.session_id = tc.session_id
+					AND tre.tool_call_message_ordinal = m.ordinal
+					AND tre.call_index = tc.call_index
+					AND tre.source = 'tool_execution'
+					AND tre.status = 'started'
+					AND tre.timestamp IS NOT NULL
+				ORDER BY tre.event_index ASC
+				LIMIT 1
+			) AS execution_started_at,
+			(
+				SELECT tre.timestamp
+				FROM tool_result_events tre
+				WHERE tre.session_id = tc.session_id
+					AND tre.tool_call_message_ordinal = m.ordinal
+					AND tre.call_index = tc.call_index
+					AND tre.source = 'tool_execution'
+					AND tre.status IN ('completed', 'errored')
+					AND tre.timestamp IS NOT NULL
+				ORDER BY tre.event_index DESC
+				LIMIT 1
+			) AS execution_completed_at,
 			s_sub.started_at, s_sub.ended_at
 		FROM tool_calls tc
+		JOIN messages m ON m.id = tc.message_id
 		LEFT JOIN sessions s_sub ON s_sub.id = tc.subagent_session_id
 		WHERE tc.session_id = ?
 		ORDER BY tc.message_id, tc.call_index`,
@@ -542,10 +587,11 @@ func (s *Store) queryCallRows(
 	for rows.Next() {
 		var r db.CallRow
 		var skill, sub sql.NullString
-		var startedAt, endedAt any
+		var executionStarted, executionCompleted, startedAt, endedAt any
 		if err := rows.Scan(
 			&r.MessageID, &r.ToolUseID, &r.ToolName, &r.Category,
-			&skill, &sub, &r.InputJSON, &startedAt, &endedAt,
+			&skill, &sub, &r.InputJSON, &executionStarted, &executionCompleted,
+			&startedAt, &endedAt,
 		); err != nil {
 			return nil, fmt.Errorf("scanning duckdb timing call: %w", err)
 		}
@@ -558,6 +604,11 @@ func (s *Store) queryCallRows(
 			r.SubagentSessionID = &value
 			if dur, ok := timingMillis(formatDBTime(startedAt), firstNonEmpty(formatDBTime(endedAt), now)); ok {
 				r.DurationMs = &dur
+			}
+		} else if completedAt := formatDBTime(executionCompleted); completedAt != "" {
+			if dur, ok := timingMillis(formatDBTime(executionStarted), completedAt); ok {
+				r.DurationMs = &dur
+				r.CompletedAt = completedAt
 			}
 		}
 		out = append(out, r)

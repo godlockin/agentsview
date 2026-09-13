@@ -8,14 +8,12 @@ import type { Report } from "../../api/types.js";
 import type { ActivitySessionRow } from "../../api/generated/index";
 import { testMoney } from "../../test/money.js";
 
-function makeRow(
-  overrides: Partial<ActivitySessionRow> = {},
-): ActivitySessionRow {
+function makeRow(overrides: Partial<ActivitySessionRow> = {}): ActivitySessionRow {
   return {
     session_id: "sess",
     title: "Session",
     project: "proj",
-	project_key: "pl1:sha256:proj",
+    project_key: "pl1:sha256:proj",
     agent: "claude",
     primary_model: "opus",
     models: ["opus"],
@@ -26,6 +24,7 @@ function makeRow(
     last_active: "2026-06-16T09:00:00Z",
     timing_quality: "high",
     is_automated: false,
+    is_subagent: false,
     ...overrides,
   };
 }
@@ -33,6 +32,9 @@ function makeRow(
 function makeReport(rows: ActivitySessionRow[]): Report {
   return {
     peak: { agents: 0, at: null },
+    interactive_peak: { agents: 0, at: null },
+    subagent_peak: { agents: 0, at: null },
+    automated_peak: { agents: 0, at: null },
     totals: {
       active_minutes: 0,
       idle_minutes: 0,
@@ -59,8 +61,9 @@ function makeReport(rows: ActivitySessionRow[]): Report {
     by_model: null,
     by_agent: null,
     by_session: rows,
-    intervals: null,
-  } as Report;
+    sessions_total: rows.length,
+    projects: {},
+  } as unknown as Report;
 }
 
 // Two timed rows with distinct agent_minutes/cost orderings plus
@@ -69,16 +72,16 @@ function makeReport(rows: ActivitySessionRow[]): Report {
 function fixtureRows(): ActivitySessionRow[] {
   return [
     makeRow({
-      session_id: "low-min",
-      title: "Low minutes high cost",
-      agent_minutes: 5,
-      cost: testMoney(9),
-    }),
-    makeRow({
       session_id: "high-min",
       title: "High minutes low cost",
       agent_minutes: 40,
       cost: testMoney(1),
+    }),
+    makeRow({
+      session_id: "low-min",
+      title: "Low minutes high cost",
+      agent_minutes: 5,
+      cost: testMoney(9),
     }),
     makeRow({
       session_id: "untimed",
@@ -138,33 +141,28 @@ describe("SessionsTable", () => {
     unmount(c);
   });
 
-  it("sorts the untimed row by its real cost when the Cost header is clicked", async () => {
+  it("requests a server sort when the Cost header is clicked", async () => {
+    const onSort = vi.fn();
     const report = makeReport(fixtureRows());
     const c = mount(SessionsTable, {
       target: document.body,
-      props: { report },
+      props: { report, onSort },
     });
     await tick();
 
-    const costHeader = document.querySelector(
-      "th.sort-cost button",
-    ) as HTMLElement | null;
+    const costHeader = document.querySelector("th.sort-cost button") as HTMLElement | null;
     expect(costHeader).toBeTruthy();
     costHeader!.dispatchEvent(new MouseEvent("click", { bubbles: true }));
     await tick();
 
-    // Cost desc over the full set: low-min (9), untimed (4), high-min (1).
-    // The untimed row carries real cost, so it participates in the cost
-    // sort instead of being pinned last.
-    expect(rowOrder()).toEqual(["low-min", "untimed", "high-min"]);
+    expect(onSort).toHaveBeenCalledWith("cost", "desc");
+    expect(rowOrder()).toEqual(["high-min", "low-min", "untimed"]);
 
     unmount(c);
   });
 
   it("intercepts a plain left-click on a session link for SPA navigation", async () => {
-    const navSpy = vi
-      .spyOn(router, "navigateToSession")
-      .mockImplementation(() => {});
+    const navSpy = vi.spyOn(router, "navigateToSession").mockImplementation(() => {});
     const report = makeReport(fixtureRows());
     const c = mount(SessionsTable, {
       target: document.body,
@@ -173,9 +171,7 @@ describe("SessionsTable", () => {
     await tick();
 
     // Default order is high-min first, so the first link is its row.
-    const link = document.querySelector(
-      ".session-row .session-link",
-    ) as HTMLAnchorElement | null;
+    const link = document.querySelector(".session-row .session-link") as HTMLAnchorElement | null;
     expect(link).toBeTruthy();
 
     // Real browser clicks are cancelable; preventDefault is a no-op
@@ -194,11 +190,12 @@ describe("SessionsTable", () => {
     unmount(c);
   });
 
-  it("restricts rows to the active session ids when filtered", async () => {
-    const report = makeReport(fixtureRows());
+  it("renders the server-filtered bucket page and its total", async () => {
+    const report = makeReport([fixtureRows()[0]!]);
+    report.sessions_total = 1;
     const c = mount(SessionsTable, {
       target: document.body,
-      props: { report, filterIds: ["high-min"], filterLabel: "06:00–09:00" },
+      props: { report, filterActive: true, filterLabel: "06:00–09:00" },
     });
     await tick();
 
@@ -215,16 +212,14 @@ describe("SessionsTable", () => {
       target: document.body,
       props: {
         report,
-        filterIds: ["high-min"],
+        filterActive: true,
         filterLabel: "06:00–09:00",
         onClearFilter,
       },
     });
     await tick();
 
-    const badge = document.querySelector(
-      ".filter-badge",
-    ) as HTMLButtonElement | null;
+    const badge = document.querySelector(".filter-badge") as HTMLButtonElement | null;
     expect(badge).toBeTruthy();
     expect(badge!.textContent).toContain("06:00–09:00");
     badge!.dispatchEvent(new MouseEvent("click", { bubbles: true }));
@@ -235,28 +230,28 @@ describe("SessionsTable", () => {
   });
 
   it("shows a filter-aware empty message for a slot with no matches", async () => {
-    const report = makeReport(fixtureRows());
-    // An empty (but non-null) id list is an active filter that matches nothing,
-    // e.g. an idle slot was clicked. The badge stays so it can be cleared.
+    const report = makeReport([]);
+    report.sessions_total = 0;
     const c = mount(SessionsTable, {
       target: document.body,
-      props: { report, filterIds: [], filterLabel: "12:00–15:00" },
+      props: { report, filterActive: true, filterLabel: "12:00–15:00" },
     });
     await tick();
 
     expect(document.querySelectorAll(".session-row").length).toBe(0);
     expect(document.querySelector(".empty")?.textContent).toContain(
-      m.activity_no_sessions_selected_slot(),
+      m.activity_no_sessions_selected_range(),
     );
     expect(document.querySelector(".filter-badge")).toBeTruthy();
 
     unmount(c);
   });
 
-  it("flags only automated sessions with an Auto badge", async () => {
+  it("labels subagents before automation and leaves interactive sessions unbadged", async () => {
     const report = makeReport([
       makeRow({ session_id: "human", title: "Human", is_automated: false }),
       makeRow({ session_id: "robot", title: "Robot", is_automated: true }),
+      makeRow({ session_id: "child", title: "Child", is_subagent: true, is_automated: true }),
     ]);
     const c = mount(SessionsTable, {
       target: document.body,
@@ -265,14 +260,13 @@ describe("SessionsTable", () => {
     await tick();
 
     expect(document.querySelectorAll(".auto-badge").length).toBe(1);
-    const robotRow = document.querySelector(
-      '.session-row[data-session-id="robot"]',
-    );
-    const humanRow = document.querySelector(
-      '.session-row[data-session-id="human"]',
-    );
+    const robotRow = document.querySelector('.session-row[data-session-id="robot"]');
+    const humanRow = document.querySelector('.session-row[data-session-id="human"]');
     expect(robotRow?.querySelector(".auto-badge")).toBeTruthy();
     expect(humanRow?.querySelector(".auto-badge")).toBeNull();
+    const child = document.querySelector('.session-row[data-session-id="child"]');
+    expect(child?.querySelector(".subagent-badge")?.textContent).toBe("Subagent");
+    expect(child?.querySelector(".auto-badge")).toBeNull();
 
     unmount(c);
   });

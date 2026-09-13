@@ -1,7 +1,8 @@
 package catalog
 
 import (
-	"encoding/json"
+	"context"
+	"encoding/json/v2"
 	"fmt"
 	"io"
 	"net/http"
@@ -11,22 +12,27 @@ import (
 	"go.kenn.io/agentsview/internal/money"
 )
 
-// openrouterURL is the public OpenRouter models endpoint. Unlike
-// most providers, OpenRouter publishes a single JSON document
-// listing every model they proxy along with its prompt/completion
-// cost, so we can fetch a stable snapshot of dozens of model
-// prices in one HTTP call. There is no auth requirement and no
-// rate-limit worth respecting for normal polling.
+// openrouterURL is OpenRouter's public model list. It needs no auth and
+// returns every proxied model with its per-token prompt/completion price.
 const openrouterURL = "https://openrouter.ai/api/v1/models"
 
-// FetchOpenRouterPricing downloads the OpenRouter public model
-// catalog and converts each entry into ModelPricing. The same
-// per-million-token convention used by FetchLiteLLMPricing applies.
-// OpenRouter prices are quoted in USD per token, not per million,
-// so they are multiplied by perMTok before being stored.
-func FetchOpenRouterPricing() ([]ModelPricing, error) {
+// FetchOpenRouterPricingContext downloads the OpenRouter model catalog and
+// binds the request lifetime to ctx.
+func FetchOpenRouterPricingContext(
+	ctx context.Context,
+) ([]ModelPricing, error) {
 	client := &http.Client{Timeout: 30 * time.Second}
-	resp, err := client.Get(openrouterURL)
+	return fetchOpenRouterPricing(ctx, client, openrouterURL)
+}
+
+func fetchOpenRouterPricing(
+	ctx context.Context, client *http.Client, url string,
+) ([]ModelPricing, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return nil, fmt.Errorf("creating openrouter pricing request: %w", err)
+	}
+	resp, err := client.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("fetching openrouter pricing: %w", err)
 	}
@@ -37,12 +43,10 @@ func FetchOpenRouterPricing() ([]ModelPricing, error) {
 			"fetching openrouter pricing: status %d", resp.StatusCode,
 		)
 	}
-
 	data, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return nil, fmt.Errorf("reading openrouter response: %w", err)
 	}
-
 	return ParseOpenRouterPricing(data)
 }
 
@@ -59,11 +63,15 @@ type openrouterEntry struct {
 	} `json:"pricing"`
 }
 
-// ParseOpenRouterPricing parses the OpenRouter /models JSON
-// envelope into ModelPricing entries. The endpoint returns a top
-// level {"data": [...]} array; text-generation entries are
-// kept, image/audio/embedding entries are dropped since the rest
-// of agentsview only knows how to price text token counters.
+// ParseOpenRouterPricing parses the OpenRouter /models envelope
+// ({"data": [...]}) into ModelPricing entries keyed by the
+// provider-qualified OpenRouter id. Only models that produce text are
+// kept: agentsview prices token counters, so image, audio, and embedding
+// outputs are skipped. Prices are quoted in USD per token as decimal
+// strings and are converted to microdollars per million tokens. Entries
+// without a usable prompt or completion price are skipped rather than
+// failing the parse: OpenRouter marks dynamically priced routers with
+// "-1", and one odd entry must not take the whole catalog offline.
 func ParseOpenRouterPricing(data []byte) ([]ModelPricing, error) {
 	var envelope struct {
 		Data []openrouterEntry `json:"data"`
@@ -73,101 +81,65 @@ func ParseOpenRouterPricing(data []byte) ([]ModelPricing, error) {
 	}
 
 	var prices []ModelPricing
-	// Count how many OpenRouter entries share each "bare" suffix
-	// (the part after the last '/'). OpenRouter ids are provider
-	// qualified (`minimax/minimax-m3`), but agentsview sessions
-	// often record the bare model name (`MiniMax-M3`) with no
-	// provider prefix. Emitting an unqualified alias lets the
-	// canonical resolver rank the OpenRouter row at the same
-	// tier as an inherently unqualified pricing key, so a bare
-	// user-side model name resolves cleanly. We only emit the
-	// alias when the bare suffix is unique inside OpenRouter, so
-	// two providers publishing the same base model do not fabricate
-	// an ambiguous unqualified row.
-	suffixCounts := make(map[string]int)
 	for _, e := range envelope.Data {
 		if !producesText(e.Architecture.Modality) {
 			continue
 		}
-		if bare := bareSuffix(e.ID); bare != "" && bare != e.ID {
-			suffixCounts[bare]++
-		}
-	}
-	for _, e := range envelope.Data {
-		if !producesText(e.Architecture.Modality) {
-			continue
-		}
-		prompt, okPrompt := parsePricePerToken(e.Pricing.Prompt)
-		completion, okCompletion := parsePricePerToken(e.Pricing.Completion)
-		if !okPrompt && !okCompletion {
-			continue
-		}
-		p := ModelPricing{ModelPattern: e.ID}
-		if okPrompt {
-			p.InputPerMTok = prompt
-		}
-		if okCompletion {
-			p.OutputPerMTok = completion
-		}
-		if cr, ok := parsePricePerToken(e.Pricing.InputCacheRead); ok {
-			p.CacheReadPerMTok = cr
-		}
-		if cw, ok := parsePricePerToken(e.Pricing.InputCacheWrite); ok {
-			p.CacheCreationPerMTok = cw
-		}
-		prices = append(prices, p)
-		if bare := bareSuffix(e.ID); bare != "" && bare != e.ID &&
-			suffixCounts[bare] == 1 {
-			alias := p
-			alias.ModelPattern = bare
-			prices = append(prices, alias)
+		p, ok := openrouterModelPricing(e)
+		if ok {
+			prices = append(prices, p)
 		}
 	}
 	return prices, nil
 }
 
-// bareSuffix returns the substring after the last '/' in an
-// OpenRouter model id, or "" if there is no '/'. Used to derive
-// an unqualified alias for OpenRouter entries so users who record
-// bare model names (no provider prefix) can still resolve pricing.
-func bareSuffix(id string) string {
-	i := strings.LastIndex(id, "/")
-	if i < 0 || i == len(id)-1 {
-		return ""
+func openrouterModelPricing(e openrouterEntry) (ModelPricing, bool) {
+	prompt, hasPrompt, err := parseOpenRouterRate(e.Pricing.Prompt)
+	if err != nil {
+		return ModelPricing{}, false
 	}
-	return id[i+1:]
+	completion, hasCompletion, err := parseOpenRouterRate(e.Pricing.Completion)
+	if err != nil || (!hasPrompt && !hasCompletion) {
+		return ModelPricing{}, false
+	}
+	cacheRead, _, err := parseOpenRouterRate(e.Pricing.InputCacheRead)
+	if err != nil {
+		return ModelPricing{}, false
+	}
+	cacheWrite, _, err := parseOpenRouterRate(e.Pricing.InputCacheWrite)
+	if err != nil {
+		return ModelPricing{}, false
+	}
+	return ModelPricing{
+		ModelPattern:         e.ID,
+		InputPerMTok:         prompt,
+		OutputPerMTok:        completion,
+		CacheCreationPerMTok: cacheWrite,
+		CacheReadPerMTok:     cacheRead,
+	}, true
 }
 
-// producesText reports whether an OpenRouter modality string
-// describes a model whose output is text tokens (the only
-// modality agentsview knows how to bill). Empty modality is
-// treated as text->text since OpenRouter omits the field for
-// pure text models. Multimodal inputs (text+image->text,
-// text+image+video->text) are accepted because the model still
-// bills prompt/completion in tokens and users routinely reach
-// them from agents that log a bare model name.
+// producesText reports whether an OpenRouter modality ("text+image->text")
+// has text on the output side. An empty modality is treated as text: the
+// field is omitted for plain text models.
 func producesText(modality string) bool {
 	if modality == "" {
 		return true
 	}
-	arrow := strings.Index(modality, "->")
-	if arrow < 0 {
-		return false
-	}
-	return modality[arrow+2:] == "text"
+	_, output, ok := strings.Cut(modality, "->")
+	return ok && strings.Contains(output, "text")
 }
 
-// parsePricePerToken turns OpenRouter's quoted string
-// ("0.000003") into a float64 USD-per-token. Empty strings
-// return ok=false so the caller can fall back to the
-// input or output rate if only one of the two is published.
-func parsePricePerToken(s string) (money.Money, bool) {
-	if s == "" {
-		return money.Money{}, false
+// parseOpenRouterRate converts a per-token USD price to per-million-token
+// microdollars. An empty value means the field is absent; zero is a valid
+// price for free models; negative or malformed values are errors.
+func parseOpenRouterRate(value string) (money.Money, bool, error) {
+	if value == "" {
+		return money.Money{}, false, nil
 	}
-	microdollars, err := money.ParseScaledDecimal(s, 12)
-	if err != nil || microdollars <= 0 {
-		return money.Money{}, false
+	rate, err := parsePerTokenRate(value)
+	if err != nil {
+		return money.Money{}, false, err
 	}
-	return money.Money{Microdollars: microdollars}, true
+	return rate, true, nil
 }

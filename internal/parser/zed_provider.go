@@ -27,9 +27,9 @@ func newZedProviderFactory(def AgentDef) ProviderFactory {
 				WithWatchRoots(zedWatchRoots),
 				WithChangedPathClassifier(zedClassifyPath),
 				WithMemberLookup(zedFindMember),
-				WithFingerprint(zedFingerprintSource),
-				WithContainerParse(zedParseContainer),
-				WithMemberParse(zedParseMember),
+				WithContextFingerprint(zedFingerprintSource),
+				WithContextContainerParse(zedParseContainer),
+				WithContextMemberParse(zedParseMember),
 				WithMemberPresence(zedMemberPresent),
 			)
 		},
@@ -49,7 +49,11 @@ func zedDiscoverEach(
 		return err
 	}
 	defer conn.Close()
-	return ForEachZedThreadMeta(ctx, conn, dbPath, func(meta ZedThreadMeta) error {
+	shape, err := inspectZedSchema(ctx, conn)
+	if err != nil {
+		return wrapZedListingError(err)
+	}
+	return forEachZedThreadMeta(ctx, conn, dbPath, shape, func(meta ZedThreadMeta) error {
 		return yield(multiSessionMatch{
 			Path: meta.VirtualPath, Container: dbPath, MemberID: meta.RawID,
 		})
@@ -84,10 +88,12 @@ func zedWatchRoots(roots []string) []WatchRoot {
 // zedClassifyPath maps a stored or changed path to its database container and
 // thread, reproducing the legacy strict sourceRef / lenient
 // sourceRefForChangedPath split: allowMissing relaxes the regular-file check so
-// a database delete (or its WAL/SHM sibling) still classifies for tombstones.
+// a database delete (or its WAL sibling) still classifies for tombstones. A
+// bare "-shm" sibling event is rejected: the provider's own read connections
+// rewrite that file, so honoring it would make every scan schedule the next.
 func zedClassifyPath(root, path string, allowMissing bool) (multiSessionMatch, bool) {
 	return classifySQLiteContainerPath(
-		root, path, zedThreadsDBRelPath, allowMissing, false, parseZedVirtualPath,
+		root, path, zedThreadsDBRelPath, allowMissing, true, parseZedVirtualPath,
 	)
 }
 
@@ -106,7 +112,7 @@ func zedFindMember(root, rawID string) (multiSessionMatch, bool) {
 	}, true
 }
 
-func zedFingerprintSource(src multiSessionSource) (SourceFingerprint, error) {
+func zedFingerprintSource(ctx context.Context, src multiSessionSource) (SourceFingerprint, error) {
 	info, err := os.Stat(src.Container)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -116,8 +122,10 @@ func zedFingerprintSource(src multiSessionSource) (SourceFingerprint, error) {
 	}
 	mtime := info.ModTime().UnixNano()
 	if src.MemberID != "" {
-		sessionMtime, err := ZedSQLiteSourceMtime(src.Path)
+		sessionMtime, err := ZedSQLiteSourceMtimeContext(ctx, src.Path)
 		switch {
+		case errors.Is(err, context.Canceled), errors.Is(err, context.DeadlineExceeded):
+			return SourceFingerprint{}, err
 		case errors.Is(err, sql.ErrNoRows):
 			// The thread row is gone but threads.db is still present. Return a
 			// keyed-empty fingerprint without error (matching the Shelley and
@@ -129,10 +137,9 @@ func zedFingerprintSource(src multiSessionSource) (SourceFingerprint, error) {
 			return SourceFingerprint{}, nil
 		case err == nil:
 			mtime = sessionMtime
+		default:
+			return SourceFingerprint{}, err
 		}
-		// A non-ErrNoRows error (unreadable DB, non-virtual path) keeps the
-		// physical DB mtime fallback, preserving the prior behavior for
-		// transient failures.
 	} else if compositeMtime, err := sqliteDBCompositeMtime(
 		src.Container, sqliteDBJournalSuffixes,
 	); err == nil {
@@ -160,7 +167,7 @@ func zedMemberPresent(src multiSessionSource) bool {
 }
 
 func zedParseMember(
-	src multiSessionSource, req ParseRequest,
+	ctx context.Context, src multiSessionSource, req ParseRequest,
 ) (*ParseResult, error) {
 	dbInfo, err := os.Stat(src.Container)
 	if err != nil {
@@ -177,13 +184,17 @@ func zedParseMember(
 		return nil, err
 	}
 	defer conn.Close()
-	return parseZedThreadFromDB(
-		conn, src.Container, src.MemberID, req.Machine, dbInfo,
+	shape, err := inspectZedSchema(ctx, conn)
+	if err != nil {
+		return nil, wrapZedLoadingError(src.MemberID, err)
+	}
+	return parseZedThreadFromDBWithSchema(
+		ctx, conn, src.Container, src.MemberID, req.Machine, dbInfo, shape,
 	)
 }
 
 func zedParseContainer(
-	src multiSessionSource, req ParseRequest,
+	ctx context.Context, src multiSessionSource, req ParseRequest,
 ) ([]ParseResult, error) {
 	dbInfo, err := os.Stat(src.Container)
 	if err != nil {
@@ -197,7 +208,15 @@ func zedParseContainer(
 		return nil, err
 	}
 	defer conn.Close()
-	metas, err := ListZedThreadMetas(conn, src.Container)
+	shape, err := inspectZedSchema(ctx, conn)
+	if err != nil {
+		return nil, wrapZedListingError(err)
+	}
+	var metas []ZedThreadMeta
+	err = forEachZedThreadMeta(ctx, conn, src.Container, shape, func(meta ZedThreadMeta) error {
+		metas = append(metas, meta)
+		return nil
+	})
 	if err != nil {
 		return nil, err
 	}
@@ -208,8 +227,8 @@ func zedParseContainer(
 	dbHash, _ := hashJSONLSourceFile(src.Container)
 	results := make([]ParseResult, 0, len(metas))
 	for _, meta := range metas {
-		result, err := parseZedThreadFromDB(
-			conn, src.Container, meta.RawID, req.Machine, dbInfo,
+		result, err := parseZedThreadFromDBWithSchema(
+			ctx, conn, src.Container, meta.RawID, req.Machine, dbInfo, shape,
 		)
 		if err != nil {
 			return nil, err
@@ -225,12 +244,13 @@ func zedParseContainer(
 	return results, nil
 }
 
-// sqliteDBJournalSuffixes is the default sibling-file suffix list for
-// sqliteDBCompositeMtime: the database file itself plus its WAL and
-// shared-memory files. Omnigent uses a narrower list (see
-// omnigentDBMtimeSuffixes) because it opens its own read connections against
-// the database, which touch the shared-memory file.
-var sqliteDBJournalSuffixes = []string{"", "-wal", "-shm"}
+// sqliteDBJournalSuffixes is the sibling-file suffix list for
+// sqliteDBCompositeMtime: the database file itself plus its WAL. The "-shm"
+// index is left out on purpose. Every committed write lands in the main file
+// or the WAL, while readers, including this process's own scan connections,
+// rewrite the shared-memory file, so folding its mtime in would make every
+// scan report the container as changed and schedule the next scan.
+var sqliteDBJournalSuffixes = []string{"", "-wal"}
 
 // sqliteDBCompositeMtime returns the freshest mtime across a SQLite database
 // file and the listed sibling suffixes (e.g. "-wal", "-shm").

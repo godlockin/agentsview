@@ -2,7 +2,9 @@ package artifact
 
 import (
 	"context"
-	"encoding/json"
+	"database/sql"
+	"encoding/json/jsontext"
+	"encoding/json/v2"
 	"errors"
 	"fmt"
 	"io"
@@ -19,9 +21,8 @@ import (
 	"go.kenn.io/agentsview/internal/db"
 )
 
-// exportOnlyKinds mirrors transport.go's package-wide transportKinds (out of
-// PR2 scope) restricted to the kinds ExportToStore can create, so tests can
-// assert nothing was published without pulling in transport.go.
+// exportOnlyKinds mirrors folderExchangeKinds, which are also the only kinds
+// ExportToStore creates.
 var exportOnlyKinds = []Kind{KindSegments, KindManifests, KindCheckpoints}
 
 func assertNoPublishedArtifacts(t *testing.T, store ArtifactStore, origin string) {
@@ -44,6 +45,38 @@ func testExportDB(t *testing.T) *db.DB {
 	database := testDB(t)
 	require.NoError(t, database.SetSyncState(originStateKey, contractOrigin))
 	return database
+}
+
+// seedBareExportSessions inserts the minimal rows these export cardinality
+// tests need in one transaction. The real sessions-table export triggers still
+// enqueue every local row; parser validation and message replacement are not
+// part of the behavior under test here.
+func seedBareExportSessions(
+	t *testing.T,
+	database *db.DB,
+	count int,
+	idFormat string,
+	machine string,
+) {
+	t.Helper()
+	ctx := t.Context()
+	require.NoError(t, database.Update(func(tx *sql.Tx) error {
+		stmt, err := tx.PrepareContext(ctx, `INSERT INTO sessions
+			(id, project, machine, agent, created_at)
+			VALUES (?, 'project', ?, 'claude', '2026-06-14T01:02:03Z')`)
+		if err != nil {
+			return err
+		}
+		defer func() { _ = stmt.Close() }()
+		for i := range count {
+			if _, err := stmt.ExecContext(
+				ctx, fmt.Sprintf(idFormat, i), machine,
+			); err != nil {
+				return err
+			}
+		}
+		return nil
+	}), "seed bare export sessions")
 }
 
 // latestStoreCheckpointForTest locates the highest-sequence checkpoint for
@@ -383,6 +416,8 @@ func deterministicRejectionBatch(
 }
 
 func TestExportContinuesPastDeterministicRejection(t *testing.T) {
+	t.Parallel()
+
 	database, store, limits := deterministicRejectionBatch(t)
 
 	result, err := exportToStoreWithLimits(
@@ -406,13 +441,24 @@ func TestExportContinuesPastDeterministicRejection(t *testing.T) {
 	assert.Contains(t, rejection.Error, "message count exceeds 2")
 }
 
-func TestExportContinuesPastInvalidTokenUsage(t *testing.T) {
+// Invalid token usage no longer costs a session its artifact export. The
+// db layer clears a malformed usage blob on read, in scanMessages, which
+// this export path loads through (artifact_export_load.go), so the value
+// can no longer reach the segment encoder.
+// Previously one truncated usage object -- the same corruption that
+// panicked GET /api/v1/sessions/{id}/messages -- rejected the whole
+// session here. Export continuing past a genuinely un-encodable session
+// stays covered by TestExportContinuesPastInvalidManifestValue and
+// TestExportContinuesPastDeterministicRejection.
+func TestExportSanitizesInvalidTokenUsage(t *testing.T) {
+	t.Parallel()
+
 	database := testExportDB(t)
 	store := newTestArtifactStore(t)
 	seedSession(t, database, "invalid", "alpha")
 	require.NoError(t, database.ReplaceSessionMessages("invalid", []db.Message{{
 		SessionID: "invalid", Ordinal: 0, Role: "assistant",
-		Content: "bad usage", TokenUsage: json.RawMessage(`{"input_tokens":`),
+		Content: "bad usage", TokenUsage: jsontext.Value(`{"input_tokens":`),
 	}}))
 	seedSession(t, database, "valid", "alpha")
 
@@ -420,21 +466,29 @@ func TestExportContinuesPastInvalidTokenUsage(t *testing.T) {
 		t.Context(), database, store, ExportOptions{Origin: contractOrigin},
 	)
 	require.NoError(t, err)
-	assert.Equal(t, 1, result.ExportedSessions)
-	assert.Equal(t, 1, result.RejectedSessions)
+	assert.Equal(t, 2, result.ExportedSessions)
+	assert.Equal(t, 0, result.RejectedSessions)
 	checkpoint := latestStoreCheckpointForTest(t, store, contractOrigin)
-	assert.NotContains(t, checkpoint.Sessions, contractOrigin+"~invalid")
+	assert.Contains(t, checkpoint.Sessions, contractOrigin+"~invalid")
 	assert.Contains(t, checkpoint.Sessions, contractOrigin+"~valid")
 	pending, err := database.PendingArtifactExports(t.Context(), 10)
 	require.NoError(t, err)
 	assert.Empty(t, pending)
-	rejection, ok, err := database.GetArtifactExportRejection(t.Context(), "invalid")
+	_, ok, err := database.GetArtifactExportRejection(t.Context(), "invalid")
 	require.NoError(t, err)
-	require.True(t, ok)
-	assert.Contains(t, rejection.Error, "encoding message segment at ordinal 0")
+	assert.False(t, ok, "a sanitized usage blob must not reject the session")
+
+	// The message itself survives; only the unusable metadata is dropped.
+	msgs, err := database.GetAllMessages(t.Context(), "invalid")
+	require.NoError(t, err)
+	require.Len(t, msgs, 1)
+	assert.Equal(t, "bad usage", msgs[0].Content)
+	assert.Empty(t, string(msgs[0].TokenUsage))
 }
 
 func TestExportContinuesPastInvalidManifestValue(t *testing.T) {
+	t.Parallel()
+
 	database := testExportDB(t)
 	store := newTestArtifactStore(t)
 	seedSession(t, database, "invalid", "alpha")
@@ -469,6 +523,8 @@ func TestExportContinuesPastInvalidManifestValue(t *testing.T) {
 }
 
 func TestFullExportSkipsPreviouslyRejectedNativeSessionID(t *testing.T) {
+	t.Parallel()
+
 	database := testExportDB(t)
 	store := newTestArtifactStore(t)
 	seedSession(t, database, "invalid~native", "alpha")
@@ -494,6 +550,8 @@ func TestFullExportSkipsPreviouslyRejectedNativeSessionID(t *testing.T) {
 }
 
 func TestFullExportRemovesPublishedNativeSessionIDRejectedByCurrentWire(t *testing.T) {
+	t.Parallel()
+
 	ctx := t.Context()
 	databasePath := filepath.Join(t.TempDir(), "archive.db")
 	database, err := db.Open(databasePath)
@@ -571,6 +629,8 @@ func TestFullExportRemovesPublishedNativeSessionIDRejectedByCurrentWire(t *testi
 }
 
 func TestExportTransientFailureDoesNotReject(t *testing.T) {
+	t.Parallel()
+
 	database := testExportDB(t)
 	seedSession(t, database, "rejected", "alpha")
 	seedSession(t, database, "valid", "alpha")
@@ -599,6 +659,8 @@ func TestExportTransientFailureDoesNotReject(t *testing.T) {
 }
 
 func TestExportRejectionWaitsForCheckpoint(t *testing.T) {
+	t.Parallel()
+
 	database, filesystem, limits := deterministicRejectionBatch(t)
 	failure := errors.New("injected checkpoint failure")
 	store := &failingArtifactStore{
@@ -622,6 +684,8 @@ func TestExportRejectionWaitsForCheckpoint(t *testing.T) {
 }
 
 func TestExportStaleRejectionCannotConsumeMutation(t *testing.T) {
+	t.Parallel()
+
 	database, filesystem, limits := deterministicRejectionBatch(t)
 	store := &mutateAfterCheckpointStore{
 		ArtifactStore: filesystem, database: database, session: "rejected",
@@ -643,6 +707,8 @@ func TestExportStaleRejectionCannotConsumeMutation(t *testing.T) {
 }
 
 func TestExportToStorePublishesDependenciesBeforeCheckpointAndSkipsUnchanged(t *testing.T) {
+	t.Parallel()
+
 	database := testExportDB(t)
 	seedSession(t, database, "sess-1", "alpha")
 	filesystem, err := newProtocolTestStore(t.TempDir())
@@ -688,6 +754,8 @@ func TestExportToStorePublishesDependenciesBeforeCheckpointAndSkipsUnchanged(t *
 }
 
 func TestExportKeepsAgentSessionNameSeparateFromUserDisplayName(t *testing.T) {
+	t.Parallel()
+
 	database := testExportDB(t)
 	store := newTestArtifactStore(t)
 	agentName := "Agent-provided title"
@@ -723,6 +791,8 @@ func TestExportKeepsAgentSessionNameSeparateFromUserDisplayName(t *testing.T) {
 }
 
 func TestExportToStorePublishesConfiguredHostnameSession(t *testing.T) {
+	t.Parallel()
+
 	database := testExportDB(t)
 	require.NoError(t, database.SetSyncState(
 		"artifact_local_machine_name", "workstation.example",
@@ -742,7 +812,84 @@ func TestExportToStorePublishesConfiguredHostnameSession(t *testing.T) {
 	assert.Contains(t, checkpoint.Sessions, contractOrigin+"~sess-hostname")
 }
 
+func TestExportPreservesSessionIDsAfterInstallationAdoption(t *testing.T) {
+	t.Parallel()
+
+	database := testExportDB(t)
+	store := newTestArtifactStore(t)
+	sourcePath := filepath.Join(t.TempDir(), "session.jsonl")
+	require.NoError(t, database.SetSyncState(
+		"artifact_local_machine_name", "workstation.example",
+	))
+	seedSession(t, database, "hostname-session", "alpha", func(sess *db.Session) {
+		sess.Machine = "workstation.example"
+		sess.FilePath = &sourcePath
+	})
+	seedSession(t, database, "legacy-session", "alpha")
+	_, err := ExportToStore(t.Context(), database, store, ExportOptions{Origin: contractOrigin})
+	require.NoError(t, err)
+	before := latestStoreCheckpointForTest(t, store, contractOrigin)
+	require.Len(t, before.Sessions, 2)
+
+	const installationID = "0123456789abcdef0123456789abcdef"
+	_, err = database.EnsureInstallationIdentity(t.Context(), installationID)
+	require.NoError(t, err)
+	for _, session := range []struct{ id, machine string }{
+		{"installation-session", installationID},
+		{"unrelated-alias", "renamed.example"},
+		{"foreign-source", "peer.example"},
+		{"retired-key-peer", "workstation.example"},
+	} {
+		seedSession(t, database, session.id, "alpha", func(sess *db.Session) {
+			sess.Machine = session.machine
+			sess.FilePath = &sourcePath
+		})
+		require.NoError(t, database.SetSyncState("machine_label:"+session.machine, "workstation.example"))
+	}
+	foreignSource := []db.SessionSourcePath{{Agent: "claude", FilePath: sourcePath}}
+	require.NoError(t, database.ReplaceActiveSessionSourceBaselines(
+		t.Context(), "peer.example", foreignSource, foreignSource,
+	))
+	_, err = ExportToStore(t.Context(), database, store, ExportOptions{Origin: contractOrigin})
+	require.NoError(t, err)
+	incremental := latestStoreCheckpointForTest(t, store, contractOrigin)
+	assert.Len(t, incremental.Sessions, 3)
+	assert.Contains(t, incremental.Sessions, contractOrigin+"~hostname-session")
+	assert.Contains(t, incremental.Sessions, contractOrigin+"~legacy-session")
+	assert.Contains(t, incremental.Sessions, contractOrigin+"~installation-session")
+	assert.NotContains(t, incremental.Sessions, contractOrigin+"~unrelated-alias")
+	assert.NotContains(t, incremental.Sessions, contractOrigin+"~foreign-source")
+	assert.NotContains(t, incremental.Sessions, contractOrigin+"~retired-key-peer")
+
+	require.NoError(t, database.RequeueAllArtifactExports())
+	_, err = ExportToStore(t.Context(), database, store, ExportOptions{Origin: contractOrigin, Full: true})
+	require.NoError(t, err)
+	assert.Equal(t, incremental.Sessions, latestStoreCheckpointForTest(t, store, contractOrigin).Sessions)
+
+	// A clean queue must still let full export rebuild both generations' bodies.
+	rebuilt := newTestArtifactStore(t)
+	_, err = ExportToStore(t.Context(), database, rebuilt, ExportOptions{Origin: contractOrigin, Full: true})
+	require.NoError(t, err)
+	manifests, err := firstStoreEntryPage(t.Context(), rebuilt, contractOrigin, KindManifests, 10)
+	require.NoError(t, err)
+	var rebuiltIDs []string
+	for _, entry := range manifests.Items {
+		published, err := decodeManifestWithLimits(
+			readContractArtifact(t, rebuilt, entry.Ref), productionArtifactLimits(),
+		)
+		require.NoError(t, err)
+		rebuiltIDs = append(rebuiltIDs, published.NativeSessionID)
+	}
+	assert.ElementsMatch(t, []string{"hostname-session", "legacy-session", "installation-session"}, rebuiltIDs)
+	stored, err := database.GetSession(t.Context(), "hostname-session")
+	require.NoError(t, err)
+	require.NotNil(t, stored)
+	assert.Equal(t, installationID, stored.Machine)
+}
+
 func TestExportToStoreFullRepairsMissingDependencyWithoutNewCheckpoint(t *testing.T) {
+	t.Parallel()
+
 	database := testExportDB(t)
 	seedSession(t, database, "sess-1", "alpha")
 	filesystem, err := newProtocolTestStore(t.TempDir())
@@ -777,6 +924,8 @@ func TestExportToStoreFullRepairsMissingDependencyWithoutNewCheckpoint(t *testin
 }
 
 func TestExportToStoreRecreatesMissingRecordedCheckpointAfterVaultReset(t *testing.T) {
+	t.Parallel()
+
 	database := testExportDB(t)
 	seedSession(t, database, "sess-1", "alpha")
 	first, err := newProtocolTestStore(t.TempDir())
@@ -809,6 +958,8 @@ func TestExportToStoreRecreatesMissingRecordedCheckpointAfterVaultReset(t *testi
 }
 
 func TestExportToStoreChangedBatchDoesNotScanCheckpointHistory(t *testing.T) {
+	t.Parallel()
+
 	database := testExportDB(t)
 	seedSession(t, database, "sess-1", "alpha")
 	filesystem, err := newProtocolTestStore(t.TempDir())
@@ -838,6 +989,8 @@ func TestExportToStoreChangedBatchDoesNotScanCheckpointHistory(t *testing.T) {
 }
 
 func TestExportToStoreDirtyBatchDefersRecordedFutureCheckpoint(t *testing.T) {
+	t.Parallel()
+
 	database := testExportDB(t)
 	seedSession(t, database, "sess-1", "alpha")
 	filesystem, err := newProtocolTestStore(t.TempDir())
@@ -899,6 +1052,8 @@ func TestExportToStoreDirtyBatchDefersRecordedFutureCheckpoint(t *testing.T) {
 }
 
 func TestExportToStoreUnchangedCheckpointUsesCatalogIdentityOnly(t *testing.T) {
+	t.Parallel()
+
 	for _, size := range []int64{128, 64 << 20} {
 		t.Run(fmt.Sprintf("size-%d", size), func(t *testing.T) {
 			database := testExportDB(t)
@@ -924,6 +1079,8 @@ func TestExportToStoreUnchangedCheckpointUsesCatalogIdentityOnly(t *testing.T) {
 }
 
 func TestExportToStoreRecordedCheckpointStatRecovery(t *testing.T) {
+	t.Parallel()
+
 	database := testExportDB(t)
 	seedSession(t, database, "sess-1", "alpha")
 	filesystem, err := newProtocolTestStore(t.TempDir())
@@ -951,6 +1108,8 @@ func TestExportToStoreRecordedCheckpointStatRecovery(t *testing.T) {
 }
 
 func TestExportToStoreBootstrapsMissingDatabaseHeadFromLatestCheckpoint(t *testing.T) {
+	t.Parallel()
+
 	database := testExportDB(t)
 	seedSession(t, database, "sess-1", "alpha")
 	filesystem, err := newProtocolTestStore(t.TempDir())
@@ -975,6 +1134,8 @@ func TestExportToStoreBootstrapsMissingDatabaseHeadFromLatestCheckpoint(t *testi
 }
 
 func TestExportCheckpointBootstrapPropagatesOperationalOpenErrors(t *testing.T) {
+	t.Parallel()
+
 	for _, test := range []struct {
 		name string
 		err  error
@@ -1002,6 +1163,8 @@ func TestExportCheckpointBootstrapPropagatesOperationalOpenErrors(t *testing.T) 
 }
 
 func TestLatestValidCheckpointFallsBackPastSemanticCandidateAndDefersFuture(t *testing.T) {
+	t.Parallel()
+
 	filesystem, err := newProtocolTestStore(t.TempDir())
 	require.NoError(t, err)
 	t.Cleanup(func() { require.NoError(t, filesystem.Close()) })
@@ -1034,6 +1197,7 @@ func TestLatestValidCheckpointFallsBackPastSemanticCandidateAndDefersFuture(t *t
 }
 
 func TestExportSpoolConstructionJoinsCleanupFailures(t *testing.T) {
+	// Serial: overrides package-level spool filesystem hooks.
 	chmodFailure := errors.New("injected spool setup failure")
 	cleanupFailure := errors.New("injected spool cleanup failure")
 	previousChmod := exportSpoolChmod
@@ -1064,6 +1228,8 @@ func TestExportSpoolConstructionJoinsCleanupFailures(t *testing.T) {
 }
 
 func TestSpoolArtifactCheckpointEnforcesDecodedSizeBoundary(t *testing.T) {
+	t.Parallel()
+
 	mapSpool, err := os.CreateTemp("", "agentsview-artifact-test-map-*")
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = closeAndRemoveExportSpool(mapSpool) })
@@ -1092,6 +1258,8 @@ func TestSpoolArtifactCheckpointEnforcesDecodedSizeBoundary(t *testing.T) {
 }
 
 func TestExportToStorePropagatesCheckpointCloseErrorWithoutAcknowledging(t *testing.T) {
+	t.Parallel()
+
 	database := testExportDB(t)
 	seedSession(t, database, "sess-1", "alpha")
 	filesystem, err := newProtocolTestStore(t.TempDir())
@@ -1116,6 +1284,8 @@ func TestExportToStorePropagatesCheckpointCloseErrorWithoutAcknowledging(t *test
 }
 
 func TestExportToStoreCancellationLeavesQueuePending(t *testing.T) {
+	t.Parallel()
+
 	database := testExportDB(t)
 	seedSession(t, database, "sess-1", "alpha")
 	filesystem, err := newProtocolTestStore(t.TempDir())
@@ -1134,6 +1304,8 @@ func TestExportToStoreCancellationLeavesQueuePending(t *testing.T) {
 }
 
 func TestExportToStoreFailureKeepsClaimAndCheckpointLast(t *testing.T) {
+	t.Parallel()
+
 	failure := errors.New("injected artifact create failure")
 	tests := []struct {
 		name         string
@@ -1186,6 +1358,8 @@ func TestExportToStoreFailureKeepsClaimAndCheckpointLast(t *testing.T) {
 }
 
 func TestExportToStoreStaleGenerationDoesNotPublishOrAcknowledge(t *testing.T) {
+	t.Parallel()
+
 	database := testExportDB(t)
 	seedSession(t, database, "sess-1", "alpha")
 	stale := &staleClaimExportDB{DB: database}
@@ -1210,6 +1384,8 @@ func TestExportToStoreStaleGenerationDoesNotPublishOrAcknowledge(t *testing.T) {
 }
 
 func TestExportToStoreStaleGenerationAfterCheckpointDoesNotAdvanceHead(t *testing.T) {
+	t.Parallel()
+
 	database := testExportDB(t)
 	seedSession(t, database, "sess-1", "alpha")
 	filesystem, err := newProtocolTestStore(t.TempDir())
@@ -1247,6 +1423,8 @@ func TestExportToStoreStaleGenerationAfterCheckpointDoesNotAdvanceHead(t *testin
 }
 
 func TestExportToStorePublicationRevisionRejectsPhysicallyCreatedStaleCheckpoint(t *testing.T) {
+	t.Parallel()
+
 	path := filepath.Join(t.TempDir(), "archive.db")
 	first, err := db.Open(path)
 	require.NoError(t, err)
@@ -1362,15 +1540,14 @@ func TestExportToStorePublicationRevisionRejectsPhysicallyCreatedStaleCheckpoint
 }
 
 func TestArtifactExportCardinalityLoadsOnlyDirtyBatch(t *testing.T) {
+	t.Parallel()
+
 	for _, archiveSize := range []int{20, 2000} {
 		t.Run(fmt.Sprintf("archive-%d", archiveSize), func(t *testing.T) {
 			database := testExportDB(t)
-			for i := range archiveSize {
-				require.NoError(t, database.UpsertSession(db.Session{
-					ID: fmt.Sprintf("peer-%04d", i), Project: "project",
-					Machine: "peer-a1b2c3", Agent: "claude",
-				}))
-			}
+			seedBareExportSessions(
+				t, database, archiveSize, "peer-%04d", "peer-a1b2c3",
+			)
 			require.NoError(t, database.UpsertSession(db.Session{
 				ID: "dirty", Project: "project", Machine: "local", Agent: "claude",
 			}))
@@ -1402,15 +1579,14 @@ func TestArtifactExportCardinalityLoadsOnlyDirtyBatch(t *testing.T) {
 }
 
 func TestExportToStoreCardinalityIgnoresUnrelatedArchiveBodies(t *testing.T) {
+	t.Parallel()
+
 	for _, archiveSize := range []int{20, 2000} {
 		t.Run(fmt.Sprintf("archive-%d", archiveSize), func(t *testing.T) {
 			database := testExportDB(t)
-			for i := range archiveSize {
-				require.NoError(t, database.UpsertSession(db.Session{
-					ID: fmt.Sprintf("peer-%04d", i), Project: "project",
-					Machine: "peer-a1b2c3", Agent: "claude",
-				}))
-			}
+			seedBareExportSessions(
+				t, database, archiveSize, "peer-%04d", "peer-a1b2c3",
+			)
 			seedSession(t, database, "dirty", "project")
 			counted := &countingCanonicalExportDB{DB: database}
 			filesystem, err := newProtocolTestStore(t.TempDir())
@@ -1431,6 +1607,8 @@ func TestExportToStoreCardinalityIgnoresUnrelatedArchiveBodies(t *testing.T) {
 }
 
 func TestExportToStoreIncrementalBatchIsBoundedAndFullStreamsAllBodies(t *testing.T) {
+	t.Parallel()
+
 	database := testExportDB(t)
 	const total = artifactExportBatchSize + 5
 	for i := range total {
@@ -1472,14 +1650,13 @@ func TestExportToStoreIncrementalBatchIsBoundedAndFullStreamsAllBodies(t *testin
 }
 
 func TestExportToStoreFullDrainsMoreThanOneClaimPage(t *testing.T) {
+	t.Parallel()
+
 	database := testExportDB(t)
 	const total = 1025
-	for i := range total {
-		require.NoError(t, database.UpsertSession(db.Session{
-			ID: fmt.Sprintf("session-%04d", i), Project: "project",
-			Machine: "local", Agent: "claude", CreatedAt: "2026-06-14T01:02:03Z",
-		}))
-	}
+	seedBareExportSessions(
+		t, database, total, "session-%04d", "local",
+	)
 	counted := &countingCanonicalExportDB{DB: database}
 	filesystem, err := newProtocolTestStore(t.TempDir())
 	require.NoError(t, err)
@@ -1511,14 +1688,11 @@ func TestExportToStoreFullDrainsMoreThanOneClaimPage(t *testing.T) {
 }
 
 func TestExportToStoreExplicitSessionIDsClaimBeyondOldestQueuePage(t *testing.T) {
+	t.Parallel()
+
 	database := testExportDB(t)
 	const total = 1025
-	for i := range total {
-		require.NoError(t, database.UpsertSession(db.Session{
-			ID: fmt.Sprintf("session-%04d", i), Project: "project",
-			Machine: "local", Agent: "claude",
-		}))
-	}
+	seedBareExportSessions(t, database, total, "session-%04d", "local")
 	filesystem, err := newProtocolTestStore(t.TempDir())
 	require.NoError(t, err)
 	t.Cleanup(func() { require.NoError(t, filesystem.Close()) })
@@ -1541,6 +1715,8 @@ func TestExportToStoreExplicitSessionIDsClaimBeyondOldestQueuePage(t *testing.T)
 }
 
 func TestExportToStorePublishesEmptyAndDeletionSets(t *testing.T) {
+	t.Parallel()
+
 	t.Run("empty", func(t *testing.T) {
 		database := testExportDB(t)
 		filesystem, err := newProtocolTestStore(t.TempDir())
@@ -1583,6 +1759,8 @@ func TestExportToStorePublishesEmptyAndDeletionSets(t *testing.T) {
 }
 
 func TestQueuedArtifactExportTreatsOwnershipLossAsDeletion(t *testing.T) {
+	t.Parallel()
+
 	database := testExportDB(t)
 	require.NoError(t, database.UpsertSession(db.Session{
 		ID: "moved", Project: "project", Machine: "local", Agent: "claude",
@@ -1611,6 +1789,8 @@ func TestQueuedArtifactExportTreatsOwnershipLossAsDeletion(t *testing.T) {
 }
 
 func TestExportEmitsNewManifestAfterDataVersionChange(t *testing.T) {
+	t.Parallel()
+
 	ctx := context.Background()
 	database := testExportDB(t)
 	store := newTestArtifactStore(t)
@@ -1641,6 +1821,8 @@ func TestExportEmitsNewManifestAfterDataVersionChange(t *testing.T) {
 }
 
 func TestExportIncludesLocalOwnedSessionClasses(t *testing.T) {
+	t.Parallel()
+
 	ctx := context.Background()
 	database := testExportDB(t)
 	store := newTestArtifactStore(t)
@@ -1668,6 +1850,8 @@ func TestExportIncludesLocalOwnedSessionClasses(t *testing.T) {
 }
 
 func TestExportScrubsUnstableArtifactIDs(t *testing.T) {
+	t.Parallel()
+
 	ctx := context.Background()
 	database := testExportDB(t)
 	store := newTestArtifactStore(t)
@@ -1709,6 +1893,8 @@ func TestExportScrubsUnstableArtifactIDs(t *testing.T) {
 }
 
 func TestExportRejectsInvalidOriginBeforeCreatingPaths(t *testing.T) {
+	t.Parallel()
+
 	ctx := context.Background()
 	database := testExportDB(t)
 	store := newTestArtifactStore(t)
@@ -1722,6 +1908,8 @@ func TestExportRejectsInvalidOriginBeforeCreatingPaths(t *testing.T) {
 }
 
 func TestExportSkipsDeletedAndForeignSessions(t *testing.T) {
+	t.Parallel()
+
 	ctx := context.Background()
 	store := newTestArtifactStore(t)
 	origin := contractOrigin
@@ -1780,6 +1968,8 @@ func (s *reEnqueueOnBoundaryStore) PendingArtifactExports(
 // when a concurrent writer keeps the queue perpetually non-empty. It must
 // give up after maxExportDrainRounds and still return whatever it exported.
 func TestExportFullDrainCapReturnsAccumulatedResultAfterUnsettledQueue(t *testing.T) {
+	t.Parallel()
+
 	const drainRounds = 3
 	database := testExportDB(t)
 	seedSession(t, database, "sess-1", "alpha")
@@ -1795,6 +1985,7 @@ func TestExportFullDrainCapReturnsAccumulatedResultAfterUnsettledQueue(t *testin
 		ctx, store, filesystem, contractOrigin, drainRounds,
 	)
 	require.EqualError(t, err, "artifact export queue did not settle after 3 drain rounds")
+	assert.ErrorIs(t, err, ErrArtifactExportUnsettled)
 	assert.Positive(t, result.ExportedSessions,
 		"the accumulated result must still be returned alongside the drain-cap error")
 }
@@ -1838,6 +2029,8 @@ func (s *reEnqueueAfterAcknowledgeStore) requeue(
 }
 
 func TestExportFullDrainCapAppliesToWritesArrivingDuringDrain(t *testing.T) {
+	t.Parallel()
+
 	const drainRounds = 3
 	database := testExportDB(t)
 	seedSession(t, database, "sess-1", "alpha")
@@ -1846,15 +2039,63 @@ func TestExportFullDrainCapAppliesToWritesArrivingDuringDrain(t *testing.T) {
 	t.Cleanup(func() { require.NoError(t, filesystem.Close()) })
 	concurrent := &reEnqueueAfterAcknowledgeStore{DB: database}
 
-	ctx, cancel := context.WithTimeout(t.Context(), 15*time.Second)
+	ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
 	defer cancel()
 
 	result, err := exportFullToStoreWithDrainRounds(
 		ctx, concurrent, filesystem, contractOrigin, drainRounds,
 	)
 	require.EqualError(t, err, "artifact export queue did not settle after 3 drain rounds")
+	assert.ErrorIs(t, err, ErrArtifactExportUnsettled)
 	assert.Positive(t, result.ExportedSessions)
 	assert.GreaterOrEqual(t, concurrent.requeues, drainRounds)
+}
+
+type finiteReEnqueueBoundaryStore struct {
+	*db.DB
+	remaining int
+}
+
+func (s *finiteReEnqueueBoundaryStore) PendingArtifactExports(
+	ctx context.Context,
+	limit int,
+) ([]db.ArtifactExportQueueItem, error) {
+	if limit == 1 && s.remaining > 0 {
+		s.remaining--
+		if err := s.ReplaceSessionMessages("sess-1", []db.Message{{
+			SessionID: "sess-1", Ordinal: 0, Role: "user",
+			Content: "one final concurrent write",
+		}}); err != nil {
+			return nil, err
+		}
+	}
+	return s.DB.PendingArtifactExports(ctx, limit)
+}
+
+func TestExportFullDrainCapDoesNotReportMoreAfterFinalDrainSettles(
+	t *testing.T,
+) {
+	t.Parallel()
+
+	database := testExportDB(t)
+	seedSession(t, database, "sess-1", "alpha")
+	store := newTestArtifactStore(t)
+	concurrent := &finiteReEnqueueBoundaryStore{
+		DB: database, remaining: 1,
+	}
+
+	result, err := exportFullToStoreWithDrainRounds(
+		t.Context(),
+		concurrent,
+		store,
+		contractOrigin,
+		1,
+	)
+	require.NoError(t, err)
+	assert.Positive(t, result.ExportedSessions)
+	pending, err := database.CountPendingArtifactExports(t.Context())
+	require.NoError(t, err)
+	assert.Zero(t, pending)
 }
 
 // TestExportRoundTripsSessionQualitySignals pins the PR1 invariant that the
@@ -1864,6 +2105,8 @@ func TestExportFullDrainCapAppliesToWritesArrivingDuringDrain(t *testing.T) {
 // signal value -- not just non-nil presence -- must survive the encode then
 // decode round trip.
 func TestExportRoundTripsSessionQualitySignals(t *testing.T) {
+	t.Parallel()
+
 	ctx := context.Background()
 	database := testExportDB(t)
 	store := newTestArtifactStore(t)

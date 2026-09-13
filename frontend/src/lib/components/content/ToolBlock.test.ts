@@ -5,10 +5,11 @@ import { describe, it, expect, vi, afterEach } from "vite-plus/test";
 import { mount, unmount, tick } from "svelte";
 import type { ToolCall } from "../../api/types.js";
 import { setLocale } from "../../i18n/index.js";
+import retainedFixtureSource from "../../utils/__fixtures__/retained-tool-image-1735.json?raw";
 
-const copyToClipboardMock = vi.hoisted(() =>
-  vi.fn().mockResolvedValue(true),
-);
+const copyToClipboardMock = vi.hoisted(() => vi.fn().mockResolvedValue(true));
+const SMALL_PNG_DATA_URI =
+  "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=";
 
 vi.mock("./SubagentInline.svelte", () => ({
   default: {},
@@ -99,6 +100,7 @@ describe("ToolBlock output section", () => {
 
     // Output content pre block should not be present when output is collapsed.
     expect(document.querySelector(".output-content")).toBeNull();
+    expect(document.querySelector(".output-mode")).toBeNull();
   });
 
   it("expands output content on clicking output-header", async () => {
@@ -123,6 +125,215 @@ describe("ToolBlock output section", () => {
     const outputContent = document.querySelector(".output-content");
     expect(outputContent).not.toBeNull();
     expect(outputContent!.textContent).toBe(resultText);
+  });
+
+  it("shows retained image placeholders in block order in output and history", async () => {
+    const result =
+      '[{"type":"input_text","text":"Before"},{"byte_size":3,"media_type":"image/png","sha256":"","text":"[Image: image/png, 3 bytes]","type":"agentsview_image","version":1},{"type":"text","text":"After"}]';
+    const toolCall: ToolCall = {
+      tool_name: "view_image",
+      category: "Other",
+      result_content: result,
+      result_events: [
+        {
+          event_index: 0,
+          status: "completed",
+          source: "tool_result",
+          content: result,
+          content_length: result.length,
+        },
+      ],
+    };
+    component = mount(ToolBlock, { target: document.body, props: { content: "", toolCall } });
+    await tick();
+    document.querySelector<HTMLButtonElement>(".tool-header")!.click();
+    await tick();
+    expect(document.querySelector(".output-header .tool-preview")?.textContent).toBe("Before");
+    document.querySelector<HTMLButtonElement>(".output-header")!.click();
+    document.querySelector<HTMLButtonElement>(".history-header")!.click();
+    await tick();
+    expect(document.querySelector(".output-content")?.textContent).toBe(
+      "Before\n\n[Image: image/png, 3 bytes]\n\nAfter",
+    );
+    expect(document.querySelector(".history-content")?.textContent).toBe(
+      "Before\n\n[Image: image/png, 3 bytes]\n\nAfter",
+    );
+    document.querySelector<HTMLButtonElement>(".output-mode button:nth-child(2)")!.click();
+    await tick();
+    expect(
+      Array.from(document.querySelectorAll(".formatted-output p"), (p) => p.textContent),
+    ).toEqual(["Before", "[Image: image/png, 3 bytes]", "After"]);
+    document.querySelector<HTMLButtonElement>('button[aria-label="Copy output"]')!.click();
+    await tick();
+    expect(copyToClipboardMock).toHaveBeenCalledWith(result);
+  });
+
+  it("renders the constructed retained PNG between text blocks", async () => {
+    const result = retainedFixtureSource;
+    const blocks = JSON.parse(result) as Array<{ image_url?: string }>;
+    const imageURL = blocks[1]?.image_url;
+    expect(imageURL).toMatch(/^data:image\/png;base64,/);
+    expect(new TextEncoder().encode(result).byteLength).toBe(1_441_138);
+
+    const toolCall: ToolCall = {
+      tool_name: "view_image",
+      category: "Other",
+      result_content: result,
+    };
+    component = mount(ToolBlock, { target: document.body, props: { content: "", toolCall } });
+    await tick();
+    document.querySelector<HTMLButtonElement>(".tool-header")!.click();
+    await tick();
+    document.querySelector<HTMLButtonElement>(".output-header")!.click();
+    await tick();
+
+    const raw = document.querySelector(".output-content");
+    expect(raw?.querySelector("img")).toBeNull();
+    expect(raw?.textContent).toBe(result.replace(/\r\n/g, "\n"));
+
+    document.querySelector<HTMLButtonElement>(".output-mode button:nth-child(2)")!.click();
+    await tick();
+
+    const formatted = document.querySelector(".formatted-output");
+    expect(formatted).not.toBeNull();
+    expect(formatted!.querySelectorAll("img")).toHaveLength(1);
+    expect(formatted!.querySelector("img")?.getAttribute("src")).toBe(imageURL);
+    expect(Array.from(formatted!.querySelectorAll("p"), (p) => p.textContent)).toEqual([
+      "Before",
+      "",
+      "After",
+    ]);
+    expect(formatted!.textContent).not.toContain("input_image");
+    expect(formatted!.textContent).not.toContain(imageURL!);
+
+    document.querySelector<HTMLButtonElement>(".output-mode button:nth-child(1)")!.click();
+    await tick();
+    expect(document.querySelector(".output-content")?.textContent).toBe(result.replace(/\r\n/g, "\n"));
+
+    document.querySelector<HTMLButtonElement>('button[aria-label="Copy output"]')!.click();
+    await tick();
+    expect(copyToClipboardMock).toHaveBeenCalledWith(result);
+  });
+
+  it("renders an image-only retained result", async () => {
+    const result = JSON.stringify([{ type: "input_image", image_url: SMALL_PNG_DATA_URI }]);
+    const toolCall: ToolCall = {
+      tool_name: "view_image",
+      category: "Other",
+      result_content: result,
+    };
+    component = mount(ToolBlock, { target: document.body, props: { content: "", toolCall } });
+    await tick();
+    document.querySelector<HTMLButtonElement>(".tool-header")!.click();
+    await tick();
+    document.querySelector<HTMLButtonElement>(".output-header")!.click();
+    await tick();
+    document.querySelector<HTMLButtonElement>(".output-mode button:nth-child(2)")!.click();
+    await tick();
+
+    const formatted = document.querySelector(".formatted-output");
+    expect(formatted?.querySelectorAll("img")).toHaveLength(1);
+    expect(formatted?.textContent).not.toContain("input_image");
+  });
+
+  it("renders migrated asset references in formatted output", async () => {
+    const result = JSON.stringify([
+      { type: "input_text", text: "Before" },
+      { type: "agentsview_image", version: 1, text: "![first](asset://first)" },
+      { type: "agentsview_image", version: 1, text: "![second](asset://nested/second)" },
+      { type: "text", text: "After" },
+    ]);
+    const base = document.createElement("base");
+    base.href = "http://localhost/app/";
+    document.head.appendChild(base);
+
+    const toolCall: ToolCall = {
+      tool_name: "view_image",
+      category: "Other",
+      result_content: result,
+    };
+    component = mount(ToolBlock, { target: document.body, props: { content: "", toolCall } });
+    await tick();
+    document.querySelector<HTMLButtonElement>(".tool-header")!.click();
+    await tick();
+    document.querySelector<HTMLButtonElement>(".output-header")!.click();
+    await tick();
+    document.querySelector<HTMLButtonElement>(".output-mode button:nth-child(2)")!.click();
+    await tick();
+
+    expect(
+      Array.from(document.querySelectorAll<HTMLImageElement>(".formatted-output img"), (img) =>
+        img.getAttribute("src"),
+      ),
+    ).toEqual(["/app/api/v1/assets/first", "/app/api/v1/assets/nested/second"]);
+    base.remove();
+  });
+
+  it("switches the expanded current output between raw and formatted modes", async () => {
+    const toolCall: ToolCall = {
+      tool_name: "Read",
+      category: "Read",
+      result_content: "# Result\n\n**bold** <script>alert(1)</script>",
+    };
+    component = mount(ToolBlock, { target: document.body, props: { content: "", toolCall } });
+    await tick();
+    document.querySelector<HTMLButtonElement>(".tool-header")!.click();
+    await tick();
+    document.querySelector<HTMLButtonElement>(".output-header")!.click();
+    await tick();
+    expect(document.querySelector(".output-mode")).not.toBeNull();
+    expect(document.querySelector(".formatted-output")).toBeNull();
+    const formatted = Array.from(
+      document.querySelectorAll<HTMLButtonElement>(".output-mode button"),
+    ).find((button) => button.textContent?.trim() === "Formatted");
+    expect(formatted).not.toBeNull();
+    formatted!.click();
+    await tick();
+    expect(document.querySelector(".formatted-output h1")?.textContent).toBe("Result");
+    expect(document.querySelector(".formatted-output script")).toBeNull();
+  });
+
+  it("keeps canonical path metadata accessible without labelling ordinary metadata", async () => {
+    const longPath =
+      "/workspace/packages/agentsview/frontend/src/lib/components/content/ToolBlock.svelte";
+    const toolCall: ToolCall = {
+      tool_name: "Read",
+      category: "Read",
+      input_json: JSON.stringify({ file_path: longPath }),
+    };
+    component = mount(ToolBlock, { target: document.body, props: { content: "", toolCall } });
+    await tick();
+    document.querySelector<HTMLButtonElement>(".tool-header")!.click();
+    await tick();
+
+    const file = document.querySelector(".meta-tag");
+    expect(file?.textContent).toContain("content/ToolBlock.svelte");
+    expect(file?.querySelector(".kit-sr-only")?.textContent).toBe(longPath);
+    expect(file?.querySelector("[aria-label]")).toBeNull();
+    expect(document.querySelector(".meta-tag:nth-child(2) [aria-label]")).toBeNull();
+  });
+
+  it("highlights search matches and fenced code in formatted output", async () => {
+    const toolCall: ToolCall = {
+      tool_name: "Read",
+      category: "Read",
+      result_content: "```ts\nconst target = true;\n```",
+    };
+    component = mount(ToolBlock, {
+      target: document.body,
+      props: { content: "", toolCall, highlightQuery: "target" },
+    });
+    await tick();
+    document.querySelector<HTMLButtonElement>(".tool-header")!.click();
+    await tick();
+    document.querySelector<HTMLButtonElement>(".output-header")!.click();
+    await tick();
+    document.querySelector<HTMLButtonElement>(".output-mode button:nth-child(2)")!.click();
+    await tick();
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    const formatted = document.querySelector(".formatted-output");
+    expect(formatted?.querySelector("code[class*='language-']")).not.toBeNull();
+    expect(formatted?.querySelector("mark.search-highlight")?.textContent).toBe("target");
   });
 
   it("shows first line as preview when output is collapsed", async () => {
@@ -180,9 +391,7 @@ describe("ToolBlock output section", () => {
     document.querySelector<HTMLButtonElement>(".output-header")!.click();
     await tick();
 
-    expect(document.querySelector(".output-content")?.textContent).toBe(
-      resultText,
-    );
+    expect(document.querySelector(".output-content")?.textContent).toBe(resultText);
   });
 
   it("renders history after expanding the tool block when result_events are set", async () => {
@@ -243,22 +452,16 @@ describe("ToolBlock output section", () => {
     document.querySelector<HTMLButtonElement>(".history-header")!.click();
     await tick();
 
-    expect(document.querySelector(".output-header .output-label")?.textContent)
-      .toBe("输出");
-    expect(document.querySelector(".history-header .output-label")?.textContent)
-      .toBe("历史");
+    expect(document.querySelector(".output-header .output-label")?.textContent).toBe("输出");
+    expect(document.querySelector(".history-header .output-label")?.textContent).toBe("历史");
     expect(
-      Array.from(document.querySelectorAll(".meta-label"))
-        .map((node) => node.textContent),
+      Array.from(document.querySelectorAll(".meta-label")).map((node) => node.textContent),
     ).toEqual(["状态：", "来源：", "agent："]);
   });
 
   it("localizes long content expansion controls", async () => {
     setLocale("zh-CN");
-    const content = Array.from(
-      { length: 22 },
-      (_, i) => `line ${i + 1}`,
-    ).join("\n");
+    const content = Array.from({ length: 22 }, (_, i) => `line ${i + 1}`).join("\n");
     component = mount(ToolBlock, {
       target: document.body,
       props: { content },
@@ -274,8 +477,7 @@ describe("ToolBlock output section", () => {
     showMore!.click();
     await tick();
 
-    expect(document.querySelector(".show-more-btn")?.textContent?.trim())
-      .toBe("收起");
+    expect(document.querySelector(".show-more-btn")?.textContent?.trim()).toBe("收起");
   });
 
   it("expands event history and shows chronological event content", async () => {
@@ -360,10 +562,7 @@ describe("ToolBlock copy affordances", () => {
   });
 
   it("copies full raw Bash fallback before show-all expansion", async () => {
-    const longCommand = Array.from(
-      { length: 230 },
-      (_, i) => `echo hidden-line-${i}`,
-    ).join("\n");
+    const longCommand = Array.from({ length: 230 }, (_, i) => `echo hidden-line-${i}`).join("\n");
     const expectedCopy = `command: ${longCommand}`;
     const toolCall: ToolCall = {
       tool_name: "Bash",
@@ -379,9 +578,7 @@ describe("ToolBlock copy affordances", () => {
     document.querySelector<HTMLButtonElement>(".tool-header")!.click();
     await tick();
 
-    expect(document.querySelector(".tool-content")?.textContent).not.toContain(
-      "hidden-line-229",
-    );
+    expect(document.querySelector(".tool-content")?.textContent).not.toContain("hidden-line-229");
 
     const copyButton = document.querySelector<HTMLButtonElement>(
       'button.kit-copy-btn[aria-label="Copy input"]',
@@ -393,9 +590,7 @@ describe("ToolBlock copy affordances", () => {
     await tick();
 
     expect(copyToClipboardMock).toHaveBeenCalledWith(expectedCopy);
-    expect(document.querySelector(".tool-content")?.textContent).not.toContain(
-      "hidden-line-229",
-    );
+    expect(document.querySelector(".tool-content")?.textContent).not.toContain("hidden-line-229");
   });
 });
 
@@ -667,10 +862,7 @@ describe("ToolBlock show-more for long content", () => {
   });
 
   it("auto-expands hidden Bash fallback content on search match", async () => {
-    const longCommand = Array.from(
-      { length: 30 },
-      (_, i) => `echo hidden-line-${i}`,
-    ).join("\n");
+    const longCommand = Array.from({ length: 30 }, (_, i) => `echo hidden-line-${i}`).join("\n");
     const toolCall: ToolCall = {
       tool_name: "Bash",
       category: "Bash",
@@ -689,9 +881,7 @@ describe("ToolBlock show-more for long content", () => {
     const toolContent = document.querySelector(".tool-content");
     expect(toolContent).not.toBeNull();
     expect(toolContent!.textContent).toContain("hidden-line-29");
-    expect(document.querySelector(".show-more-btn")!.textContent).toContain(
-      "show less",
-    );
+    expect(document.querySelector(".show-more-btn")!.textContent).toContain("show less");
   });
 });
 
@@ -939,9 +1129,7 @@ describe("ToolBlock collapsed preview", () => {
     await tick();
 
     const preview = document.querySelector(".tool-header .tool-preview");
-    expect(preview!.textContent).toBe(
-      "#29 · in_progress · Rebuild Companies list table columns",
-    );
+    expect(preview!.textContent).toBe("#29 · in_progress · Rebuild Companies list table columns");
   });
 
   it("shows just task id and status for TaskUpdate without subject", async () => {

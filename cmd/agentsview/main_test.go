@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"database/sql"
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"log"
@@ -18,13 +19,13 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.kenn.io/agentsview/internal/config"
 	"go.kenn.io/agentsview/internal/db"
-	"go.kenn.io/agentsview/internal/db/driver"
 	"go.kenn.io/agentsview/internal/dbtest"
 	duckdbsync "go.kenn.io/agentsview/internal/duckdb"
 	"go.kenn.io/agentsview/internal/parser"
@@ -33,6 +34,99 @@ import (
 	agentsync "go.kenn.io/agentsview/internal/sync"
 	"go.kenn.io/agentsview/internal/testjsonl"
 )
+
+type cursorSecretRecorder struct {
+	secret []byte
+}
+
+type usageCacheBackfillRecorder struct {
+	started  chan struct{}
+	release  chan struct{}
+	waited   chan struct{}
+	observer func()
+}
+
+func (recorder *usageCacheBackfillRecorder) SetUsageCacheBackfillStarted(
+	observer func(),
+) {
+	recorder.observer = observer
+}
+
+func (recorder *usageCacheBackfillRecorder) StartUsageCacheBackfill(
+	context.Context,
+) error {
+	close(recorder.started)
+	if recorder.observer != nil {
+		recorder.observer()
+	}
+	return nil
+}
+
+func (recorder *usageCacheBackfillRecorder) WaitUsageCacheBackfill(
+	context.Context,
+) error {
+	close(recorder.waited)
+	<-recorder.release
+	return nil
+}
+
+func TestServeStartsUsageCacheBackfill(t *testing.T) {
+	recorder := &usageCacheBackfillRecorder{
+		started: make(chan struct{}), release: make(chan struct{}),
+		waited: make(chan struct{}),
+	}
+	idle := server.NewIdleTracker(time.Minute, func() {})
+	startDaemonUsageCacheBackfill(context.Background(), recorder, idle)
+	select {
+	case <-recorder.started:
+	case <-time.After(time.Second):
+		t.Fatal("usage cache backfill did not start")
+	}
+	select {
+	case <-recorder.waited:
+	case <-time.After(time.Second):
+		t.Fatal("usage cache backfill was not joined by tracked work")
+	}
+	close(recorder.release)
+}
+
+// Foreground servers and daemons with idle timeout disabled pass a nil
+// tracker; the backfill must still start and join its wait goroutine.
+func TestServeStartsUsageCacheBackfillWithoutIdleTracker(t *testing.T) {
+	recorder := &usageCacheBackfillRecorder{
+		started: make(chan struct{}), release: make(chan struct{}),
+		waited: make(chan struct{}),
+	}
+	startDaemonUsageCacheBackfill(context.Background(), recorder, nil)
+	select {
+	case <-recorder.started:
+	case <-time.After(time.Second):
+		t.Fatal("usage cache backfill did not start")
+	}
+	select {
+	case <-recorder.waited:
+	case <-time.After(time.Second):
+		t.Fatal("usage cache backfill was not awaited without an idle tracker")
+	}
+	close(recorder.release)
+}
+
+func (recorder *cursorSecretRecorder) SetCursorSecret(secret []byte) {
+	recorder.secret = append([]byte(nil), secret...)
+}
+
+func TestApplyRequiredCursorSecret(t *testing.T) {
+	recorder := &cursorSecretRecorder{}
+	err := applyRequiredCursorSecret(recorder, config.Config{})
+	assert.ErrorContains(t, err, "cursor secret is not configured")
+
+	want := []byte("configured cursor secret")
+	err = applyRequiredCursorSecret(recorder, config.Config{
+		CursorSecret: base64.StdEncoding.EncodeToString(want),
+	})
+	require.NoError(t, err)
+	assert.Equal(t, want, recorder.secret)
+}
 
 func TestRuntimeWarningHelper(t *testing.T) {
 	logOutput := captureLogOutput(t)
@@ -278,7 +372,8 @@ func TestRunPGRuntimeWarningHelperProcess(t *testing.T) {
 		t, filepath.Join(os.Getenv("AGENTSVIEW_DATA_DIR"), "pg.db"),
 	)
 	ctx, cancel := context.WithCancel(context.Background())
-	port := server.FindAvailablePort("127.0.0.1", 0)
+	port, err := server.FindAvailablePort("127.0.0.1", 0)
+	require.NoError(t, err)
 	appCfg := config.Config{
 		Host:    "127.0.0.1",
 		Port:    port,
@@ -527,30 +622,33 @@ func TestNewDaemonIdleTrackerEnvOverridesConfig(t *testing.T) {
 type fakeUnwatchedPollSyncer struct {
 	calls     int
 	callRoots [][]string
-	callFull  []bool
 }
 
-func (f *fakeUnwatchedPollSyncer) ReconcileWatchRoots(
-	_ context.Context, roots []string, full bool,
+func (f *fakeUnwatchedPollSyncer) ReconcileProviderRoots(
+	_ context.Context, _ parser.AgentType, roots []string,
 ) error {
 	f.calls++
 	f.callRoots = append(f.callRoots, append([]string(nil), roots...))
-	f.callFull = append(f.callFull, full)
 	return nil
 }
 
-func TestPollUnwatchedRootsOnceUsesScopedAuthoritativeReconciliation(t *testing.T) {
+func (f *fakeUnwatchedPollSyncer) ReconcileProviderRootsGrouped(
+	ctx context.Context, groups []agentsync.ProviderRootsGroup,
+) error {
+	return reconcileGroupsSequentially(ctx, groups, f.ReconcileProviderRoots)
+}
+
+func TestPollUnwatchedScopesOnceUsesScopedAuthoritativeReconciliation(t *testing.T) {
 	fake := &fakeUnwatchedPollSyncer{}
 	roots := []string{"/tmp/claude", "/tmp/codex"}
+	groups := map[parser.AgentType][]string{"": roots}
 
-	pollUnwatchedRootsOnce(t.Context(), fake, roots)
-	pollUnwatchedRootsOnce(t.Context(), fake, roots)
+	require.NoError(t, pollUnwatchedScopesOnce(t.Context(), fake, groups))
+	require.NoError(t, pollUnwatchedScopesOnce(t.Context(), fake, groups))
 
 	require.Equal(t, 2, fake.calls)
 	assert.Equal(t, roots, fake.callRoots[0])
-	assert.False(t, fake.callFull[0])
 	assert.Equal(t, roots, fake.callRoots[1])
-	assert.False(t, fake.callFull[1])
 }
 
 func TestCollectWatchRootsPreservesDirsSharingWatchRoot(t *testing.T) {
@@ -565,7 +663,7 @@ func TestCollectWatchRootsPreservesDirsSharingWatchRoot(t *testing.T) {
 		},
 	}
 
-	roots, unwatchedDirs, _ := collectWatchRoots(cfg)
+	roots, unwatchedDirs, _, _ := collectWatchRoots(cfg)
 
 	assert.ElementsMatch(t, []string{sessionsDir, archivedDir}, unwatchedDirs,
 		"missing roots retain polling until native activation completes")
@@ -600,6 +698,23 @@ func TestCollectWatchRootsPreservesDirsSharingWatchRoot(t *testing.T) {
 	assert.Empty(t, archived.persistentPollingDirs)
 }
 
+func TestCollectWatchRootsOmitsLocallyDisabledProvider(t *testing.T) {
+	root := t.TempDir()
+	cfg := config.Config{
+		DisabledAgents: []parser.AgentType{parser.AgentGemini},
+		AgentDirs: map[parser.AgentType][]string{
+			parser.AgentGemini: {root},
+		},
+	}
+
+	roots, unwatched, symlinkGated, persistent := collectWatchRoots(cfg)
+
+	assert.Empty(t, roots)
+	assert.Empty(t, unwatched)
+	assert.Empty(t, symlinkGated)
+	assert.Empty(t, persistent)
+}
+
 func TestCollectWatchRootsPollsRecursiveSymlinkProviderRoot(t *testing.T) {
 	root := t.TempDir()
 	targetVSRoot := filepath.Join(t.TempDir(), "vs-target")
@@ -614,7 +729,7 @@ func TestCollectWatchRootsPollsRecursiveSymlinkProviderRoot(t *testing.T) {
 		},
 	}
 
-	roots, unwatchedDirs, _ := collectWatchRoots(cfg)
+	roots, unwatchedDirs, _, _ := collectWatchRoots(cfg)
 
 	require.Len(t, roots, 2)
 	assert.Equal(t, root, roots[0].path)
@@ -640,22 +755,26 @@ type fakeEmitter struct {
 func (f *fakeEmitter) Emit(_ string) { f.count.Add(1) }
 
 func TestStartRemoteHostSync_EmitsAfterSuccess(t *testing.T) {
-	em := &fakeEmitter{}
-	syncFn := func() (int, error) { return 3, nil }
+	synctest.Test(t, func(t *testing.T) {
+		em := &fakeEmitter{}
+		syncFn := func() (int, error) { return 3, nil }
 
-	done := make(chan struct{})
-	exited := make(chan struct{})
-	interval := 10 * time.Millisecond
-	go func() {
-		runRemoteHostSyncLoop(context.Background(), "test-host", interval, syncFn, em, nil, done)
-		close(exited)
-	}()
+		done := make(chan struct{})
+		exited := make(chan struct{})
+		interval := 10 * time.Millisecond
+		go func() {
+			runRemoteHostSyncLoop(t.Context(), "test-host", interval, syncFn, em, nil, done)
+			close(exited)
+		}()
+		defer func() {
+			close(done)
+			synctest.Wait()
+			<-exited
+		}()
 
-	time.Sleep(3 * interval)
-	close(done)
-	<-exited
-
-	assert.Positive(t, em.count.Load(), "emitter should have been called at least once")
+		synctest.Sleep(3 * interval)
+		assert.Positive(t, em.count.Load(), "emitter should have been called at least once")
+	})
 }
 
 func TestRemoteHostSyncFuncSerializesWithEngineExclusiveLock(t *testing.T) {
@@ -874,7 +993,7 @@ func TestRemoteHostSyncFuncForcesFullWhenDatabaseNeedsResync(t *testing.T) {
 	require.NoError(t, err)
 	require.NoError(t, database.Close())
 
-	raw, err := sql.Open(driver.DriverName, dbPath)
+	raw, err := sql.Open("sqlite3", dbPath)
 	require.NoError(t, err)
 	_, err = raw.Exec("PRAGMA user_version = 0")
 	require.NoError(t, err)
@@ -1004,79 +1123,101 @@ func (e *scopedEmitter) Emit(scope string) {
 }
 
 func TestStartRemoteHostSync_EmitsSessionsScopeAfterSuccess(t *testing.T) {
-	em := &scopedEmitter{scopes: make(chan string, 1)}
-	syncFn := func() (int, error) { return 3, nil }
+	synctest.Test(t, func(t *testing.T) {
+		em := &scopedEmitter{scopes: make(chan string, 1)}
+		syncFn := func() (int, error) { return 3, nil }
 
-	done := make(chan struct{})
-	exited := make(chan struct{})
-	interval := 10 * time.Millisecond
-	go func() {
-		runRemoteHostSyncLoop(context.Background(), "test-host", interval, syncFn, em, nil, done)
-		close(exited)
-	}()
+		done := make(chan struct{})
+		exited := make(chan struct{})
+		interval := 10 * time.Millisecond
+		go func() {
+			runRemoteHostSyncLoop(t.Context(), "test-host", interval, syncFn, em, nil, done)
+			close(exited)
+		}()
+		defer func() {
+			close(done)
+			<-exited
+		}()
 
-	select {
-	case scope := <-em.scopes:
-		assert.Equal(t, "sessions", scope)
-	case <-time.After(3 * interval):
-		require.FailNow(t, "timed out waiting for remote sync event")
-	}
-	close(done)
-	<-exited
+		// Wait for the loop to start its ticker before advancing fake time.
+		synctest.Wait()
+		time.Sleep(interval)
+		synctest.Wait()
+
+		select {
+		case scope := <-em.scopes:
+			assert.Equal(t, "sessions", scope)
+		default:
+			require.FailNow(t, "remote sync did not emit after its first tick")
+		}
+	})
 }
 
 func TestStartRemoteHostSync_NoEmitOnZeroSynced(t *testing.T) {
-	em := &fakeEmitter{}
-	syncFn := func() (int, error) { return 0, nil }
+	synctest.Test(t, func(t *testing.T) {
+		em := &fakeEmitter{}
+		syncFn := func() (int, error) { return 0, nil }
 
-	done := make(chan struct{})
-	exited := make(chan struct{})
-	interval := 10 * time.Millisecond
-	go func() {
-		runRemoteHostSyncLoop(context.Background(), "test-host", interval, syncFn, em, nil, done)
-		close(exited)
-	}()
+		done := make(chan struct{})
+		exited := make(chan struct{})
+		interval := 10 * time.Millisecond
+		go func() {
+			runRemoteHostSyncLoop(t.Context(), "test-host", interval, syncFn, em, nil, done)
+			close(exited)
+		}()
+		defer func() {
+			close(done)
+			synctest.Wait()
+			<-exited
+		}()
 
-	time.Sleep(3 * interval)
-	close(done)
-	<-exited
-
-	assert.Zero(t, em.count.Load(), "emitter should not fire when no sessions synced")
+		synctest.Sleep(3 * interval)
+		assert.Zero(t, em.count.Load(), "emitter should not fire when no sessions synced")
+	})
 }
 
 func TestStartRemoteHostSync_NoEmitOnError(t *testing.T) {
-	em := &fakeEmitter{}
-	syncFn := func() (int, error) { return 0, errors.New("ssh failure") }
+	synctest.Test(t, func(t *testing.T) {
+		em := &fakeEmitter{}
+		syncFn := func() (int, error) { return 0, errors.New("ssh failure") }
 
-	done := make(chan struct{})
-	exited := make(chan struct{})
-	interval := 10 * time.Millisecond
-	go func() {
-		runRemoteHostSyncLoop(context.Background(), "test-host", interval, syncFn, em, nil, done)
-		close(exited)
-	}()
+		done := make(chan struct{})
+		exited := make(chan struct{})
+		interval := 10 * time.Millisecond
+		go func() {
+			runRemoteHostSyncLoop(t.Context(), "test-host", interval, syncFn, em, nil, done)
+			close(exited)
+		}()
+		defer func() {
+			close(done)
+			synctest.Wait()
+			<-exited
+		}()
 
-	time.Sleep(3 * interval)
-	close(done)
-	<-exited
-
-	assert.Zero(t, em.count.Load(), "emitter should not fire when sync fails")
+		synctest.Sleep(3 * interval)
+		assert.Zero(t, em.count.Load(), "emitter should not fire when sync fails")
+	})
 }
 
 func TestStartRemoteHostSync_NilEmitterSafe(t *testing.T) {
-	syncFn := func() (int, error) { return 1, nil }
+	synctest.Test(t, func(t *testing.T) {
+		syncFn := func() (int, error) { return 1, nil }
 
-	done := make(chan struct{})
-	exited := make(chan struct{})
-	interval := 10 * time.Millisecond
-	go func() {
-		runRemoteHostSyncLoop(context.Background(), "test-host", interval, syncFn, nil, nil, done)
-		close(exited)
-	}()
+		done := make(chan struct{})
+		exited := make(chan struct{})
+		interval := 10 * time.Millisecond
+		go func() {
+			runRemoteHostSyncLoop(t.Context(), "test-host", interval, syncFn, nil, nil, done)
+			close(exited)
+		}()
+		defer func() {
+			close(done)
+			synctest.Wait()
+			<-exited
+		}()
 
-	time.Sleep(2 * interval)
-	close(done)
-	<-exited
+		synctest.Sleep(2 * interval)
+	})
 }
 
 func TestCollectWatchRootsHermesSessionsWatchesStateDBParent(t *testing.T) {
@@ -1090,7 +1231,7 @@ func TestCollectWatchRootsHermesSessionsWatchesStateDBParent(t *testing.T) {
 		},
 	}
 
-	roots, unwatchedDirs, _ := collectWatchRoots(cfg)
+	roots, unwatchedDirs, _, _ := collectWatchRoots(cfg)
 
 	require.Empty(t, unwatchedDirs, "unwatched dirs before watcher setup")
 	require.Len(t, roots, 2)
@@ -1113,7 +1254,7 @@ func TestCollectWatchRootsWatchesHermesProfilesContainerRecursively(t *testing.T
 		},
 	}
 
-	roots, unwatchedDirs, _ := collectWatchRoots(cfg)
+	roots, unwatchedDirs, _, _ := collectWatchRoots(cfg)
 
 	require.Empty(t, unwatchedDirs)
 	require.Len(t, roots, 1)
@@ -1131,7 +1272,7 @@ func TestCollectWatchRootsUsesCoworkProviderRecursiveRoot(t *testing.T) {
 		},
 	}
 
-	roots, unwatchedDirs, _ := collectWatchRoots(cfg)
+	roots, unwatchedDirs, _, _ := collectWatchRoots(cfg)
 
 	require.Empty(t, unwatchedDirs, "cowork root should be watched directly")
 	got, ok := findCollectedWatchRoot(roots, root)
@@ -1152,7 +1293,7 @@ func TestCollectWatchRootsUsesGeminiProviderMetadataRoot(t *testing.T) {
 		},
 	}
 
-	roots, unwatchedDirs, _ := collectWatchRoots(cfg)
+	roots, unwatchedDirs, _, _ := collectWatchRoots(cfg)
 
 	require.Empty(t, unwatchedDirs, "all gemini provider roots exist")
 	metadataRoot, ok := findCollectedWatchRoot(roots, root)
@@ -1167,7 +1308,7 @@ func TestCollectWatchRootsUsesGeminiProviderMetadataRoot(t *testing.T) {
 
 func TestCollectWatchRootsUsesAntigravityCLIHistoryRoot(t *testing.T) {
 	root := t.TempDir()
-	for _, subdir := range []string{"brain", "conversations", "implicit"} {
+	for _, subdir := range []string{"brain", "cache", "conversations", "implicit"} {
 		require.NoError(t, os.Mkdir(filepath.Join(root, subdir), 0o755))
 	}
 	cfg := config.Config{
@@ -1176,12 +1317,15 @@ func TestCollectWatchRootsUsesAntigravityCLIHistoryRoot(t *testing.T) {
 		},
 	}
 
-	roots, unwatchedDirs, _ := collectWatchRoots(cfg)
+	roots, unwatchedDirs, _, _ := collectWatchRoots(cfg)
 
 	require.Empty(t, unwatchedDirs, "all antigravity cli provider roots exist")
 	historyRoot, ok := findCollectedWatchRoot(roots, root)
 	require.True(t, ok, "antigravity cli history.jsonl root not collected")
 	assert.False(t, historyRoot.recursive)
+	cache, ok := findCollectedWatchRoot(roots, filepath.Join(root, "cache"))
+	require.True(t, ok, "antigravity cli workspace cache root not collected")
+	assert.False(t, cache.recursive)
 	conversations, ok := findCollectedWatchRoot(
 		roots, filepath.Join(root, "conversations"),
 	)
@@ -1203,7 +1347,7 @@ func TestCollectWatchRootsIncludesDevinProviderRootsForNonFileAgent(t *testing.T
 		},
 	}
 
-	roots, unwatchedDirs, _ := collectWatchRoots(cfg)
+	roots, unwatchedDirs, _, _ := collectWatchRoots(cfg)
 
 	require.Empty(t, unwatchedDirs)
 	cliRoot, ok := findCollectedWatchRoot(roots, filepath.Join(root, "cli"))
@@ -1225,7 +1369,7 @@ func TestCollectWatchRootsTracksExactAgentsForSharedRoot(t *testing.T) {
 		parser.AgentCodex:  {root},
 	}}
 
-	roots, unwatchedDirs, _ := collectWatchRoots(cfg)
+	roots, unwatchedDirs, _, _ := collectWatchRoots(cfg)
 
 	require.Empty(t, unwatchedDirs)
 	shared, ok := findCollectedWatchRoot(roots, root)
@@ -1251,7 +1395,7 @@ func TestCollectWatchRootsPreservesMissingProviderRoots(t *testing.T) {
 		},
 	}
 
-	roots, unwatchedDirs, _ := collectWatchRoots(cfg)
+	roots, unwatchedDirs, _, _ := collectWatchRoots(cfg)
 
 	require.Len(t, roots, 2)
 	cliRoot, ok := findCollectedWatchRoot(roots, filepath.Join(root, "cli"))
@@ -1309,6 +1453,7 @@ func TestStartFileWatcherSuppressesPendingPollingWhenLifecycleIsOwned(t *testing
 			MissingRootLifecycleOwned: true,
 		}},
 		got,
+		nil,
 	), "owned missing roots must not schedule authoritative polling")
 }
 
@@ -1521,9 +1666,9 @@ func TestWatchPollingObligationsMissingRootLifecycleCardinality(t *testing.T) {
 				unwatched = append(unwatched, syncDir)
 			}
 
-			assert.Empty(t, watchPollingObligations(roots, owned, nil),
+			assert.Empty(t, watchPollingObligations(roots, owned, nil, nil),
 				"native lifecycle work must remain independent of configured archive cardinality")
-			assert.Len(t, watchPollingObligations(roots, portable, unwatched), rootCount,
+			assert.Len(t, watchPollingObligations(roots, portable, unwatched, nil), rootCount,
 				"portable backends retain one obligation per uncovered missing root")
 		})
 	}
@@ -1541,9 +1686,9 @@ func TestOpenCodeFormatMissingRootsUseNativeLifecycleWithoutPolling(t *testing.T
 				parser.AgentMiMoCode: dirs,
 			}}
 
-			roots, unwatched, _ := collectWatchRoots(cfg)
+			roots, unwatched, _, persistentDirAgents := collectWatchRoots(cfg)
 			require.Len(t, roots, rootCount)
-			results := make([]agentsync.RecursiveWatchResult, rootCount)
+			results := make([]agentsync.RecursiveWatchResult, len(roots))
 			for i := range results {
 				results[i] = agentsync.RecursiveWatchResult{
 					Watched:                   1,
@@ -1552,7 +1697,7 @@ func TestOpenCodeFormatMissingRootsUseNativeLifecycleWithoutPolling(t *testing.T
 			}
 			unwatched = accountRegisteredWatchRoots(unwatched, roots, results)
 
-			assert.Empty(t, watchPollingObligations(roots, results, unwatched),
+			assert.Empty(t, watchPollingObligations(roots, results, unwatched, persistentDirAgents),
 				"absent OpenCode-format providers must not add archive-scale polling")
 		})
 	}
@@ -1578,11 +1723,20 @@ func TestWatchPollingObligationsKeepPendingAndPersistentReasonsIndependent(t *te
 		roots,
 		[]agentsync.RecursiveWatchResult{{Watched: 1}, {Watched: 1}},
 		[]string{shared},
+		map[string][]parser.AgentType{shared: {parser.AgentDevin}},
 	)
 
 	assert.Equal(t, []agentsync.PollingObligation{
-		{Key: pendingPath, Roots: []string{shared}, Probe: pendingPath},
-		{Key: "persistent:" + shared, Roots: []string{shared}, Probe: shared},
+		{
+			Key:    pendingPath,
+			Scopes: []agentsync.PollingScope{{Agent: "devin", Root: shared}},
+			Probe:  pendingPath,
+		},
+		{
+			Key:    "persistent:" + shared,
+			Scopes: []agentsync.PollingScope{{Agent: "devin", Root: shared}},
+			Probe:  shared,
+		},
 	}, got)
 }
 
@@ -1598,10 +1752,13 @@ func TestWatchPollingObligationsCoverRegistrationFailureByLogicalRoot(t *testing
 		roots,
 		[]agentsync.RecursiveWatchResult{{Unwatched: 1, Err: errors.New("watch failed")}},
 		[]string{syncDir},
+		nil,
 	)
 
 	assert.Equal(t, []agentsync.PollingObligation{{
-		Key: watchPath, Roots: []string{syncDir}, Probe: watchPath,
+		Key:    "degraded:claude:" + watchPath,
+		Scopes: []agentsync.PollingScope{{Agent: "claude", Root: syncDir}},
+		Probe:  watchPath,
 	}}, got)
 }
 
@@ -1617,22 +1774,26 @@ func TestSymlinkPollingObligationsGateDirsOnTargetAvailability(t *testing.T) {
 	symRoot := filepath.Join(parent, "sessions")
 	requireSymlinkOrSkip(t, target, symRoot)
 
-	obligations := symlinkPollingObligations(map[string][]string{
-		symRoot: {parent},
+	obligations := symlinkPollingObligations(map[string][]watchScope{
+		symRoot: {{syncDir: parent}},
 	})
 	require.Equal(t, []agentsync.PollingObligation{{
-		Key: "symlink:" + symRoot, Roots: []string{parent}, Probe: symRoot,
+		Key: "symlink:" + symRoot, Scopes: []agentsync.PollingScope{{Root: parent}}, Probe: symRoot,
 	}}, obligations)
 
 	combined := []pollingObligation{
-		{Key: "persistent:" + parent, Roots: []string{parent}, Probe: parent},
-		{Key: obligations[0].Key, Roots: obligations[0].Roots, Probe: obligations[0].Probe},
+		{Key: "persistent:" + parent, Scopes: []pollingScope{{Root: parent}}, Probe: parent},
+		{
+			Key:    obligations[0].Key,
+			Scopes: []pollingScope{{Root: parent}},
+			Probe:  obligations[0].Probe,
+		},
 	}
-	assert.Equal(t, []string{parent}, availableUnwatchedPollRoots(combined),
+	assert.Equal(t, []string{parent}, availableUnwatchedPollRootsFlat(combined),
 		"a working symlink target keeps the dir pollable")
 
 	require.NoError(t, os.RemoveAll(target))
-	assert.Empty(t, availableUnwatchedPollRoots(combined),
+	assert.Empty(t, availableUnwatchedPollRootsFlat(combined),
 		"a broken symlink target must defer the dir even though the dir itself exists")
 }
 
@@ -1654,21 +1815,26 @@ func TestWatcherUnavailableFallbackDefersBrokenSymlinkScope(t *testing.T) {
 	syncer := &recordingUnwatchedPollSyncer{wake: make(chan struct{}, 3)}
 	coordinator := newUnwatchedPollCoordinatorWithTicks(
 		t.Context(), syncer, make(chan time.Time), func() {},
-		func(run func()) { run() }, nil,
+		func(run func()) { run() }, nil, time.Now,
+		func(d time.Duration) <-chan time.Time {
+			ch := make(chan time.Time, 1)
+			ch <- time.Time{}
+			return ch
+		},
 	)
 	t.Cleanup(coordinator.Stop)
 	options := agentsync.WatcherOptions{
 		OnCoverageDegraded: func(roots []string) error {
+			scopes := make([]pollingScope, 0, len(roots))
+			for _, r := range roots {
+				scopes = append(scopes, pollingScope{Root: r})
+			}
 			return coordinator.AddObligation(pollingObligation{
-				Key: "watcher-fallback", Roots: roots,
+				Key: "watcher-fallback", Scopes: scopes,
 			})
 		},
 		OnPollingRequired: func(obligation agentsync.PollingObligation) error {
-			return coordinator.AddObligation(pollingObligation{
-				Key:   obligation.Key,
-				Roots: obligation.Roots,
-				Probe: obligation.Probe,
-			})
+			return coordinator.AddObligation(syncObligationToPoller(obligation))
 		},
 	}
 
@@ -1676,7 +1842,8 @@ func TestWatcherUnavailableFallbackDefersBrokenSymlinkScope(t *testing.T) {
 		options,
 		nil,
 		[]string{parent, other},
-		map[string][]string{symRoot: {parent}},
+		map[string][]watchScope{symRoot: {{syncDir: parent}}},
+		nil,
 	))
 
 	bothDirs := []string{parent, other}
@@ -1711,24 +1878,41 @@ func TestWatcherUnavailableFallbackDefersMissingNestedRootScope(t *testing.T) {
 	nestedRoot := filepath.Join(parent, "tmp")
 	other := requireExistingPollRoot(t, t.TempDir(), "other")
 
-	syncer := &recordingUnwatchedPollSyncer{wake: make(chan struct{}, 2)}
+	syncer := &recordingUnwatchedPollSyncer{wake: make(chan struct{}, 4)}
+	// passDone fires once per complete poll pass regardless of how many
+	// per-agent ReconcileProviderRoots calls the pass makes. Waiting on
+	// syncer.wake races when two agent groups fire: the empty-agent group
+	// runs first, syncer.wake fires, and the test resumes before Gemini
+	// records parent — intermittently failing the assertion.
+	passDone := make(chan struct{}, 4)
 	coordinator := newUnwatchedPollCoordinatorWithTicks(
 		t.Context(), syncer, make(chan time.Time), func() {},
-		func(run func()) { run() }, nil,
+		func(run func()) {
+			run()
+			select {
+			case passDone <- struct{}{}:
+			default:
+			}
+		}, nil, time.Now,
+		func(d time.Duration) <-chan time.Time {
+			ch := make(chan time.Time, 1)
+			ch <- time.Time{}
+			return ch
+		},
 	)
 	t.Cleanup(coordinator.Stop)
 	options := agentsync.WatcherOptions{
 		OnCoverageDegraded: func(roots []string) error {
+			scopes := make([]pollingScope, 0, len(roots))
+			for _, r := range roots {
+				scopes = append(scopes, pollingScope{Root: r})
+			}
 			return coordinator.AddObligation(pollingObligation{
-				Key: "watcher-fallback", Roots: roots,
+				Key: "watcher-fallback", Scopes: scopes,
 			})
 		},
 		OnPollingRequired: func(obligation agentsync.PollingObligation) error {
-			return coordinator.AddObligation(pollingObligation{
-				Key:   obligation.Key,
-				Roots: obligation.Roots,
-				Probe: obligation.Probe,
-			})
+			return coordinator.AddObligation(syncObligationToPoller(obligation))
 		},
 	}
 	roots := []watchRoot{{
@@ -1739,21 +1923,31 @@ func TestWatcherUnavailableFallbackDefersMissingNestedRootScope(t *testing.T) {
 	}}
 
 	require.NoError(t, registerWatcherUnavailableObligations(
-		options, roots, []string{parent, other}, nil,
+		options, roots, []string{parent, other}, nil, nil,
 	))
 
 	coordinator.requestPoll()
-	requirePollWithin(t, syncer.wake, time.Second)
+	requirePollWithin(t, passDone, time.Second)
 	assert.Equal(t, [][]string{{other}}, syncer.snapshot(),
 		"a missing nested watch root must defer the configured dir from the fallback poll")
 
 	require.NoError(t, os.MkdirAll(nestedRoot, 0o755))
-	bothDirs := []string{parent, other}
-	slices.Sort(bothDirs)
+	snap1 := syncer.snapshot()
 	coordinator.requestPoll()
-	requirePollWithin(t, syncer.wake, time.Second)
-	assert.Equal(t, [][]string{{other}, bothDirs}, syncer.snapshot(),
+	requirePollWithin(t, passDone, time.Second)
+	// Per-agent polling: parent (gemini) and other ("") arrive as separate calls.
+	// Collect everything new since poll 1.
+	snap2 := syncer.snapshot()
+	polled2 := make(map[string]bool)
+	for _, call := range snap2[len(snap1):] {
+		for _, d := range call {
+			polled2[d] = true
+		}
+	}
+	assert.True(t, polled2[parent],
 		"the deferred dir must rejoin the poll once the nested root is restored")
+	assert.True(t, polled2[other],
+		"other must continue to be polled")
 }
 
 // TestWatcherUnavailableFallbackDefersNestedRootLostAfterRegistration guards
@@ -1771,23 +1965,39 @@ func TestWatcherUnavailableFallbackDefersNestedRootLostAfterRegistration(t *test
 	other := requireExistingPollRoot(t, t.TempDir(), "other")
 
 	syncer := &recordingUnwatchedPollSyncer{wake: make(chan struct{}, 3)}
+	// passDone fires once per poll pass (after run() returns), regardless of how
+	// many per-agent ReconcileProviderRoots calls the pass makes. This avoids a
+	// timing hazard where syncer.wake (fired per-call) leaves a leftover signal
+	// that causes requirePollWithin to return early for the next pass.
+	passDone := make(chan struct{}, 3)
 	coordinator := newUnwatchedPollCoordinatorWithTicks(
 		t.Context(), syncer, make(chan time.Time), func() {},
-		func(run func()) { run() }, nil,
+		func(run func()) {
+			run()
+			select {
+			case passDone <- struct{}{}:
+			default:
+			}
+		}, nil, time.Now,
+		func(d time.Duration) <-chan time.Time {
+			ch := make(chan time.Time, 1)
+			ch <- time.Time{}
+			return ch
+		},
 	)
 	t.Cleanup(coordinator.Stop)
 	options := agentsync.WatcherOptions{
 		OnCoverageDegraded: func(roots []string) error {
+			scopes := make([]pollingScope, 0, len(roots))
+			for _, r := range roots {
+				scopes = append(scopes, pollingScope{Root: r})
+			}
 			return coordinator.AddObligation(pollingObligation{
-				Key: "watcher-fallback", Roots: roots,
+				Key: "watcher-fallback", Scopes: scopes,
 			})
 		},
 		OnPollingRequired: func(obligation agentsync.PollingObligation) error {
-			return coordinator.AddObligation(pollingObligation{
-				Key:   obligation.Key,
-				Roots: obligation.Roots,
-				Probe: obligation.Probe,
-			})
+			return coordinator.AddObligation(syncObligationToPoller(obligation))
 		},
 	}
 	roots := []watchRoot{{
@@ -1798,27 +2008,101 @@ func TestWatcherUnavailableFallbackDefersNestedRootLostAfterRegistration(t *test
 	}}
 
 	require.NoError(t, registerWatcherUnavailableObligations(
-		options, roots, []string{parent, other}, nil,
+		options, roots, []string{parent, other}, nil, nil,
 	))
 
-	bothDirs := []string{parent, other}
-	slices.Sort(bothDirs)
+	// Per-agent polling: parent (gemini) and other ("") arrive as separate calls.
+	// Collect unique dirs across all calls within a pass to check coverage.
+	collectPolled := func(calls [][]string) map[string]bool {
+		m := make(map[string]bool)
+		for _, c := range calls {
+			for _, d := range c {
+				m[d] = true
+			}
+		}
+		return m
+	}
+
 	coordinator.requestPoll()
-	requirePollWithin(t, syncer.wake, time.Second)
-	assert.Equal(t, [][]string{bothDirs}, syncer.snapshot(),
+	requirePollWithin(t, passDone, time.Second)
+	snap1 := syncer.snapshot()
+	polled1 := collectPolled(snap1)
+	assert.True(t, polled1[parent] && polled1[other],
 		"a present nested watch root keeps the configured dir pollable")
 
 	require.NoError(t, os.RemoveAll(nestedRoot))
 	coordinator.requestPoll()
-	requirePollWithin(t, syncer.wake, time.Second)
-	assert.Equal(t, [][]string{bothDirs, {other}}, syncer.snapshot(),
-		"a nested root lost after registration must defer the configured dir")
+	requirePollWithin(t, passDone, time.Second)
+	snap2 := syncer.snapshot()
+	delta2 := snap2[len(snap1):]
+	polled2 := collectPolled(delta2)
+	for _, call := range delta2 {
+		assert.NotContains(t, call, parent,
+			"a nested root lost after registration must defer the configured dir")
+	}
+	// De-vacuumize: if a regression causes zero second-pass calls the loop above
+	// passes vacuously. Assert other is present to catch over-suppression.
+	assert.True(t, polled2[other],
+		"the unaffected other dir must still be polled when the nested root is missing")
 
 	require.NoError(t, os.MkdirAll(nestedRoot, 0o755))
 	coordinator.requestPoll()
-	requirePollWithin(t, syncer.wake, time.Second)
-	assert.Equal(t, [][]string{bothDirs, {other}, bothDirs}, syncer.snapshot(),
+	requirePollWithin(t, passDone, time.Second)
+	snap3 := syncer.snapshot()
+	polled3 := collectPolled(snap3[len(snap2):])
+	assert.True(t, polled3[parent] && polled3[other],
 		"the deferred dir must rejoin the poll once the nested root is restored")
+}
+
+// TestRegisterWatcherUnavailableCoversDegradedWithoutPollingRequired
+// when OnCoverageDegraded is set but OnPollingRequired is nil (as archive-watch
+// callers do), registerWatcherUnavailableObligations must still call
+// OnCoverageDegraded with all unwatched dirs.
+//
+// Pre-fix, the probeGated exclusion is applied unconditionally. Because
+// every obligation returned by watchPollingObligations has a probe (the
+// physical watch root path), probeGated ends up containing every scope root,
+// and fallbackDirs is always empty → OnCoverageDegraded is silently never
+// called and archive coverage is silently dropped.
+//
+// The fix: skip the probeGated exclusion when OnPollingRequired is nil, because
+// without a named obligation owner the probe-gated obligations are NOT
+// installed; the coverage-degraded fallback must cover all dirs.
+func TestRegisterWatcherUnavailableCoversDegradedWithoutPollingRequired(t *testing.T) {
+	parent := t.TempDir()
+	// nestedRoot does not exist; it becomes the probe for parent's obligation.
+	nestedRoot := filepath.Join(parent, "tmp")
+	other := requireExistingPollRoot(t, t.TempDir(), "other")
+
+	var degradedRoots []string
+	options := agentsync.WatcherOptions{
+		// OnPollingRequired is intentionally nil — archive-watch callers omit it.
+		OnCoverageDegraded: func(roots []string) error {
+			degradedRoots = append(degradedRoots, roots...)
+			return nil
+		},
+	}
+	roots := []watchRoot{{
+		path:               nestedRoot,
+		recursive:          true,
+		scopes:             []watchScope{{agent: parser.AgentGemini, syncDir: parent}},
+		pendingPollingDirs: []string{parent},
+	}}
+
+	require.NoError(t, registerWatcherUnavailableObligations(
+		options, roots, []string{parent, other}, nil, nil,
+	))
+
+	// Pre-fix, probeGated excludes parent (its scope has a probe=nestedRoot
+	// obligation) and other (its scope has a probe=other persistent obligation),
+	// so fallbackDirs is empty and OnCoverageDegraded is never called.
+	// Post-fix, the probeGated exclusion is skipped when OnPollingRequired
+	// is nil, and OnCoverageDegraded receives all dirs.
+	assert.Contains(t, degradedRoots, parent,
+		"OnCoverageDegraded must cover parent even though it has a probe obligation, "+
+			"when OnPollingRequired is nil")
+	assert.Contains(t, degradedRoots, other,
+		"OnCoverageDegraded must also cover other")
 }
 
 // TestWatcherUnavailableObligationsGateBeforeFallback snapshots the pollable
@@ -1841,22 +2125,22 @@ func TestWatcherUnavailableObligationsGateBeforeFallback(t *testing.T) {
 		make(chan time.Time), func() {}, func(run func()) { run() },
 		func([]string) {
 			stepAvailable = append(stepAvailable,
-				availableUnwatchedPollRoots(coordinator.currentPollObligations()))
-		},
+				availableUnwatchedPollRootsFlat(coordinator.currentPollObligations()))
+		}, time.Now, time.After,
 	)
 	t.Cleanup(coordinator.Stop)
 	options := agentsync.WatcherOptions{
 		OnCoverageDegraded: func(roots []string) error {
+			scopes := make([]pollingScope, 0, len(roots))
+			for _, r := range roots {
+				scopes = append(scopes, pollingScope{Root: r})
+			}
 			return coordinator.AddObligation(pollingObligation{
-				Key: "watcher-fallback", Roots: roots,
+				Key: "watcher-fallback", Scopes: scopes,
 			})
 		},
 		OnPollingRequired: func(obligation agentsync.PollingObligation) error {
-			return coordinator.AddObligation(pollingObligation{
-				Key:   obligation.Key,
-				Roots: obligation.Roots,
-				Probe: obligation.Probe,
-			})
+			return coordinator.AddObligation(syncObligationToPoller(obligation))
 		},
 	}
 	roots := []watchRoot{{
@@ -1867,7 +2151,7 @@ func TestWatcherUnavailableObligationsGateBeforeFallback(t *testing.T) {
 	}}
 
 	require.NoError(t, registerWatcherUnavailableObligations(
-		options, roots, []string{parent, other}, nil,
+		options, roots, []string{parent, other}, nil, nil,
 	))
 
 	require.NotEmpty(t, stepAvailable)
@@ -2600,11 +2884,17 @@ func TestSyncWatchBatch(t *testing.T) {
 	})
 }
 
-type stubRetryRootsError struct{ roots []string }
+type stubRetryRootsError struct {
+	paths    []string
+	roots    []string
+	overflow bool
+}
 
 func (e *stubRetryRootsError) Error() string { return "reconciliation incomplete" }
 
 func (e *stubRetryRootsError) ReconciliationRetryRoots() []string { return e.roots }
+func (e *stubRetryRootsError) ReconciliationRetryPaths() []string { return e.paths }
+func (e *stubRetryRootsError) ReconciliationRetryOverflow() bool  { return e.overflow }
 
 // TestGapReconciliationRetryBatch pins the startup-gap classification: a gap
 // reconciliation error carrying retry roots yields a scoped retry batch, and
@@ -2616,6 +2906,22 @@ func TestGapReconciliationRetryBatch(t *testing.T) {
 	assert.Equal(t, agentsync.WatchBatch{
 		ReconcileRoots: []string{"/b", "/a"},
 	}, scoped)
+
+	typed := gapReconciliationRetryBatch(fmt.Errorf(
+		"gap: %w", &stubRetryRootsError{
+			paths: []string{"/sessions/child.jsonl", "/sessions/child.jsonl"},
+			roots: []string{"/sessions/root"},
+		},
+	))
+	assert.Equal(t, agentsync.WatchBatch{
+		Paths:          []string{"/sessions/child.jsonl"},
+		ReconcileRoots: []string{"/sessions/root"},
+	}, typed)
+
+	overflow := gapReconciliationRetryBatch(fmt.Errorf(
+		"gap: %w", &stubRetryRootsError{paths: []string{"/child"}, overflow: true},
+	))
+	assert.Equal(t, agentsync.WatchBatch{FullSync: true}, overflow)
 
 	full := gapReconciliationRetryBatch(errors.New("plain failure"))
 	assert.Equal(t, agentsync.WatchBatch{FullSync: true}, full)
@@ -2890,8 +3196,8 @@ func TestReconcileRootPathsDefersUnstatableSymlinkTargetScope(t *testing.T) {
 // A watcher overflow forces a full recovery over every configured root. A
 // configured root that is a symlink whose target was removed streams an empty
 // discovery without error, so the recovery must defer that scope instead of
-// tombstoning every baselined session beneath it, while genuine deletions
-// under present roots still tombstone.
+// marking every baselined session beneath it source-missing, while genuine
+// deletions under present roots still update source state.
 func TestSyncWatchBatchFullRecoveryDefersBrokenSymlinkRoot(t *testing.T) {
 	dataDir := t.TempDir()
 	claudeRoot := t.TempDir()
@@ -2934,9 +3240,9 @@ func TestSyncWatchBatchFullRecoveryDefersBrokenSymlinkRoot(t *testing.T) {
 	))
 
 	cfg := config.Config{
-		DataDir:          dataDir,
-		DBPath:           filepath.Join(dataDir, "sessions.db"),
-		LocalMachineName: "local",
+		DataDir:        dataDir,
+		DBPath:         filepath.Join(dataDir, "sessions.db"),
+		InstallationID: "local",
 		AgentDirs: map[parser.AgentType][]string{
 			parser.AgentClaude: {claudeRoot},
 			parser.AgentCodex:  {codexRoot},
@@ -2945,7 +3251,7 @@ func TestSyncWatchBatchFullRecoveryDefersBrokenSymlinkRoot(t *testing.T) {
 	database := dbtest.OpenTestDBAt(t, cfg.DBPath)
 	engine := agentsync.NewEngine(database, agentsync.EngineConfig{
 		AgentDirs: cfg.AgentDirs,
-		Machine:   cfg.LocalMachineName,
+		Machine:   cfg.InstallationID,
 	})
 	t.Cleanup(engine.Close)
 
@@ -2967,24 +3273,34 @@ func TestSyncWatchBatchFullRecoveryDefersBrokenSymlinkRoot(t *testing.T) {
 		func() watchRecoveryScope { return probeWatchRecoveryScope(cfg) },
 	))
 
-	survivor, err := database.GetSession(t.Context(), "codex:"+codexUUID)
+	survivor, err := database.GetSessionFull(t.Context(), "codex:"+codexUUID)
 	require.NoError(t, err)
-	assert.NotNil(t, survivor,
-		"sessions under a broken symlink root must not be tombstoned by an unrelated overflow")
+	require.NotNil(t, survivor,
+		"sessions under a broken symlink root must survive an unrelated overflow")
+	assert.Nil(t, survivor.SourceMissingAt,
+		"a deferred broken-symlink root must not change source state")
 	kept, err := database.GetSession(t.Context(), "claude-kept")
 	require.NoError(t, err)
 	assert.NotNil(t, kept)
 	deleted, err := database.GetSession(t.Context(), "claude-deleted")
 	require.NoError(t, err)
-	assert.Nil(t, deleted,
-		"a genuine deletion under a present root must still tombstone")
+	assert.NotNil(t, deleted,
+		"a missing source under a present root must remain browsable")
+	archived, err := database.GetSessionFull(t.Context(), "claude-deleted")
+	require.NoError(t, err)
+	require.NotNil(t, archived)
+	assert.Nil(t, archived.DeletedAt)
+	assert.Nil(t, archived.DeletionCause)
+	assert.NotNil(t, archived.SourceMissingAt,
+		"a genuine deletion under a present root must update source state")
 }
 
 // A watcher overflow forces a full recovery over every configured root. A
 // root whose physical path is unavailable (unmounted volume, deleted provider
 // dir) streams an empty discovery without error, so the recovery must defer
-// that scope instead of tombstoning every baselined session beneath it, while
-// genuine deletions under present roots still tombstone.
+// that scope instead of marking every baselined session beneath it
+// source-missing, while genuine deletions under present roots still update
+// source state.
 func TestSyncWatchBatchFullRecoveryDefersUnavailableRoots(t *testing.T) {
 	dataDir := t.TempDir()
 	claudeRoot := t.TempDir()
@@ -3023,9 +3339,9 @@ func TestSyncWatchBatchFullRecoveryDefersUnavailableRoots(t *testing.T) {
 	))
 
 	cfg := config.Config{
-		DataDir:          dataDir,
-		DBPath:           filepath.Join(dataDir, "sessions.db"),
-		LocalMachineName: "local",
+		DataDir:        dataDir,
+		DBPath:         filepath.Join(dataDir, "sessions.db"),
+		InstallationID: "local",
 		AgentDirs: map[parser.AgentType][]string{
 			parser.AgentClaude: {claudeRoot},
 			parser.AgentCodex:  {codexRoot},
@@ -3034,7 +3350,7 @@ func TestSyncWatchBatchFullRecoveryDefersUnavailableRoots(t *testing.T) {
 	database := dbtest.OpenTestDBAt(t, cfg.DBPath)
 	engine := agentsync.NewEngine(database, agentsync.EngineConfig{
 		AgentDirs: cfg.AgentDirs,
-		Machine:   cfg.LocalMachineName,
+		Machine:   cfg.InstallationID,
 	})
 	t.Cleanup(engine.Close)
 
@@ -3056,22 +3372,26 @@ func TestSyncWatchBatchFullRecoveryDefersUnavailableRoots(t *testing.T) {
 		func() watchRecoveryScope { return probeWatchRecoveryScope(cfg) },
 	))
 
-	survivor, err := database.GetSession(t.Context(), "codex:"+codexUUID)
+	survivor, err := database.GetSessionFull(t.Context(), "codex:"+codexUUID)
 	require.NoError(t, err)
-	assert.NotNil(t, survivor,
-		"sessions under an unavailable root must not be tombstoned by an unrelated overflow")
+	require.NotNil(t, survivor,
+		"sessions under an unavailable root must survive an unrelated overflow")
+	assert.Nil(t, survivor.SourceMissingAt,
+		"a deferred unavailable root must not change source state")
 	kept, err := database.GetSession(t.Context(), "claude-kept")
 	require.NoError(t, err)
 	assert.NotNil(t, kept)
 	deleted, err := database.GetSession(t.Context(), "claude-deleted")
 	require.NoError(t, err)
-	assert.Nil(t, deleted,
-		"a genuine deletion under a present root must still tombstone")
+	assert.NotNil(t, deleted,
+		"a missing source under a present root must remain browsable")
 	archived, err := database.GetSessionFull(t.Context(), "claude-deleted")
 	require.NoError(t, err)
 	require.NotNil(t, archived)
-	require.NotNil(t, archived.DeletionCause)
-	assert.Equal(t, "source_missing", *archived.DeletionCause)
+	assert.Nil(t, archived.DeletedAt)
+	assert.Nil(t, archived.DeletionCause)
+	assert.NotNil(t, archived.SourceMissingAt,
+		"a genuine deletion under a present root must update source state")
 }
 
 // A configured root can nest inside another configured root of the same
@@ -3105,9 +3425,9 @@ func TestSyncWatchBatchFullRecoveryDefersOverlappingUnavailableRoot(t *testing.T
 	))
 
 	cfg := config.Config{
-		DataDir:          dataDir,
-		DBPath:           filepath.Join(dataDir, "sessions.db"),
-		LocalMachineName: "local",
+		DataDir:        dataDir,
+		DBPath:         filepath.Join(dataDir, "sessions.db"),
+		InstallationID: "local",
 		AgentDirs: map[parser.AgentType][]string{
 			parser.AgentClaude: {baseRoot, nestedRoot},
 		},
@@ -3115,7 +3435,7 @@ func TestSyncWatchBatchFullRecoveryDefersOverlappingUnavailableRoot(t *testing.T
 	database := dbtest.OpenTestDBAt(t, cfg.DBPath)
 	engine := agentsync.NewEngine(database, agentsync.EngineConfig{
 		AgentDirs: cfg.AgentDirs,
-		Machine:   cfg.LocalMachineName,
+		Machine:   cfg.InstallationID,
 	})
 	t.Cleanup(engine.Close)
 
@@ -3178,9 +3498,9 @@ func TestSyncWatchBatchDirectoryRenameDefersUnavailableProviderRoots(t *testing.
 	writeCodexSession(rootB, uuidB)
 
 	cfg := config.Config{
-		DataDir:          dataDir,
-		DBPath:           filepath.Join(dataDir, "sessions.db"),
-		LocalMachineName: "local",
+		DataDir:        dataDir,
+		DBPath:         filepath.Join(dataDir, "sessions.db"),
+		InstallationID: "local",
 		AgentDirs: map[parser.AgentType][]string{
 			parser.AgentCodex: {rootA, rootB},
 		},
@@ -3188,7 +3508,7 @@ func TestSyncWatchBatchDirectoryRenameDefersUnavailableProviderRoots(t *testing.
 	database := dbtest.OpenTestDBAt(t, cfg.DBPath)
 	engine := agentsync.NewEngine(database, agentsync.EngineConfig{
 		AgentDirs: cfg.AgentDirs,
-		Machine:   cfg.LocalMachineName,
+		Machine:   cfg.InstallationID,
 	})
 	t.Cleanup(engine.Close)
 
@@ -3227,4 +3547,100 @@ func TestSyncWatchBatchDirectoryRenameDefersUnavailableProviderRoots(t *testing.
 	require.NoError(t, err)
 	assert.NotNil(t, synced,
 		"the available root must still reconcile the rename authoritatively")
+}
+
+// TestOpenCodeSQLiteOnlyRootKeepsItsPollingFallback is the regression that a
+// coverage-unit split can introduce silently. A SQLite-layout OpenCode root
+// never grows a storage/ directory, so a polling obligation probed on that
+// path could never be satisfied, and an unsatisfiable probe defers every other
+// obligation sharing the configured dir. The root would then have neither
+// native coverage nor polling.
+func TestOpenCodeSQLiteOnlyRootKeepsItsPollingFallback(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "opencode")
+	require.NoError(t, os.MkdirAll(root, 0o755))
+	require.NoError(t, os.WriteFile(
+		filepath.Join(root, "opencode.db"), []byte("db"), 0o600,
+	))
+	require.NoDirExists(t, filepath.Join(root, "storage"))
+
+	cfg := config.Config{AgentDirs: map[parser.AgentType][]string{
+		parser.AgentOpenCode: {root},
+	}}
+	roots, unwatched, symlinkGated, persistentDirAgents := collectWatchRoots(cfg)
+
+	// Degraded coverage is the only reason this root needs polling at all.
+	// Registration skips a unit that does not exist, so its result stays
+	// zero-valued.
+	results := make([]agentsync.RecursiveWatchResult, len(roots))
+	for i := range results {
+		if roots[i].exists {
+			results[i] = agentsync.RecursiveWatchResult{Unwatched: 1}
+		}
+	}
+	obligations := watchPollingObligations(
+		roots, results, unwatched, persistentDirAgents,
+	)
+	obligations = append(obligations, symlinkPollingObligations(symlinkGated)...)
+
+	local := make([]pollingObligation, 0, len(obligations))
+	for _, obligation := range obligations {
+		local = append(local, syncObligationToPoller(obligation))
+	}
+	scopes := availableUnwatchedPollScopes(local)
+	assert.Equal(t, []string{root}, scopes[parser.AgentOpenCode],
+		"degraded coverage on a SQLite-only root must still reach polling")
+}
+
+// TestOpenCodeAbsentRootPollsTheConfiguredDir covers the cold-start layout:
+// nothing is installed yet, so the plan must leave one satisfiable probe on
+// the configured dir rather than a deeper path that appears only afterwards.
+func TestOpenCodeAbsentRootPollsTheConfiguredDir(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "not-installed")
+	cfg := config.Config{AgentDirs: map[parser.AgentType][]string{
+		parser.AgentOpenCode: {root},
+	}}
+	roots, unwatched, symlinkGated, persistentDirAgents := collectWatchRoots(cfg)
+
+	obligations := watchPollingObligations(
+		roots, make([]agentsync.RecursiveWatchResult, len(roots)),
+		unwatched, persistentDirAgents,
+	)
+	obligations = append(obligations, symlinkPollingObligations(symlinkGated)...)
+	require.NotEmpty(t, obligations)
+	for _, obligation := range obligations {
+		assert.Equal(t, filepath.Clean(root), filepath.Clean(obligation.Probe),
+			"no obligation may be probed on a path deeper than the configured dir")
+	}
+
+	require.NoError(t, os.MkdirAll(root, 0o755))
+	local := make([]pollingObligation, 0, len(obligations))
+	for _, obligation := range obligations {
+		local = append(local, syncObligationToPoller(obligation))
+	}
+	scopes := availableUnwatchedPollScopes(local)
+	assert.Equal(t, []string{root}, scopes[parser.AgentOpenCode],
+		"the dir must become pollable as soon as it appears")
+}
+
+func TestCollectWatchRootsWatchesAliasHomeIndexes(t *testing.T) {
+	base := t.TempDir()
+	primary := filepath.Join(base, "codex")
+	alias := filepath.Join(base, "codex-alt")
+	sessionsDir := filepath.Join(primary, "sessions")
+	require.NoError(t, os.MkdirAll(sessionsDir, 0o755))
+	require.NoError(t, os.MkdirAll(alias, 0o755))
+	cfg := config.Config{
+		AgentDirs: map[parser.AgentType][]string{
+			parser.AgentCodex: {sessionsDir},
+		},
+		ProviderMetadata: map[parser.AgentType]map[string][]string{
+			parser.AgentCodex: {sessionsDir: {primary, alias}},
+		},
+	}
+
+	roots, _, _, _ := collectWatchRoots(cfg)
+
+	aliasRoot, ok := findCollectedWatchRoot(roots, alias)
+	require.True(t, ok, "the alias home must be watched for session_index.jsonl")
+	assert.False(t, aliasRoot.recursive)
 }

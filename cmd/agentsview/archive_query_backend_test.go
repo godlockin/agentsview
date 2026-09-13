@@ -3,6 +3,9 @@ package main
 import (
 	"context"
 	"net/http"
+	"net/http/httptest"
+	"net/url"
+	"os"
 	"path/filepath"
 	"testing"
 	"time"
@@ -12,7 +15,40 @@ import (
 	"go.kenn.io/agentsview/internal/config"
 	"go.kenn.io/agentsview/internal/db"
 	"go.kenn.io/agentsview/internal/dbtest"
+	"go.kenn.io/agentsview/internal/parser"
+	"go.kenn.io/agentsview/internal/testjsonl"
 )
+
+func TestDaemonArchiveQueryBackendDefaultsMappedLocalTimezone(t *testing.T) {
+	t.Setenv("TZ", "America/New_York")
+	oldLocal := time.Local
+	time.Local = time.FixedZone("Eastern Standard Time", -5*60*60)
+	t.Cleanup(func() { time.Local = oldLocal })
+
+	var queries []url.Values
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		queries = append(queries, r.URL.Query())
+		writeJSONResponse(w, `{"timezone":"America/New_York"}`)
+	}))
+	t.Cleanup(ts.Close)
+	backend := daemonArchiveQueryBackend{tr: transport{URL: ts.URL}}
+
+	_, err := backend.ActivityReport(context.Background(), ActivityReportConfig{
+		Preset: "day",
+	})
+	require.NoError(t, err)
+	require.Len(t, queries, 1)
+	assert.Equal(t, "America/New_York", queries[0].Get("timezone"))
+	assert.Equal(t, todayIn("America/New_York"), queries[0].Get("date"))
+
+	_, err = backend.ActivityReport(context.Background(), ActivityReportConfig{
+		Preset: "day", Date: "2026-03-09", Timezone: "Europe/Berlin",
+	})
+	require.NoError(t, err)
+	require.Len(t, queries, 2)
+	assert.Equal(t, "Europe/Berlin", queries[1].Get("timezone"))
+	assert.Equal(t, "2026-03-09", queries[1].Get("date"))
+}
 
 func TestResolveArchiveQueryBackendNoSyncStartsNoSyncDaemon(t *testing.T) {
 	testDataDir(t)
@@ -109,7 +145,8 @@ func TestLocalArchiveQuerySessionUsageNoSyncSkipsSingleSessionSync(
 	}
 	stderr := captureStderr(t, func() {
 		out, exitCode, err := backend.SessionUsage(
-			context.Background(), "codex:no-sync-usage",
+			context.Background(),
+			sessionUsageQuery{SessionID: "codex:no-sync-usage"},
 		)
 		require.NoError(t, err)
 		require.NotNil(t, out)
@@ -118,4 +155,84 @@ func TestLocalArchiveQuerySessionUsageNoSyncSkipsSingleSessionSync(
 	})
 	assert.NotContains(t, stderr, "warning: sync failed")
 	assert.NotContains(t, stderr, "warning: pricing seed failed")
+}
+
+// TestLocalSessionUsageRefreshesSubagentTranscripts covers the freshness
+// half of the subagent rollup: SyncSingleSession only knows about the named
+// session's file, so the backend must also ingest the agent-*.jsonl files
+// beside it. Without that, a session that just finished would report a
+// combined cost missing its most recent subagents.
+func TestLocalSessionUsageRefreshesSubagentTranscripts(t *testing.T) {
+	dataDir := testDataDir(t)
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	for _, def := range parser.Registry {
+		if def.EnvVar != "" {
+			t.Setenv(def.EnvVar,
+				filepath.Join(home, "agent-dirs", string(def.Type)))
+		}
+	}
+	claudeDir := t.TempDir()
+	t.Setenv("CLAUDE_PROJECTS_DIR", claudeDir)
+
+	projDir := filepath.Join(claudeDir, "-home-proj")
+	require.NoError(t, os.MkdirAll(
+		filepath.Join(projDir, "parent-uuid", "subagents"), 0o755))
+	parentPath := filepath.Join(projDir, "parent-uuid.jsonl")
+	require.NoError(t, os.WriteFile(parentPath, []byte(
+		testjsonl.NewSessionBuilder().
+			AddClaudeUser("2026-05-20T10:00:00Z", "delegate this").
+			AddClaudeAssistant("2026-05-20T10:00:05Z", "on it").
+			String(),
+	), 0o644))
+
+	dbPath := sessionsDBPath(dataDir)
+	database := dbtest.OpenTestDBAt(t, dbPath)
+	backend := localArchiveQueryBackend{
+		cfg: config.Config{
+			DBPath: dbPath,
+			AgentDirs: map[parser.AgentType][]string{
+				parser.AgentClaude: {claudeDir},
+			},
+		},
+		database: database,
+		offline:  true,
+	}
+	ctx := context.Background()
+
+	// Ingest the parent, then write a subagent transcript the way Claude
+	// Code does after the parent's own file was last synced.
+	_, _, err := backend.SessionUsage(
+		ctx, sessionUsageQuery{SessionID: "parent-uuid"})
+	require.NoError(t, err)
+
+	require.NoError(t, os.WriteFile(
+		filepath.Join(projDir, "parent-uuid", "subagents",
+			"agent-worker1.jsonl"),
+		[]byte(testjsonl.NewSessionBuilder().
+			AddClaudeUserWithSessionID(
+				"2026-05-20T10:01:00Z", "do the subtask", "parent-uuid").
+			AddClaudeAssistant("2026-05-20T10:01:30Z", "subtask done").
+			String()),
+		0o644))
+
+	out, _, err := backend.SessionUsage(
+		ctx, sessionUsageQuery{SessionID: "parent-uuid"})
+	require.NoError(t, err)
+	require.NotNil(t, out)
+	assert.Equal(t, 1, out.SubagentCount,
+		"the new subagent transcript must be ingested before the query")
+
+	child, err := database.GetSession(ctx, "agent-worker1")
+	require.NoError(t, err)
+	require.NotNil(t, child, "subagent session was not synced")
+	require.NotNil(t, child.ParentSessionID)
+	assert.Equal(t, "parent-uuid", *child.ParentSessionID)
+
+	// --own-only skips the subagent refresh and the combined view.
+	own, _, err := backend.SessionUsage(
+		ctx, sessionUsageQuery{SessionID: "parent-uuid", OwnOnly: true})
+	require.NoError(t, err)
+	require.NotNil(t, own)
+	assert.Zero(t, own.SubagentCount)
 }

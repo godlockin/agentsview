@@ -124,6 +124,7 @@ func TestParseCopilotSession_ToolCalls(t *testing.T) {
 		`{"type":"session.start","data":{"sessionId":"tool-test"},"timestamp":"2025-01-15T10:00:00Z"}`,
 		`{"type":"user.message","data":{"content":"Read the config file"},"timestamp":"2025-01-15T10:00:01Z"}`,
 		`{"type":"assistant.message","data":{"content":"","toolRequests":[{"toolCallId":"tc-1","name":"view","arguments":"{\"path\":\"config.json\"}"}]},"timestamp":"2025-01-15T10:00:02Z"}`,
+		`{"type":"tool.execution_start","data":{"toolCallId":"tc-1"},"timestamp":"2025-01-15T10:00:02.100Z"}`,
 		`{"type":"tool.execution_complete","data":{"toolCallId":"tc-1","success":true,"result":"{\"key\":\"value\"}"},"timestamp":"2025-01-15T10:00:03Z"}`,
 		`{"type":"assistant.message","data":{"content":"The config file contains a key-value pair."},"timestamp":"2025-01-15T10:00:04Z"}`,
 	)
@@ -139,6 +140,12 @@ func TestParseCopilotSession_ToolCalls(t *testing.T) {
 		ToolUseID: "tc-1",
 		InputJSON: `{"path":"config.json"}`,
 	}})
+	require.Len(t, tcMsg.ToolCalls[0].ResultEvents, 2)
+	assert.Equal(t, "started", tcMsg.ToolCalls[0].ResultEvents[0].Status)
+	assert.Equal(t, "completed", tcMsg.ToolCalls[0].ResultEvents[1].Status)
+	assert.Equal(t, "tool_execution", tcMsg.ToolCalls[0].ResultEvents[1].Source)
+	assert.Equal(t, parseTimestamp("2025-01-15T10:00:03Z"),
+		tcMsg.ToolCalls[0].ResultEvents[1].Timestamp)
 
 	// Check tool result message.
 	trMsg := msgs[2]
@@ -517,6 +524,18 @@ func TestParseCopilotSession_ModelChange(t *testing.T) {
 	assertEqual(t, "", msgs[0].Model, "msgs[0].Model")
 }
 
+func TestParseCopilotSession_AssistantModel(t *testing.T) {
+	path := writeCopilotJSONL(t,
+		`{"type":"session.start","data":{"sessionId":"assistant-model"},"timestamp":"2025-01-15T10:00:00Z"}`,
+		`{"type":"user.message","data":{"content":"Hello"},"timestamp":"2025-01-15T10:00:01Z"}`,
+		`{"type":"assistant.message","data":{"content":"Hi there","model":"claude-sonnet-4.6"},"timestamp":"2025-01-15T10:00:02Z"}`,
+	)
+
+	_, msgs := parseAndValidateHelper(t, path, "m", 2)
+
+	assert.Equal(t, "claude-sonnet-4-6", msgs[1].Model)
+}
+
 func TestParseCopilotSession_NoModel(t *testing.T) {
 	path := writeCopilotJSONL(t,
 		`{"type":"session.start","data":{"sessionId":"no-model"},"timestamp":"2025-01-15T10:00:00Z"}`,
@@ -887,9 +906,40 @@ func TestParseCopilotSession_NoShutdown_NoUsageEvents(t *testing.T) {
 	path := writeCopilotJSONL(t,
 		`{"type":"session.start","data":{"sessionId":"no-shut","context":{"cwd":"/proj","branch":"main"}},"timestamp":"2025-01-15T10:00:00Z"}`,
 		`{"type":"user.message","data":{"content":"Hello"},"timestamp":"2025-01-15T10:00:01Z"}`,
-		`{"type":"assistant.message","data":{"content":"Hi."},"timestamp":"2025-01-15T10:00:02Z"}`,
+		`{"type":"assistant.message","data":{"content":"Hi.","model":"gpt-5.6-terra","outputTokens":42},"timestamp":"2025-01-15T10:00:02Z"}`,
 	)
 
-	_, _, usage := parseCopilotFull(t, path, "m")
+	_, msgs, usage := parseCopilotFull(t, path, "m")
 	assert.Empty(t, usage, "no shutdown event should produce no usage events")
+	assert.Equal(t, "gpt-5.6-terra", msgs[1].Model)
+	assert.JSONEq(t, `{"output_tokens":42}`, string(msgs[1].TokenUsage))
+}
+
+func TestParseCopilotSession_ShutdownUsageSuppressesMessageFallback(t *testing.T) {
+	path := writeCopilotJSONL(t,
+		`{"type":"session.start","data":{"sessionId":"shutdown-wins"},"timestamp":"2026-06-15T10:00:00Z"}`,
+		`{"type":"user.message","data":{"content":"Hello"},"timestamp":"2026-06-15T10:00:01Z"}`,
+		`{"type":"assistant.message","data":{"content":"Hi.","model":"gpt-5.6-terra","outputTokens":42},"timestamp":"2026-06-15T10:00:02Z"}`,
+		`{"type":"session.shutdown","data":{"modelMetrics":{"gpt-5.6-terra":{"usage":{"inputTokens":100,"outputTokens":50}}}},"timestamp":"2026-06-15T10:01:00Z"}`,
+	)
+
+	_, msgs, usage := parseCopilotFull(t, path, "m")
+
+	require.Len(t, usage, 1)
+	assert.Equal(t, 50, usage[0].OutputTokens)
+	assert.Empty(t, msgs[1].TokenUsage)
+}
+
+func TestCopilotResumedOutputAfterShutdown(t *testing.T) {
+	path := writeCopilotJSONL(t,
+		`{"type":"session.start","timestamp":"2026-09-01T10:00:00Z","data":{"sessionId":"resumed"}}`,
+		`{"type":"assistant.message","timestamp":"2026-09-01T10:00:01Z","data":{"content":"First","model":"gpt-5.4","outputTokens":3}}`,
+		`{"type":"session.shutdown","timestamp":"2026-09-01T10:00:02Z","data":{"modelMetrics":{"gpt-5.4":{"usage":{"outputTokens":3}}}}}`,
+		`{"type":"assistant.message","timestamp":"2026-09-01T11:00:00Z","data":{"content":"Later","model":"gpt-5.4","outputTokens":7}}`,
+	)
+	_, msgs, usage := parseCopilotFull(t, path, "local")
+	require.Len(t, usage, 1)
+	assert.Equal(t, 3, usage[0].OutputTokens)
+	assert.Empty(t, msgs[0].TokenUsage)
+	assert.JSONEq(t, `{"output_tokens":7}`, string(msgs[1].TokenUsage))
 }

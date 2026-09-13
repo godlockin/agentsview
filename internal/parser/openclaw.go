@@ -3,7 +3,8 @@
 package parser
 
 import (
-	"encoding/json"
+	"context"
+	"encoding/json/v2"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -101,7 +102,7 @@ func (p *openClawProvider) parseSession(
 		case "user":
 			content := msg.Get("content")
 			text, thinkingText, hasThinking, hasToolUse, tcs, trs :=
-				ExtractTextContent(content)
+				ExtractTextContent(context.Background(), content)
 			text = strings.TrimSpace(text)
 			if text == "" && len(tcs) == 0 && len(trs) == 0 {
 				continue
@@ -134,7 +135,7 @@ func (p *openClawProvider) parseSession(
 		case "assistant":
 			content := msg.Get("content")
 			text, thinkingText, hasThinking, hasToolUse, tcs, trs :=
-				ExtractTextContent(content)
+				ExtractTextContent(context.Background(), content)
 			text = strings.TrimSpace(text)
 			if text == "" && len(tcs) == 0 && len(trs) == 0 {
 				continue
@@ -303,7 +304,7 @@ func applyOpenClawAssistantUsage(
 		"cache_read_input_tokens":     cacheRead,
 		"cache_creation_input_tokens": cacheWrite,
 	}
-	j, err := json.Marshal(normalized)
+	j, err := json.Marshal(normalized, json.Deterministic(true))
 	if err != nil {
 		return
 	}

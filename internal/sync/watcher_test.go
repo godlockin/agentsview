@@ -2,13 +2,14 @@ package sync
 
 import (
 	"context"
+	"encoding/json/v2"
 	"errors"
 	"fmt"
-	"io"
 	"log"
 	"os"
 	"path/filepath"
 	"slices"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -492,6 +493,107 @@ func TestPendingWatchBatchOverflowsByEntryCount(t *testing.T) {
 	assert.Empty(t, batch.Paths)
 }
 
+func TestWatchBatchAccumulatorMergesAndSortsPublicWork(t *testing.T) {
+	accumulator := NewWatchBatchAccumulator(nil)
+	rename := WatchRename{
+		Path: "/sessions/c.jsonl", Root: "/sessions", Agent: "codex", ItemType: ItemIsFile,
+	}
+	accumulator.Add(WatchBatch{
+		Paths:          []string{"/sessions/b.jsonl", "/sessions/a.jsonl"},
+		Renames:        []WatchRename{rename},
+		ReconcileRoots: []string{"/sessions", "/other"},
+		LostEvents:     true,
+	})
+	accumulator.Add(WatchBatch{
+		Paths:          []string{"/sessions/a.jsonl"},
+		Renames:        []WatchRename{rename},
+		ReconcileRoots: []string{"/other"},
+	})
+
+	batch, ok := accumulator.Take()
+	require.True(t, ok)
+	assert.Equal(t, WatchBatch{
+		Paths:           []string{"/sessions/a.jsonl", "/sessions/b.jsonl"},
+		Renames:         []WatchRename{rename},
+		ReconcileRoots:  []string{"/other", "/sessions"},
+		LostEvents:      true,
+		lifecycleTokens: nil,
+	}, batch)
+	assert.True(t, accumulator.Empty())
+}
+
+func TestWatchBatchAccumulatorReportsEntryAndBytePromotion(t *testing.T) {
+	tests := []struct {
+		name       string
+		add        func(*WatchBatchAccumulator)
+		wantReason WatchBatchPromotionReason
+	}{
+		{
+			name: "entry limit",
+			add: func(accumulator *WatchBatchAccumulator) {
+				paths := make([]string, defaultWatchBatchMaxEntries+1)
+				for i := range paths {
+					paths[i] = fmt.Sprintf("/sessions/%05d", i)
+				}
+				accumulator.Add(WatchBatch{Paths: paths})
+			},
+			wantReason: WatchBatchPromotionEntryLimit,
+		},
+		{
+			name: "byte limit",
+			add: func(accumulator *WatchBatchAccumulator) {
+				accumulator.Add(WatchBatch{Paths: []string{
+					"/sessions/" + strings.Repeat("a", defaultWatchBatchMaxPathBytes),
+				}})
+			},
+			wantReason: WatchBatchPromotionByteLimit,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var reasons []WatchBatchPromotionReason
+			accumulator := NewWatchBatchAccumulator(func(reason WatchBatchPromotionReason) {
+				reasons = append(reasons, reason)
+			})
+
+			tt.add(accumulator)
+			accumulator.Add(WatchBatch{
+				Paths:          []string{"/sessions/after-overflow"},
+				ReconcileRoots: []string{"/sessions"},
+			})
+
+			batch, ok := accumulator.Take()
+			require.True(t, ok)
+			assert.Equal(t, WatchBatch{FullSync: true, LostEvents: true}, batch)
+			assert.Equal(t, []WatchBatchPromotionReason{tt.wantReason}, reasons)
+			assert.True(t, accumulator.Empty(),
+				"full sync must supersede later fine-grained work in the same accumulation window")
+		})
+	}
+}
+
+func TestWatchBatchJSONExcludesLifecycleTokens(t *testing.T) {
+	gate := &recordingLifecycleGate{acknowledged: make(chan uint64, 1)}
+	want := WatchBatch{
+		Paths:          []string{"/sessions/a.jsonl"},
+		Renames:        []WatchRename{{Path: "/sessions/old", Root: "/sessions", ItemType: ItemIsDir}},
+		ReconcileRoots: []string{"/sessions"},
+		LostEvents:     true,
+	}
+	withLifecycle := want
+	withLifecycle.lifecycleTokens = []backendLifecycleToken{{gate: gate, generation: 4}}
+
+	data, err := json.Marshal(withLifecycle)
+	require.NoError(t, err)
+	assert.Contains(t, string(data), `"paths"`)
+	assert.NotContains(t, string(data), "lifecycle")
+	assert.NotContains(t, string(data), `"Paths"`)
+
+	var got WatchBatch
+	require.NoError(t, json.Unmarshal(data, &got))
+	assert.Equal(t, want, got)
+}
+
 func TestPendingWatchBatchOverflowsByPathBytes(t *testing.T) {
 	pending := newPendingWatchBatch(10, len("/sessions/a.jsonl"))
 
@@ -706,7 +808,10 @@ func TestWatcherBatchesPathsAndEnforcesDispatchFloor(t *testing.T) {
 	laterPath := filepath.Join(dir, "c.jsonl")
 	require.NoError(t, os.WriteFile(laterPath, []byte("c"), 0o644))
 	second := receiveWatcherCall(t, calls)
-	assert.GreaterOrEqual(t, second.at.Sub(first.at), minInterval,
+	// These timestamps are inside the callback, after the scheduler's clock
+	// read. Allow the same dispatch jitter as the sustained-write test below.
+	const dispatchJitter = 25 * time.Millisecond
+	assert.GreaterOrEqual(t, second.at.Sub(first.at), minInterval-dispatchJitter,
 		"callbacks started less than the configured minimum interval apart")
 	assert.Contains(t, second.paths, laterPath)
 }
@@ -780,8 +885,13 @@ func TestWatcherSustainedWritesProgress(t *testing.T) {
 
 	assert.Contains(t, first.paths, path)
 	assert.Contains(t, second.paths, path)
+	// The watcher spaces callbacks from its own clock reads taken before each
+	// dispatch, while these stamps are taken inside the callback. Dispatch
+	// jitter and coarse Windows timers can therefore shave a few
+	// milliseconds off the observed spacing without the watcher firing early.
+	const dispatchJitter = 25 * time.Millisecond
 	spacing := second.at.Sub(first.at)
-	assert.GreaterOrEqual(t, spacing, minInterval,
+	assert.GreaterOrEqual(t, spacing, minInterval-dispatchJitter,
 		"sustained-write callbacks started too close together")
 	assert.LessOrEqual(t, spacing, minInterval+dispatchTolerance,
 		"sustained writes did not make bounded progress")
@@ -834,6 +944,57 @@ func TestWatcherSchedulerContinuesIntakeWithOnePendingAccumulator(t *testing.T) 
 	assert.Equal(t, []string{"/sessions/during-callback.jsonl"}, secondBatch.Paths)
 	assert.Equal(t, int32(1), maxConcurrent.Load(),
 		"watcher callbacks must remain serialized")
+}
+
+func TestWatcherDeferredPathRetryPreservesCoalescedReconcileRoot(t *testing.T) {
+	started := make(chan struct{})
+	release := make(chan struct{})
+	calls := make(chan WatchBatch, 2)
+	var callbackCount atomic.Int32
+	backend := newFakeWatchBackend()
+	w, err := newWatcherWithBackend(
+		0, 0,
+		func(_ context.Context, batch WatchBatch) error {
+			calls <- batch
+			if callbackCount.Add(1) == 1 {
+				close(started)
+				<-release
+				return &watchBatchApplyError{
+					cause: errors.New("deferred path"),
+					retry: WatchBatch{Paths: []string{"/sessions/deferred.jsonl"}},
+				}
+			}
+			return nil
+		},
+		backend, defaultWatchBatchMaxEntries, defaultWatchBatchMaxPathBytes,
+	)
+	require.NoError(t, err)
+	w.Start()
+	t.Cleanup(func() {
+		select {
+		case <-release:
+		default:
+			close(release)
+		}
+		w.Stop()
+	})
+
+	backend.sendEvent(t, "/sessions/deferred.jsonl")
+	select {
+	case <-started:
+	case <-time.After(watcherTestTimeout):
+		t.Fatal("timed out waiting for deferred callback")
+	}
+	backend.sendBackendEvent(t, backendEvent{
+		Path: "/sessions", Root: "/sessions", Op: backendOpReconcileRootChange,
+	})
+	close(release)
+	first := receiveWatchBatch(t, calls)
+	second := receiveWatchBatch(t, calls)
+	assert.Contains(t, first.Paths, "/sessions/deferred.jsonl")
+	assert.Contains(t, second.Paths, "/sessions/deferred.jsonl")
+	assert.Contains(t, second.ReconcileRoots, "/sessions")
+	assert.False(t, second.FullSync)
 }
 
 func TestWatcherOverflowCollapsesPathAndByteLimitsToOneFullSync(t *testing.T) {
@@ -1646,7 +1807,7 @@ func TestWatcherStopWaitsForRunningCallbackAndDiscardsPending(t *testing.T) {
 
 func TestWatcherSchedulerBackendErrorsRemainDrainable(t *testing.T) {
 	previousLogOutput := log.Writer()
-	log.SetOutput(io.Discard)
+	log.SetOutput(t.Output())
 	t.Cleanup(func() { log.SetOutput(previousLogOutput) })
 
 	backend := newFakeWatchBackend()

@@ -144,6 +144,10 @@ func (b *directBackend) List(
 		return nil, fmt.Errorf("list: %w", err)
 	}
 	f.Timezone = timezone
+	f.Machine, err = db.ResolveMachineFilter(ctx, b.db, f.Machine)
+	if err != nil {
+		return nil, err
+	}
 	if _, err := db.ParseSortSpec(f.OrderBy); err != nil {
 		return nil, fmt.Errorf(
 			"list: invalid sort %q: %v (valid keys: %s)",
@@ -193,6 +197,7 @@ func listFilterToDB(f ListFilter) db.SessionFilter {
 		ExcludeOneShot:       !f.IncludeOneShot,
 		ExcludeAutomated:     !f.IncludeAutomated,
 		IncludeChildren:      f.IncludeChildren,
+		IncludeSource:        f.IncludeSource,
 		Cursor:               f.Cursor,
 		Limit:                f.Limit,
 		MinToolFailures:      f.MinToolFailures,
@@ -395,6 +400,17 @@ func (b *directBackend) Sync(
 	}
 	if in.Path != "" && in.ID != "" {
 		return nil, errors.New("sync: only one of path or id allowed")
+	}
+	if in.Subagents && in.ID == "" {
+		return nil, errors.New("sync: subagents requires id")
+	}
+	if in.Subagents {
+		if err := b.engine.SyncSessionWithSubagentsContext(
+			ctx, in.ID,
+		); err != nil {
+			return nil, err
+		}
+		return b.Get(ctx, in.ID)
 	}
 
 	path := in.Path
@@ -644,6 +660,14 @@ func (b *directBackend) Search(
 	if query == "" {
 		return nil, &db.SearchInputError{Msg: "search: query required"}
 	}
+	for _, d := range []string{req.DateFrom, req.DateTo} {
+		if d != "" && !timeutil.IsValidDate(d) {
+			return nil, &db.SearchInputError{Msg: "search: invalid date format: use YYYY-MM-DD"}
+		}
+	}
+	if req.DateFrom != "" && req.DateTo != "" && req.DateFrom > req.DateTo {
+		return nil, &db.SearchInputError{Msg: "search: date_from must not be after date_to"}
+	}
 	if !b.db.HasFTS() {
 		return nil, ErrSearchUnavailable
 	}
@@ -658,7 +682,12 @@ func (b *directBackend) Search(
 		limit = db.MaxSearchLimit
 	}
 	page, err := b.db.Search(ctx, db.SearchFilter{
-		Query:   db.PrepareFTSQuery(query),
+		DateFrom: req.DateFrom,
+		DateTo:   req.DateTo,
+		// Pass the query through untouched. db.Search prepares it itself,
+		// and pre-quoting here made every Chinese query look like an
+		// explicit FTS5 expression, which skipped word segmentation.
+		Query:   query,
 		Project: req.Project,
 		Sort:    req.Sort,
 		Cursor:  req.Cursor,
@@ -686,6 +715,10 @@ func (b *directBackend) UsageSummary(
 	ctx context.Context, req UsageRequest,
 ) (*UsageSummaryResult, error) {
 	var err error
+	req.Machine, err = db.ResolveMachineFilter(ctx, b.db, req.Machine)
+	if err != nil {
+		return nil, err
+	}
 	req, err = ResolveUsageProjectKeys(ctx, b.db, req)
 	if err != nil {
 		return nil, err
@@ -721,6 +754,10 @@ func (b *directBackend) UsagePairwiseComparison(
 	ctx context.Context, req UsagePairwiseComparisonRequest,
 ) (*UsagePairwiseComparisonResponse, error) {
 	var err error
+	req.Machine, err = db.ResolveMachineFilter(ctx, b.db, req.Machine)
+	if err != nil {
+		return nil, err
+	}
 	req, err = ResolveUsagePairwiseProjectKeys(ctx, b.db, req)
 	if err != nil {
 		return nil, err
@@ -793,25 +830,30 @@ func (b *directBackend) SearchContent(
 		return nil, &db.SearchInputError{Msg: "search: " + err.Error()}
 	}
 	req.Timezone = timezone
+	req.Machine, err = db.ResolveMachineFilter(ctx, b.db, req.Machine)
+	if err != nil {
+		return nil, err
+	}
 	page, err := b.db.SearchContent(ctx, db.ContentSearchFilter{
-		Pattern:          req.Pattern,
-		Mode:             req.Mode,
-		Sources:          req.Sources,
-		ExcludeSystem:    req.ExcludeSystem,
-		Project:          req.Project,
-		ExcludeProject:   req.ExcludeProject,
-		Machine:          req.Machine,
-		GitBranch:        req.GitBranch,
-		Agent:            req.Agent,
-		Date:             req.Date,
-		DateFrom:         req.DateFrom,
-		DateTo:           req.DateTo,
-		Timezone:         req.Timezone,
-		ActiveSince:      req.ActiveSince,
-		IncludeChildren:  req.IncludeChildren,
-		IncludeAutomated: req.IncludeAutomated,
-		IncludeOneShot:   req.IncludeOneShot,
-		Scope:            req.Scope,
+		Pattern:           req.Pattern,
+		Mode:              req.Mode,
+		Sources:           req.Sources,
+		ExcludeSystem:     req.ExcludeSystem,
+		Project:           req.Project,
+		ExcludeProject:    req.ExcludeProject,
+		Machine:           req.Machine,
+		GitBranch:         req.GitBranch,
+		Agent:             req.Agent,
+		Date:              req.Date,
+		DateFrom:          req.DateFrom,
+		DateTo:            req.DateTo,
+		Timezone:          req.Timezone,
+		ActiveSince:       req.ActiveSince,
+		IncludeChildren:   req.IncludeChildren,
+		IncludeAutomated:  req.IncludeAutomated,
+		IncludeOneShot:    req.IncludeOneShot,
+		ExcludeSessionIDs: req.ExcludeSessionIDs,
+		Scope:             req.Scope,
 		// The store builds snippets from the full source field and redacts
 		// secrets (including ones straddling the snippet window) unless reveal
 		// is set. Redacting the pre-truncated snippet here would miss those.

@@ -2,7 +2,8 @@ package server_test
 
 import (
 	"context"
-	"encoding/json"
+	"encoding/json/jsontext"
+	"encoding/json/v2"
 	"fmt"
 	"io"
 	"net/http"
@@ -506,7 +507,7 @@ func TestGenerateInsight_StaysBlockedForReadOnlyStoreWithoutInsightWrites(t *tes
 	w := te.post(t, "/api/v1/insights/generate",
 		`{"type":"daily_activity","date_from":"2025-01-15","date_to":"2025-01-15"}`)
 	assertStatus(t, w, http.StatusNotImplemented)
-	assertBodyContains(t, w, "read-only mode")
+	assertBodyContains(t, w, "insight generation is not available for this archive")
 	assert.False(t, called)
 }
 
@@ -520,6 +521,52 @@ func TestGenerateCannedInsight_RequiresExplicitOptIn(t *testing.T) {
 	assertBodyContains(t, w, "llm_opt_in")
 }
 
+func TestGenerateCannedInsight_AcceptsPartialSessionFilterPayload(t *testing.T) {
+	var calls atomic.Int32
+	var generatedPrompt string
+	stubGen := func(
+		_ context.Context, agent, prompt string, _ insight.LogFunc,
+	) (insight.Result, error) {
+		calls.Add(1)
+		require.Equal(t, "codex", agent)
+		generatedPrompt = prompt
+		return insight.Result{
+			Agent: "codex",
+			Model: "test-model",
+			Content: `{
+				"schema_version":"llm_insight.v1",
+				"kind":"model_cost_review",
+				"summary":"The filtered model cost aggregate is ready for review.",
+				"confidence":"medium",
+				"recommendations":[{
+					"title":"Review the selected agent's model costs",
+					"rationale":"The aggregate contains the requested session agent and normalized filter values.",
+					"actions":["Compare the selected agent's model usage"],
+					"evidence_refs":["aggregate:empty"],
+					"impact":"medium",
+					"effort":"low"
+				}],
+				"risks":[],
+				"evidence_refs":["aggregate:empty"]
+			}`,
+		}, nil
+	}
+	te := setupWithServerOpts(t, []server.Option{
+		server.WithGenerateStreamFunc(stubGen),
+	})
+
+	w := te.post(t, "/api/v1/insights/generate",
+		`{"type":"llm_canned","kind":"model_cost_review","date_from":"2025-01-15","date_to":"2025-01-15","agent":"codex","llm_opt_in":true,"timezone":"America/New_York","automated_scope":"human","filters":{"agent":"claude"}}`)
+
+	assertStatus(t, w, http.StatusOK)
+	assertBodyContains(t, w, "event: done")
+	assert.Equal(t, int32(1), calls.Load())
+	assert.Contains(t, generatedPrompt, `"agent":"claude"`)
+	assert.Contains(t, generatedPrompt, `"timezone":"America/New_York"`)
+	assert.Contains(t, generatedPrompt, `"automated_scope":"human"`)
+	assert.Contains(t, generatedPrompt, `"include_one_shot":false`)
+}
+
 func TestGenerateCannedInsight_RejectsInvalidFilterTimezone(t *testing.T) {
 	te := setup(t)
 
@@ -528,6 +575,41 @@ func TestGenerateCannedInsight_RejectsInvalidFilterTimezone(t *testing.T) {
 
 	assertStatus(t, w, http.StatusBadRequest)
 	assertBodyContains(t, w, "invalid timezone: Fake/Zone")
+}
+
+func TestGenerateCannedInsight_RejectsInvalidPartialSessionFilterValues(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		body string
+		want string
+	}{
+		{
+			name: "automated scope",
+			body: `{"automated_scope":"bogus"}`,
+			want: "automated_scope must be human, all, or automated",
+		},
+		{
+			name: "minimum user messages",
+			body: `{"min_user_messages":-1}`,
+			want: "min_user_messages must be >= 0",
+		},
+		{
+			name: "active since",
+			body: `{"active_since":"not-a-timestamp"}`,
+			want: "active_since must be RFC3339 timestamp",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			te := setup(t)
+			w := te.post(t, "/api/v1/insights/generate", fmt.Sprintf(
+				`{"type":"llm_canned","kind":"prompt_maturity_review","date_from":"2025-01-15","date_to":"2025-01-15","agent":"claude","llm_opt_in":true,"filters":%s}`,
+				tc.body,
+			))
+
+			assertStatus(t, w, http.StatusBadRequest)
+			assertBodyContains(t, w, tc.want)
+		})
+	}
 }
 
 func TestGenerateCannedInsight_ReturnsValidationDetail(t *testing.T) {
@@ -757,11 +839,11 @@ func TestGenerateCannedInsight_ModelCostPromptIncludesModelBreakdown(t *testing.
 		switch i {
 		case 1:
 			m.Model = "claude-opus-4-7"
-			m.TokenUsage = json.RawMessage(
+			m.TokenUsage = jsontext.Value(
 				`{"input_tokens":1000,"output_tokens":200,"cache_creation_input_tokens":100,"cache_read_input_tokens":50}`)
 		case 3:
 			m.Model = "claude-sonnet-4-6"
-			m.TokenUsage = json.RawMessage(
+			m.TokenUsage = jsontext.Value(
 				`{"input_tokens":2000,"output_tokens":300,"cache_creation_input_tokens":0,"cache_read_input_tokens":400}`)
 		}
 	})
@@ -961,6 +1043,8 @@ func TestGenerateCannedInsight_UsesSessionFilterPayload(t *testing.T) {
 		s.HasToolCalls = true
 		s.TerminationStatus = &clean
 	})
+	const installationID = "0123456789abcdef0123456789abcdef"
+	require.NoError(t, te.db.AdoptMachineIdentity(t.Context(), installationID, []string{"workstation"}))
 
 	firstPayload := `{"type":"llm_canned","kind":"prompt_maturity_review","date_from":"2025-01-15","date_to":"2025-01-15","project":"my-app","agent":"claude","llm_opt_in":true,"filters":{"timezone":"America/New_York","agent":"codex","machine":"workstation","termination":"clean","min_user_messages":2,"include_one_shot":false,"automated_scope":"human"}}`
 	w := te.post(t, "/api/v1/insights/generate", firstPayload)
@@ -974,6 +1058,25 @@ func TestGenerateCannedInsight_UsesSessionFilterPayload(t *testing.T) {
 	assert.NotContains(t, generatedPrompts[0], claudePrompt)
 	assert.NotContains(t, generatedPrompts[0], wrongMachinePrompt)
 	assert.NotContains(t, generatedPrompts[0], oneShotPrompt)
+	assert.Contains(t, generatedPrompts[0], `"machine":"`+installationID+`"`)
+	events := parseSSE(w.Body.String())
+	require.NotEmpty(t, events)
+	require.Equal(t, "done", events[len(events)-1].Event, w.Body.String())
+	var saved db.Insight
+	require.NoError(t, json.Unmarshal([]byte(events[len(events)-1].Data), &saved))
+	assert.Contains(t, saved.ProvenanceJSON, `"machine":"`+installationID+`"`)
+
+	canonicalPayload := strings.Replace(firstPayload, `"machine":"workstation"`, `"machine":"`+installationID+`"`, 1)
+	w = te.post(t, "/api/v1/insights/generate", canonicalPayload)
+	assertStatus(t, w, http.StatusOK)
+	require.Equal(t, int32(1), calls.Load(), "alias and installation ID must share the cached insight")
+	events = parseSSE(w.Body.String())
+	require.NotEmpty(t, events)
+	require.Equal(t, "done", events[len(events)-1].Event, w.Body.String())
+	var cached db.Insight
+	require.NoError(t, json.Unmarshal([]byte(events[len(events)-1].Data), &cached))
+	assert.Equal(t, saved.ID, cached.ID)
+	assert.Equal(t, "hit", cached.CacheStatus)
 
 	secondPayload := `{"type":"llm_canned","kind":"prompt_maturity_review","date_from":"2025-01-15","date_to":"2025-01-15","project":"my-app","agent":"claude","llm_opt_in":true,"filters":{"timezone":"America/New_York","agent":"claude","machine":"workstation","termination":"clean","min_user_messages":2,"include_one_shot":false,"automated_scope":"human"}}`
 	w = te.post(t, "/api/v1/insights/generate", secondPayload)
@@ -1899,4 +2002,32 @@ func (te *testEnv) seedInsight(
 	id, err := te.db.InsertInsight(insight)
 	require.NoError(t, err)
 	return id
+}
+
+func TestGenerateInsight_ArchiveContentCapability(t *testing.T) {
+	for _, policy := range []config.ArchiveContent{config.ArchiveContentFull, config.ArchiveContentTranscripts, config.ArchiveContentUsage} {
+		t.Run(string(policy), func(t *testing.T) {
+			called := false
+			te := setupWithServerOpts(t, []server.Option{
+				server.WithGenerateFunc(func(context.Context, string, string) (insight.Result, error) {
+					called = true
+					return insight.Result{Agent: "claude", Content: "report"}, nil
+				}),
+			})
+			// Tightening after server construction must update both the
+			// advertised capability and the request guard.
+			te.db.SetArchiveContent(policy)
+			available := !policy.UsageOnly()
+			version := decode[map[string]any](t, te.get(t, "/api/v1/version"))
+			assert.Equal(t, available, version["insight_generation_available"], "capability must be explicit")
+			w := te.post(t, "/api/v1/insights/generate",
+				`{"type":"daily_activity","date_from":"2025-01-15","date_to":"2025-01-15"}`)
+			if available {
+				assertStatus(t, w, http.StatusOK)
+			} else {
+				assertStatus(t, w, http.StatusNotImplemented)
+			}
+			assert.Equal(t, available, called, "unavailable generation must not invoke the agent")
+		})
+	}
 }

@@ -5,7 +5,8 @@ import (
 	"bytes"
 	"context"
 	"database/sql"
-	"encoding/json"
+	"encoding/json/jsontext"
+	"encoding/json/v2"
 	"errors"
 	"fmt"
 	"mime/multipart"
@@ -605,6 +606,36 @@ func TestOpenAPIEndpointDocumentsExistingAPIRoutes(t *testing.T) {
 	assert.Contains(t, spec.Paths["/api/v1/session-stats"], "get")
 }
 
+func TestTypedRoutesRejectDuplicateJSONMembers(t *testing.T) {
+	te := setup(t)
+
+	w := te.post(t, "/api/v1/config/terminal", `{"mode":"auto","mode":"clipboard"}`)
+
+	assertStatus(t, w, http.StatusBadRequest)
+}
+
+func TestOpenAPIEndpointDocumentsTokenUsageAsArbitraryJSON(t *testing.T) {
+	te := setup(t)
+
+	w := te.get(t, "/api/openapi.json")
+	require.Equal(t, http.StatusOK, w.Code, "body: %s", w.Body.String())
+
+	var spec struct {
+		Components struct {
+			Schemas map[string]struct {
+				Properties map[string]jsontext.Value `json:"properties"`
+			} `json:"schemas"`
+		} `json:"components"`
+	}
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &spec))
+
+	messageSchema, ok := spec.Components.Schemas["DbMessage"]
+	require.True(t, ok, "spec missing DbMessage schema")
+	tokenUsage, ok := messageSchema.Properties["token_usage"]
+	require.True(t, ok, "DbMessage schema missing token_usage")
+	assert.JSONEq(t, `{}`, string(tokenUsage))
+}
+
 func TestOpenAPIEndpointKeepsUsageSummaryContract(t *testing.T) {
 	te := setup(t)
 
@@ -672,7 +703,7 @@ func TestOpenAPIEndpointDocumentsEnumsAndRequestBodies(t *testing.T) {
 	require.Equal(t, http.StatusOK, w.Code, "body: %s", w.Body.String())
 	type openAPISchema struct {
 		Ref        string                   `json:"$ref"`
-		Enum       []string                 `json:"enum"`
+		Enum       []any                    `json:"enum"`
 		Properties map[string]openAPISchema `json:"properties"`
 	}
 	type openAPIParameter struct {
@@ -714,49 +745,49 @@ func TestOpenAPIEndpointDocumentsEnumsAndRequestBodies(t *testing.T) {
 		path   string
 		method string
 		name   string
-		want   []string
+		want   []any
 	}{
 		{
 			path:   "/api/v1/sessions/{id}/messages",
 			method: "get",
 			name:   "direction",
-			want:   []string{"asc", "desc"},
+			want:   []any{"asc", "desc"},
 		},
 		{
 			path:   "/api/v1/search",
 			method: "get",
 			name:   "sort",
-			want:   []string{"relevance", "recency"},
+			want:   []any{"relevance", "recency"},
 		},
 		{
 			path:   "/api/v1/search/content",
 			method: "get",
 			name:   "mode",
-			want:   []string{"substring", "regex", "fts", "semantic", "hybrid"},
+			want:   []any{"substring", "regex", "fts", "semantic", "hybrid"},
 		},
 		{
 			path:   "/api/v1/search/content",
 			method: "get",
 			name:   "scope",
-			want:   []string{"top", "all", "subordinate"},
+			want:   []any{"top", "all", "subordinate"},
 		},
 		{
 			path:   "/api/v1/sessions/{id}/md",
 			method: "get",
 			name:   "depth",
-			want:   []string{"1", "all"},
+			want:   []any{"1", "all"},
 		},
 		{
 			path:   "/api/v1/analytics/activity",
 			method: "get",
 			name:   "granularity",
-			want:   []string{"day", "week", "month"},
+			want:   []any{"day", "week", "month"},
 		},
 		{
 			path:   "/api/v1/analytics/heatmap",
 			method: "get",
 			name:   "metric",
-			want:   []string{"messages", "sessions", "output_tokens"},
+			want:   []any{"messages", "sessions", "output_tokens"},
 		},
 	} {
 		pathItem, ok := spec.Paths[tt.path]
@@ -764,7 +795,7 @@ func TestOpenAPIEndpointDocumentsEnumsAndRequestBodies(t *testing.T) {
 		op, ok := pathItem[tt.method]
 		require.True(t, ok, "spec missing operation %s %s", tt.method, tt.path)
 
-		var got []string
+		var got []any
 		for _, param := range op.Parameters {
 			if param.Name == tt.name && param.In == "query" {
 				got = param.Schema.Enum
@@ -823,7 +854,7 @@ func TestOpenAPIEndpointDocumentsEnumsAndRequestBodies(t *testing.T) {
 	mode, ok := schema.Properties["mode"]
 	require.True(t, ok, "post /api/v1/config/terminal missing mode property")
 	mode = resolveSchema(mode)
-	assert.Equal(t, []string{"auto", "custom", "clipboard"}, mode.Enum)
+	assert.Equal(t, []any{"auto", "custom", "clipboard"}, mode.Enum)
 }
 
 func TestSearchContentSemanticGETRequiresIntentHeader(t *testing.T) {
@@ -912,7 +943,7 @@ func TestOpenAPIEndpointDocumentsBatchDeleteSessionIDsAsNonNullableArray(t *test
 			Schemas map[string]struct {
 				Required   []string `json:"required"`
 				Properties map[string]struct {
-					Type json.RawMessage `json:"type"`
+					Type jsontext.Value `json:"type"`
 				} `json:"properties"`
 			} `json:"schemas"`
 		} `json:"components"`
@@ -1170,6 +1201,20 @@ func (te *testEnv) upload(
 	w := httptest.NewRecorder()
 	te.handler.ServeHTTP(w, req)
 	return w
+}
+
+func claudeTranscriptWithMessageCount(count int) string {
+	b := testjsonl.NewSessionBuilder()
+	base := time.Date(2024, 1, 1, 10, 0, 0, 0, time.UTC)
+	for i := range count {
+		timestamp := base.Add(time.Duration(i) * time.Second).Format(time.RFC3339)
+		if i%2 == 0 {
+			b.AddClaudeUser(timestamp, fmt.Sprintf("question %d", i/2))
+		} else {
+			b.AddClaudeAssistant(timestamp, fmt.Sprintf("answer %d", i/2))
+		}
+	}
+	return b.String()
 }
 
 // decode unmarshals the response body into a typed struct.
@@ -1451,7 +1496,7 @@ func TestListSessions_Empty(t *testing.T) {
 
 	// Verify raw JSON has "sessions":[] not "sessions":null.
 	var raw struct {
-		Sessions json.RawMessage `json:"sessions"`
+		Sessions jsontext.Value `json:"sessions"`
 	}
 	if err := json.Unmarshal(
 		w.Body.Bytes(), &raw,
@@ -1485,6 +1530,35 @@ func TestListSessions_WithData(t *testing.T) {
 		t.Fatalf("expected 3 sessions, got %d",
 			len(resp.Sessions))
 	}
+}
+
+func TestListSessions_IncludesSourcePathOnlyWhenRequested(t *testing.T) {
+	te := setup(t)
+	sourcePath := filepath.Join(t.TempDir(), "session.jsonl")
+	te.seedSession(t, "s1", "my-app", 5, func(s *db.Session) {
+		s.FilePath = &sourcePath
+	})
+
+	decodeSession := func(t *testing.T, path string) map[string]jsontext.Value {
+		t.Helper()
+		w := te.get(t, path)
+		assertStatus(t, w, http.StatusOK)
+		var raw struct {
+			Sessions []map[string]jsontext.Value `json:"sessions"`
+		}
+		require.NoError(t, json.Unmarshal(w.Body.Bytes(), &raw))
+		require.Len(t, raw.Sessions, 1)
+		return raw.Sessions[0]
+	}
+
+	withoutSource := decodeSession(t, "/api/v1/sessions")
+	assert.NotContains(t, withoutSource, "file_path")
+
+	withSource := decodeSession(t, "/api/v1/sessions?include_source=true")
+	require.Contains(t, withSource, "file_path")
+	var gotPath string
+	require.NoError(t, json.Unmarshal(withSource["file_path"], &gotPath))
+	assert.Equal(t, sourcePath, gotPath)
 }
 
 func TestListSessions_ProjectFilter(t *testing.T) {
@@ -1832,6 +1906,19 @@ func TestGetSession_Found(t *testing.T) {
 	if resp.ID != "s1" {
 		t.Fatalf("expected id=s1, got %v", resp.ID)
 	}
+}
+
+func TestGetSession_RoundTripsReservedIDCharacters(t *testing.T) {
+	te := setup(t)
+	const sessionID = "deepseek-harness:child%7E/%25?#"
+	te.seedSession(t, sessionID, "my-app", 2)
+
+	w := te.get(t, "/api/v1/sessions/"+
+		"deepseek-harness%3Achild%257E%2F%2525%3F%23")
+	assertStatus(t, w, http.StatusOK)
+
+	resp := decode[db.Session](t, w)
+	assert.Equal(t, sessionID, resp.ID)
 }
 
 func TestGetSession_NotFound(t *testing.T) {
@@ -3209,6 +3296,83 @@ func TestAuthRequiredProtectsPing(t *testing.T) {
 	assertStatus(t, w, http.StatusOK)
 }
 
+func TestPingReportsStalledSyncWithoutLosingDaemonIdentity(t *testing.T) {
+	dir := tempDirWithRetryCleanup(t)
+	cfg := config.Config{
+		Host: "127.0.0.1", Port: 0, DataDir: dir,
+		DBPath: filepath.Join(dir, "test.db"), WriteTimeout: 30 * time.Second,
+	}
+	database := dbtest.OpenTestDBAt(t, cfg.DBPath)
+	engine := sync.NewEngine(database, sync.EngineConfig{
+		Machine: "test", ProgressStallAfter: time.Nanosecond,
+	})
+	t.Cleanup(engine.Close)
+	te := &testEnv{
+		srv: server.New(cfg, database, engine), db: database, engine: engine,
+		dataDir: dir,
+	}
+	te.handler = wrapTestHandler(cfg, te.srv.Handler())
+	type pingResponse struct {
+		OK      bool `json:"ok"`
+		Healthy bool `json:"healthy"`
+		Sync    *struct {
+			Phase     sync.Phase `json:"phase"`
+			Stalled   bool       `json:"stalled"`
+			StartedAt string     `json:"started_at"`
+			UpdatedAt string     `json:"updated_at"`
+		} `json:"sync,omitempty"`
+	}
+
+	healthy := decode[pingResponse](t, te.get(t, "/api/ping"))
+	assert.True(t, healthy.OK)
+	assert.True(t, healthy.Healthy)
+	assert.Nil(t, healthy.Sync)
+
+	progressSeen := make(chan struct{})
+	release := make(chan struct{})
+	var releaseOnce stdlibsync.Once
+	defer releaseOnce.Do(func() { close(release) })
+	done := make(chan struct{})
+	var once stdlibsync.Once
+	go func() {
+		engine.SyncAll(t.Context(), func(sync.Progress) {
+			once.Do(func() { close(progressSeen) })
+			<-release
+		})
+		close(done)
+	}()
+	select {
+	case <-progressSeen:
+	case <-time.After(time.Second):
+		require.FailNow(t, "sync did not publish progress")
+	}
+	require.Eventually(t, func() bool {
+		progress, active := engine.CurrentProgress()
+		return active && progress.Stalled
+	}, time.Second, time.Millisecond,
+		"sync progress did not age into the stalled state")
+
+	stalled := decode[pingResponse](t, te.get(t, "/api/ping"))
+	assert.True(t, stalled.OK,
+		"ping must keep proving the running daemon's identity")
+	assert.False(t, stalled.Healthy)
+	require.NotNil(t, stalled.Sync)
+	assert.Equal(t, sync.PhaseDiscovering, stalled.Sync.Phase)
+	assert.True(t, stalled.Sync.Stalled)
+	assert.NotEmpty(t, stalled.Sync.StartedAt)
+	assert.NotEmpty(t, stalled.Sync.UpdatedAt)
+
+	releaseOnce.Do(func() { close(release) })
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		require.FailNow(t, "sync did not finish after progress callback returned")
+	}
+	finished := decode[pingResponse](t, te.get(t, "/api/ping"))
+	assert.True(t, finished.Healthy)
+	assert.Nil(t, finished.Sync)
+}
+
 func TestGetGithubConfig(t *testing.T) {
 	t.Setenv("AGENTSVIEW_GITHUB_TOKEN", "")
 	t.Setenv("PATH", t.TempDir())
@@ -3471,6 +3635,79 @@ func TestSettingsChartPaletteRoundTrip(t *testing.T) {
 	assert.Equal(t, config.ChartPaletteMatplotlib, persisted.ChartPalette)
 }
 
+func TestOpenAPISettingsZoomLevels(t *testing.T) {
+	te := setup(t)
+	w := te.get(t, "/api/openapi.json")
+	require.Equal(t, http.StatusOK, w.Code)
+
+	var spec struct {
+		Components struct {
+			Schemas map[string]struct {
+				Properties map[string]jsontext.Value `json:"properties"`
+			} `json:"schemas"`
+		} `json:"components"`
+	}
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &spec))
+	for _, name := range []string{"SettingsResponse", "SettingsUpdateRequest"} {
+		var zoom struct {
+			Type string `json:"type"`
+			Enum []int  `json:"enum"`
+		}
+		require.NoError(t, json.Unmarshal(spec.Components.Schemas[name].Properties["zoom_level"], &zoom), name)
+		assert.Equal(t, "integer", zoom.Type, name)
+		assert.Equal(t, []int{67, 75, 80, 90, 100, 110, 120, 125, 130, 150, 175, 200}, zoom.Enum, name)
+	}
+}
+
+func TestSettingsZoomLevelRoundTrip(t *testing.T) {
+	configured := config.ZoomLevel120
+	te := setup(t, func(cfg *config.Config) { cfg.ZoomLevel = &configured })
+	require.NoError(t, os.WriteFile(filepath.Join(te.dataDir, "config.toml"), []byte(
+		"github_token = \"keep\"\n[proxy]\nmode = \"caddy\"\n"), 0o600))
+	putSettings := func(body string) *httptest.ResponseRecorder {
+		req := httptest.NewRequest(http.MethodPut, "/api/v1/settings", strings.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Origin", "http://127.0.0.1:0")
+		w := httptest.NewRecorder()
+		te.handler.ServeHTTP(w, req)
+		return w
+	}
+
+	w := te.get(t, "/api/v1/settings")
+	assertStatus(t, w, http.StatusOK)
+	assert.Contains(t, w.Body.String(), `"zoom_level":120`)
+
+	w = putSettings(`{"zoom_level":120}`)
+	assertStatus(t, w, http.StatusOK)
+	var updated struct {
+		ZoomLevel *config.ZoomLevel `json:"zoom_level"`
+	}
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &updated))
+	require.NotNil(t, updated.ZoomLevel)
+	assert.Equal(t, config.ZoomLevel120, *updated.ZoomLevel)
+
+	var persisted struct {
+		ZoomLevel   *config.ZoomLevel  `toml:"zoom_level"`
+		GithubToken string             `toml:"github_token"`
+		Proxy       config.ProxyConfig `toml:"proxy"`
+	}
+	_, err := toml.DecodeFile(filepath.Join(te.dataDir, "config.toml"), &persisted)
+	require.NoError(t, err)
+	require.NotNil(t, persisted.ZoomLevel)
+	assert.Equal(t, config.ZoomLevel120, *persisted.ZoomLevel)
+	assert.Equal(t, "keep", persisted.GithubToken)
+	assert.Equal(t, "caddy", persisted.Proxy.Mode)
+
+	before, err := os.ReadFile(filepath.Join(te.dataDir, "config.toml"))
+	require.NoError(t, err)
+	w = putSettings(`{"zoom_level":101}`)
+	assertStatus(t, w, http.StatusBadRequest)
+	assertBodyContains(t, w, "zoom_level")
+	after, err := os.ReadFile(filepath.Join(te.dataDir, "config.toml"))
+	require.NoError(t, err)
+	assert.Equal(t, before, after)
+}
+
 func TestSettingsRejectInvalidChartPaletteWithoutChangingSelection(t *testing.T) {
 	te := setup(t)
 	putSettings := func(body string) *httptest.ResponseRecorder {
@@ -3500,6 +3737,269 @@ func TestSettingsRejectInvalidChartPaletteWithoutChangingSelection(t *testing.T)
 	}
 	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &got))
 	assert.Equal(t, config.ChartPaletteMatplotlib, got.ChartPalette)
+}
+
+func TestSettingsToolResultImagesRoundTrip(t *testing.T) {
+	te := setup(t)
+	// Point the loader at the same data dir the handler writes, so the
+	// assertions below exercise config.LoadMinimal rather than re-parsing the
+	// stored string themselves.
+	t.Setenv("AGENTSVIEW_DATA_DIR", te.dataDir)
+	loadedPolicy := func(t *testing.T) config.ToolResultImages {
+		t.Helper()
+		cfg, err := config.LoadMinimal()
+		require.NoError(t, err)
+		return cfg.ToolResultImages
+	}
+	putSettings := func(body string) *httptest.ResponseRecorder {
+		req := httptest.NewRequest(http.MethodPut, "/api/v1/settings",
+			strings.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Origin", "http://127.0.0.1:0")
+		w := httptest.NewRecorder()
+		te.handler.ServeHTTP(w, req)
+		return w
+	}
+
+	w := te.get(t, "/api/v1/settings")
+	assertStatus(t, w, http.StatusOK)
+	var initial struct {
+		ToolResultImages string `json:"tool_result_images"`
+	}
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &initial))
+	assert.Equal(t, "keep", initial.ToolResultImages)
+
+	w = putSettings(`{"tool_result_images":"drop"}`)
+	assertStatus(t, w, http.StatusOK)
+	var updated struct {
+		ToolResultImages string `json:"tool_result_images"`
+	}
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &updated))
+	assert.Equal(t, "drop", updated.ToolResultImages)
+
+	var persisted struct {
+		ToolResultImages string `toml:"tool_result_images"`
+	}
+	_, err := toml.DecodeFile(filepath.Join(te.dataDir, "config.toml"), &persisted)
+	require.NoError(t, err)
+	assert.Equal(t, "drop", persisted.ToolResultImages)
+	assert.Equal(t, config.ToolResultImagesDrop, loadedPolicy(t))
+
+	w = putSettings(`{"tool_result_images":"keep"}`)
+	assertStatus(t, w, http.StatusOK)
+	var restored struct {
+		ToolResultImages string `json:"tool_result_images"`
+	}
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &restored))
+	assert.Equal(t, "keep", restored.ToolResultImages)
+
+	_, err = toml.DecodeFile(filepath.Join(te.dataDir, "config.toml"), &persisted)
+	require.NoError(t, err)
+	assert.Equal(t, "keep", persisted.ToolResultImages)
+	assert.Equal(t, config.ToolResultImagesKeep, loadedPolicy(t))
+}
+
+func TestSettingsRejectsOutOfEnumToolResultImages(t *testing.T) {
+	te := setup(t)
+	putSettings := func(body string) *httptest.ResponseRecorder {
+		req := httptest.NewRequest(http.MethodPut, "/api/v1/settings",
+			strings.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Origin", "http://127.0.0.1:0")
+		w := httptest.NewRecorder()
+		te.handler.ServeHTTP(w, req)
+		return w
+	}
+
+	// Establish a known prior state.
+	w := putSettings(`{"tool_result_images":"drop"}`)
+	assertStatus(t, w, http.StatusOK)
+
+	w = putSettings(`{"tool_result_images":"strip"}`)
+	assertStatus(t, w, http.StatusBadRequest)
+
+	w = putSettings(`{"tool_result_images":""}`)
+	assertStatus(t, w, http.StatusBadRequest)
+
+	// Stored selection must be unchanged.
+	var persisted struct {
+		ToolResultImages string `toml:"tool_result_images"`
+	}
+	_, err := toml.DecodeFile(filepath.Join(te.dataDir, "config.toml"), &persisted)
+	require.NoError(t, err)
+	assert.Equal(t, "drop", persisted.ToolResultImages)
+}
+
+func TestSettingsToolResultImagesRejectionPreservesSiblingKeys(t *testing.T) {
+	te := setup(t)
+	putSettings := func(body string) *httptest.ResponseRecorder {
+		req := httptest.NewRequest(http.MethodPut, "/api/v1/settings",
+			strings.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Origin", "http://127.0.0.1:0")
+		w := httptest.NewRecorder()
+		te.handler.ServeHTTP(w, req)
+		return w
+	}
+
+	// Establish initial state.
+	w := putSettings(`{"chart_palette":"matplotlib"}`)
+	assertStatus(t, w, http.StatusOK)
+
+	// A body with a valid palette change and an invalid policy:
+	// Huma rejects the whole request before the handler runs.
+	w = putSettings(`{"chart_palette":"agentsview","tool_result_images":"strip"}`)
+	assertStatus(t, w, http.StatusBadRequest)
+
+	// Neither key must have changed.
+	w = te.get(t, "/api/v1/settings")
+	assertStatus(t, w, http.StatusOK)
+	var got struct {
+		ChartPalette     string `json:"chart_palette"`
+		ToolResultImages string `json:"tool_result_images"`
+	}
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &got))
+	assert.Equal(t, "matplotlib", got.ChartPalette)
+	assert.Equal(t, "keep", got.ToolResultImages)
+}
+
+func TestSettingsToolResultImagesReadOnlyBackend(t *testing.T) {
+	te := setupPGMode(t)
+	req := httptest.NewRequest(http.MethodPut, "/api/v1/settings",
+		strings.NewReader(`{"tool_result_images":"drop"}`))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Origin", "http://127.0.0.1:0")
+	w := httptest.NewRecorder()
+	te.handler.ServeHTTP(w, req)
+	assertStatus(t, w, http.StatusNotImplemented)
+
+	_, err := os.Stat(filepath.Join(te.dataDir, "config.toml"))
+	assert.True(t, os.IsNotExist(err), "config.toml must not be written by a read-only backend")
+}
+
+func TestSettingsZoomLevelReadOnlyBackend(t *testing.T) {
+	te := setupPGMode(t)
+	req := httptest.NewRequest(http.MethodPut, "/api/v1/settings",
+		strings.NewReader(`{"zoom_level":120}`))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Origin", "http://127.0.0.1:0")
+	w := httptest.NewRecorder()
+	te.handler.ServeHTTP(w, req)
+	assertStatus(t, w, http.StatusNotImplemented)
+
+	_, err := os.Stat(filepath.Join(te.dataDir, "config.toml"))
+	assert.True(t, os.IsNotExist(err), "config.toml must not be written by a read-only backend")
+}
+
+func TestSettingsDisabledProvidersRoundTrip(t *testing.T) {
+	geminiDir := filepath.Join(t.TempDir(), "gemini")
+	te := setup(t, func(cfg *config.Config) {
+		cfg.AgentDirs = map[parser.AgentType][]string{
+			parser.AgentClaude: {"/sessions/claude"},
+			parser.AgentGemini: {geminiDir},
+		}
+	})
+	put := func(body string) *httptest.ResponseRecorder {
+		req := httptest.NewRequest(http.MethodPut, "/api/v1/settings",
+			strings.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
+		w := httptest.NewRecorder()
+		te.handler.ServeHTTP(w, req)
+		return w
+	}
+
+	w := put(`{"disabled_agents":["gemini","claude","gemini"]}`)
+	assertStatus(t, w, http.StatusOK)
+	type sessionProvider struct {
+		ID                 parser.AgentType `json:"id"`
+		DisplayName        string           `json:"display_name"`
+		Dirs               []string         `json:"dirs"`
+		PostAnswerToolWork bool             `json:"post_answer_tool_work"`
+	}
+	var got struct {
+		SessionProviders []sessionProvider  `json:"session_providers"`
+		DisabledAgents   []parser.AgentType `json:"disabled_agents"`
+	}
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &got))
+	assert.Equal(t,
+		[]parser.AgentType{parser.AgentClaude, parser.AgentGemini},
+		got.DisabledAgents,
+	)
+	require.NotEmpty(t, got.SessionProviders)
+	assert.Equal(t, parser.AgentClaude, got.SessionProviders[0].ID)
+	assert.Equal(t, "Claude Code", got.SessionProviders[0].DisplayName)
+	assert.Equal(t, []string{"/sessions/claude"}, got.SessionProviders[0].Dirs)
+	assert.False(t, got.SessionProviders[0].PostAnswerToolWork)
+	codexIndex := slices.IndexFunc(got.SessionProviders,
+		func(provider sessionProvider) bool {
+			return provider.ID == parser.AgentCodex
+		})
+	require.NotEqual(t, -1, codexIndex)
+	assert.True(t, got.SessionProviders[codexIndex].PostAnswerToolWork)
+	geminiIndex := slices.IndexFunc(got.SessionProviders,
+		func(provider sessionProvider) bool {
+			return provider.ID == parser.AgentGemini
+		})
+	require.NotEqual(t, -1, geminiIndex)
+	gemini := got.SessionProviders[geminiIndex]
+	assert.Equal(t, "Gemini", gemini.DisplayName)
+	assert.Equal(t, []string{geminiDir}, gemini.Dirs)
+
+	var persisted struct {
+		DisabledAgents []parser.AgentType `toml:"disabled_agents"`
+	}
+	_, err := toml.DecodeFile(filepath.Join(te.dataDir, "config.toml"), &persisted)
+	require.NoError(t, err)
+	assert.Equal(t, got.DisabledAgents, persisted.DisabledAgents)
+}
+
+func TestSettingsDisabledProvidersDefaultToEmptyArray(t *testing.T) {
+	te := setup(t)
+
+	w := te.get(t, "/api/v1/settings")
+	assertStatus(t, w, http.StatusOK)
+	var got struct {
+		DisabledAgents jsontext.Value `json:"disabled_agents"`
+	}
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &got))
+	assert.JSONEq(t, `[]`, string(got.DisabledAgents))
+}
+
+func TestSettingsRejectInvalidDisabledProviderWithoutMutation(t *testing.T) {
+	te := setup(t)
+	put := func(body string) *httptest.ResponseRecorder {
+		req := httptest.NewRequest(http.MethodPut, "/api/v1/settings",
+			strings.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
+		w := httptest.NewRecorder()
+		te.handler.ServeHTTP(w, req)
+		return w
+	}
+
+	assertStatus(t, put(`{"disabled_agents":["gemini"]}`), http.StatusOK)
+	w := put(`{"disabled_agents":["nope"]}`)
+	assertStatus(t, w, http.StatusBadRequest)
+	assertBodyContains(t, w, "unknown session provider")
+
+	w = te.get(t, "/api/v1/settings")
+	assertStatus(t, w, http.StatusOK)
+	var got struct {
+		DisabledAgents []parser.AgentType `json:"disabled_agents"`
+	}
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &got))
+	assert.Equal(t, []parser.AgentType{parser.AgentGemini}, got.DisabledAgents)
+}
+
+func TestSettingsDisabledProvidersRemainLockedInPGMode(t *testing.T) {
+	te := setupPGMode(t)
+	req := httptest.NewRequest(http.MethodPut, "/api/v1/settings",
+		strings.NewReader(`{"disabled_agents":["gemini"]}`))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	te.handler.ServeHTTP(w, req)
+
+	assertStatus(t, w, http.StatusNotImplemented)
+	assertBodyContains(t, w, "settings cannot be modified")
 }
 
 func TestSettingsRemainLockedInPGMode(t *testing.T) {
@@ -3919,6 +4419,47 @@ func TestUploadSession_ExcludedOrTrashedConflict(t *testing.T) {
 	}
 }
 
+func TestUploadSession_RejectsShorterReplacementWithoutConsent(t *testing.T) {
+	te := setup(t)
+	const sessionID = "upload-shorter"
+	query := "project=myproj&machine=remote"
+	longTranscript := claudeTranscriptWithMessageCount(96)
+	shortTranscript := claudeTranscriptWithMessageCount(24)
+
+	w := te.upload(t, sessionID+".jsonl", longTranscript, query)
+	assertStatus(t, w, http.StatusOK)
+	destPath := filepath.Join(
+		te.dataDir, "uploads", "myproj", sessionID+".jsonl",
+	)
+	requireSessionMessages := func(want int) {
+		t.Helper()
+		messages, err := te.db.GetAllMessages(t.Context(), sessionID)
+		require.NoError(t, err)
+		require.Len(t, messages, want)
+	}
+	requireArchive := func(want string) {
+		t.Helper()
+		content, err := os.ReadFile(destPath)
+		require.NoError(t, err)
+		require.Equal(t, want, string(content))
+	}
+	requireSessionMessages(96)
+	requireArchive(longTranscript)
+
+	w = te.upload(t, sessionID+".jsonl", shortTranscript, query)
+	assertStatus(t, w, http.StatusConflict)
+	assertErrorResponse(t, w,
+		"session upload rejected: session upload-shorter has 96 messages, upload has 24; retry with allow_shorter=true")
+	requireSessionMessages(96)
+	requireArchive(longTranscript)
+
+	w = te.upload(t, sessionID+".jsonl", shortTranscript,
+		query+"&allow_shorter=true")
+	assertStatus(t, w, http.StatusOK)
+	requireSessionMessages(24)
+	requireArchive(shortTranscript)
+}
+
 func TestUploadSession_MultiSessionConflictDoesNotPartiallyWrite(t *testing.T) {
 
 	te := setup(t)
@@ -3981,8 +4522,10 @@ func TestUploadSession_ReuploadPreservesPins(t *testing.T) {
 	_, err = te.db.PinMessage("upload-pinned", msgs[0].ID, &note)
 	require.NoError(t, err, "PinMessage")
 
+	// The pinned message is unchanged; only the reply was edited, so
+	// the pin re-attaches to its message through the identity rules.
 	updated := testjsonl.NewSessionBuilder().
-		AddClaudeUser(tsEarly, "updated upload").
+		AddClaudeUser(tsEarly, "original upload").
 		AddClaudeAssistant(tsEarlyS5, "updated reply").
 		String()
 	w = te.upload(t, "upload-pinned.jsonl", updated,
@@ -4000,6 +4543,133 @@ func TestUploadSession_ReuploadPreservesPins(t *testing.T) {
 	if pins[0].Note == nil || *pins[0].Note != note {
 		t.Fatalf("pin note = %v, want %q", pins[0].Note, note)
 	}
+}
+
+// TestUploadSession_ReuploadDropsPinOnEditedMessage documents the
+// intended limit: a re-upload that edits the pinned UUID-less message
+// itself destroys the only identity the pin can follow, so the pin is
+// dropped rather than guessed onto the edited row. Both stores apply
+// the same rule, keeping SQLite and PostgreSQL consistent.
+func TestUploadSession_ReuploadDropsPinOnEditedMessage(t *testing.T) {
+	te := setup(t)
+
+	initial := testjsonl.NewSessionBuilder().
+		AddClaudeUser(tsEarly, "original upload").
+		AddClaudeAssistant(tsEarlyS5, "original reply").
+		String()
+	w := te.upload(t, "upload-pin-edited.jsonl", initial,
+		"project=myproj&machine=remote")
+	assertStatus(t, w, http.StatusOK)
+
+	msgs, err := te.db.GetAllMessages(
+		context.Background(), "upload-pin-edited",
+	)
+	require.NoError(t, err, "GetAllMessages")
+	require.Len(t, msgs, 2, "initial messages")
+	_, err = te.db.PinMessage("upload-pin-edited", msgs[0].ID, nil)
+	require.NoError(t, err, "PinMessage")
+
+	updated := testjsonl.NewSessionBuilder().
+		AddClaudeUser(tsEarly, "edited upload").
+		AddClaudeAssistant(tsEarlyS5, "original reply").
+		String()
+	w = te.upload(t, "upload-pin-edited.jsonl", updated,
+		"project=myproj&machine=remote")
+	assertStatus(t, w, http.StatusOK)
+
+	pins, err := te.db.ListPinnedMessages(
+		context.Background(), "upload-pin-edited", "",
+	)
+	require.NoError(t, err, "ListPinnedMessages")
+	assert.Empty(t, pins,
+		"editing the pinned message drops the pin")
+}
+
+func TestUploadSession_ReuploadDoesNotMoveLegacyPinToIDEEnvelope(t *testing.T) {
+	te := setup(t)
+	const sessionID = "upload-pinned-envelope"
+	const mixedPrompt = "<ide_opened_file>The user opened /workspace/app/README.md.</ide_opened_file> Explain this file."
+
+	require.NoError(t, te.db.UpsertSession(db.Session{
+		ID: sessionID, Project: "myproj", Machine: "remote", Agent: "claude",
+	}), "seed legacy uploaded session")
+	require.NoError(t, te.db.ReplaceSessionMessages(sessionID, []db.Message{{
+		SessionID: sessionID, Ordinal: 0, Role: "user",
+		Content: mixedPrompt, ContentLength: len(mixedPrompt),
+	}}), "seed legacy mixed prompt")
+	msgs, err := te.db.GetAllMessages(context.Background(), sessionID)
+	require.NoError(t, err, "GetAllMessages before re-upload")
+	require.Len(t, msgs, 1, "legacy messages")
+	_, err = te.db.PinMessage(sessionID, msgs[0].ID, nil)
+	require.NoError(t, err, "PinMessage")
+
+	updated := testjsonl.NewSessionBuilder().
+		AddClaudeUser(tsEarly, mixedPrompt).
+		String()
+	w := te.upload(t, sessionID+".jsonl", updated,
+		"project=myproj&machine=remote")
+	assertStatus(t, w, http.StatusOK)
+
+	pins, err := te.db.ListPinnedMessages(context.Background(), sessionID, "")
+	require.NoError(t, err, "ListPinnedMessages")
+	assert.Empty(t, pins,
+		"legacy pin must not move from the prompt to hidden IDE metadata")
+
+	msgs, err = te.db.GetAllMessages(context.Background(), sessionID)
+	require.NoError(t, err, "GetAllMessages after re-upload")
+	require.Len(t, msgs, 2, "split messages")
+	assert.True(t, msgs[0].IsSystem, "IDE envelope must remain hidden")
+	assert.Equal(t, "Explain this file.", msgs[1].Content)
+}
+
+func TestUploadSession_ReuploadFollowsLegacyPinAcrossIDEEnvelopeSplit(t *testing.T) {
+	te := setup(t)
+	const sessionID = "upload-pinned-after-envelope"
+	const mixedPrompt = "<ide_opened_file>The user opened /workspace/app/README.md.</ide_opened_file> Explain this file."
+
+	require.NoError(t, te.db.UpsertSession(db.Session{
+		ID: sessionID, Project: "myproj", Machine: "remote", Agent: "claude",
+	}), "seed legacy uploaded session")
+	require.NoError(t, te.db.ReplaceSessionMessages(sessionID, []db.Message{
+		{
+			SessionID: sessionID, Ordinal: 0, Role: "user",
+			Content: mixedPrompt, ContentLength: len(mixedPrompt),
+		},
+		{
+			SessionID: sessionID, Ordinal: 1, Role: "assistant",
+			Content: "Legacy reply", ContentLength: len("Legacy reply"),
+		},
+	}), "seed legacy messages")
+	msgs, err := te.db.GetAllMessages(context.Background(), sessionID)
+	require.NoError(t, err, "GetAllMessages before re-upload")
+	require.Len(t, msgs, 2, "legacy messages")
+	_, err = te.db.PinMessage(sessionID, msgs[1].ID, nil)
+	require.NoError(t, err, "PinMessage")
+
+	updated := testjsonl.NewSessionBuilder().
+		AddClaudeUser(tsEarly, mixedPrompt).
+		AddClaudeAssistant(tsEarlyS5, "Legacy reply").
+		String()
+	w := te.upload(t, sessionID+".jsonl", updated,
+		"project=myproj&machine=remote")
+	assertStatus(t, w, http.StatusOK)
+
+	// The envelope split shifts the whole visible tail. The pin's
+	// role, content, and occurrence rank identify its message, so the
+	// pin follows "Legacy reply" to its shifted ordinal instead of
+	// re-attaching to the visible prompt at the saved ordinal.
+	pins, err := te.db.ListPinnedMessages(context.Background(), sessionID, "")
+	require.NoError(t, err, "ListPinnedMessages")
+	require.Len(t, pins, 1, "legacy pin must survive the envelope split")
+	assert.Equal(t, 2, pins[0].Ordinal,
+		"pin follows its message, not the saved ordinal")
+
+	msgs, err = te.db.GetAllMessages(context.Background(), sessionID)
+	require.NoError(t, err, "GetAllMessages after re-upload")
+	require.Len(t, msgs, 3, "split messages")
+	assert.True(t, msgs[0].IsSystem, "IDE envelope must remain hidden")
+	assert.Equal(t, "Explain this file.", msgs[1].Content)
+	assert.Equal(t, "Legacy reply", msgs[2].Content)
 }
 
 func TestUploadSession_EmptyFile(t *testing.T) {
@@ -4673,7 +5343,8 @@ func TestFindAvailablePortSkipsOccupied(t *testing.T) {
 
 	occupied := ln.Addr().(*net.TCPAddr).Port
 
-	got := server.FindAvailablePort("127.0.0.1", occupied)
+	got, err := server.FindAvailablePort("127.0.0.1", occupied)
+	require.NoError(t, err)
 	if got == occupied {
 		t.Errorf(
 			"FindAvailablePort returned occupied port %d", occupied,
@@ -4681,11 +5352,55 @@ func TestFindAvailablePortSkipsOccupied(t *testing.T) {
 	}
 }
 
+func TestFindAvailablePortWildcardSkipsIPv4OccupiedPort(t *testing.T) {
+	// A dual-stack wildcard listen can succeed on IPv6 while an unrelated
+	// process still owns the port on IPv4 (observed on macOS), so wildcard
+	// availability must check the IPv4 wildcard address on its own.
+	ln, err := net.Listen("tcp4", "0.0.0.0:0")
+	require.NoError(t, err, "bind IPv4 wildcard")
+	defer ln.Close()
+
+	occupied := ln.Addr().(*net.TCPAddr).Port
+
+	got, err := server.FindAvailablePort("0.0.0.0", occupied)
+	require.NoError(t, err)
+	assert.NotEqual(t, occupied, got,
+		"wildcard port selection must skip an IPv4-occupied port")
+}
+
+func TestFindAvailablePortWildcardSkipsIPv6OccupiedPort(t *testing.T) {
+	ln, err := net.Listen("tcp6", "[::]:0")
+	if err != nil {
+		t.Skipf("IPv6 unavailable: %v", err)
+	}
+	defer ln.Close()
+
+	occupied := ln.Addr().(*net.TCPAddr).Port
+
+	got, err := server.FindAvailablePort("0.0.0.0", occupied)
+	require.NoError(t, err)
+	assert.NotEqual(t, occupied, got,
+		"wildcard port selection must skip an IPv6-occupied port")
+}
+
 func TestFindAvailablePortZeroReturnsAssignedPort(t *testing.T) {
-	got := server.FindAvailablePort("127.0.0.1", 0)
+	got, err := server.FindAvailablePort("127.0.0.1", 0)
+	require.NoError(t, err)
 	if got == 0 {
 		t.Fatal("FindAvailablePort returned literal port 0")
 	}
+}
+
+func TestFindAvailablePortDoesNotReturnExhaustedCandidate(t *testing.T) {
+	ln, err := net.Listen("tcp4", "127.0.0.1:65535")
+	if err != nil {
+		t.Skipf("reserve final TCP port: %v", err)
+	}
+	defer ln.Close()
+
+	_, err = server.FindAvailablePort("127.0.0.1", 65535)
+	require.Error(t, err,
+		"an exhausted search must report that no candidate is available")
 }
 
 func TestEvents_StreamsDataChangedAfterSync(t *testing.T) {
@@ -4882,7 +5597,7 @@ func TestHandleToolCalls_Basic(t *testing.T) {
 		ToolCalls []service.ToolCall `json:"tool_calls"`
 		Count     int                `json:"count"`
 	}
-	require.NoError(t, json.NewDecoder(w.Body).Decode(&body))
+	require.NoError(t, json.UnmarshalRead(w.Body, &body))
 	require.Equal(t, 2, body.Count)
 	require.Len(t, body.ToolCalls, 2)
 	assert.Equal(t, "Read", body.ToolCalls[0].ToolName)
@@ -4922,4 +5637,71 @@ func TestHandleSyncSession_InvalidJSON(t *testing.T) {
 	w := httptest.NewRecorder()
 	te.handler.ServeHTTP(w, req)
 	assertStatus(t, w, http.StatusBadRequest)
+}
+
+func TestSettingsAgentHomesPersistAndRoundTrip(t *testing.T) {
+	te := setup(t)
+	require.NoError(t, os.WriteFile(filepath.Join(te.dataDir, "config.toml"),
+		[]byte("[agents.pi]\ndirs = [\"/sessions/pi\"]\n"), 0o600))
+	put := func(body string) *httptest.ResponseRecorder {
+		req := httptest.NewRequest(http.MethodPut, "/api/v1/settings",
+			strings.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
+		w := httptest.NewRecorder()
+		te.handler.ServeHTTP(w, req)
+		return w
+	}
+	type sessionProvider struct {
+		ID             parser.AgentType `json:"id"`
+		HomesSupported bool             `json:"homes_supported"`
+		Homes          []string         `json:"homes"`
+	}
+	decode := func(w *httptest.ResponseRecorder) map[parser.AgentType]sessionProvider {
+		var got struct {
+			SessionProviders []sessionProvider `json:"session_providers"`
+		}
+		require.NoError(t, json.Unmarshal(w.Body.Bytes(), &got))
+		byID := make(map[parser.AgentType]sessionProvider, len(got.SessionProviders))
+		for _, provider := range got.SessionProviders {
+			byID[provider.ID] = provider
+		}
+		return byID
+	}
+
+	w := put(`{"agent_homes":{"codex":["~/.codex-work","/srv/codex"],"pi":["~/.pi-work/agent","~/.pi-personal/agent"]}}`)
+	assertStatus(t, w, http.StatusOK)
+	providers := decode(w)
+	assert.True(t, providers[parser.AgentCodex].HomesSupported)
+	assert.Equal(t, []string{"~/.codex-work", "/srv/codex"},
+		providers[parser.AgentCodex].Homes)
+	assert.True(t, providers[parser.AgentPi].HomesSupported)
+	assert.Equal(t, []string{"~/.pi-work/agent", "~/.pi-personal/agent"}, providers[parser.AgentPi].Homes)
+	assert.True(t, providers[parser.AgentClaude].HomesSupported)
+	assert.Equal(t, []string{}, providers[parser.AgentClaude].Homes)
+	assert.False(t, providers[parser.AgentGemini].HomesSupported)
+
+	var persisted struct {
+		Agents map[string]config.AgentDirectoryConfig `toml:"agents"`
+	}
+	_, err := toml.DecodeFile(filepath.Join(te.dataDir, "config.toml"), &persisted)
+	require.NoError(t, err)
+	assert.Equal(t, []string{"~/.codex-work", "/srv/codex"}, persisted.Agents["codex"].Homes)
+	assert.Equal(t, []string{"~/.pi-work/agent", "~/.pi-personal/agent"}, persisted.Agents["pi"].Homes)
+	assert.Equal(t, []string{"/sessions/pi"}, persisted.Agents["pi"].Dirs)
+
+	w = put(`{"agent_homes":{"gemini":["/x"]}}`)
+	assertStatus(t, w, http.StatusBadRequest)
+	assertBodyContains(t, w, "does not support alternate homes")
+
+	w = put(`{"agent_homes":{"codex":[],"pi":[]}}`)
+	assertStatus(t, w, http.StatusOK)
+	assert.Equal(t, []string{}, decode(w)[parser.AgentCodex].Homes)
+	raw, err := os.ReadFile(filepath.Join(te.dataDir, "config.toml"))
+	require.NoError(t, err)
+	persisted.Agents = nil
+	_, err = toml.Decode(string(raw), &persisted)
+	require.NoError(t, err)
+	assert.Empty(t, persisted.Agents["codex"].Homes)
+	assert.Empty(t, persisted.Agents["pi"].Homes)
+	assert.Equal(t, []string{"/sessions/pi"}, persisted.Agents["pi"].Dirs)
 }

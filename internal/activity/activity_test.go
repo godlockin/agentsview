@@ -1,7 +1,7 @@
 package activity
 
 import (
-	"encoding/json"
+	"encoding/json/v2"
 	"testing"
 	"time"
 
@@ -172,9 +172,6 @@ func TestAggregate_ArbitraryRangeIntervalClip(t *testing.T) {
 		{SessionID: "a", Ordinal: 2, Timestamp: "2026-06-16T10:40:00Z", Role: "assistant", Model: "m1"},
 	}
 	r := mustAggregate(t, p, nil, act, nil)
-	require.Len(t, r.Intervals, 1)
-	assert.Equal(t, "2026-06-16T10:30:00Z", r.Intervals[0].Start, "clipped to range_start, not midnight")
-	assert.Equal(t, "2026-06-16T10:33:00Z", r.Intervals[0].End)
 	assert.InDelta(t, 3.0, r.Totals.AgentMinutes, 1e-9)
 }
 
@@ -382,97 +379,6 @@ func TestAggregate_MidnightClipWithFarSuccessor(t *testing.T) {
 	assert.InDelta(t, 1.0, r.Totals.AgentMinutes, 1e-9)
 }
 
-func TestAggregate_IntervalsExposedSortedAndContiguous(t *testing.T) {
-	p := baseParams(t, "2026-06-16", "UTC")
-	// Session "a" has THREE messages in the 10:00-10:05 slot, so buildIntervals
-	// emits TWO contiguous consecutive-pair intervals there: [10:00,10:01) and
-	// [10:01,10:02). The frontend must dedup these by session id. Session "b"
-	// yields one interval [10:01,10:03).
-	act := []ActivityEvent{
-		{SessionID: "a", Ordinal: 1, Timestamp: "2026-06-16T10:00:00Z", Role: "user"},
-		{SessionID: "a", Ordinal: 2, Timestamp: "2026-06-16T10:01:00Z", Role: "assistant", Model: "m1"},
-		{SessionID: "a", Ordinal: 3, Timestamp: "2026-06-16T10:02:00Z", Role: "assistant", Model: "m1"},
-		{SessionID: "b", Ordinal: 1, Timestamp: "2026-06-16T10:01:00Z", Role: "user"},
-		{SessionID: "b", Ordinal: 2, Timestamp: "2026-06-16T10:03:00Z", Role: "assistant", Model: "m1"},
-	}
-	r := mustAggregate(t, p, nil, act, nil)
-	want := []ReportInterval{
-		{SessionID: "a", Start: "2026-06-16T10:00:00Z", End: "2026-06-16T10:01:00Z"},
-		{SessionID: "a", Start: "2026-06-16T10:01:00Z", End: "2026-06-16T10:02:00Z"},
-		{SessionID: "b", Start: "2026-06-16T10:01:00Z", End: "2026-06-16T10:03:00Z"},
-	}
-	assert.Equal(t, want, r.Intervals,
-		"intervals exposed, sorted by (start,end,session); a's two contiguous "+
-			"intervals are both present so the frontend dedups by session id")
-}
-
-func TestAggregate_IntervalsClippedToEffEnd(t *testing.T) {
-	loc := mustLoad(t, "UTC")
-	start, err := time.Parse(time.RFC3339, "2026-06-16T00:00:00Z")
-	require.NoError(t, err)
-	end := start.AddDate(0, 0, 1)
-	effEnd, err := time.Parse(time.RFC3339, "2026-06-16T12:00:00Z")
-	require.NoError(t, err)
-	p := Params{
-		RangeStart: start, RangeEnd: end, Loc: loc,
-		EffectiveEnd: effEnd, Partial: true,
-		GapCapSeconds: 300, Bucket: BucketSpec{BucketMinute, 300},
-	}
-	// Pair [11:58,12:10): the 12-min gap caps to 5 min -> [11:58,12:03); the clip
-	// to effEnd (12:00) is binding, so the exposed interval ends at 12:00.
-	act := []ActivityEvent{
-		{SessionID: "s1", Ordinal: 1, Timestamp: "2026-06-16T11:58:00Z", Role: "user"},
-		{SessionID: "s1", Ordinal: 2, Timestamp: "2026-06-16T12:10:00Z", Role: "assistant", Model: "m1"},
-	}
-	r := mustAggregate(t, p, nil, act, nil)
-	require.True(t, r.Partial)
-	require.Len(t, r.Intervals, 1)
-	assert.Equal(t, "2026-06-16T11:58:00Z", r.Intervals[0].Start)
-	assert.Equal(t, "2026-06-16T12:00:00Z", r.Intervals[0].End,
-		"interval straddling effEnd is clipped to it")
-}
-
-func TestAggregate_OverlapExceedsPeakConcurrency(t *testing.T) {
-	p := baseParams(t, "2026-06-16", "UTC")
-	// Within the single 5-min slot [10:05,10:10): session a is active
-	// [10:05,10:07) and session b [10:08,10:10). They never overlap in time, so
-	// peak concurrency is 1 -- but TWO distinct sessions overlap the slot. This
-	// is exactly why the popover's "N active" can exceed the bar's max_agents.
-	act := []ActivityEvent{
-		{SessionID: "a", Ordinal: 1, Timestamp: "2026-06-16T10:05:00Z", Role: "user"},
-		{SessionID: "a", Ordinal: 2, Timestamp: "2026-06-16T10:07:00Z", Role: "assistant", Model: "m1"},
-		{SessionID: "b", Ordinal: 1, Timestamp: "2026-06-16T10:08:00Z", Role: "user"},
-		{SessionID: "b", Ordinal: 2, Timestamp: "2026-06-16T10:10:00Z", Role: "assistant", Model: "m1"},
-	}
-	r := mustAggregate(t, p, nil, act, nil)
-	assert.Equal(t, 1, r.Peak.Agents, "sessions never overlap in time -> peak concurrency 1")
-	want := []ReportInterval{
-		{SessionID: "a", Start: "2026-06-16T10:05:00Z", End: "2026-06-16T10:07:00Z"},
-		{SessionID: "b", Start: "2026-06-16T10:08:00Z", End: "2026-06-16T10:10:00Z"},
-	}
-	assert.Equal(t, want, r.Intervals,
-		"two distinct sessions overlap the slot though peak concurrency is 1")
-}
-
-func TestAggregate_IntervalsUseSecondResolutionForParity(t *testing.T) {
-	p := baseParams(t, "2026-06-16", "UTC")
-	// Two messages 0.5s apart yield a sub-second interval. Bounds are exposed at
-	// second resolution (RFC3339) so they stay byte-identical across the
-	// microsecond-resolution PostgreSQL/DuckDB mirrors; finer precision would let
-	// the same session serialize differently per backend. The span therefore
-	// collapses to a point (start == end), which the client places in the slot
-	// containing the instant. See activeSessions.ts.
-	act := []ActivityEvent{
-		{SessionID: "a", Ordinal: 1, Timestamp: "2026-06-16T10:00:00.300Z", Role: "user"},
-		{SessionID: "a", Ordinal: 2, Timestamp: "2026-06-16T10:00:00.800Z", Role: "assistant", Model: "m1"},
-	}
-	r := mustAggregate(t, p, nil, act, nil)
-	require.Len(t, r.Intervals, 1)
-	assert.Equal(t, "2026-06-16T10:00:00Z", r.Intervals[0].Start)
-	assert.Equal(t, "2026-06-16T10:00:00Z", r.Intervals[0].End,
-		"sub-second bounds collapse to second resolution for cross-backend parity")
-}
-
 func TestAggregate_BucketPeakSplitAtTotalPeakInstant(t *testing.T) {
 	p := baseParams(t, "2026-06-16", "UTC")
 	// All activity falls in the single 5-min bucket [10:00,10:05). Two AUTOMATED
@@ -522,7 +428,7 @@ func TestAggregate_BreakdownCostAndAutomatedSegments(t *testing.T) {
 		GapCapSeconds: 300, Bucket: BucketSpec{BucketMinute, 300},
 	}
 	// ta: timed automated (2 min, cost 1). ti: timed interactive (3 min, cost 2).
-	// ua: UNTIMED automated (no activity, cost 4). All project "P", model "m1".
+	// ua: untimed automated subagent (no activity, cost 4). All project "P", model "m1".
 	act := []ActivityEvent{
 		{SessionID: "ta", Ordinal: 1, Timestamp: "2026-06-16T10:00:00Z", Role: "user"},
 		{SessionID: "ta", Ordinal: 2, Timestamp: "2026-06-16T10:02:00Z", Role: "assistant", Model: "m1"},
@@ -537,9 +443,13 @@ func TestAggregate_BreakdownCostAndAutomatedSegments(t *testing.T) {
 	sessions := []SessionMeta{
 		{SessionID: "ta", Project: "P", Agent: "claude", IsAutomated: true},
 		{SessionID: "ti", Project: "P", Agent: "claude", IsAutomated: false},
-		{SessionID: "ua", Project: "P", Agent: "claude", IsAutomated: true},
+		{SessionID: "ua", Project: "P", Agent: "claude", IsAutomated: true, IsSubagent: true},
 	}
 	r := mustAggregate(t, p, sessions, act, usage)
+	assert.Equal(t, 3, r.Totals.Sessions)
+	assert.Equal(t, 1, r.Totals.InteractiveSessions)
+	assert.Equal(t, 1, r.Totals.AutomatedSessions)
+	assert.Equal(t, 1, r.Totals.SubagentSessions, "even automated and untimed subagents count separately")
 
 	require.Len(t, r.ByProject, 1)
 	proj := r.ByProject[0]
@@ -548,19 +458,20 @@ func TestAggregate_BreakdownCostAndAutomatedSegments(t *testing.T) {
 	assert.Equal(t, money.MustParseDollars("7"), proj.Cost, "1+2+4 includes the untimed session")
 	assert.InDelta(t, 2.0, proj.AutomatedAgentMinutes, 1e-9)
 	assert.InDelta(t, 3.0, proj.InteractiveAgentMinutes, 1e-9)
-	assert.Equal(t, money.MustParseDollars("5"), proj.AutomatedCost, "ta 1 + ua 4")
+	assert.Equal(t, money.MustParseDollars("1"), proj.AutomatedCost, "automated subagent cost is separate")
 	assert.Equal(t, money.MustParseDollars("2"), proj.InteractiveCost, "ti 2")
 	assert.InDelta(t, proj.AgentMinutes,
-		proj.AutomatedAgentMinutes+proj.InteractiveAgentMinutes, 1e-9)
-	assert.Equal(t, proj.Cost, money.MustAdd(proj.AutomatedCost, proj.InteractiveCost))
+		proj.AutomatedAgentMinutes+proj.InteractiveAgentMinutes+proj.SubagentAgentMinutes, 1e-9)
+	assert.Equal(t, proj.Cost, money.MustAdd(money.MustAdd(proj.AutomatedCost, proj.InteractiveCost), proj.SubagentCost))
 	assert.Equal(t, r.Totals.Cost, proj.Cost,
 		"cost breakdown sums to total cost; untimed cost is not dropped")
 
 	assert.InDelta(t, 5.0, r.Totals.AgentMinutes, 1e-9)
 	assert.InDelta(t, 2.0, r.Totals.AutomatedAgentMinutes, 1e-9)
 	assert.InDelta(t, 3.0, r.Totals.InteractiveAgentMinutes, 1e-9)
-	assert.Equal(t, money.MustParseDollars("5.0"), r.Totals.AutomatedCost)
+	assert.Equal(t, money.MustParseDollars("1.0"), r.Totals.AutomatedCost)
 	assert.Equal(t, money.MustParseDollars("2.0"), r.Totals.InteractiveCost)
+	assert.Equal(t, money.MustParseDollars("4.0"), r.Totals.SubagentCost)
 
 	autoByID := map[string]bool{}
 	for _, row := range r.BySession {
@@ -574,8 +485,11 @@ func TestAggregate_BreakdownCostAndAutomatedSegments(t *testing.T) {
 	assert.Equal(t, "m1", r.ByModel[0].Key)
 	assert.InDelta(t, 5.0, r.ByModel[0].AgentMinutes, 1e-9)
 	assert.Equal(t, money.MustParseDollars("7.0"), r.ByModel[0].Cost)
-	assert.Equal(t, money.MustParseDollars("5.0"), r.ByModel[0].AutomatedCost)
+	assert.Equal(t, money.MustParseDollars("1.0"), r.ByModel[0].AutomatedCost)
 	assert.Equal(t, money.MustParseDollars("2.0"), r.ByModel[0].InteractiveCost)
+	assert.Equal(t, money.MustParseDollars("4.0"), r.ByModel[0].SubagentCost)
+	assert.Equal(t, money.MustParseDollars("4.0"), proj.SubagentCost)
+	assert.Equal(t, money.MustParseDollars("4.0"), r.ByAgent[0].SubagentCost)
 }
 
 // TestAggregate_UsageOnlySessionZeroCostKeepsPrimaryModel confirms a session
@@ -661,4 +575,73 @@ func TestAggregate_BreakdownCostDeterministicAcrossSessionOrder(t *testing.T) {
 		"by-agent cost must not depend on session arrival order")
 	require.Equal(t, rAsc.ByProject[0].Cost, rDesc.ByProject[0].Cost,
 		"by-project cost must not depend on session arrival order")
+}
+
+// Category peaks need not coincide with the combined peak: a burst of
+// delegated work must not hide a later increase in human-facing sessions.
+func TestAggregate_IndependentSessionKindPeaks(t *testing.T) {
+	p := baseParams(t, "2026-06-16", "UTC")
+	sessions := []SessionMeta{
+		{SessionID: "human-1", Project: "P", Agent: "claude"},
+		{SessionID: "human-2", Project: "P", Agent: "claude"},
+		{SessionID: "child-1", Project: "P", Agent: "claude", IsSubagent: true},
+		{SessionID: "child-2", Project: "P", Agent: "claude", IsSubagent: true, IsAutomated: true},
+		{SessionID: "automated", Project: "P", Agent: "claude", IsAutomated: true},
+	}
+	var events []ActivityEvent
+	for _, span := range []struct{ id, start, end string }{
+		{"human-1", "10:00", "10:04"},
+		{"human-2", "10:03", "10:04"},
+		{"child-1", "10:01", "10:03"},
+		{"child-2", "10:01", "10:03"},
+		{"automated", "10:00", "10:02"},
+	} {
+		events = append(events,
+			ActivityEvent{SessionID: span.id, Ordinal: 1, Timestamp: "2026-06-16T" + span.start + ":00Z", Role: "user"},
+			ActivityEvent{SessionID: span.id, Ordinal: 2, Timestamp: "2026-06-16T" + span.end + ":00Z", Role: "assistant", Model: "m1"},
+		)
+	}
+	r := mustAggregate(t, p, sessions, events, nil)
+	for _, tc := range []struct {
+		name  string
+		peak  Peak
+		count int
+		at    string
+	}{
+		{"combined", r.Peak, 4, "2026-06-16T10:01:00Z"},
+		{"interactive", r.InteractivePeak, 2, "2026-06-16T10:03:00Z"},
+		{"subagent", r.SubagentPeak, 2, "2026-06-16T10:01:00Z"},
+		{"automated", r.AutomatedPeak, 1, "2026-06-16T10:00:00Z"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			assert.Equal(t, tc.count, tc.peak.Agents)
+			require.NotNil(t, tc.peak.At)
+			assert.Equal(t, tc.at, *tc.peak.At)
+		})
+	}
+	bucket := r.Buckets[120]
+	assert.Equal(t, 4, bucket.MaxAgents)
+	assert.Equal(t, 2, bucket.MaxInteractiveAgents)
+	assert.Equal(t, 2, bucket.MaxSubagentAgents)
+	assert.Equal(t, 1, bucket.MaxAutomatedAgents)
+	assert.Equal(t, 1, bucket.InteractiveAtPeak)
+	assert.Equal(t, 2, bucket.SubagentAtPeak)
+	assert.Equal(t, 1, bucket.AutomatedAtPeak)
+	assert.Equal(t, 4.0, r.Totals.ActiveMinutes)
+	assert.Equal(t, 11.0, r.Totals.AgentMinutes)
+	assert.Equal(t, 5.0, r.Totals.InteractiveAgentMinutes)
+	assert.Equal(t, 4.0, r.Totals.SubagentAgentMinutes)
+	assert.Equal(t, 2.0, r.Totals.AutomatedAgentMinutes)
+	for _, rows := range [][]KeyMinutes{r.ByProject, r.ByAgent, r.ByModel} {
+		require.Len(t, rows, 1)
+		assert.Equal(t, 4.0, rows[0].SubagentAgentMinutes)
+		assert.Equal(t, 5.0, rows[0].InteractiveAgentMinutes)
+		assert.Equal(t, 2.0, rows[0].AutomatedAgentMinutes)
+	}
+	for _, row := range r.BySession {
+		if row.SessionID == "child-2" {
+			assert.True(t, row.IsSubagent)
+			assert.True(t, row.IsAutomated)
+		}
+	}
 }

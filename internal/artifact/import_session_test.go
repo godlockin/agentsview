@@ -3,7 +3,7 @@ package artifact
 import (
 	"bytes"
 	"context"
-	"encoding/json"
+	"encoding/json/jsontext"
 	"errors"
 	"fmt"
 	"strings"
@@ -18,6 +18,8 @@ import (
 func TestRewriteManifestForImportClearsLocalStateAndPrefixesRelationships(
 	t *testing.T,
 ) {
+	t.Parallel()
+
 	filePath := "/provider/session.jsonl"
 	fileSize := int64(1024)
 	fileMtime := int64(42)
@@ -117,6 +119,8 @@ func TestRewriteManifestForImportClearsLocalStateAndPrefixesRelationships(
 }
 
 func TestLoadImportedSessionCompleteClosure(t *testing.T) {
+	t.Parallel()
+
 	database := testExportDB(t)
 	store := newTestArtifactStore(t)
 	m := importTestManifest("session")
@@ -138,12 +142,15 @@ func TestLoadImportedSessionCompleteClosure(t *testing.T) {
 }
 
 func TestLoadImportedSessionDefersOversizedFutureSegment(t *testing.T) {
+	t.Parallel()
+
 	database := testExportDB(t)
 	store := newTestArtifactStore(t)
 	var segment strings.Builder
 	for range productionArtifactLimits().segmentMessages + 1 {
-		segment.WriteString(
-			"{\"content\":\"future\",\"ordinal\":0,\"role\":\"user\",\"v\":2}\n",
+		_, _ = fmt.Fprintf(&segment,
+			"{\"content\":\"future\",\"ordinal\":0,\"role\":\"user\",\"v\":%d}\n",
+			messageSegmentFormatVersion+1,
 		)
 	}
 	segmentHash := createHashedImportArtifact(
@@ -165,10 +172,12 @@ func TestLoadImportedSessionDefersOversizedFutureSegment(t *testing.T) {
 	var future *futureArtifactVersionError
 	require.ErrorAs(t, err, &future)
 	assert.Equal(t, Kind(KindSegments), future.Kind)
-	assert.Equal(t, 2, future.Version)
+	assert.Equal(t, messageSegmentFormatVersion+1, future.Version)
 }
 
 func TestLoadImportedSessionDefersMissingAndFutureDependencies(t *testing.T) {
+	t.Parallel()
+
 	tests := []struct {
 		name       string
 		prepare    func(*testing.T, ArtifactStore) string
@@ -191,7 +200,7 @@ func TestLoadImportedSessionDefersMissingAndFutureDependencies(t *testing.T) {
 		{
 			name: "future manifest",
 			prepare: func(t *testing.T, store ArtifactStore) string {
-				body := []byte(`{"origin":"contract-a1b2c3","v":3}`)
+				body := []byte(`{"origin":"contract-a1b2c3","v":5}`)
 				return createHashedImportArtifact(
 					t, store, KindManifests, ".json", body,
 				)
@@ -201,9 +210,10 @@ func TestLoadImportedSessionDefersMissingAndFutureDependencies(t *testing.T) {
 		{
 			name: "future segment",
 			prepare: func(t *testing.T, store ArtifactStore) string {
-				segment := []byte(
-					"{\"content\":\"future\",\"ordinal\":0,\"role\":\"user\",\"v\":2}\n",
-				)
+				segment := []byte(fmt.Sprintf(
+					"{\"content\":\"future\",\"ordinal\":0,\"role\":\"user\",\"v\":%d}\n",
+					messageSegmentFormatVersion+1,
+				))
 				segmentHash := createHashedImportArtifact(
 					t, store, KindSegments, ".ndjson", segment,
 				)
@@ -239,6 +249,8 @@ func TestLoadImportedSessionDefersMissingAndFutureDependencies(t *testing.T) {
 }
 
 func TestLoadImportedSessionQuarantinesInvalidStatDependency(t *testing.T) {
+	t.Parallel()
+
 	tests := []struct {
 		name string
 		kind Kind
@@ -284,6 +296,8 @@ func TestLoadImportedSessionQuarantinesInvalidStatDependency(t *testing.T) {
 func TestLoadImportedSessionQuarantinesPersistenceInvariantViolations(
 	t *testing.T,
 ) {
+	t.Parallel()
+
 	tests := []struct {
 		name    string
 		prepare func(*testing.T, ArtifactStore) (manifest, string)
@@ -367,6 +381,8 @@ func TestLoadImportedSessionQuarantinesPersistenceInvariantViolations(
 }
 
 func TestLoadImportedSessionQuarantinesInvalidCompleteDependency(t *testing.T) {
+	t.Parallel()
+
 	tests := []struct {
 		name    string
 		prepare func(*testing.T, ArtifactStore) (string, Ref)
@@ -437,6 +453,8 @@ func TestLoadImportedSessionQuarantinesInvalidCompleteDependency(t *testing.T) {
 }
 
 func TestLoadImportedSessionAcceptsNoncanonicalManifestAndSegment(t *testing.T) {
+	t.Parallel()
+
 	database := testExportDB(t)
 	store := newTestArtifactStore(t)
 	segment := []byte(
@@ -470,6 +488,8 @@ func TestLoadImportedSessionAcceptsNoncanonicalManifestAndSegment(t *testing.T) 
 }
 
 func TestLoadImportedSessionEnforcesAggregateLimits(t *testing.T) {
+	t.Parallel()
+
 	database := testExportDB(t)
 	store := newTestArtifactStore(t)
 	m := importTestManifest("session")
@@ -488,6 +508,8 @@ func TestLoadImportedSessionEnforcesAggregateLimits(t *testing.T) {
 }
 
 func TestLoadImportedSessionAggregateBoundaries(t *testing.T) {
+	t.Parallel()
+
 	tests := []struct {
 		name      string
 		configure func(*artifactLimits)
@@ -590,6 +612,8 @@ func TestLoadImportedSessionAggregateBoundaries(t *testing.T) {
 }
 
 func TestLoadImportedSessionPropagatesOperationalStoreError(t *testing.T) {
+	t.Parallel()
+
 	database := testExportDB(t)
 	base := newTestArtifactStore(t)
 	m := importTestManifest("session")
@@ -681,7 +705,12 @@ func createHashedImportArtifact(
 }
 
 func jsonIndent(destination *bytes.Buffer, source []byte) error {
-	return json.Indent(destination, source, "", "  ")
+	formatted := jsontext.Value(source).Clone()
+	if err := formatted.Indent(jsontext.WithIndent("  ")); err != nil {
+		return err
+	}
+	_, err := destination.Write(formatted)
+	return err
 }
 
 type failingImportOpenStore struct {

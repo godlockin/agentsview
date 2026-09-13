@@ -5,7 +5,8 @@ package main
 import (
 	"bytes"
 	"context"
-	"encoding/json"
+	"encoding/json/jsontext"
+	"encoding/json/v2"
 	"errors"
 	"fmt"
 	"io"
@@ -229,6 +230,9 @@ func parseGenerationID(raw string) (int64, error) {
 // requireVectorEnabled rejects every embeddings subcommand up front when
 // [vector] is not configured, with the exact message the brief specifies.
 func requireVectorEnabled(cfg config.Config) error {
+	if cfg.ArchiveContent.UsageOnly() {
+		return fmt.Errorf("%w: embeddings require transcript content", db.ErrArchiveContentExcluded)
+	}
 	if !cfg.Vector.Enabled {
 		return errors.New(
 			"vector search is not enabled: set [vector] enabled = true in config.toml",
@@ -293,7 +297,7 @@ func recallVectorGeneration(
 // named server ("" means the default), combining the global model identity
 // and caller-selected role prefix with that server's transport settings.
 func newVectorEncoder(
-	c config.VectorEmbeddingsConfig, serverName, inputPrefix string,
+	c config.VectorEmbeddingsConfig, serverName, inputPrefix string, retryRateLimits bool,
 ) (kitvec.EncodeFunc, error) {
 	name, server, err := c.Server(serverName)
 	if err != nil {
@@ -307,30 +311,35 @@ func newVectorEncoder(
 	return vector.NewEncoder(vector.EncoderConfig{
 		Endpoint:          server.Endpoint,
 		APIKey:            server.APIKey(),
+		OllamaCPUFallback: server.OllamaCPUFallback,
 		Model:             c.Model,
 		Dimension:         c.Dimension,
 		RequestDimensions: c.RequestDimensions,
 		Timeout:           timeout,
 		MaxRetries:        server.MaxRetries,
+		RetryRateLimits:   retryRateLimits,
 		InputPrefix:       inputPrefix,
 		InputSuffix:       c.InputSuffix,
 	}), nil
 }
 
 // newVectorQueryEncoder builds the default or named server encoder used only
-// for search queries.
+// for search queries. Queries are latency-sensitive, so a 429 fails fast
+// through the normal MaxRetries budget rather than retrying indefinitely.
 func newVectorQueryEncoder(
 	c config.VectorEmbeddingsConfig, serverName string,
 ) (kitvec.EncodeFunc, error) {
-	return newVectorEncoder(c, serverName, c.QueryPrefix)
+	return newVectorEncoder(c, serverName, c.QueryPrefix, false)
 }
 
 // newVectorDocumentEncoder builds the default or named server encoder used
-// only for document builds and repairs.
+// only for document builds and repairs. Document builds are long-running and
+// durable (progress survives a restart), so a 429 is retried until it clears
+// rather than aborting the whole build.
 func newVectorDocumentEncoder(
 	c config.VectorEmbeddingsConfig, serverName string,
 ) (kitvec.EncodeFunc, error) {
-	return newVectorEncoder(c, serverName, c.DocumentPrefix)
+	return newVectorEncoder(c, serverName, c.DocumentPrefix, true)
 }
 
 // vectorDocumentEncoderSet builds one document encoder per configured
@@ -349,8 +358,10 @@ func vectorDocumentEncoderSet(c config.VectorEmbeddingsConfig) (vector.EncoderSe
 		set.ByName[name] = vector.ManagedEncoder{
 			Encode: enc,
 			Settings: vector.EncodeSettings{
-				BatchSize:   server.BatchSize,
-				Concurrency: server.Concurrency,
+				BatchSize:          server.BatchSize,
+				ModelContextTokens: c.ModelContextTokens,
+				MaxBatchTokens:     server.MaxBatchTokens,
+				Concurrency:        server.Concurrency,
 			},
 		}
 	}
@@ -782,9 +793,10 @@ func runEmbeddingsList(ctx context.Context, out io.Writer, jsonOutput bool, stor
 		if gens == nil {
 			gens = []vector.GenerationInfo{}
 		}
-		return json.NewEncoder(out).Encode(struct {
+		return json.MarshalEncode(jsontext.NewEncoder(out), struct {
 			Generations []vector.GenerationInfo `json:"generations"`
 		}{gens})
+
 	}
 	printGenerationsTable(out, gens)
 	return nil
@@ -1050,7 +1062,7 @@ func (c embeddingsDaemonClient) do(
 	if out == nil {
 		return nil
 	}
-	return json.NewDecoder(resp.Body).Decode(out)
+	return json.UnmarshalRead(resp.Body, out)
 }
 
 // daemonErrorMessage extracts the {"error": "..."} message huma's error

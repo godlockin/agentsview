@@ -20,8 +20,10 @@
 package parser
 
 import (
+	"context"
 	"crypto/sha256"
-	"encoding/json"
+	"encoding/json/jsontext"
+	"encoding/json/v2"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -547,7 +549,7 @@ func parseKiloLegacyMessages(
 	totalCacheWrites int,
 	err error,
 ) {
-	var rawMessages []json.RawMessage
+	var rawMessages []jsontext.Value
 	if unmarshalErr := json.Unmarshal(data, &rawMessages); unmarshalErr != nil {
 		// Tolerate a single-object file (defensive).
 		var single kiloLegacyMessage
@@ -556,7 +558,7 @@ func parseKiloLegacyMessages(
 				time.Time{}, time.Time{}, 0, 0,
 				fmt.Errorf("parsing ui_messages.json: %w", unmarshalErr)
 		}
-		rawMessages = []json.RawMessage{data}
+		rawMessages = []jsontext.Value{data}
 	}
 
 	messages = make([]ParsedMessage, 0, len(rawMessages))
@@ -724,6 +726,7 @@ func parseKiloLegacyMessages(
 					Role:          RoleUser,
 					Content:       output,
 					IsSystem:      true,
+					SourceSubtype: SourceSubtypeToolResult,
 					Timestamp:     ts,
 					ContentLength: len(output),
 					ToolResults:   toolResults,
@@ -762,6 +765,7 @@ func parseKiloLegacyMessages(
 					Role:          RoleSystem,
 					Content:       content,
 					IsSystem:      true,
+					SourceSubtype: SourceSubtypeToolResult,
 					Timestamp:     ts,
 					ContentLength: len(content),
 				})
@@ -801,6 +805,7 @@ func parseKiloLegacyMessages(
 					Role:          RoleSystem,
 					Content:       content,
 					IsSystem:      true,
+					SourceSubtype: SourceSubtypeToolResult,
 					Timestamp:     ts,
 					ContentLength: len(content),
 				})
@@ -842,6 +847,7 @@ func parseKiloLegacyMessages(
 					Role:          RoleSystem,
 					Content:       content,
 					IsSystem:      true,
+					SourceSubtype: SourceSubtypeToolResult,
 					Timestamp:     ts,
 					ContentLength: len(content),
 				})
@@ -1098,7 +1104,7 @@ func distinctModels(s []string) int {
 // mixed-provider sessions where attributing all usage to one provider
 // would be incorrect.
 func parseKiloLegacyMessagesDistinctProviders(data []byte) int {
-	var rawMessages []json.RawMessage
+	var rawMessages []jsontext.Value
 	if err := json.Unmarshal(data, &rawMessages); err != nil {
 		return 0
 	}
@@ -1200,7 +1206,7 @@ func classifyKiloLegacyMessage(
 			cmdName = "executeCommand"
 		}
 		inputMap := map[string]string{"command": cmdText}
-		inputJSON, err := json.Marshal(inputMap)
+		inputJSON, err := json.Marshal(inputMap, json.Deterministic(true))
 		if err != nil {
 			return RoleAssistant, nil, nil
 		}
@@ -1322,8 +1328,8 @@ func kiloUnwrapJSONEnvelope(text string) string {
 		return ""
 	}
 	var envelope struct {
-		Question string          `json:"question"`
-		Suggest  json.RawMessage `json:"suggest"`
+		Question string         `json:"question"`
+		Suggest  jsontext.Value `json:"suggest"`
 	}
 	if err := json.Unmarshal([]byte(text), &envelope); err != nil {
 		return ""
@@ -1518,12 +1524,12 @@ func kiloExtractAPIRequestStats(text string) (
 	validPayload bool,
 ) {
 	var data struct {
-		TokensIn          any             `json:"tokensIn"`
-		TokensOut         any             `json:"tokensOut"`
-		Cost              json.RawMessage `json:"cost"`
-		InferenceProvider string          `json:"inferenceProvider"`
-		CacheReads        any             `json:"cacheReads"`
-		CacheWrites       any             `json:"cacheWrites"`
+		TokensIn          any            `json:"tokensIn"`
+		TokensOut         any            `json:"tokensOut"`
+		Cost              jsontext.Value `json:"cost"`
+		InferenceProvider string         `json:"inferenceProvider"`
+		CacheReads        any            `json:"cacheReads"`
+		CacheWrites       any            `json:"cacheWrites"`
 	}
 	if err := json.Unmarshal([]byte(text), &data); err != nil {
 		return 0, 0, 0, money.Money{}, false, "", 0, 0, false
@@ -1679,7 +1685,7 @@ func parseKiloLegacyToolCall(text string, ordinal int) *ParsedToolCall {
 	for _, field := range kiloResultBearingReadTools[strings.ToLower(toolName)] {
 		delete(toolData, field)
 	}
-	inputJSON, err := json.Marshal(toolData)
+	inputJSON, err := json.Marshal(toolData, json.Deterministic(true))
 	if err != nil {
 		return nil
 	}
@@ -1696,7 +1702,7 @@ func parseKiloLegacyToolCall(text string, ordinal int) *ParsedToolCall {
 			tc.SkillName, _ = toolData["name"].(string)
 		}
 	} else {
-		tc.SkillName = inferToolSkillName(toolName, tc.InputJSON)
+		tc.SkillName = inferToolSkillName(context.Background(), toolName, tc.InputJSON)
 	}
 	// FilePath is exposed from the payload when present so the
 	// frontend can route Edits / Writes to the right file even
@@ -1732,7 +1738,7 @@ func parseKiloLegacyMCPToolCall(
 		Category:  "MCP",
 		InputJSON: inputJSON,
 	}
-	tc.SkillName = inferToolSkillName(qualified, inputJSON)
+	tc.SkillName = inferToolSkillName(context.Background(), qualified, inputJSON)
 	return tc
 }
 
@@ -1751,7 +1757,7 @@ func buildKiloLegacyMCPInputJSON(toolData map[string]any) string {
 				}
 			}
 		case map[string]any, []any:
-			if b, err := json.Marshal(v); err == nil {
+			if b, err := json.Marshal(v, json.Deterministic(true)); err == nil {
 				return string(b)
 			}
 		}
@@ -1763,7 +1769,7 @@ func buildKiloLegacyMCPInputJSON(toolData map[string]any) string {
 		}
 		env[k] = val
 	}
-	if b, err := json.Marshal(env); err == nil {
+	if b, err := json.Marshal(env, json.Deterministic(true)); err == nil {
 		return string(b)
 	}
 	return "{}"

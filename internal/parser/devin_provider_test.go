@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -27,12 +28,12 @@ func TestDevinProviderCapabilities(t *testing.T) {
 func TestDevinProviderDiscoverFindParse(t *testing.T) {
 	const sessionID = "session-123"
 	dbPath, _ := newDevinSessionFixture(t, devinSessionRow{
-		ID:                 sessionID,
-		Title:              "DB title wins",
-		WorkingDirectory:   "/Users/alice/code/my-app",
-		Model:              "db-model",
-		CreatedAtMillis:    new(int64(1704103199000)),
-		LastActivityMillis: new(int64(1704103265000)),
+		ID:               sessionID,
+		Title:            "DB title wins",
+		WorkingDirectory: "/Users/alice/code/my-app",
+		Model:            "db-model",
+		CreatedAt:        new(int64(1704103199)),
+		LastActivityAt:   new(int64(1704103265)),
 	}, `{
 		"agent":{"model_name":"devin-1"},
 		"steps":[
@@ -65,7 +66,7 @@ func TestDevinProviderDiscoverFindParse(t *testing.T) {
 	assert.Equal(t, virtualPath, discovered[0].Key)
 	assert.Equal(t, virtualPath, discovered[0].DisplayPath)
 	assert.Equal(t, virtualPath, discovered[0].FingerprintKey)
-	assert.Equal(t, int64(1704103265000000000), discovered[0].DiscoveryMTimeNS)
+	assert.Equal(t, int64(1704103265_000_000_000), discovered[0].DiscoveryMTimeNS)
 
 	changed, err := provider.SourcesForChangedPath(context.Background(), ChangedPathRequest{
 		Path:      filepath.Join(root, "cli", "transcripts", sessionID+".json"),
@@ -111,8 +112,8 @@ func TestDevinProviderDiscoverFindParse(t *testing.T) {
 func TestDevinProviderDBEventsFanOutAndPreserveTombstones(t *testing.T) {
 	const liveSessionID = "session-live"
 	fixture := newDevinTestFixture(t,
-		devinSessionRow{ID: liveSessionID, Title: "Live", WorkingDirectory: "/tmp/live", Model: "db-model", CreatedAtMillis: new(int64(1704103199000)), LastActivityMillis: new(int64(1704103265000))},
-		devinSessionRow{ID: "session-deleted", Title: "Deleted", WorkingDirectory: "/tmp/deleted", Model: "db-model", CreatedAtMillis: new(int64(1704103199000)), LastActivityMillis: new(int64(1704103264000))},
+		devinSessionRow{ID: liveSessionID, Title: "Live", WorkingDirectory: "/tmp/live", Model: "db-model", CreatedAt: new(int64(1704103199)), LastActivityAt: new(int64(1704103265))},
+		devinSessionRow{ID: "session-deleted", Title: "Deleted", WorkingDirectory: "/tmp/deleted", Model: "db-model", CreatedAt: new(int64(1704103199)), LastActivityAt: new(int64(1704103264))},
 	)
 	fixture.writeTranscript(t, liveSessionID, `{"steps":[]}`)
 	root := fixture.Root
@@ -124,7 +125,7 @@ func TestDevinProviderDBEventsFanOutAndPreserveTombstones(t *testing.T) {
 	provider, ok := NewProvider(AgentDevin, ProviderConfig{Roots: []string{root}})
 	require.True(t, ok)
 
-	for _, changedPath := range []string{dbPath, dbPath + "-wal", dbPath + "-shm"} {
+	for _, changedPath := range []string{dbPath, dbPath + "-wal"} {
 		changed, err := provider.SourcesForChangedPath(context.Background(), ChangedPathRequest{
 			Path:              changedPath,
 			EventKind:         "write",
@@ -143,8 +144,8 @@ func TestDevinProviderDBEventsFanOutAndPreserveTombstones(t *testing.T) {
 func TestDevinProviderTranscriptEventsTargetLiveOrStoredSession(t *testing.T) {
 	const liveSessionID = "session-live"
 	fixture := newDevinTestFixture(t,
-		devinSessionRow{ID: liveSessionID, Title: "Live", WorkingDirectory: "/tmp/live", Model: "db-model", CreatedAtMillis: new(int64(1704103199000)), LastActivityMillis: new(int64(1704103265000))},
-		devinSessionRow{ID: "session-deleted", Title: "Deleted", WorkingDirectory: "/tmp/deleted", Model: "db-model", CreatedAtMillis: new(int64(1704103199000)), LastActivityMillis: new(int64(1704103264000))},
+		devinSessionRow{ID: liveSessionID, Title: "Live", WorkingDirectory: "/tmp/live", Model: "db-model", CreatedAt: new(int64(1704103199)), LastActivityAt: new(int64(1704103265))},
+		devinSessionRow{ID: "session-deleted", Title: "Deleted", WorkingDirectory: "/tmp/deleted", Model: "db-model", CreatedAt: new(int64(1704103199)), LastActivityAt: new(int64(1704103264))},
 	)
 	fixture.writeTranscript(t, liveSessionID, `{"steps":[]}`)
 	root := fixture.Root
@@ -178,7 +179,7 @@ func TestDevinProviderTranscriptEventsTargetLiveOrStoredSession(t *testing.T) {
 
 func TestDevinProviderRejectsUnrelatedChangedPaths(t *testing.T) {
 	const sessionID = "session-123"
-	dbPath, _ := newDevinSessionFixture(t, devinSessionRow{ID: sessionID, Title: "Title", WorkingDirectory: "/tmp/app", Model: "db-model", CreatedAtMillis: new(int64(1704103199000)), LastActivityMillis: new(int64(1704103265000))}, `{"steps":[]}`)
+	dbPath, _ := newDevinSessionFixture(t, devinSessionRow{ID: sessionID, Title: "Title", WorkingDirectory: "/tmp/app", Model: "db-model", CreatedAt: new(int64(1704103199)), LastActivityAt: new(int64(1704103265))}, `{"steps":[]}`)
 	root := filepath.Dir(filepath.Dir(dbPath))
 
 	provider, ok := NewProvider(AgentDevin, ProviderConfig{Roots: []string{root}})
@@ -187,6 +188,12 @@ func TestDevinProviderRejectsUnrelatedChangedPaths(t *testing.T) {
 	for _, req := range []ChangedPathRequest{
 		{
 			Path:      filepath.Join(root, "cli", "sessions.db-backup"),
+			EventKind: "write",
+			WatchRoot: filepath.Join(root, "cli"),
+		},
+		{
+			// The provider's own read connection rewrites the -shm index.
+			Path:      filepath.Join(root, "cli", devinDBFilename+"-shm"),
 			EventKind: "write",
 			WatchRoot: filepath.Join(root, "cli"),
 		},
@@ -215,12 +222,12 @@ func TestDevinProviderRejectsUnrelatedChangedPaths(t *testing.T) {
 func TestDevinProviderMissingTranscriptUsesMessageNodeFallback(t *testing.T) {
 	const sessionID = "session-db-only"
 	fixture := newDevinTestFixture(t,
-		devinSessionRow{ID: sessionID, Title: "DB only session", WorkingDirectory: "/tmp/db-only-project", Model: "db-only-model", CreatedAtMillis: new(int64(1704103200000)), LastActivityMillis: new(int64(1704103209000))},
+		devinSessionRow{ID: sessionID, Title: "DB only session", WorkingDirectory: "/tmp/db-only-project", Model: "db-only-model", CreatedAt: new(int64(1704103200)), LastActivityAt: new(int64(1704103209))},
 	)
 	root := fixture.Root
 	fixture.insertMessageNodes(t,
-		devinSyntheticMessageNodeRow{SessionID: sessionID, NodeID: 1, ChatMessage: `{"role":"user","content":"fallback user"}`, CreatedAtMillis: 1704103201000},
-		devinSyntheticMessageNodeRow{SessionID: sessionID, NodeID: 2, ChatMessage: `{"role":"assistant","content":"fallback assistant"}`, CreatedAtMillis: 1704103205000},
+		devinSyntheticMessageNodeRow{SessionID: sessionID, NodeID: 1, ChatMessage: `{"role":"user","content":"fallback user"}`, CreatedAt: 1704103201},
+		devinSyntheticMessageNodeRow{SessionID: sessionID, NodeID: 2, ChatMessage: `{"role":"assistant","content":"fallback assistant"}`, CreatedAt: 1704103205},
 	)
 
 	provider, ok := NewProvider(AgentDevin, ProviderConfig{Roots: []string{root}, Machine: "devbox"})
@@ -243,7 +250,7 @@ func TestDevinProviderMissingTranscriptUsesMessageNodeFallback(t *testing.T) {
 func TestDevinProviderMissingTranscriptWithoutDBMessagesReturnsProviderError(t *testing.T) {
 	const sessionID = "session-db-only-empty"
 	fixture := newDevinTestFixture(t,
-		devinSessionRow{ID: sessionID, Title: "DB only session", WorkingDirectory: "/tmp/db-only-project", Model: "db-only-model", CreatedAtMillis: new(int64(1704103200000)), LastActivityMillis: new(int64(1704103209000))},
+		devinSessionRow{ID: sessionID, Title: "DB only session", WorkingDirectory: "/tmp/db-only-project", Model: "db-only-model", CreatedAt: new(int64(1704103200)), LastActivityAt: new(int64(1704103209))},
 	)
 	root := fixture.Root
 
@@ -264,7 +271,7 @@ func TestDevinProviderMissingTranscriptWithoutDBMessagesReturnsProviderError(t *
 
 func TestDevinProviderCompositeFingerprintStableAndRedacted(t *testing.T) {
 	const sessionID = "session-fingerprint"
-	dbPath, transcriptPath := newDevinSessionFixture(t, devinSessionRow{ID: sessionID, Title: "Stable title", WorkingDirectory: "/Users/alice/.config/devin/project", Model: "db-model", CreatedAtMillis: new(int64(1704103200000)), LastActivityMillis: new(int64(1704103209000)), MetadataJSON: `{"token_hint":"redacted"}`}, `{"token":"secret-token-123","steps":[{"step_id":"step-1","source":"user","message":"hello"}]}`)
+	dbPath, transcriptPath := newDevinSessionFixture(t, devinSessionRow{ID: sessionID, Title: "Stable title", WorkingDirectory: "/Users/alice/.config/devin/project", Model: "db-model", CreatedAt: new(int64(1704103200)), LastActivityAt: new(int64(1704103209)), MetadataJSON: `{"token_hint":"redacted"}`}, `{"token":"secret-token-123","steps":[{"step_id":"step-1","source":"user","message":"hello"}]}`)
 	root := filepath.Dir(filepath.Dir(dbPath))
 	virtualPath := VirtualSourcePath(dbPath, sessionID)
 
@@ -291,7 +298,7 @@ func TestDevinProviderCompositeFingerprintStableAndRedacted(t *testing.T) {
 
 func TestDevinProviderFingerprintChangesWhenTranscriptChangesWithoutDBMetadataChange(t *testing.T) {
 	const sessionID = "session-transcript-change"
-	dbPath, transcriptPath := newDevinSessionFixture(t, devinSessionRow{ID: sessionID, Title: "Transcript change", WorkingDirectory: "/tmp/app", Model: "db-model", CreatedAtMillis: new(int64(1704103200000)), LastActivityMillis: new(int64(1704103209000))}, `{"steps":[{"step_id":"step-1","source":"user","message":"alpha"}]}`)
+	dbPath, transcriptPath := newDevinSessionFixture(t, devinSessionRow{ID: sessionID, Title: "Transcript change", WorkingDirectory: "/tmp/app", Model: "db-model", CreatedAt: new(int64(1704103200)), LastActivityAt: new(int64(1704103209))}, `{"steps":[{"step_id":"step-1","source":"user","message":"alpha"}]}`)
 	root := filepath.Dir(filepath.Dir(dbPath))
 
 	provider, ok := NewProvider(AgentDevin, ProviderConfig{Roots: []string{root}})
@@ -319,8 +326,13 @@ func TestDevinProviderFingerprintChangesWhenTranscriptChangesWithoutDBMetadataCh
 
 func TestDevinProviderFingerprintChangesWhenLastActivityChanges(t *testing.T) {
 	const sessionID = "session-last-activity"
-	dbPath, _ := newDevinSessionFixture(t, devinSessionRow{ID: sessionID, Title: "DB change", WorkingDirectory: "/tmp/app", Model: "db-model", CreatedAtMillis: new(int64(1704103200000)), LastActivityMillis: new(int64(1704103209000))}, `{"steps":[]}`)
+	dbPath, transcriptPath := newDevinSessionFixture(t, devinSessionRow{ID: sessionID, Title: "DB change", WorkingDirectory: "/tmp/app", Model: "db-model", CreatedAt: new(int64(1704103200)), LastActivityAt: new(int64(1704103209))}, `{"steps":[]}`)
 	root := filepath.Dir(filepath.Dir(dbPath))
+	// Keep filesystem timestamps older than the session activity so the
+	// fingerprint change measures metadata, independent of filesystem timing.
+	fileTime := time.Unix(1704103200, 0)
+	require.NoError(t, os.Chtimes(dbPath, fileTime, fileTime))
+	require.NoError(t, os.Chtimes(transcriptPath, fileTime, fileTime))
 
 	provider, ok := NewProvider(AgentDevin, ProviderConfig{Roots: []string{root}})
 	require.True(t, ok)
@@ -332,19 +344,21 @@ func TestDevinProviderFingerprintChangesWhenLastActivityChanges(t *testing.T) {
 	before, err := provider.Fingerprint(context.Background(), source)
 	require.NoError(t, err)
 
-	execDevinTestSQL(t, dbPath, `UPDATE sessions SET last_activity_at = 1704103215000 WHERE id = 'session-last-activity'`)
+	execDevinTestSQL(t, dbPath, `UPDATE sessions SET last_activity_at = 1704103215 WHERE id = 'session-last-activity'`)
+	require.NoError(t, os.Chtimes(dbPath, fileTime, fileTime))
 
 	after, err := provider.Fingerprint(context.Background(), source)
 	require.NoError(t, err)
 
 	assert.Equal(t, before.Key, after.Key)
-	assert.Greater(t, after.MTimeNS, before.MTimeNS)
+	assert.Equal(t, int64(1704103209000000000), before.MTimeNS)
+	assert.Equal(t, int64(1704103215000000000), after.MTimeNS)
 	assert.NotEqual(t, before.Hash, after.Hash)
 }
 
 func TestDevinProviderFingerprintChangesWhenWorkingDirectoryChanges(t *testing.T) {
 	const sessionID = "session-cwd-change"
-	dbPath, _ := newDevinSessionFixture(t, devinSessionRow{ID: sessionID, Title: "CWD change", WorkingDirectory: "/tmp/app", Model: "db-model", CreatedAtMillis: new(int64(1704103200000)), LastActivityMillis: new(int64(1704103209000))}, `{"steps":[]}`)
+	dbPath, _ := newDevinSessionFixture(t, devinSessionRow{ID: sessionID, Title: "CWD change", WorkingDirectory: "/tmp/app", Model: "db-model", CreatedAt: new(int64(1704103200)), LastActivityAt: new(int64(1704103209))}, `{"steps":[]}`)
 	root := filepath.Dir(filepath.Dir(dbPath))
 
 	provider, ok := NewProvider(AgentDevin, ProviderConfig{Roots: []string{root}})
@@ -368,7 +382,7 @@ func TestDevinProviderFingerprintChangesWhenWorkingDirectoryChanges(t *testing.T
 
 func TestDevinProviderFingerprintWithoutTranscriptUsesDBFreshnessOnly(t *testing.T) {
 	const sessionID = "session-missing-transcript"
-	dbPath, transcriptPath := newDevinSessionFixture(t, devinSessionRow{ID: sessionID, Title: "DB only session", WorkingDirectory: "/tmp/app", Model: "db-model", CreatedAtMillis: new(int64(1704103200000)), LastActivityMillis: new(int64(1704103209000))}, `{"steps":[]}`)
+	dbPath, transcriptPath := newDevinSessionFixture(t, devinSessionRow{ID: sessionID, Title: "DB only session", WorkingDirectory: "/tmp/app", Model: "db-model", CreatedAt: new(int64(1704103200)), LastActivityAt: new(int64(1704103209))}, `{"steps":[]}`)
 	root := filepath.Dir(filepath.Dir(dbPath))
 	virtualPath := VirtualSourcePath(dbPath, sessionID)
 	require.NoError(t, os.Remove(transcriptPath))
@@ -393,10 +407,10 @@ func TestDevinProviderFingerprintWithoutTranscriptUsesDBFreshnessOnly(t *testing
 func TestDevinProviderFingerprintWithoutTranscriptChangesWhenMessageNodesChange(t *testing.T) {
 	const sessionID = "session-message-node-change"
 	fixture := newDevinTestFixture(t,
-		devinSessionRow{ID: sessionID, Title: "DB messages", WorkingDirectory: "/tmp/app", Model: "db-model", CreatedAtMillis: new(int64(1704103200000)), LastActivityMillis: new(int64(1704103209000))},
+		devinSessionRow{ID: sessionID, Title: "DB messages", WorkingDirectory: "/tmp/app", Model: "db-model", CreatedAt: new(int64(1704103200)), LastActivityAt: new(int64(1704103209))},
 	)
 	fixture.insertMessageNodes(t,
-		devinSyntheticMessageNodeRow{SessionID: sessionID, NodeID: 1, ChatMessage: `{"role":"user","content":"alpha"}`, CreatedAtMillis: 1704103201000},
+		devinSyntheticMessageNodeRow{SessionID: sessionID, NodeID: 1, ChatMessage: `{"role":"user","content":"alpha"}`, CreatedAt: 1704103201},
 	)
 
 	provider, ok := NewProvider(AgentDevin, ProviderConfig{Roots: []string{fixture.Root}})
@@ -418,11 +432,47 @@ func TestDevinProviderFingerprintWithoutTranscriptChangesWhenMessageNodesChange(
 	assert.NotEqual(t, before.Hash, after.Hash)
 }
 
+func TestDevinProviderFingerprintWithoutTranscriptChangesWhenMainChainChanges(t *testing.T) {
+	const sessionID = "session-main-chain-change"
+	fixture := newDevinTestFixture(t,
+		devinSessionRow{
+			ID:               sessionID,
+			Title:            "DB messages",
+			WorkingDirectory: "/tmp/app",
+			Model:            "db-model",
+			CreatedAt:        new(int64(1704103200)),
+			LastActivityAt:   new(int64(1704103209)),
+			MainChainID:      new(int64(2)),
+		},
+	)
+	fixture.insertMessageNodes(t,
+		devinSyntheticMessageNodeRow{SessionID: sessionID, NodeID: 1, ChatMessage: `{"role":"user","content":"question"}`, CreatedAt: 1704103201},
+		devinSyntheticMessageNodeRow{SessionID: sessionID, NodeID: 2, ParentNodeID: new(int64(1)), ChatMessage: `{"role":"assistant","content":"first branch"}`, CreatedAt: 1704103205},
+		devinSyntheticMessageNodeRow{SessionID: sessionID, NodeID: 3, ParentNodeID: new(int64(1)), ChatMessage: `{"role":"assistant","content":"second branch"}`, CreatedAt: 1704103205},
+	)
+
+	provider, ok := NewProvider(AgentDevin, ProviderConfig{Roots: []string{fixture.Root}})
+	require.True(t, ok)
+	source, ok, err := provider.FindSource(context.Background(), FindSourceRequest{RawSessionID: sessionID})
+	require.NoError(t, err)
+	require.True(t, ok)
+
+	before, err := provider.Fingerprint(context.Background(), source)
+	require.NoError(t, err)
+	execDevinTestSQL(t, fixture.DBPath,
+		`UPDATE sessions SET main_chain_id = 3 WHERE id = 'session-main-chain-change'`)
+	after, err := provider.Fingerprint(context.Background(), source)
+	require.NoError(t, err)
+
+	assert.Equal(t, before.Key, after.Key)
+	assert.NotEqual(t, before.Hash, after.Hash)
+}
+
 func TestDevinProviderRejectsInvalidStoredVirtualPaths(t *testing.T) {
 	const sessionID = "session-123"
 	fixture := newDevinTestFixture(t,
-		devinSessionRow{ID: sessionID, Title: "Title", WorkingDirectory: "/tmp/app", Model: "db-model", CreatedAtMillis: new(int64(1704103199000)), LastActivityMillis: new(int64(1704103265000))},
-		devinSessionRow{ID: "session-999", Title: "Other", WorkingDirectory: "/tmp/other", Model: "db-model", CreatedAtMillis: new(int64(1704103199000)), LastActivityMillis: new(int64(1704103265000))},
+		devinSessionRow{ID: sessionID, Title: "Title", WorkingDirectory: "/tmp/app", Model: "db-model", CreatedAt: new(int64(1704103199)), LastActivityAt: new(int64(1704103265))},
+		devinSessionRow{ID: "session-999", Title: "Other", WorkingDirectory: "/tmp/other", Model: "db-model", CreatedAt: new(int64(1704103199)), LastActivityAt: new(int64(1704103265))},
 	)
 	fixture.writeTranscript(t, sessionID, `{"steps":[]}`)
 	root := fixture.Root
@@ -459,7 +509,7 @@ func TestDevinProviderRejectsInvalidStoredVirtualPaths(t *testing.T) {
 
 func TestDevinProviderDedupesDuplicateRoots(t *testing.T) {
 	const sessionID = "session-123"
-	dbPath, _ := newDevinSessionFixture(t, devinSessionRow{ID: sessionID, Title: "Title", WorkingDirectory: "/tmp/app", Model: "db-model", CreatedAtMillis: new(int64(1704103199000)), LastActivityMillis: new(int64(1704103265000))}, `{"steps":[]}`)
+	dbPath, _ := newDevinSessionFixture(t, devinSessionRow{ID: sessionID, Title: "Title", WorkingDirectory: "/tmp/app", Model: "db-model", CreatedAt: new(int64(1704103199)), LastActivityAt: new(int64(1704103265))}, `{"steps":[]}`)
 	root := filepath.Dir(filepath.Dir(dbPath))
 
 	provider, ok := NewProvider(AgentDevin, ProviderConfig{Roots: []string{root, root, filepath.Join(root, ".")}})
@@ -472,7 +522,7 @@ func TestDevinProviderDedupesDuplicateRoots(t *testing.T) {
 
 func TestDevinProviderDeletedRowFingerprintsTombstoneAndSkips(t *testing.T) {
 	const sessionID = "session-123"
-	dbPath, _ := newDevinSessionFixture(t, devinSessionRow{ID: sessionID, Title: "Title", WorkingDirectory: "/tmp/app", Model: "db-model", CreatedAtMillis: new(int64(1704103199000)), LastActivityMillis: new(int64(1704103265000))}, `{"steps":[]}`)
+	dbPath, _ := newDevinSessionFixture(t, devinSessionRow{ID: sessionID, Title: "Title", WorkingDirectory: "/tmp/app", Model: "db-model", CreatedAt: new(int64(1704103199)), LastActivityAt: new(int64(1704103265))}, `{"steps":[]}`)
 	root := filepath.Dir(filepath.Dir(dbPath))
 	virtualPath := VirtualSourcePath(dbPath, sessionID)
 
@@ -508,7 +558,7 @@ func TestDevinProviderDeletedRowFingerprintsTombstoneAndSkips(t *testing.T) {
 
 func TestDevinProviderHiddenRowFingerprintsTombstoneAndSkips(t *testing.T) {
 	const sessionID = "session-hidden"
-	dbPath, _ := newDevinSessionFixture(t, devinSessionRow{ID: sessionID, Title: "Title", WorkingDirectory: "/tmp/app", Model: "db-model", CreatedAtMillis: new(int64(1704103199000)), LastActivityMillis: new(int64(1704103265000)), Hidden: false}, `{"steps":[]}`)
+	dbPath, _ := newDevinSessionFixture(t, devinSessionRow{ID: sessionID, Title: "Title", WorkingDirectory: "/tmp/app", Model: "db-model", CreatedAt: new(int64(1704103199)), LastActivityAt: new(int64(1704103265)), Hidden: false}, `{"steps":[]}`)
 	root := filepath.Dir(filepath.Dir(dbPath))
 	virtualPath := VirtualSourcePath(dbPath, sessionID)
 
@@ -544,7 +594,7 @@ func TestDevinProviderHiddenRowFingerprintsTombstoneAndSkips(t *testing.T) {
 
 func TestDevinProviderCorruptTranscriptReturnsProviderError(t *testing.T) {
 	const sessionID = "session-corrupt"
-	dbPath, transcriptPath := newDevinSessionFixture(t, devinSessionRow{ID: sessionID, Title: "Corrupt transcript", WorkingDirectory: "/tmp/app", Model: "db-model", CreatedAtMillis: new(int64(1704103199000)), LastActivityMillis: new(int64(1704103265000))}, `{"steps":[]}`)
+	dbPath, transcriptPath := newDevinSessionFixture(t, devinSessionRow{ID: sessionID, Title: "Corrupt transcript", WorkingDirectory: "/tmp/app", Model: "db-model", CreatedAt: new(int64(1704103199)), LastActivityAt: new(int64(1704103265))}, `{"steps":[]}`)
 	root := filepath.Dir(filepath.Dir(dbPath))
 	require.NoError(t, os.WriteFile(transcriptPath, []byte(`{"secret":"token-123","steps":[`), 0o644))
 
@@ -571,7 +621,7 @@ func TestDevinProviderIgnoresCredentialPathsAndRedactsSecretBearingErrors(t *tes
 		secretSentinel = "oauth-token-SYNTHETIC-SECRET-SENTINEL"
 	)
 	fixture := newDevinTestFixture(t,
-		devinSessionRow{ID: sessionID, Title: "Privacy", WorkingDirectory: "/tmp/app", Model: "db-model", CreatedAtMillis: new(int64(1704103199000)), LastActivityMillis: new(int64(1704103265000))},
+		devinSessionRow{ID: sessionID, Title: "Privacy", WorkingDirectory: "/tmp/app", Model: "db-model", CreatedAt: new(int64(1704103199)), LastActivityAt: new(int64(1704103265))},
 	)
 	transcriptPath := fixture.writeTranscript(t, sessionID, `{"api_key":"oauth-token-SYNTHETIC-SECRET-SENTINEL","steps":[`)
 
@@ -626,7 +676,7 @@ func TestDevinProviderIgnoresCredentialPathsAndRedactsSecretBearingErrors(t *tes
 
 func TestDevinProviderMissingDBSkipsAndPreservesSessions(t *testing.T) {
 	const sessionID = "session-123"
-	dbPath, _ := newDevinSessionFixture(t, devinSessionRow{ID: sessionID, Title: "Title", WorkingDirectory: "/tmp/app", Model: "db-model", CreatedAtMillis: new(int64(1704103199000)), LastActivityMillis: new(int64(1704103265000))}, `{"steps":[]}`)
+	dbPath, _ := newDevinSessionFixture(t, devinSessionRow{ID: sessionID, Title: "Title", WorkingDirectory: "/tmp/app", Model: "db-model", CreatedAt: new(int64(1704103199)), LastActivityAt: new(int64(1704103265))}, `{"steps":[]}`)
 	root := filepath.Dir(filepath.Dir(dbPath))
 	virtualPath := VirtualSourcePath(dbPath, sessionID)
 

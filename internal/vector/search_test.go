@@ -2,7 +2,7 @@ package vector
 
 import (
 	"context"
-	"encoding/json"
+	"encoding/json/v2"
 	"math"
 	"net/http"
 	"net/http/httptest"
@@ -119,6 +119,26 @@ func TestSearchPageExhaustionUsesChunkCandidatesBeforeDocumentRollup(t *testing.
 	_, exhausted, err = ix.SearchPage(ctx, fakeSearchEncoder(), "alpha", 100)
 	require.NoError(t, err)
 	assert.True(t, exhausted)
+}
+
+func TestSearchRejectsCandidateCountAboveEngineKMax(t *testing.T) {
+	ix := openTestIndex(t)
+	ctx := context.Background()
+
+	_, err := ix.Build(ctx, threeDocSearchSource(), fakeSearchEncoder(),
+		fakeGeneration("fake-model"), BuildOptions{})
+	require.NoError(t, err)
+
+	_, _, err = ix.SearchPage(
+		ctx, fakeSearchEncoder(), "alpha", MaxKNNCandidates,
+	)
+	require.NoError(t, err)
+
+	_, _, err = ix.SearchPage(
+		ctx, fakeSearchEncoder(), "alpha", MaxKNNCandidates+1,
+	)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "k value in knn query too large")
 }
 
 func TestSearchNoGenerationsReturnsErrNoActiveGeneration(t *testing.T) {
@@ -852,7 +872,7 @@ func TestSearchReducedDimensionsEndToEnd(t *testing.T) {
 			Input      []string `json:"input"`
 			Dimensions int      `json:"dimensions"`
 		}
-		require.NoError(t, json.NewDecoder(r.Body).Decode(&req))
+		require.NoError(t, json.UnmarshalRead(r.Body, &req))
 		mu.Lock()
 		requestedDims = append(requestedDims, req.Dimensions)
 		mu.Unlock()
@@ -876,7 +896,7 @@ func TestSearchReducedDimensionsEndToEnd(t *testing.T) {
 			data[i] = map[string]any{"index": i, "embedding": vec}
 		}
 		w.Header().Set("Content-Type", "application/json")
-		require.NoError(t, json.NewEncoder(w).Encode(map[string]any{"data": data}))
+		require.NoError(t, json.MarshalWrite(w, map[string]any{"data": data}))
 	}))
 	defer srv.Close()
 

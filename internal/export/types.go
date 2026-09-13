@@ -9,9 +9,9 @@ import (
 	"go.kenn.io/agentsview/internal/money"
 )
 
-const UsageDailySchemaVersion = 4
-const ActivityReportSchemaVersion = 4
-const SessionSummarySchemaVersion = 4
+const UsageDailySchemaVersion = 6
+const ActivityReportSchemaVersion = 8
+const SessionSummarySchemaVersion = 6
 
 // CostSource is a closed contract enum. Adding a value requires a schema version
 // bump for any export surface that emits it.
@@ -51,8 +51,34 @@ type EffectiveModelRate struct {
 	InputCostPerMTok      money.Money `json:"input_cost_per_mtok"`
 	OutputCostPerMTok     money.Money `json:"output_cost_per_mtok"`
 	CacheWriteCostPerMTok money.Money `json:"cache_write_cost_per_mtok"`
-	CacheReadCostPerMTok  money.Money `json:"cache_read_cost_per_mtok"`
-	CostSource            CostSource  `json:"cost_source"`
+	// Zero means no separate 1h cache-write rate; 1h writes bill at
+	// cache_write_cost_per_mtok.
+	CacheWrite1hCostPerMTok money.Money        `json:"cache_write_1h_cost_per_mtok"`
+	CacheReadCostPerMTok    money.Money        `json:"cache_read_cost_per_mtok"`
+	CostSource              CostSource         `json:"cost_source"`
+	Bands                   []PricingBand      `json:"bands"`
+	Application             PricingApplication `json:"application"`
+}
+
+type PricingBand struct {
+	AboveInputTokens    int         `json:"above_input_tokens"`
+	InputPerMTok        money.Money `json:"input_cost_per_mtok"`
+	OutputPerMTok       money.Money `json:"output_cost_per_mtok"`
+	CacheWritePerMTok   money.Money `json:"cache_write_cost_per_mtok"`
+	CacheWrite1hPerMTok money.Money `json:"cache_write_1h_cost_per_mtok"`
+	CacheReadPerMTok    money.Money `json:"cache_read_cost_per_mtok"`
+	UpdatedAt           *time.Time  `json:"-"`
+}
+
+type PricingApplication struct {
+	BaseRequestCount  int                  `json:"base_request_count"`
+	AggregateRowCount int                  `json:"aggregate_row_count"`
+	Bands             []AppliedPricingBand `json:"bands"`
+}
+
+type AppliedPricingBand struct {
+	AboveInputTokens int `json:"above_input_tokens"`
+	RequestCount     int `json:"request_count"`
 }
 
 // ProjectResolution is a closed contract enum. Adding a value requires a schema

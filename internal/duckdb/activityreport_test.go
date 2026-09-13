@@ -4,7 +4,8 @@ package duckdb
 
 import (
 	"context"
-	"encoding/json"
+	"encoding/json/jsontext"
+	"fmt"
 	"testing"
 	"time"
 
@@ -52,6 +53,145 @@ func activityReportStore(
 	return NewStoreFromDB(syncer.DB())
 }
 
+func TestActivityReportSourceProbeTracksIdentityRevision(t *testing.T) {
+	ctx := context.Background()
+	conn := openTestDuckDB(t)
+	require.NoError(t, EnsureSchema(ctx, conn))
+	store := NewStoreFromDB(conn)
+
+	before, err := store.ActivityReportSourceProbe(ctx)
+	require.NoError(t, err)
+	require.NoError(t, recordMetadataKey(
+		ctx, conn, identityRevisionMetadataKey, "7",
+	))
+	after, err := store.ActivityReportSourceProbe(ctx)
+	require.NoError(t, err)
+
+	assert.NotEqual(t, before, after,
+		"identity-only mirror updates must change the Activity probe")
+}
+
+func TestActivityReportCandidateSourcePreservesRangeEdgePairs(t *testing.T) {
+	const sessionID = "range-edge"
+	timestamps := []string{
+		"2026-06-13T23:54:59Z",
+		"2026-06-13T23:59:30Z",
+		"2026-06-14T00:00:30Z",
+		"2026-06-14T23:59:00Z",
+		"2026-06-15T00:20:00Z",
+	}
+	session := syncSession(sessionID, "edges", "edge", timestamps[0], len(timestamps))
+	session.EndedAt = &timestamps[len(timestamps)-1]
+	messages := make([]db.Message, 0, len(timestamps))
+	for ordinal, timestamp := range timestamps {
+		messages = append(messages, syncMessage(
+			sessionID, ordinal, "user", "edge", timestamp,
+		))
+	}
+	store := activityReportStore(t, []db.SessionBatchWrite{{
+		Session: session, Messages: messages,
+		DataVersion: 1, ReplaceMessages: true,
+	}}, nil)
+	q := duckDayQuery(t, "2026-06-14", "UTC")
+
+	var starts []int
+	err := store.ActivityReportCandidateSource(
+		[]string{sessionID}, q,
+	)(context.Background(), func(candidate activity.IntervalCandidate) error {
+		starts = append(starts, candidate.StartOrdinal)
+		return nil
+	})
+	require.NoError(t, err)
+	assert.Equal(t, []int{1, 2, 3}, starts,
+		"left pruning and right successor lookup must preserve adjacency")
+}
+
+func TestDuckActivityReportIncludesToolCompletionEvents(t *testing.T) {
+	const sessionID = "tool-completion"
+	started := "2026-06-14T10:00:00Z"
+	called := "2026-06-14T10:01:00Z"
+	completed := "2026-06-14T10:02:00Z"
+	session := syncSession(sessionID, "tools", "tool timing", started, 2)
+	session.EndedAt = &completed
+	callMessage := syncMessage(
+		sessionID, 1, "assistant", "", called,
+	)
+	callMessage.Model = "model-x"
+	callMessage.HasToolUse = true
+	callMessage.ToolCalls = []db.ToolCall{{
+		SessionID: sessionID,
+		ToolName:  "sample_tool",
+		Category:  "Other",
+		ToolUseID: "sample-call",
+		CallIndex: 0,
+		ResultEvents: []db.ToolResultEvent{
+			{ToolUseID: "sample-call", Source: "tool_execution",
+				Status: "started", Timestamp: called, EventIndex: 0},
+			{ToolUseID: "sample-call", Source: "tool_execution",
+				Status: "completed", Timestamp: completed, EventIndex: 1},
+		},
+	}}
+	store := activityReportStore(t, []db.SessionBatchWrite{{
+		Session: session,
+		Messages: []db.Message{
+			syncMessage(sessionID, 0, "user", "run the sample", started),
+			callMessage,
+		},
+		DataVersion: 1, ReplaceMessages: true,
+	}}, nil)
+
+	report, err := store.GetActivityReport(
+		context.Background(), db.AnalyticsFilter{Timezone: "UTC"},
+		duckDayQuery(t, "2026-06-14", "UTC"),
+	)
+	require.NoError(t, err)
+	require.Len(t, report.BySession, 1)
+	require.NotNil(t, report.BySession[0].AgentMinutes)
+	assert.InDelta(t, 2.0, *report.BySession[0].AgentMinutes, 1e-9)
+}
+
+func TestDuckActivityReportDoesNotDoubleCountInlineToolCompletion(t *testing.T) {
+	const sessionID = "inline-tool-completion"
+	started := "2026-06-14T10:00:00Z"
+	called := "2026-06-14T10:01:00Z"
+	continued := "2026-06-14T10:01:30Z"
+	completed := "2026-06-14T10:02:00Z"
+	ended := "2026-06-14T10:03:00Z"
+	session := syncSession(sessionID, "tools", "inline tool timing", started, 4)
+	session.EndedAt = &ended
+	callMessage := syncMessage(sessionID, 1, "assistant", "", called)
+	callMessage.HasToolUse = true
+	callMessage.ToolCalls = []db.ToolCall{{
+		SessionID: sessionID, ToolName: "sample_tool", Category: "Other",
+		ToolUseID: "sample-call", CallIndex: 0,
+		ResultEvents: []db.ToolResultEvent{
+			{ToolUseID: "sample-call", Source: "tool_execution",
+				Status: "started", Timestamp: called, EventIndex: 0},
+			{ToolUseID: "sample-call", Source: "tool_execution",
+				Status: "completed", Timestamp: completed, EventIndex: 1},
+		},
+	}}
+	store := activityReportStore(t, []db.SessionBatchWrite{{
+		Session: session,
+		Messages: []db.Message{
+			syncMessage(sessionID, 0, "user", "run the sample", started),
+			callMessage,
+			syncMessage(sessionID, 2, "assistant", "continuing", continued),
+			syncMessage(sessionID, 3, "assistant", "finished", ended),
+		},
+		DataVersion: 1, ReplaceMessages: true,
+	}}, nil)
+
+	report, err := store.GetActivityReport(
+		context.Background(), db.AnalyticsFilter{Timezone: "UTC"},
+		duckDayQuery(t, "2026-06-14", "UTC"),
+	)
+	require.NoError(t, err)
+	require.Len(t, report.BySession, 1)
+	require.NotNil(t, report.BySession[0].AgentMinutes)
+	assert.InDelta(t, 3.0, *report.BySession[0].AgentMinutes, 1e-9)
+}
+
 func TestDuckGetActivityReportBasicConcurrency(t *testing.T) {
 	ctx := context.Background()
 	// Two overlapping sessions on 2026-06-14 (UTC), each two timestamped
@@ -88,6 +228,7 @@ func TestDuckGetActivityReportBasicConcurrency(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, 2, r.Peak.Agents)
 	assert.Equal(t, 2, r.Totals.Sessions)
+	assert.Equal(t, 2, r.SessionsTotal)
 	assert.GreaterOrEqual(t, len(r.ByAgent), 2)
 }
 
@@ -101,7 +242,7 @@ func TestDuckGetActivityReportIncludesSubagentUsage(t *testing.T) {
 	root := syncSession("root", "proj1", "root first", "2026-06-14T10:00:00.000Z", 1)
 	rootMsg := syncMessage("root", 0, "assistant", "x", "2026-06-14T10:00:00.000Z")
 	rootMsg.Model = "root-model"
-	rootMsg.TokenUsage = json.RawMessage(`{"input_tokens":1000,"output_tokens":500}`)
+	rootMsg.TokenUsage = jsontext.Value(`{"input_tokens":1000,"output_tokens":500}`)
 	rootMsg.OutputTokens = 500
 	rootMsg.ClaudeMessageID = "m-root"
 	rootMsg.ClaudeRequestID = "r-root"
@@ -112,7 +253,7 @@ func TestDuckGetActivityReportIncludesSubagentUsage(t *testing.T) {
 	sub.ParentSessionID = &parent
 	subMsg := syncMessage("agent-sub", 0, "assistant", "y", "2026-06-14T10:03:00.000Z")
 	subMsg.Model = "sub-model"
-	subMsg.TokenUsage = json.RawMessage(`{"input_tokens":2000,"output_tokens":700}`)
+	subMsg.TokenUsage = jsontext.Value(`{"input_tokens":2000,"output_tokens":700}`)
 	subMsg.OutputTokens = 700
 	subMsg.ClaudeMessageID = "m-sub"
 	subMsg.ClaudeRequestID = "r-sub"
@@ -124,7 +265,7 @@ func TestDuckGetActivityReportIncludesSubagentUsage(t *testing.T) {
 	// must drop its usage row while the session itself still appears.
 	forkMsg := syncMessage("fork", 0, "assistant", "x", "2026-06-14T10:05:00.000Z")
 	forkMsg.Model = "root-model"
-	forkMsg.TokenUsage = json.RawMessage(`{"input_tokens":1000,"output_tokens":500}`)
+	forkMsg.TokenUsage = jsontext.Value(`{"input_tokens":1000,"output_tokens":500}`)
 	forkMsg.OutputTokens = 500
 	forkMsg.ClaudeMessageID = "m-root"
 	forkMsg.ClaudeRequestID = "r-root"
@@ -155,6 +296,10 @@ func TestDuckGetActivityReportIncludesSubagentUsage(t *testing.T) {
 	assert.Contains(t, ids, "agent-sub",
 		"subagent session must be a candidate")
 	assert.Contains(t, ids, "fork", "fork session must be a candidate")
+	assert.Equal(t, 3, r.Totals.Sessions)
+	assert.Equal(t, 2, r.Totals.InteractiveSessions, "subagents are not interactive conversations")
+	assert.Equal(t, 1, r.Totals.SubagentSessions)
+	assert.Zero(t, r.Totals.AutomatedSessions)
 	assert.Equal(t, 1200, r.Totals.OutputTokens,
 		"totals include subagent usage; the fork's replayed row dedups away")
 	// Cost = root (1000*3+500*15)/1e6 + subagent (2000*3+700*15)/1e6; the
@@ -170,7 +315,7 @@ func TestDuckGetActivityReportUsageCostAndTokens(t *testing.T) {
 	// cost is deterministic.
 	msg := syncMessage("s1", 0, "assistant", "x", "2026-06-14T10:30:00.000Z")
 	msg.Model = "claude-sonnet-4-20250514"
-	msg.TokenUsage = json.RawMessage(
+	msg.TokenUsage = jsontext.Value(
 		`{"input_tokens":1000,"output_tokens":500}`)
 	msg.OutputTokens = 500
 	writes := []db.SessionBatchWrite{{
@@ -191,9 +336,228 @@ func TestDuckGetActivityReportUsageCostAndTokens(t *testing.T) {
 		duckDayQuery(t, "2026-06-14", "UTC"))
 	require.NoError(t, err)
 	assert.Equal(t, 1, r.Totals.Sessions)
+	require.Len(t, r.Buckets, 288)
+	assert.Equal(t, 1000, r.Buckets[126].InputTokens)
 	assert.Equal(t, 500, r.Totals.OutputTokens)
 	// Cost = (1000*3 + 500*15) / 1e6 = 0.0105
 	assert.Equal(t, money.MustParseDollars("0.0105"), r.Totals.Cost)
+}
+
+func TestDuckGetActivityReportPrefersCompleteClaudeSnapshot(t *testing.T) {
+	ctx := context.Background()
+	sess := syncSession(
+		"streamed", "proj1", "first", "2026-06-14T10:30:00.000Z", 2)
+	sess.Agent = "claude"
+	partial := syncMessage(
+		"streamed", 0, "assistant", "partial", "2026-06-14T10:30:00.000Z")
+	partial.Model = "claude-sonnet-4-20250514"
+	partial.ClaudeMessageID = "msg-stream"
+	partial.ClaudeRequestID = "req-stream"
+	partial.TokenUsage = jsontext.Value(`{"input_tokens":1000,"output_tokens":5}`)
+	partial.OutputTokens = 5
+	complete := syncMessage(
+		"streamed", 1, "assistant", "complete", "2026-06-14T10:31:00.000Z")
+	complete.Model = "claude-sonnet-4-20250514"
+	complete.ClaudeMessageID = "msg-stream"
+	complete.ClaudeRequestID = "req-stream"
+	complete.TokenUsage = jsontext.Value(`{"input_tokens":1000,"output_tokens":631}`)
+	complete.OutputTokens = 631
+	store := activityReportStore(t, []db.SessionBatchWrite{{
+		Session:         sess,
+		Messages:        []db.Message{partial, complete},
+		DataVersion:     1,
+		ReplaceMessages: true,
+	}}, []db.ModelPricing{{
+		ModelPattern:  "claude-sonnet-4-20250514",
+		InputPerMTok:  money.MustParseDollars("3.0"),
+		OutputPerMTok: money.MustParseDollars("15.0"),
+	}})
+
+	r, err := store.GetActivityReport(
+		ctx, db.AnalyticsFilter{Timezone: "UTC"},
+		duckDayQuery(t, "2026-06-14", "UTC"))
+	require.NoError(t, err)
+	assert.Equal(t, 631, r.Totals.OutputTokens)
+}
+
+func TestDuckGetActivityReportFiltersAfterCrossSessionSnapshotSelection(
+	t *testing.T,
+) {
+	ctx := context.Background()
+	parent := syncSession(
+		"activity-parent", "parent-project", "parent",
+		"2026-06-14T10:00:00.000Z", 1)
+	parent.Agent = "claude"
+	child := syncSession(
+		"activity-child", "child-project", "child",
+		"2026-06-14T10:01:00.000Z", 1)
+	child.Agent = "claude"
+	partial := syncMessage(
+		"activity-parent", 0, "assistant", "partial",
+		"2026-06-14T10:00:00.000Z")
+	partial.Model = "partial-model"
+	partial.TokenUsage = jsontext.Value(`{"input_tokens":10,"output_tokens":5}`)
+	partial.OutputTokens = 5
+	partial.ClaudeMessageID = "activity-message"
+	partial.ClaudeRequestID = "activity-request"
+	complete := syncMessage(
+		"activity-child", 0, "assistant", "complete",
+		"2026-06-14T10:01:00.000Z")
+	complete.Model = "complete-model"
+	complete.TokenUsage = jsontext.Value(
+		`{"input_tokens":1000,"output_tokens":631}`)
+	complete.OutputTokens = 631
+	complete.ClaudeMessageID = "activity-message"
+	complete.ClaudeRequestID = "activity-request"
+	store := activityReportStore(t, []db.SessionBatchWrite{
+		{Session: parent, Messages: []db.Message{partial},
+			DataVersion: 1, ReplaceMessages: true},
+		{Session: child, Messages: []db.Message{complete},
+			DataVersion: 1, ReplaceMessages: true},
+	}, nil)
+
+	parentReport, err := store.GetActivityReport(ctx, db.AnalyticsFilter{
+		Project: "parent-project", Timezone: "UTC",
+	}, duckDayQuery(t, "2026-06-14", "UTC"))
+	require.NoError(t, err)
+	assert.Equal(t, 1, parentReport.Totals.Sessions)
+	assert.Equal(t, 631, parentReport.Totals.OutputTokens,
+		"the parent filter must retain the complete child snapshot")
+
+	childReport, err := store.GetActivityReport(ctx, db.AnalyticsFilter{
+		Project: "child-project", Timezone: "UTC",
+	}, duckDayQuery(t, "2026-06-14", "UTC"))
+	require.NoError(t, err)
+	assert.Equal(t, 1, childReport.Totals.Sessions)
+	assert.Zero(t, childReport.Totals.OutputTokens,
+		"the child source must not claim usage attributed to the parent")
+}
+
+func TestDuckGetActivityReportSelectsPeersForLargeSnapshotKeySet(t *testing.T) {
+	const pairCount = duckMaxSQLVars + 1
+	ctx := context.Background()
+	candidate := syncSession(
+		"large-candidate", "included-project", "candidate",
+		"2026-06-14T10:00:00.000Z", pairCount)
+	peer := syncSession(
+		"large-peer", "excluded-project", "peer",
+		"2026-06-14T10:01:00.000Z", pairCount)
+	candidateMessages := make([]db.Message, pairCount)
+	peerMessages := make([]db.Message, pairCount)
+	for i := range pairCount {
+		messageID := fmt.Sprintf("large-message-%04d", i)
+		requestID := fmt.Sprintf("large-request-%04d", i)
+		candidateMessages[i] = syncMessage(
+			candidate.ID, i, "assistant", "partial",
+			"2026-06-14T10:00:00.000Z")
+		candidateMessages[i].ClaudeMessageID = messageID
+		candidateMessages[i].ClaudeRequestID = requestID
+		candidateMessages[i].TokenUsage = jsontext.Value(
+			`{"input_tokens":1,"output_tokens":1}`)
+		candidateMessages[i].OutputTokens = 1
+		peerMessages[i] = syncMessage(
+			peer.ID, i, "assistant", "complete",
+			"2026-06-14T10:01:00.000Z")
+		peerMessages[i].ClaudeMessageID = messageID
+		peerMessages[i].ClaudeRequestID = requestID
+		peerMessages[i].TokenUsage = jsontext.Value(
+			`{"input_tokens":1,"output_tokens":10}`)
+		peerMessages[i].OutputTokens = 10
+	}
+	store := activityReportStore(t, []db.SessionBatchWrite{
+		{Session: candidate, Messages: candidateMessages,
+			DataVersion: 1, ReplaceMessages: true},
+		{Session: peer, Messages: peerMessages,
+			DataVersion: 1, ReplaceMessages: true},
+	}, nil)
+
+	report, err := store.GetActivityReport(ctx, db.AnalyticsFilter{
+		Project: "included-project", Timezone: "UTC",
+	}, duckDayQuery(t, "2026-06-14", "UTC"))
+	require.NoError(t, err)
+	assert.Equal(t, pairCount*10, report.Totals.OutputTokens,
+		"every complete peer snapshot must remain attributed to the candidate")
+}
+
+func TestDuckGetActivityReportDeduplicatesAfterProjectFilter(t *testing.T) {
+	ctx := context.Background()
+	excluded := syncSession(
+		"excluded-earlier", "excluded-project", "excluded",
+		"2026-06-14T10:00:00Z", 1)
+	excluded.Agent = "claude"
+	included := syncSession(
+		"included-later", "included-project", "included",
+		"2026-06-14T10:01:00Z", 1)
+	included.Agent = "claude"
+	excludedMsg := syncMessage(
+		"excluded-earlier", 0, "assistant", "excluded",
+		"2026-06-14T10:00:00Z")
+	excludedMsg.Model = "model-x"
+	excludedMsg.TokenUsage = jsontext.Value(
+		`{"input_tokens":10,"output_tokens":5}`)
+	excludedMsg.OutputTokens = 5
+	excludedMsg.SourceUUID = "shared-source"
+	includedMsg := syncMessage(
+		"included-later", 0, "assistant", "included",
+		"2026-06-14T10:01:00Z")
+	includedMsg.Model = "model-x"
+	includedMsg.TokenUsage = jsontext.Value(
+		`{"input_tokens":20,"output_tokens":631}`)
+	includedMsg.OutputTokens = 631
+	includedMsg.SourceUUID = "shared-source"
+	store := activityReportStore(t, []db.SessionBatchWrite{
+		{Session: excluded, Messages: []db.Message{excludedMsg},
+			DataVersion: 1, ReplaceMessages: true},
+		{Session: included, Messages: []db.Message{includedMsg},
+			DataVersion: 1, ReplaceMessages: true},
+	}, nil)
+
+	report, err := store.GetActivityReport(ctx, db.AnalyticsFilter{
+		Project: "included-project", Timezone: "UTC",
+	}, duckDayQuery(t, "2026-06-14", "UTC"))
+	require.NoError(t, err)
+	assert.Equal(t, 631, report.Totals.OutputTokens,
+		"an excluded duplicate must not suppress included usage")
+}
+
+// TestDuckActivityReportRowStatus1hCacheWrites prices the 1h-TTL subset of
+// a message row's cache writes at the 1h rate through the activity-report
+// path, and splits the cache-savings math the same way (issue #1452's
+// first sample request).
+func TestDuckActivityReportRowStatus1hCacheWrites(t *testing.T) {
+	resolver := export.NewPricingResolver([]export.EffectivePricingRow{{
+		ModelPattern: "claude-fable-5",
+		Rates: export.ModelRates{
+			InputPerMTok:        money.MustParseDollars("10"),
+			OutputPerMTok:       money.MustParseDollars("50"),
+			CacheWritePerMTok:   money.MustParseDollars("12.50"),
+			CacheWrite1hPerMTok: money.MustParseDollars("20"),
+			CacheReadPerMTok:    money.MustParseDollars("1"),
+		},
+	}})
+
+	savings, cost, priced, contributes, err := duckActivityReportRowStatus(
+		duckActivityReportUsageRow{
+			model:     "claude-fable-5",
+			source:    "message",
+			ts:        "2026-08-13T12:00:05Z",
+			inputTok:  2,
+			outputTok: 62,
+			cacheCr:   8989,
+			cacheCr1h: 8989,
+			cacheRd:   15892,
+		},
+		resolver,
+	)
+
+	require.NoError(t, err)
+	assert.True(t, priced)
+	assert.True(t, contributes)
+	// 2x10 + 62x50 + 8989x20 + 15892x1 per MTok = $0.198792, matching
+	// Claude Code's own total_cost_usd for this request.
+	assert.Equal(t, money.Money{Microdollars: 198_792}, cost)
+	// Savings: reads earn (10 - 1) x 15892; 1h writes cost (10 - 20) x 8989.
+	assert.Equal(t, money.Money{Microdollars: 53_138}, savings)
 }
 
 func TestDuckActivityReportRowStatusCanonicalizesKimiAliasByTimestamp(t *testing.T) {
@@ -236,9 +600,10 @@ func TestDuckActivityReportRowStatusCanonicalizesKimiAliasByTimestamp(t *testing
 
 			_, cost, priced, contributes, err := duckActivityReportRowStatus(
 				duckActivityReportUsageRow{
-					model:    "daimon-kimi-code",
-					ts:       tt.timestamp,
-					inputTok: 1_000_000,
+					model:     "daimon-kimi-code",
+					ts:        tt.timestamp,
+					pricingTS: tt.timestamp,
+					inputTok:  1_000_000,
 				},
 				resolver,
 			)
@@ -278,9 +643,10 @@ func TestDuckActivityReportRowStatusPrefersExactCustomKimiAlias(t *testing.T) {
 
 	_, cost, priced, contributes, err := duckActivityReportRowStatus(
 		duckActivityReportUsageRow{
-			model:    "daimon-kimi-code",
-			ts:       "2026-07-19T00:00:00Z",
-			inputTok: 1_000_000,
+			model:     "daimon-kimi-code",
+			ts:        "2026-07-19T00:00:00Z",
+			pricingTS: "2026-07-19T00:00:00Z",
+			inputTok:  1_000_000,
 		},
 		resolver,
 	)
@@ -295,6 +661,109 @@ func TestDuckActivityReportRowStatusPrefersExactCustomKimiAlias(t *testing.T) {
 	resolutions := block.Models["daimon-kimi-code"].Resolutions
 	require.Len(t, resolutions, 1)
 	assert.Equal(t, "daimon-kimi-code", resolutions[0].PricedModel)
+}
+
+func TestDuckActivityReportRowStatusUsesFlatRateForUntimedUsage(t *testing.T) {
+	embedded := pricingpkg.EmbeddedGenAIDocument()
+	resolver := export.NewPricingResolver([]export.EffectivePricingRow{
+		{
+			ModelPattern: "gpt-5.6-luna",
+			Rates: export.ModelRates{
+				InputPerMTok: money.MustParseDollars("9"),
+				Source:       export.PricingRowSourceFetched,
+			},
+		},
+		{
+			GenAI: embedded.Prices, GenAIVersion: embedded.Version,
+			GenAISource: export.PricingRowSourceEmbedded,
+		},
+	})
+
+	_, cost, priced, contributes, err := duckActivityReportRowStatus(
+		duckActivityReportUsageRow{
+			model: "gpt-5.6-luna", ts: "2026-08-01T00:00:00Z",
+			pricingTS: "", inputTok: 1_000,
+		},
+		resolver,
+	)
+
+	require.NoError(t, err)
+	assert.True(t, priced)
+	assert.True(t, contributes)
+	assert.Equal(t, money.MustParseDollars("0.009"), cost)
+}
+
+func TestDuckGetActivityReportPricingBandApplicationCountedOnce(t *testing.T) {
+	ctx := context.Background()
+	sess := syncSession(
+		"pricing-band", "proj1", "banded", "2026-06-14T10:30:00.000Z", 1)
+	msg := syncMessage(
+		sess.ID, 0, "assistant", "request", "2026-06-14T10:30:00.000Z")
+	msg.Model = "banded-model"
+	msg.TokenUsage = jsontext.Value(`{"input_tokens":300000}`)
+	store := activityReportStore(t, []db.SessionBatchWrite{{
+		Session: sess, Messages: []db.Message{msg},
+		DataVersion: 1, ReplaceMessages: true,
+	}}, []db.ModelPricing{{
+		ModelPattern: "banded-model",
+		InputPerMTok: money.MustParseDollars("1"),
+		Bands: []db.PricingBand{{
+			AboveInputTokens: 200_000,
+			InputPerMTok:     money.MustParseDollars("2"),
+		}},
+	}})
+
+	report, err := store.GetActivityReport(
+		ctx, db.AnalyticsFilter{Timezone: "UTC"},
+		duckDayQuery(t, "2026-06-14", "UTC"))
+	require.NoError(t, err)
+	assert.Equal(t, money.Money{Microdollars: 600_000}, report.Totals.Cost)
+	require.NotNil(t, report.Pricing)
+	provenance := report.Pricing.Models["banded-model"]
+	require.Len(t, provenance.Resolutions, 1)
+	assert.Equal(t, export.PricingApplication{
+		Bands: []export.AppliedPricingBand{{
+			AboveInputTokens: 200_000,
+			RequestCount:     1,
+		}},
+	}, provenance.Resolutions[0].Application)
+}
+
+func TestDuckGetActivityReportPricesGooseRequestAsRequestScoped(t *testing.T) {
+	ctx := context.Background()
+	sess := syncSession(
+		"pricing-band", "proj1", "banded", "2026-06-14T10:30:00.000Z", 1)
+	msg := syncMessage(
+		sess.ID, 0, "user", "request", "2026-06-14T10:30:00.000Z")
+	store := activityReportStore(t, []db.SessionBatchWrite{{
+		Session: sess, Messages: []db.Message{msg}, UsageEvents: []db.UsageEvent{{
+			Source: "goose-request", Model: "banded-model", InputTokens: 300_000,
+			OccurredAt: "2026-06-14T10:30:30.000Z", DedupKey: "goose-request",
+		}},
+		DataVersion: 1, ReplaceMessages: true,
+	}}, []db.ModelPricing{{
+		ModelPattern: "banded-model",
+		InputPerMTok: money.MustParseDollars("1"),
+		Bands: []db.PricingBand{{
+			AboveInputTokens: 200_000,
+			InputPerMTok:     money.MustParseDollars("2"),
+		}},
+	}})
+
+	report, err := store.GetActivityReport(
+		ctx, db.AnalyticsFilter{Timezone: "UTC"},
+		duckDayQuery(t, "2026-06-14", "UTC"))
+	require.NoError(t, err)
+	assert.Equal(t, money.Money{Microdollars: 600_000}, report.Totals.Cost)
+	require.NotNil(t, report.Pricing)
+	provenance := report.Pricing.Models["banded-model"]
+	require.Len(t, provenance.Resolutions, 1)
+	assert.Equal(t, export.PricingApplication{
+		Bands: []export.AppliedPricingBand{{
+			AboveInputTokens: 200_000,
+			RequestCount:     1,
+		}},
+	}, provenance.Resolutions[0].Application)
 }
 
 func TestDuckGetActivityReportCopilotReportedCostReplacesSessionEstimates(t *testing.T) {
@@ -349,8 +818,8 @@ func TestDuckGetActivityReportPricingModelsOnlyIncludeDedupSurvivors(t *testing.
 	earlier := syncSession("earlier", "proj1", "first", "2026-06-14T10:30:00.000Z", 1)
 	earlier.Agent = "claude"
 	earlierMsg := syncMessage("earlier", 0, "assistant", "x", "2026-06-14T10:30:00.000Z")
-	earlierMsg.Model = "kept-model"
-	earlierMsg.TokenUsage = json.RawMessage(
+	earlierMsg.Model = "partial-model"
+	earlierMsg.TokenUsage = jsontext.Value(
 		`{"input_tokens":1000,"output_tokens":500}`)
 	earlierMsg.OutputTokens = 500
 	earlierMsg.ClaudeMessageID = "m-dup"
@@ -359,8 +828,8 @@ func TestDuckGetActivityReportPricingModelsOnlyIncludeDedupSurvivors(t *testing.
 	later := syncSession("later", "proj1", "first", "2026-06-14T10:31:00.000Z", 1)
 	later.Agent = "claude"
 	laterMsg := syncMessage("later", 0, "assistant", "x", "2026-06-14T10:31:00.000Z")
-	laterMsg.Model = "discarded-model"
-	laterMsg.TokenUsage = json.RawMessage(
+	laterMsg.Model = "complete-model"
+	laterMsg.TokenUsage = jsontext.Value(
 		`{"input_tokens":2000,"output_tokens":900}`)
 	laterMsg.OutputTokens = 900
 	laterMsg.ClaudeMessageID = "m-dup"
@@ -381,8 +850,8 @@ func TestDuckGetActivityReportPricingModelsOnlyIncludeDedupSurvivors(t *testing.
 		},
 	}
 	pricing := []db.ModelPricing{
-		{ModelPattern: "kept-model", InputPerMTok: money.MustParseDollars("3.0"), OutputPerMTok: money.MustParseDollars("15.0")},
-		{ModelPattern: "discarded-model", InputPerMTok: money.MustParseDollars("3.0"), OutputPerMTok: money.MustParseDollars("15.0")},
+		{ModelPattern: "partial-model", InputPerMTok: money.MustParseDollars("3.0"), OutputPerMTok: money.MustParseDollars("15.0")},
+		{ModelPattern: "complete-model", InputPerMTok: money.MustParseDollars("3.0"), OutputPerMTok: money.MustParseDollars("15.0")},
 	}
 	store := activityReportStore(t, writes, pricing)
 
@@ -390,10 +859,10 @@ func TestDuckGetActivityReportPricingModelsOnlyIncludeDedupSurvivors(t *testing.
 		ctx, db.AnalyticsFilter{Timezone: "UTC"},
 		duckDayQuery(t, "2026-06-14", "UTC"))
 	require.NoError(t, err)
-	assert.Equal(t, 500, r.Totals.OutputTokens)
+	assert.Equal(t, 900, r.Totals.OutputTokens)
 	require.NotNil(t, r.Pricing)
-	assert.Contains(t, r.Pricing.Models, "kept-model")
-	assert.NotContains(t, r.Pricing.Models, "discarded-model")
+	assert.Contains(t, r.Pricing.Models, "complete-model")
+	assert.NotContains(t, r.Pricing.Models, "partial-model")
 }
 
 func TestDuckGetActivityReportPreservesSessionSummaryUsageEventTokens(t *testing.T) {
@@ -459,7 +928,7 @@ func TestDuckGetActivityReportExcludesIneligibleUsage(t *testing.T) {
 
 	eligible := syncMessage("s1", 0, "assistant", "x", "2026-06-14T10:30:00.000Z")
 	eligible.Model = "claude-sonnet-4-20250514"
-	eligible.TokenUsage = json.RawMessage(
+	eligible.TokenUsage = jsontext.Value(
 		`{"input_tokens":1000,"output_tokens":500}`)
 	eligible.OutputTokens = 500
 	// Ineligible: a synthetic-model message carrying real token_usage. The
@@ -467,7 +936,7 @@ func TestDuckGetActivityReportExcludesIneligibleUsage(t *testing.T) {
 	// into the day totals even though the blob is non-empty.
 	synthetic := syncMessage("s1", 1, "assistant", "y", "2026-06-14T10:31:00.000Z")
 	synthetic.Model = "<synthetic>"
-	synthetic.TokenUsage = json.RawMessage(
+	synthetic.TokenUsage = jsontext.Value(
 		`{"input_tokens":9000,"output_tokens":7000}`)
 	synthetic.OutputTokens = 7000
 
@@ -577,8 +1046,8 @@ func TestDuckGetActivityReportOpenSessionWithInRangeMessageIncluded(t *testing.T
 }
 
 // TestDuckGetActivityReportUsageDedupSubSecondOrder confirms DuckDB orders the
-// usage stream by the parsed instant so first-seen-wins dedup keeps the
-// chronologically earlier row when two rows share a dedup key in the same
+// usage stream by the parsed instant so first-seen-wins fallback dedup keeps
+// the chronologically earlier row when two rows share a source UUID in the same
 // second -- one whole-second ("...00Z"), one fractional ("...00.123Z"). DuckDB
 // already sorts on the parsed time (not the formatted text), so this locks in
 // that cross-backend behavior, matching the SQLite
@@ -591,23 +1060,23 @@ func TestDuckGetActivityReportUsageDedupSubSecondOrder(t *testing.T) {
 		OutputPerMTok: money.MustParseDollars("15.0"),
 	}}
 
-	// A resumed/forked pair shares one (claude_message_id, claude_request_id)
+	// A resumed/forked pair shares one source UUID fallback dedup identity
 	// across two sessions: the earlier whole-second instant carries 500 output
 	// tokens, the later fractional instant 9000. Dedup must keep the 500 row.
 	earlier := syncSession("earlier", "proj1", "first", "2026-06-14T10:30:00Z", 1)
 	earlierMsg := syncMessage("earlier", 0, "assistant", "x", "2026-06-14T10:30:00Z")
 	earlierMsg.Model = "claude-sonnet-4-20250514"
 	earlierMsg.ClaudeMessageID = "dup-m"
-	earlierMsg.ClaudeRequestID = "dup-r"
-	earlierMsg.TokenUsage = json.RawMessage(`{"input_tokens":1000,"output_tokens":500}`)
+	earlierMsg.SourceUUID = "dup-source"
+	earlierMsg.TokenUsage = jsontext.Value(`{"input_tokens":1000,"output_tokens":500}`)
 	earlierMsg.OutputTokens = 500
 
 	later := syncSession("later", "proj2", "first", "2026-06-14T10:30:00.123Z", 1)
 	laterMsg := syncMessage("later", 0, "assistant", "x", "2026-06-14T10:30:00.123Z")
 	laterMsg.Model = "claude-sonnet-4-20250514"
 	laterMsg.ClaudeMessageID = "dup-m"
-	laterMsg.ClaudeRequestID = "dup-r"
-	laterMsg.TokenUsage = json.RawMessage(`{"input_tokens":1000,"output_tokens":9000}`)
+	laterMsg.SourceUUID = "dup-source"
+	laterMsg.TokenUsage = jsontext.Value(`{"input_tokens":1000,"output_tokens":9000}`)
 	laterMsg.OutputTokens = 9000
 
 	writes := []db.SessionBatchWrite{
@@ -640,7 +1109,7 @@ func TestDuckGetActivityReportUsageDedupFallsBackToSourceUUID(t *testing.T) {
 	earlierMsg.Model = "claude-sonnet-4-20250514"
 	earlierMsg.ClaudeMessageID = "dup-m"
 	earlierMsg.SourceUUID = "src-dup"
-	earlierMsg.TokenUsage = json.RawMessage(`{"input_tokens":1000,"output_tokens":500}`)
+	earlierMsg.TokenUsage = jsontext.Value(`{"input_tokens":1000,"output_tokens":500}`)
 	earlierMsg.OutputTokens = 500
 
 	later := syncSession("later", "proj2", "first", "2026-06-14T10:30:01Z", 1)
@@ -649,7 +1118,7 @@ func TestDuckGetActivityReportUsageDedupFallsBackToSourceUUID(t *testing.T) {
 	laterMsg.Model = "claude-sonnet-4-20250514"
 	laterMsg.ClaudeMessageID = "dup-m"
 	laterMsg.SourceUUID = "src-dup"
-	laterMsg.TokenUsage = json.RawMessage(`{"input_tokens":1000,"output_tokens":900}`)
+	laterMsg.TokenUsage = jsontext.Value(`{"input_tokens":1000,"output_tokens":900}`)
 	laterMsg.OutputTokens = 900
 
 	writes := []db.SessionBatchWrite{
@@ -679,7 +1148,7 @@ func TestDuckGetActivityReportZeroCostKeepsPrimaryModel(t *testing.T) {
 	msg := syncMessage("u", 0, "assistant", "x", "2026-06-14T10:30:00Z")
 	// Known model, unpriced and zero tokens -> a usage row with zero cost.
 	msg.Model = "model-x"
-	msg.TokenUsage = json.RawMessage(`{"input_tokens":0,"output_tokens":0}`)
+	msg.TokenUsage = jsontext.Value(`{"input_tokens":0,"output_tokens":0}`)
 	msg.OutputTokens = 0
 	writes := []db.SessionBatchWrite{{
 		Session: sess, Messages: []db.Message{msg},

@@ -4,7 +4,8 @@ import (
 	"bufio"
 	"context"
 	"database/sql"
-	"encoding/json"
+	"encoding/json/jsontext"
+	"encoding/json/v2"
 	"fmt"
 	"io"
 	"slices"
@@ -88,6 +89,9 @@ func (db *DB) ImportAcceptedRecallEntriesJSONLWithOptions(
 	ctx context.Context, r io.Reader, opts RecallImportOptions,
 ) (RecallImportResult, error) {
 	var result RecallImportResult
+	if err := db.requireDerivedTextStorage("recall entries"); err != nil {
+		return result, err
+	}
 	scanner := bufio.NewScanner(r)
 	scanner.Buffer(make([]byte, 0, 64*1024), 4*1024*1024)
 	lineNo := 0
@@ -99,7 +103,7 @@ func (db *DB) ImportAcceptedRecallEntriesJSONLWithOptions(
 		if line == "" {
 			continue
 		}
-		var fields map[string]json.RawMessage
+		var fields map[string]jsontext.Value
 		if err := json.Unmarshal([]byte(line), &fields); err != nil {
 			return result, fmt.Errorf(
 				"importing recall line %d: invalid JSON: %w",
@@ -458,7 +462,7 @@ func (db *DB) importAcceptedRecallEntry(
 }
 
 func hostControlledRecallImportField(
-	fields map[string]json.RawMessage,
+	fields map[string]jsontext.Value,
 ) (string, bool, error) {
 	hostControlledFields := []string{
 		"review_state",
@@ -475,7 +479,7 @@ func hostControlledRecallImportField(
 	if !ok {
 		return "", false, nil
 	}
-	var evidenceFields map[string]json.RawMessage
+	var evidenceFields map[string]jsontext.Value
 	if err := json.Unmarshal(rawEvidence, &evidenceFields); err != nil {
 		return "", false, fmt.Errorf("invalid evidence JSON: %w", err)
 	}

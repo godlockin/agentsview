@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -242,10 +243,12 @@ func TestDuckUsageAggregateCostRecordsMixedReportedAndComputed(t *testing.T) {
 
 	cost, _, priced, contributes, err := duckUsageAggregateCost(
 		"mixed-model",
-		1000, 2000, 3000, 4000,
-		100, 200, 300, 400, 500,
+		1000, 2000, 3000, 0, 4000,
+		100, 200, 300, 400, 0, 500,
+		0,
 		250_000,
 		true,
+		false,
 		resolver,
 	)
 	require.NoError(t, err)
@@ -259,15 +262,192 @@ func TestDuckUsageAggregateCostRecordsMixedReportedAndComputed(t *testing.T) {
 	assert.Equal(t, export.CostSourceMixed, block.Models["mixed-model"].CostSource)
 }
 
+func TestDuckUsageAggregateCostRecordsWebSearchOnlyComputed(t *testing.T) {
+	resolver := export.NewPricingResolver([]export.EffectivePricingRow{{
+		ModelPattern: "mixed-model",
+		Rates: export.ModelRates{
+			Source: export.PricingRowSourceFetched,
+		},
+	}})
+
+	_, _, priced, contributes, err := duckUsageAggregateCost(
+		"mixed-model",
+		0, 0, 0, 0, 0,
+		0, 0, 0, 0, 0, 0,
+		0,
+		30_000,
+		true,
+		false,
+		resolver,
+	)
+	require.NoError(t, err)
+	require.True(t, priced)
+	require.True(t, contributes)
+
+	cost, _, priced, contributes, err := duckUsageAggregateCost(
+		"mixed-model",
+		0, 0, 0, 0, 0,
+		0, 0, 0, 0, 0, 0,
+		2,
+		0,
+		false,
+		true,
+		resolver,
+	)
+	require.NoError(t, err)
+	require.True(t, priced)
+	require.True(t, contributes)
+	assert.Equal(t, money.Money{Microdollars: 20_000}, cost)
+
+	block, err := resolver.BuildBlock()
+	require.NoError(t, err)
+	assert.Equal(t, export.CostSourceMixed, block.CostSource)
+	assert.Equal(t, export.CostSourceMixed, block.Models["mixed-model"].CostSource)
+}
+
+func TestDuckUsageAggregateCostPricingBandRequestScope(t *testing.T) {
+	tests := []struct {
+		name          string
+		requestScoped bool
+		wantCost      int64
+		wantSavings   int64
+		wantAggregate int
+		wantBand      int
+	}{
+		{
+			name:          "request uses selected band for cost and savings",
+			requestScoped: true,
+			wantCost:      220_002,
+			wantSavings:   180_000,
+			wantBand:      1,
+		},
+		{
+			name:          "aggregate uses base for cost and savings",
+			wantCost:      110_001,
+			wantSavings:   90_000,
+			wantAggregate: 1,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			resolver := export.NewPricingResolver([]export.EffectivePricingRow{{
+				ModelPattern: "banded-model",
+				Rates: export.ModelRates{
+					InputPerMTok:     money.MustParseDollars("1"),
+					CacheReadPerMTok: money.MustParseDollars("0.1"),
+					Bands: []export.PricingBand{{
+						AboveInputTokens: 200_000,
+						InputPerMTok:     money.MustParseDollars("2"),
+						CacheReadPerMTok: money.MustParseDollars("0.2"),
+					}},
+				},
+			}})
+
+			cost, savings, priced, contributes, err := duckUsageAggregateCost(
+				"banded-model",
+				100_001, 0, 0, 0, 100_000,
+				100_001, 0, 0, 0, 0, 100_000,
+				0,
+				0,
+				false,
+				tt.requestScoped,
+				resolver,
+			)
+			require.NoError(t, err)
+			assert.True(t, priced)
+			assert.True(t, contributes)
+			assert.Equal(t, money.Money{Microdollars: tt.wantCost}, cost)
+			assert.Equal(t, money.Money{Microdollars: tt.wantSavings}, savings)
+			block, err := resolver.BuildBlock()
+			require.NoError(t, err)
+			provenance := block.Models["banded-model"]
+			require.Len(t, provenance.Resolutions, 1)
+			application := provenance.Resolutions[0].Application
+			assert.Equal(t, tt.wantAggregate, application.AggregateRowCount)
+			if tt.wantBand > 0 {
+				require.Len(t, application.Bands, 1)
+				assert.Equal(t, tt.wantBand, application.Bands[0].RequestCount)
+			}
+		})
+	}
+}
+
+func TestDuckUsageAggregateCostPositPremiumsBandAndSavings(t *testing.T) {
+	resolver := export.NewPricingResolver([]export.EffectivePricingRow{{
+		ModelPattern: "banded-model",
+		Rates: export.ModelRates{
+			InputPerMTok:     money.MustParseDollars("1"),
+			CacheReadPerMTok: money.MustParseDollars("0.1"),
+			Bands: []export.PricingBand{{
+				AboveInputTokens: 200_000,
+				InputPerMTok:     money.MustParseDollars("2"),
+				CacheReadPerMTok: money.MustParseDollars("0.2"),
+			}},
+		},
+	}})
+
+	cost, savings, priced, contributes, err := duckUsageAggregateResolvedCost(
+		"banded-model", "banded-model", "positai", time.Time{},
+		100_001, 0, 0, 0, 100_000,
+		100_001, 0, 0, 0, 0, 100_000,
+		0, 0, false, true, resolver)
+	require.NoError(t, err)
+	assert.True(t, priced)
+	assert.True(t, contributes)
+	assert.Equal(t, money.Money{Microdollars: 242_002}, cost)
+	assert.Equal(t, money.Money{Microdollars: 198_000}, savings)
+	t.Logf("observed Posit band cost: %d microdollars; savings: %d microdollars",
+		cost.Microdollars, savings.Microdollars)
+}
+
+func TestDuckUsageAggregateCostReportedRowUsesBilledBandForSavings(t *testing.T) {
+	resolver := export.NewPricingResolver([]export.EffectivePricingRow{{
+		ModelPattern: "banded-model",
+		Rates: export.ModelRates{
+			InputPerMTok:     money.MustParseDollars("1"),
+			CacheReadPerMTok: money.MustParseDollars("0.1"),
+			Bands: []export.PricingBand{{
+				AboveInputTokens: 200_000,
+				InputPerMTok:     money.MustParseDollars("2"),
+				CacheReadPerMTok: money.MustParseDollars("0.2"),
+			}},
+		},
+	}})
+
+	cost, savings, priced, contributes, err := duckUsageAggregateResolvedCost(
+		"banded-model", "banded-model", "positai", time.Time{},
+		100_001, 0, 0, 0, 100_000,
+		0, 0, 0, 0, 0, 0,
+		0,
+		75_000,
+		true,
+		true,
+		resolver,
+	)
+	require.NoError(t, err)
+	assert.True(t, priced)
+	assert.True(t, contributes)
+	assert.Equal(t, money.Money{Microdollars: 75_000}, cost)
+	assert.Equal(t, money.Money{Microdollars: 198_000}, savings)
+	block, err := resolver.BuildBlock()
+	require.NoError(t, err)
+	provenance := block.Models["banded-model"]
+	require.Len(t, provenance.Resolutions, 1)
+	assert.Equal(t, export.PricingApplication{},
+		provenance.Resolutions[0].Application)
+}
+
 func TestDuckUsageAggregateCostKeepsMixedUnpricedComputedTokensUnpriced(t *testing.T) {
 	resolver := export.NewPricingResolver(nil)
 
 	cost, _, priced, contributes, err := duckUsageAggregateCost(
 		"unknown-model",
-		1000, 2000, 0, 0,
 		1000, 2000, 0, 0, 0,
+		1000, 2000, 0, 0, 0, 0,
+		0,
 		250_000,
 		true,
+		false,
 		resolver,
 	)
 
@@ -298,9 +478,11 @@ func TestDuckUsageAggregateCostIncludesReasoningOnlyRows(t *testing.T) {
 
 	cost, _, priced, contributes, err := duckUsageAggregateCost(
 		"reasoning-model",
-		0, 0, 0, 0,
-		0, 0, 300, 0, 0,
+		0, 0, 0, 0, 0,
+		0, 0, 300, 0, 0, 0,
 		0,
+		0,
+		false,
 		false,
 		resolver,
 	)
@@ -328,9 +510,11 @@ func TestDuckUsageAggregateCostRecordsZeroTokenModelProvenance(t *testing.T) {
 
 	cost, _, priced, contributes, err := duckUsageAggregateCost(
 		"zero-model",
-		0, 0, 0, 0,
 		0, 0, 0, 0, 0,
+		0, 0, 0, 0, 0, 0,
 		0,
+		0,
+		false,
 		false,
 		resolver,
 	)
@@ -366,9 +550,10 @@ func TestDuckUsageAggregateCostPrefersExactCustomKimiAlias(t *testing.T) {
 
 	cost, _, priced, contributes, err := duckUsageAggregateResolvedCost(
 		"kimi-for-coding", pricingpkg.KimiK3Canonical,
-		1_000_000, 0, 0, 0,
+		"", time.Time{},
 		1_000_000, 0, 0, 0, 0,
-		0, false, resolver,
+		1_000_000, 0, 0, 0, 0, 0,
+		0, 0, false, true, resolver,
 	)
 
 	require.NoError(t, err)
@@ -1720,4 +1905,94 @@ func duckHOWMessages(cells []db.HourOfWeekCell, dow, hour int) int {
 		}
 	}
 	return -1
+}
+
+// TestDuckDailyUsageEventModelEligibility pins the DuckDB
+// aggregator's usage-event eligibility contract for Codebuff/
+// Freebuff's parser-attributed agent template name. The Codebuff
+// parser (internal/parser/codebuff.go) sets Model = <agentType>
+// (e.g. "base2-deepseek", "base2-free-minimax-m3") rather than the
+// agent name so the per-model breakdown in the usage report stays
+// granular. The aggregate must accept any non-empty Model value and
+// reject empty-model rows: hard-coding an accepted model literal
+// would drop the template-attributed cost (TotalCost falls to zero),
+// and dropping the non-empty-model requirement would leak the
+// empty-model row's cost into TotalCost.
+func TestDuckDailyUsageEventModelEligibility(t *testing.T) {
+	ctx := context.Background()
+	templateCost := money.MustParseDollars("0.05")
+	emptyModelCost := money.MustParseDollars("0.99")
+	sess := syncSession(
+		"codebuff:eligibility", "alpha", "cost only",
+		"2026-07-15T10:00:00.000Z", 0)
+	sess.Agent = "codebuff"
+	store := newDuckAnalyticsStore(t, []db.SessionBatchWrite{{
+		Session: sess,
+		UsageEvents: []db.UsageEvent{
+			{
+				Source: "session", Model: "base2-deepseek",
+				Cost: &templateCost, CostStatus: "reported",
+				CostSource: "session",
+				OccurredAt: "2026-07-15T10:05:00Z",
+				DedupKey:   "template-model",
+			},
+			{
+				Source: "session", Model: "",
+				Cost: &emptyModelCost, CostStatus: "reported",
+				CostSource: "session",
+				OccurredAt: "2026-07-15T10:06:00Z",
+				DedupKey:   "empty-model",
+			},
+		},
+		DataVersion: 1, ReplaceMessages: true,
+	}})
+
+	daily, err := store.GetDailyUsage(ctx, db.UsageFilter{
+		From: "2026-07-15", To: "2026-07-15", Timezone: "UTC",
+	})
+	require.NoError(t, err, "GetDailyUsage")
+	assert.Equal(t, templateCost, daily.Totals.TotalCost,
+		"the template-model cost must be included and the "+
+			"empty-model cost excluded")
+	require.Len(t, daily.Daily, 1)
+	assert.Equal(t, templateCost, daily.Daily[0].TotalCost)
+	require.Len(t, daily.Daily[0].ModelBreakdowns, 1,
+		"only the template-attributed model may surface")
+	assert.Equal(t, "base2-deepseek",
+		daily.Daily[0].ModelBreakdowns[0].ModelName)
+}
+
+func TestDuckAnalyticsToolsWindowsMessagesInSQL(t *testing.T) {
+	ctx := context.Background()
+	var observedQuery string
+	previousObserver := analyticsQueryObserver
+	analyticsQueryObserver = func(query string) {
+		if observedQuery == "" && strings.Contains(query, "FROM tool_calls tc") {
+			observedQuery = query
+		}
+	}
+	t.Cleanup(func() { analyticsQueryObserver = previousObserver })
+	var writes []db.SessionBatchWrite
+	for n, ts := range []string{"2023-01-01T12:00:00Z", "2025-05-31T10:00:00Z", "2025-06-01T09:59:59Z", "2027-01-01T12:00:00Z", ""} {
+		id := fmt.Sprintf("window-%d", n)
+		writes = append(writes, db.SessionBatchWrite{
+			Session:     syncSession(id, "window", "claude", "2025-06-01T00:00:00Z", 1),
+			Messages:    []db.Message{duckModelMessage(id, 0, "assistant", "read", ts, "model-a", db.ToolCall{ToolName: "Read", Category: "Read", SkillName: "review"})},
+			DataVersion: 1, ReplaceMessages: true,
+		})
+	}
+	store := newDuckAnalyticsStore(t, writes)
+	f := db.AnalyticsFilter{From: "2025-06-01", To: "2025-06-01", Timezone: "Pacific/Kiritimati", Model: "model-a"}
+	resp, err := store.GetAnalyticsTools(ctx, f)
+	require.NoError(t, err)
+	assert.Equal(t, 3, resp.TotalCalls)
+	from, to := duckAnalyticsWindowBounds(f)
+	pred, _ := duckAnalyticsMessageWindowPred("m.timestamp", from, to)
+	require.NotEmpty(t, observedQuery, "production tool query was not observed")
+	assert.Contains(t, observedQuery, pred,
+		"production tool query must carry the message window predicate")
+	skills, err := store.GetAnalyticsSkills(ctx, f, "day")
+	require.NoError(t, err)
+	assert.Equal(t, 3, skills.TotalSkillCalls)
+	t.Log("production tool query carried the message window predicate; SQL admitted 3 calls; tools and skills retain UTC+14 boundary and null fallback")
 }

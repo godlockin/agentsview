@@ -1,6 +1,10 @@
 package parser
 
 import (
+	"context"
+	"database/sql"
+	"encoding/json/jsontext"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -9,6 +13,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/mattn/go-sqlite3"
 	"github.com/tidwall/gjson"
 
 	"go.kenn.io/agentsview/internal/money"
@@ -19,6 +24,7 @@ const (
 	copilotEventSessionStart    = "session.start"
 	copilotEventUserMessage     = "user.message"
 	copilotEventAssistantMsg    = "assistant.message"
+	copilotEventToolStart       = "tool.execution_start"
 	copilotEventToolComplete    = "tool.execution_complete"
 	copilotEventAssistantReason = "assistant.reasoning"
 	copilotEventModelChange     = "session.model_change"
@@ -33,15 +39,19 @@ var copilotUsageBasedPricingStartedAt = time.Date(
 // copilotSessionBuilder accumulates state while scanning a
 // Copilot JSONL session file line by line.
 type copilotSessionBuilder struct {
-	messages     []ParsedMessage
-	usageEvents  []ParsedUsageEvent
-	firstMessage string
-	startedAt    time.Time
-	endedAt      time.Time
-	sessionID    string
-	project      string
-	ordinal      int
-	currentModel string
+	messages                []ParsedMessage
+	usageEvents             []ParsedUsageEvent
+	firstMessage            string
+	startedAt               time.Time
+	endedAt                 time.Time
+	sessionID               string
+	project                 string
+	ordinal                 int
+	currentModel            string
+	shutdownCoveredMessages int
+	usageCoveredAt          time.Time
+	fallbackOutput          int
+	hasFallbackOutput       bool
 }
 
 func newCopilotSessionBuilder() *copilotSessionBuilder {
@@ -69,6 +79,8 @@ func (b *copilotSessionBuilder) processLine(line string) {
 		b.handleUserMessage(data, ts)
 	case copilotEventAssistantMsg:
 		b.handleAssistantMessage(data, ts)
+	case copilotEventToolStart:
+		b.handleToolStart(data, ts)
 	case copilotEventToolComplete:
 		b.handleToolComplete(data, ts)
 	case copilotEventAssistantReason:
@@ -190,6 +202,10 @@ func (b *copilotSessionBuilder) handleAssistantMessage(
 
 	outputTokens := int(data.Get("outputTokens").Int())
 	hasOutputTokens := data.Get("outputTokens").Exists()
+	model := normalizeCopilotModel(data.Get("model").Str)
+	if model == "" {
+		model = b.currentModel
+	}
 
 	b.messages = append(b.messages, ParsedMessage{
 		Ordinal:         b.ordinal,
@@ -200,11 +216,19 @@ func (b *copilotSessionBuilder) handleAssistantMessage(
 		HasToolUse:      hasToolUse,
 		ContentLength:   len(displayContent),
 		ToolCalls:       toolCalls,
-		Model:           b.currentModel,
+		Model:           model,
 		OutputTokens:    outputTokens,
 		HasOutputTokens: hasOutputTokens,
 	})
 	b.ordinal++
+}
+
+func (b *copilotSessionBuilder) handleToolStart(
+	data gjson.Result, ts time.Time,
+) {
+	b.appendToolExecutionEvent(
+		data.Get("toolCallId").Str, "started", "", ts,
+	)
 }
 
 func (b *copilotSessionBuilder) handleToolComplete(
@@ -220,6 +244,11 @@ func (b *copilotSessionBuilder) handleToolComplete(
 	if r.Type != gjson.String && r.Raw != "" {
 		content = r.Raw
 	}
+	status := "completed"
+	if success := data.Get("success"); success.Exists() && !success.Bool() {
+		status = "errored"
+	}
+	b.appendToolExecutionEvent(toolCallID, status, content, ts)
 	contentLen := len(content)
 
 	// Emit a tool-result-only user message for pairing.
@@ -234,6 +263,30 @@ func (b *copilotSessionBuilder) handleToolComplete(
 		}},
 	})
 	b.ordinal++
+}
+
+func (b *copilotSessionBuilder) appendToolExecutionEvent(
+	toolCallID, status, content string, ts time.Time,
+) {
+	if toolCallID == "" {
+		return
+	}
+	for _, v := range slices.Backward(b.messages) {
+		for j := range v.ToolCalls {
+			call := &v.ToolCalls[j]
+			if call.ToolUseID != toolCallID {
+				continue
+			}
+			call.ResultEvents = append(call.ResultEvents, ParsedToolResultEvent{
+				ToolUseID: toolCallID,
+				Source:    "tool_execution",
+				Status:    status,
+				Content:   content,
+				Timestamp: ts,
+			})
+			return
+		}
+	}
 }
 
 func (b *copilotSessionBuilder) handleAssistantReasoning() {
@@ -303,6 +356,10 @@ func (b *copilotSessionBuilder) handleShutdown(
 			return true
 		},
 	)
+	if len(events) > 0 {
+		// Transcript order identifies covered messages even without timestamps.
+		b.shutdownCoveredMessages = len(b.messages)
+	}
 	sort.Slice(events, func(i, j int) bool {
 		return events[i].Model < events[j].Model
 	})
@@ -328,6 +385,175 @@ func (b *copilotSessionBuilder) handleShutdown(
 		events[0].CostSource = copilotReportedCostSource
 	}
 	b.usageEvents = append(b.usageEvents, events...)
+}
+
+// retainStoreOutputRemainder treats pre-cutoff store and transcript output as
+// overlapping observations, not proof that every response reached the store.
+// Without a shared response ID, only the positive aggregate difference is
+// known to be absent. Keep it separate from per-request store facts rather than
+// attributing a missing call to an arbitrary transcript message.
+func (b *copilotSessionBuilder) retainStoreOutputRemainder() {
+	storeOutput := make(map[string]int)
+	for _, event := range b.usageEvents {
+		if event.Source == "session-store" {
+			storeOutput[event.Model] += event.OutputTokens
+		}
+	}
+	type observedOutput struct {
+		tokens int
+		at     time.Time
+	}
+	observed := make(map[string]observedOutput)
+	unknown := 0
+	for _, message := range b.messages {
+		if message.Role != RoleAssistant || !message.HasOutputTokens ||
+			(!message.Timestamp.IsZero() && message.Timestamp.After(b.usageCoveredAt)) {
+			continue
+		}
+		if message.Model == "" {
+			unknown += message.OutputTokens
+			continue
+		}
+		value := observed[message.Model]
+		value.tokens += message.OutputTokens
+		if message.Timestamp.After(value.at) {
+			value.at = message.Timestamp
+		}
+		observed[message.Model] = value
+	}
+	models := make([]string, 0, len(observed))
+	for model := range observed {
+		models = append(models, model)
+	}
+	sort.Strings(models)
+	for _, model := range models {
+		value := observed[model]
+		if extra := value.tokens - storeOutput[model]; extra > 0 {
+			b.usageEvents = append(b.usageEvents, ParsedUsageEvent{
+				Source: "transcript-output-remainder", Model: model, OutputTokens: extra,
+				OccurredAt: timeString(value.at, b.startedAt),
+			})
+		}
+		storeOutput[model] = max(storeOutput[model]-value.tokens, 0)
+	}
+	// Unknown-model responses can overlap any remaining store output. Retain
+	// only the excess, unpriced, as for other model-less transcript fallback.
+	for _, tokens := range storeOutput {
+		unknown -= tokens
+	}
+	if unknown > 0 {
+		b.fallbackOutput += unknown
+		b.hasFallbackOutput = true
+	}
+}
+
+func (b *copilotSessionBuilder) applyMessageUsageFallback() {
+	for i := range b.messages {
+		message := &b.messages[i]
+		if i < b.shutdownCoveredMessages || message.Role != RoleAssistant ||
+			!message.HasOutputTokens ||
+			(!b.usageCoveredAt.IsZero() &&
+				(message.Timestamp.IsZero() || !message.Timestamp.After(b.usageCoveredAt))) {
+			continue
+		}
+		b.fallbackOutput += message.OutputTokens
+		b.hasFallbackOutput = true
+		if message.Model == "" {
+			continue
+		}
+		message.TokenUsage = jsontext.Value(
+			fmt.Sprintf(`{"output_tokens":%d}`, message.OutputTokens),
+		)
+	}
+}
+
+func (b *copilotSessionBuilder) markUsageCoveredAt(occurredAt time.Time) {
+	if occurredAt.After(b.usageCoveredAt) {
+		b.usageCoveredAt = occurredAt
+	}
+}
+
+// loadCopilotStoreUsage reads the CLI's observed per-request token data when
+// available. Billing semantics for this undocumented store are not assumed.
+func loadCopilotStoreUsage(
+	storePath, rawSessionID string,
+) ([]ParsedUsageEvent, error) {
+	if storePath == "" || rawSessionID == "" {
+		return nil, nil
+	}
+	if _, err := os.Stat(storePath); err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("stat copilot session store %s: %w", storePath, err)
+	}
+	store, err := sql.Open(
+		"sqlite3",
+		"file:"+sqliteURIPath(storePath)+"?mode=ro&_busy_timeout=3000",
+	)
+	if err != nil {
+		return nil, fmt.Errorf("opening copilot session store %s: %w", storePath, err)
+	}
+	defer store.Close()
+
+	rows, err := store.Query(`
+		SELECT id, model, input_tokens, output_tokens, cache_read_tokens,
+		       cache_write_tokens, reasoning_tokens, created_at
+		FROM assistant_usage_events
+		WHERE session_id = ?
+		ORDER BY id
+	`, rawSessionID)
+	if err != nil {
+		// Older stores need not contain usage data. Confirm a missing schema
+		// before falling back; operational read failures must remain retryable.
+		if sqliteErr, ok := errors.AsType[sqlite3.Error](err); ok && sqliteErr.Code == sqlite3.ErrError {
+			hasUsage, schemaErr := copilotStoreHasUsageSchema(context.Background(), store.QueryRowContext)
+			if schemaErr == nil && !hasUsage {
+				return nil, nil
+			}
+		}
+		return nil, fmt.Errorf("reading copilot session store %s: %w", storePath, err)
+	}
+	defer rows.Close()
+
+	var events []ParsedUsageEvent
+	for rows.Next() {
+		var id int64
+		var model, createdAt string
+		var input, output, cacheRead, cacheWrite, reasoning sql.NullInt64
+		if err := rows.Scan(
+			&id, &model, &input, &output, &cacheRead, &cacheWrite, &reasoning,
+			&createdAt,
+		); err != nil {
+			return nil, fmt.Errorf("scanning copilot session-store usage: %w", err)
+		}
+		events = append(events, ParsedUsageEvent{
+			Source:                   "session-store",
+			Model:                    normalizeCopilotModel(model),
+			InputTokens:              max(int(input.Int64-cacheRead.Int64-cacheWrite.Int64), 0),
+			OutputTokens:             int(output.Int64),
+			CacheCreationInputTokens: int(cacheWrite.Int64),
+			CacheReadInputTokens:     int(cacheRead.Int64),
+			ReasoningTokens:          int(reasoning.Int64),
+			OccurredAt:               createdAt,
+			DedupKey:                 fmt.Sprintf("session-store:%d", id),
+		})
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterating copilot session-store usage: %w", err)
+	}
+	return events, nil
+}
+
+func copilotStoreHasUsageSchema(ctx context.Context, queryRow func(context.Context, string, ...any) *sql.Row) (bool, error) {
+	var columns int
+	err := queryRow(ctx, `
+		SELECT count(*) FROM pragma_table_info('assistant_usage_events')
+		WHERE name IN ('id', 'session_id', 'model', 'input_tokens',
+		    'output_tokens', 'cache_read_tokens', 'cache_write_tokens',
+		    'reasoning_tokens', 'created_at')
+	`).Scan(&columns)
+	return columns == 9, err
 }
 
 func formatCopilotToolCalls(
@@ -393,6 +619,12 @@ func readCopilotWorkspaceName(eventsPath string) string {
 func (p *copilotProvider) parseSession(
 	path, machine string,
 ) (*ParsedSession, []ParsedMessage, []ParsedUsageEvent, error) {
+	return p.parseSessionWithStore(path, machine, "")
+}
+
+func (p *copilotProvider) parseSessionWithStore(
+	path, machine, storePath string,
+) (*ParsedSession, []ParsedMessage, []ParsedUsageEvent, error) {
 	info, err := os.Stat(path)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -438,12 +670,45 @@ func (p *copilotProvider) parseSession(
 	if !hasContent {
 		return nil, nil, nil, nil
 	}
-
-	sessionID := b.sessionID
-	if sessionID == "" {
-		sessionID = sessionIDFromPath(path)
+	rawSessionID := b.sessionID
+	if rawSessionID == "" {
+		rawSessionID = sessionIDFromPath(path)
 	}
-	sessionID = "copilot:" + sessionID
+	usesStoreUsage := false
+	if !b.startedAt.Before(copilotUsageBasedPricingStartedAt) {
+		storeUsage, err := loadCopilotStoreUsage(storePath, rawSessionID)
+		if err != nil {
+			return nil, nil, nil, err
+		}
+		if len(storeUsage) > 0 {
+			for _, event := range storeUsage {
+				b.markUsageCoveredAt(parseTimestamp(event.OccurredAt))
+			}
+			for _, event := range b.usageEvents {
+				if event.Cost == nil ||
+					event.CostSource != copilotReportedCostSource {
+					continue
+				}
+				// Store usage supplies richer observed tokens, but transcript
+				// shutdown remains the authoritative reported-cost source.
+				storeUsage = append(storeUsage, ParsedUsageEvent{
+					Source: event.Source, Model: event.Model, OccurredAt: event.OccurredAt,
+					Cost: event.Cost, CostStatus: event.CostStatus, CostSource: event.CostSource,
+				})
+				break
+			}
+			b.usageEvents = storeUsage
+			// Only the selected token source determines message coverage.
+			b.shutdownCoveredMessages = 0
+			usesStoreUsage = true
+		}
+	}
+	if usesStoreUsage {
+		b.retainStoreOutputRemainder()
+	}
+	b.applyMessageUsageFallback()
+
+	sessionID := "copilot:" + rawSessionID
 
 	// Prefer the workspace.yaml name (LLM-generated or user-set
 	// title) over the raw first user message. Falls back to the
@@ -478,6 +743,17 @@ func (p *copilotProvider) parseSession(
 	}
 
 	accumulateMessageTokenUsage(sess, b.messages)
+	if usesStoreUsage {
+		// Store output and uncovered message output replace the transcript total,
+		// including when the store contains no positive output tokens.
+		sess.TotalOutputTokens = 0
+		sess.HasTotalOutputTokens = false
+		applyUsageEventTokenTotals(sess, b.usageEvents)
+		if b.hasFallbackOutput {
+			sess.HasTotalOutputTokens = true
+			sess.TotalOutputTokens += b.fallbackOutput
+		}
+	}
 
 	// Stamp the session ID on usage events (not known until here).
 	// DedupKey encodes the event's position in the slice so that
@@ -485,12 +761,14 @@ func (p *copilotProvider) parseSession(
 	// several shutdown events) each get a distinct key.
 	for i := range b.usageEvents {
 		b.usageEvents[i].SessionID = sessionID
-		b.usageEvents[i].DedupKey = fmt.Sprintf(
-			"shutdown:%s:%s:%d",
-			sessionID,
-			b.usageEvents[i].Model,
-			i,
-		)
+		if b.usageEvents[i].DedupKey == "" {
+			b.usageEvents[i].DedupKey = fmt.Sprintf(
+				"shutdown:%s:%s:%d",
+				sessionID,
+				b.usageEvents[i].Model,
+				i,
+			)
+		}
 	}
 
 	return sess, b.messages, b.usageEvents, nil

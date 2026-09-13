@@ -1,4 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vite-plus/test";
+import { mount, tick, unmount } from "svelte";
 import { ui } from "../stores/ui.svelte.js";
 import { sessions } from "../stores/sessions.svelte.js";
 import { starred } from "../stores/starred.svelte.js";
@@ -6,7 +7,10 @@ import { router } from "../stores/router.svelte.js";
 import { messages } from "../stores/messages.svelte.js";
 import { SessionsService } from "../api/generated/index";
 import { copyToClipboard } from "../utils/clipboard.js";
+import AppHeader from "../components/layout/AppHeader.svelte";
+import SidebarToggleButton from "../components/layout/SidebarToggleButton.svelte";
 import { registerShortcuts } from "./keyboard.js";
+import { registerSessionList } from "./arrow-target.js";
 
 vi.mock("../utils/clipboard.js", () => ({
   copyToClipboard: vi.fn().mockResolvedValue(true),
@@ -25,6 +29,7 @@ describe("registerShortcuts", () => {
   let cleanup: () => void;
   let navigateMessage: (delta: number) => void;
   let navigateUserPrompt: (delta: number) => void;
+  let detachSessionList: (() => void) | undefined;
 
   beforeEach(() => {
     ui.activeModal = null;
@@ -38,10 +43,13 @@ describe("registerShortcuts", () => {
     navigateMessage = vi.fn();
     navigateUserPrompt = vi.fn();
     cleanup = registerShortcuts({ navigateMessage, navigateUserPrompt });
+    detachSessionList = undefined;
   });
 
   afterEach(() => {
     cleanup();
+    detachSessionList?.();
+    document.body.innerHTML = "";
   });
 
   describe("Cmd+K modal toggle", () => {
@@ -137,6 +145,192 @@ describe("registerShortcuts", () => {
       ui.activeModal = "commandPalette";
       fireKey("J", { shiftKey: true });
       expect(navigateUserPrompt).not.toHaveBeenCalled();
+    });
+  });
+
+  describe("arrow target", () => {
+    function mountSessionList(
+      navigate = (delta: number) =>
+        sessions.navigateSession(
+          delta,
+          starred.filterOnly ? (session) => starred.isStarred(session.id) : undefined,
+        ),
+    ) {
+      const list = document.createElement("div");
+      list.className = "session-list-scroll";
+      document.body.appendChild(list);
+      detachSessionList = registerSessionList(list, navigate);
+      return list;
+    }
+
+    it("navigates sessions up and down in the registered list", () => {
+      const list = mountSessionList();
+      sessions.sessions = [{ id: "s1" } as any, { id: "s2" } as any];
+      sessions.activeSessionId = "s1";
+      const row = document.createElement("button");
+      list.appendChild(row);
+      row.focus();
+      fireKey("ArrowDown");
+      expect(sessions.activeSessionId).toBe("s2");
+      fireKey("ArrowUp");
+      expect(sessions.activeSessionId).toBe("s1");
+      expect(navigateMessage).not.toHaveBeenCalled();
+    });
+
+    it("switches panes after deliberate pointer interaction, not hover", () => {
+      const navigateSessions = vi.fn();
+      const list = mountSessionList(navigateSessions);
+      const row = document.createElement("button");
+      list.appendChild(row);
+      row.focus();
+
+      fireKey("ArrowDown");
+      expect(navigateSessions).toHaveBeenCalledWith(1);
+
+      const message = document.createElement("div");
+      message.className = "message-list-scroll";
+      document.body.appendChild(message);
+      message.dispatchEvent(new Event("pointermove", { bubbles: true }));
+      fireKey("ArrowDown");
+      expect(navigateSessions).toHaveBeenCalledTimes(2);
+      expect(navigateMessage).not.toHaveBeenCalled();
+
+      message.dispatchEvent(new Event("pointerdown", { bubbles: true }));
+      expect(document.activeElement).toBe(row);
+
+      fireKey("ArrowDown");
+      expect(navigateSessions).toHaveBeenCalledTimes(2);
+      expect(navigateMessage).toHaveBeenCalledWith(1);
+
+      const unrelated = document.createElement("button");
+      document.body.appendChild(unrelated);
+      row.dispatchEvent(new Event("pointerdown", { bubbles: true }));
+      unrelated.dispatchEvent(new Event("pointerdown", { bubbles: true }));
+      fireKey("ArrowDown");
+      expect(navigateSessions).toHaveBeenCalledTimes(3);
+      expect(navigateMessage).toHaveBeenCalledTimes(1);
+    });
+
+    it("uses session navigation after a sidebar control interaction", () => {
+      const navigateSessions = vi.fn();
+      const sidebar = document.createElement("aside");
+      sidebar.id = "session-sidebar";
+      const filter = document.createElement("button");
+      sidebar.appendChild(filter);
+      document.body.appendChild(sidebar);
+      const list = mountSessionList(navigateSessions);
+      sidebar.appendChild(list);
+
+      const messagePane = document.createElement("div");
+      messagePane.className = "message-list-scroll";
+      document.body.appendChild(messagePane);
+      messagePane.dispatchEvent(new Event("pointerdown", { bubbles: true }));
+      filter.dispatchEvent(new Event("pointerdown", { bubbles: true }));
+
+      fireKey("ArrowDown");
+
+      expect(navigateSessions).toHaveBeenCalledWith(1);
+      expect(navigateMessage).not.toHaveBeenCalled();
+    });
+
+    it("keeps arrow navigation within the starred-only list", () => {
+      const list = mountSessionList();
+      sessions.sessions = [{ id: "s1" } as any, { id: "s2" } as any, { id: "s3" } as any];
+      sessions.activeSessionId = "s1";
+      starred.filterOnly = true;
+      starred.ids = new Set(["s1", "s3"]);
+      const row = document.createElement("button");
+      list.appendChild(row);
+      row.focus();
+
+      fireKey("ArrowDown");
+      expect(sessions.activeSessionId).toBe("s3");
+      fireKey("ArrowUp");
+      expect(sessions.activeSessionId).toBe("s1");
+      expect(navigateMessage).not.toHaveBeenCalled();
+    });
+
+    it.each([
+      ["direct/root", {}],
+      ["subagent", { relationship_type: "subagent" }],
+      ["forked child", { parent_session_id: "root", relationship_type: "fork" }],
+      ["continuation", { parent_session_id: "root", relationship_type: "continuation" }],
+      ["imported", { agent: "imported-agent" }],
+      ["soft-deleted", { deleted_at: "2026-08-01T00:00:00Z" }],
+      ["tombstoned", { tombstoned: true }],
+    ])("preserves arrow routing for the %s Session lineage variant", (_name, variant) => {
+      const list = mountSessionList();
+      sessions.sessions = [{ id: "root" } as any, { id: "variant", ...variant } as any];
+      sessions.activeSessionId = "root";
+      const row = document.createElement("button");
+      list.appendChild(row);
+      row.focus();
+
+      fireKey("ArrowDown");
+
+      expect(sessions.activeSessionId).toBe("variant");
+      expect(navigateMessage).not.toHaveBeenCalled();
+    });
+
+    it("keeps message fallback and native vetoes", () => {
+      const list = mountSessionList();
+      list.appendChild(document.createElement("button"));
+      fireKey("ArrowDown");
+      expect(navigateMessage).toHaveBeenCalledWith(1);
+
+      const input = document.createElement("input");
+      list.appendChild(input);
+      input.focus();
+      fireKey("ArrowDown");
+      expect(navigateMessage).toHaveBeenCalledTimes(1);
+      expect(sessions.activeSessionId).toBeNull();
+    });
+
+    it("does not route arrows from a dialog through the message fallback", () => {
+      const list = mountSessionList();
+      const dialog = document.createElement("div");
+      dialog.setAttribute("role", "dialog");
+      const button = document.createElement("button");
+      dialog.appendChild(button);
+      list.appendChild(dialog);
+      button.focus();
+
+      fireKey("ArrowDown");
+
+      expect(navigateMessage).not.toHaveBeenCalled();
+      expect(sessions.activeSessionId).toBeNull();
+    });
+
+    it("clears the list route when the component disconnects", () => {
+      const list = mountSessionList();
+      list.remove();
+      fireKey("ArrowDown");
+      expect(navigateMessage).toHaveBeenCalledWith(1);
+    });
+
+    it("routes arrows to messages after mobile auto-close hides the sidebar", () => {
+      const navigateSessions = vi.fn();
+      const sidebar = document.createElement("aside");
+      document.body.appendChild(sidebar);
+      const list = mountSessionList(navigateSessions);
+      sidebar.appendChild(list);
+      list.dispatchEvent(new Event("pointerdown", { bubbles: true }));
+
+      sidebar.style.display = "none";
+      fireKey("ArrowDown");
+
+      expect(navigateSessions).not.toHaveBeenCalled();
+      expect(navigateMessage).toHaveBeenCalledWith(1);
+    });
+
+    it("clears the list route when registration is unregistered", () => {
+      const list = mountSessionList();
+      detachSessionList?.();
+      detachSessionList = undefined;
+      list.appendChild(document.createElement("button"));
+      fireKey("ArrowDown");
+      expect(navigateMessage).toHaveBeenCalledWith(1);
+      expect(sessions.activeSessionId).toBeNull();
     });
   });
 
@@ -326,8 +520,76 @@ describe("registerShortcuts", () => {
       expect(ui.sidebarOpen).toBe(true);
     });
 
+    it("moves focus out of the sidebar when the shortcut collapses it", async () => {
+      router.navigate("sessions");
+      ui.isMobileViewport = false;
+      ui.sidebarOpen = true;
+
+      const sidebar = document.createElement("aside");
+      sidebar.id = "session-sidebar";
+      const focusedControl = document.createElement("button");
+      focusedControl.textContent = "Focused sidebar control";
+      sidebar.appendChild(focusedControl);
+      document.body.appendChild(sidebar);
+      const contentToggle = mount(SidebarToggleButton, {
+        target: document.body,
+        props: { placement: "content" },
+      });
+
+      try {
+        focusedControl.focus();
+        fireKey("b");
+        await tick();
+
+        const openButton = document.querySelector<HTMLButtonElement>(
+          'button[aria-label="Open sidebar"]',
+        );
+        expect(ui.sidebarOpen).toBe(false);
+        expect(openButton).not.toBeNull();
+        await vi.waitFor(() => {
+          expect(document.activeElement).toBe(openButton);
+        });
+      } finally {
+        await unmount(contentToggle);
+        sidebar.remove();
+      }
+    });
+
+    it("moves mobile focus from the closing drawer to the hamburger", async () => {
+      router.navigate("sessions");
+      ui.isMobileViewport = true;
+      ui.sidebarOpen = true;
+
+      const sidebar = document.createElement("aside");
+      sidebar.id = "session-sidebar";
+      const focusedControl = document.createElement("button");
+      focusedControl.textContent = "Focused mobile drawer control";
+      sidebar.appendChild(focusedControl);
+      document.body.appendChild(sidebar);
+      const header = mount(AppHeader, { target: document.body });
+
+      try {
+        focusedControl.focus();
+        fireKey("b");
+        await tick();
+
+        const hamburger = document.querySelector<HTMLButtonElement>(
+          'button[aria-label="Toggle sidebar"]',
+        );
+        expect(ui.sidebarOpen).toBe(false);
+        expect(hamburger).not.toBeNull();
+        await vi.waitFor(() => {
+          expect(document.activeElement).toBe(hamburger);
+        });
+      } finally {
+        await unmount(header);
+        sidebar.remove();
+        ui.isMobileViewport = false;
+      }
+    });
+
     it("should navigate to sessions on non-session routes when mobile", () => {
-      router.navigate("insights");
+      router.navigate("quality");
       ui.isMobileViewport = true;
       ui.sidebarOpen = false;
       fireKey("b");
@@ -337,12 +599,12 @@ describe("registerShortcuts", () => {
     });
 
     it("should toggle sidebar on non-session routes when desktop", () => {
-      router.navigate("insights");
+      router.navigate("quality");
       ui.isMobileViewport = false;
       ui.sidebarOpen = true;
       fireKey("b");
       expect(ui.sidebarOpen).toBe(false);
-      expect(router.route).toBe("insights");
+      expect(router.route).toBe("quality");
     });
 
     it("should not toggle sidebar when modal is open", () => {
@@ -417,7 +679,7 @@ describe("registerShortcuts", () => {
         is_system: false,
       },
     ];
-    vi.spyOn(SessionsService, "postApiV1SessionsIdResume").mockRejectedValue(
+    vi.spyOn(SessionsService, "postApiV1SessionsByIdResume").mockRejectedValue(
       new Error("backend unavailable"),
     );
 
@@ -470,7 +732,7 @@ describe("registerShortcuts", () => {
         is_system: false,
       },
     ];
-    vi.spyOn(SessionsService, "postApiV1SessionsIdResume").mockResolvedValue({
+    vi.spyOn(SessionsService, "postApiV1SessionsByIdResume").mockResolvedValue({
       launched: false,
       command: "claude --resume run:keyboard-session",
       cwd: "/tmp/project",
@@ -524,7 +786,7 @@ describe("registerShortcuts", () => {
       },
     ];
     messages.hasOlder = true;
-    vi.spyOn(SessionsService, "postApiV1SessionsIdResume").mockRejectedValue(
+    vi.spyOn(SessionsService, "postApiV1SessionsByIdResume").mockRejectedValue(
       new Error("backend unavailable"),
     );
 
@@ -544,7 +806,7 @@ describe("registerShortcuts", () => {
       first_message: null,
       started_at: null,
       ended_at: null,
-      message_count: 3001,
+      message_count: 1,
       user_message_count: 1,
       total_output_tokens: 0,
       peak_context_tokens: 0,
@@ -553,10 +815,37 @@ describe("registerShortcuts", () => {
     };
     sessions.sessions = [session];
     sessions.activeSessionId = session.id;
-    messages.sessionId = session.id;
+    vi.mocked(vi.spyOn(SessionsService, "getApiV1SessionsById"), {
+      partial: true,
+    }).mockResolvedValueOnce(session);
+    vi.spyOn(SessionsService, "getApiV1SessionsByIdMessages").mockResolvedValueOnce({
+      messages: [
+        {
+          id: 1,
+          session_id: session.id,
+          ordinal: 0,
+          role: "assistant",
+          content: "answer",
+          timestamp: "",
+          has_thinking: false,
+          thinking_text: "",
+          has_tool_use: false,
+          content_length: 6,
+          model: "claude sonnet",
+          token_usage: null,
+          context_tokens: 0,
+          output_tokens: 0,
+          has_context_tokens: false,
+          has_output_tokens: false,
+          is_system: false,
+        },
+      ],
+      count: 1,
+    });
+    await messages.loadSession(session.id);
     messages.loading = true;
-    (messages as any)._stableMainModel = "claude sonnet";
-    vi.spyOn(SessionsService, "postApiV1SessionsIdResume").mockRejectedValue(
+    expect(messages.mainModel).toBe("claude sonnet");
+    vi.spyOn(SessionsService, "postApiV1SessionsByIdResume").mockRejectedValue(
       new Error("backend unavailable"),
     );
 

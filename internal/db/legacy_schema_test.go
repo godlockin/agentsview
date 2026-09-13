@@ -227,6 +227,96 @@ func TestOpenLegacySchemasPreservesArchiveAndRequestsResync(t *testing.T) {
 	}
 }
 
+func TestParserParentSessionIDMigrationBackfillsCurrentParent(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "legacy.db")
+	conn, err := sql.Open("sqlite3", makeDSN(path, false))
+	require.NoError(t, err)
+	conn.SetMaxOpenConns(1)
+
+	_, err = conn.Exec(v06LegacySchema)
+	require.NoError(t, err, "create legacy schema")
+	_, err = conn.Exec(`
+		INSERT INTO sessions (
+			id, project, machine, agent, parent_session_id
+		) VALUES (
+			'kid', 'project-a', 'local', 'claude', 'parsed-parent'
+		)`)
+	require.NoError(t, err, "insert legacy child")
+	_, err = conn.Exec(fmt.Sprintf(
+		"PRAGMA user_version = %d", dataVersion,
+	))
+	require.NoError(t, err, "set current data version")
+	require.NoError(t, conn.Close(), "close legacy database")
+
+	d, err := Open(path)
+	require.NoError(t, err, "open migrated database")
+	defer d.Close()
+
+	var got sql.NullString
+	err = d.getReader().QueryRow(`
+		SELECT parser_parent_session_id FROM sessions WHERE id = 'kid'
+	`).Scan(&got)
+	require.NoError(t, err, "query migrated parser parent")
+	require.True(t, got.Valid, "migrated parser parent must be set")
+	assert.Equal(t, "parsed-parent", got.String, "migrated parser parent")
+}
+
+func TestParserParentSessionIDMigrationRollsBackWhenBackfillFails(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "legacy.db")
+	conn, err := sql.Open("sqlite3", makeDSN(path, false))
+	require.NoError(t, err)
+	conn.SetMaxOpenConns(1)
+
+	_, err = conn.Exec(v06LegacySchema)
+	require.NoError(t, err, "create legacy schema")
+	_, err = conn.Exec(`
+		INSERT INTO sessions (
+			id, project, machine, agent, parent_session_id
+		) VALUES (
+			'kid', 'project-a', 'local', 'claude', 'parsed-parent'
+		);
+		CREATE TRIGGER fail_parser_parent_backfill
+		BEFORE UPDATE OF parser_parent_session_id ON sessions BEGIN
+			SELECT RAISE(ABORT, 'injected parser parent backfill failure');
+		END;`)
+	require.NoError(t, err, "prepare failing legacy migration")
+	_, err = conn.Exec(fmt.Sprintf(
+		"PRAGMA user_version = %d", dataVersion,
+	))
+	require.NoError(t, err, "set current data version")
+	require.NoError(t, conn.Close(), "close legacy database")
+
+	d, err := Open(path)
+	require.ErrorContains(t, err, "injected parser parent backfill failure")
+	require.Nil(t, d)
+
+	conn, err = sql.Open("sqlite3", makeDSN(path, false))
+	require.NoError(t, err, "reopen failed migration")
+	conn.SetMaxOpenConns(1)
+	var columnCount int
+	err = conn.QueryRow(`
+		SELECT count(*) FROM pragma_table_info('sessions')
+		WHERE name = 'parser_parent_session_id'
+	`).Scan(&columnCount)
+	require.NoError(t, err, "inspect schema after failed migration")
+	assert.Zero(t, columnCount, "failed migration must roll back added column")
+	_, err = conn.Exec(`DROP TRIGGER fail_parser_parent_backfill`)
+	require.NoError(t, err, "remove injected migration failure")
+	require.NoError(t, conn.Close(), "close failed migration database")
+
+	d, err = Open(path)
+	require.NoError(t, err, "retry migration")
+	defer d.Close()
+
+	var got sql.NullString
+	err = d.getReader().QueryRow(`
+		SELECT parser_parent_session_id FROM sessions WHERE id = 'kid'
+	`).Scan(&got)
+	require.NoError(t, err, "query retried parser parent")
+	require.True(t, got.Valid, "retried parser parent must be set")
+	assert.Equal(t, "parsed-parent", got.String, "retried parser parent")
+}
+
 func TestLegacySchemaAddsArtifactImportAuthorityNonDestructively(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "legacy.db")
 	conn, err := sql.Open("sqlite3", makeDSN(path, false))
@@ -296,5 +386,35 @@ func requireLegacyRepairIndexes(t *testing.T, d *DB) {
 		`, name).Scan(&count)
 		require.NoError(t, err)
 		assert.Equal(t, 1, count, "index %s", name)
+	}
+}
+
+func TestToolResultMetadataMigrationPreservesArchivedEvents(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "legacy.db")
+	conn, err := sql.Open("sqlite3", makeDSN(path, false))
+	require.NoError(t, err)
+	_, err = conn.Exec(preParentLegacySchema + `
+ CREATE TABLE tool_result_events (
+ id INTEGER PRIMARY KEY, session_id TEXT NOT NULL,
+ tool_call_message_ordinal INTEGER NOT NULL, call_index INTEGER NOT NULL DEFAULT 0,
+ tool_use_id TEXT, agent_id TEXT, subagent_session_id TEXT, source TEXT NOT NULL,
+ status TEXT NOT NULL, content TEXT NOT NULL, content_length INTEGER NOT NULL DEFAULT 0,
+ timestamp TEXT, event_index INTEGER NOT NULL DEFAULT 0);
+ INSERT INTO sessions(id,project) VALUES ('s1','project-a');
+ INSERT INTO tool_result_events(session_id,tool_call_message_ordinal,source,status,content,content_length)
+ VALUES ('s1',0,'function_call_output','','archived',8);`)
+	require.NoError(t, err)
+	require.NoError(t, conn.Close())
+	for range 2 {
+		d, err := Open(path)
+		require.NoError(t, err)
+		var content string
+		var digest []byte
+		var participates *bool
+		require.NoError(t, d.Reader().QueryRow(`SELECT content, raw_content_digest, summary_participates FROM tool_result_events WHERE session_id='s1'`).Scan(&content, &digest, &participates))
+		assert.Equal(t, "archived", content)
+		assert.Nil(t, digest, "migration cannot recover the original bytes")
+		assert.Nil(t, participates, "missing raw metadata remains explicit")
+		require.NoError(t, d.Close())
 	}
 }

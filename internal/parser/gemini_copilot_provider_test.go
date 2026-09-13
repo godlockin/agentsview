@@ -8,6 +8,7 @@ import (
 	"runtime"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -85,6 +86,97 @@ func TestGeminiProviderSourceMethods(t *testing.T) {
 	fingerprint, err := provider.Fingerprint(context.Background(), found)
 	require.Error(t, err)
 	require.Empty(t, fingerprint)
+}
+
+func TestGeminiProviderDiscoverEmptyRootSkipsProjectMap(t *testing.T) {
+	root := t.TempDir()
+	require.NoError(t, os.MkdirAll(
+		filepath.Join(root, "tmp", "unused-project", geminiChatsDir),
+		0o755,
+	))
+	writeSourceFile(t, filepath.Join(root, "projects.json"),
+		`{"projects":{"/projects/unused":"unused-project"}}`)
+
+	projectMapBuilds := 0
+	orig := buildGeminiProjectMap
+	buildGeminiProjectMap = func(string) map[string]string {
+		projectMapBuilds++
+		return map[string]string{}
+	}
+	t.Cleanup(func() { buildGeminiProjectMap = orig })
+
+	provider, ok := NewProvider(AgentGemini, ProviderConfig{Roots: []string{root}})
+	require.True(t, ok)
+	discovered, err := provider.Discover(t.Context())
+	require.NoError(t, err)
+	assert.Empty(t, discovered)
+	assert.Zero(t, projectMapBuilds)
+}
+
+func TestGeminiProviderDiscoverEachEmptyRootSkipsProjectMap(t *testing.T) {
+	root := t.TempDir()
+	require.NoError(t, os.MkdirAll(
+		filepath.Join(root, "tmp", "unused-project", geminiChatsDir),
+		0o755,
+	))
+	writeSourceFile(t, filepath.Join(root, "trustedFolders.json"),
+		`{"trustedFolders":["/projects/unused"]}`)
+
+	diskMapBuilds := 0
+	orig := newGeminiDiscoveryMap
+	newGeminiDiscoveryMap = func(ctx context.Context) (*discoveryDiskMap, error) {
+		diskMapBuilds++
+		return newDiscoveryDiskMapForContext(ctx)
+	}
+	t.Cleanup(func() { newGeminiDiscoveryMap = orig })
+
+	provider, ok := NewProvider(AgentGemini, ProviderConfig{Roots: []string{root}})
+	require.True(t, ok)
+	discoverer, ok := provider.(StreamingDiscoverer)
+	require.True(t, ok)
+	var discovered []SourceRef
+	err := discoverer.DiscoverEach(t.Context(), func(source SourceRef) error {
+		discovered = append(discovered, source)
+		return nil
+	})
+	require.NoError(t, err)
+	assert.Empty(t, discovered)
+	assert.Zero(t, diskMapBuilds)
+}
+
+func TestGeminiProviderDiscoverEachBuildsOneProjectMapForSessions(t *testing.T) {
+	root := t.TempDir()
+	writeSourceFile(t, filepath.Join(root, "projects.json"),
+		`{"projects":{"/projects/used":"used-project"}}`)
+	for _, name := range []string{
+		"session-2026-06-19T12-00-first.json",
+		"session-2026-06-19T12-01-second.jsonl",
+	} {
+		writeSourceFile(t, filepath.Join(root, "tmp", "used-project", geminiChatsDir, name), "{}")
+	}
+
+	diskMapBuilds := 0
+	orig := newGeminiDiscoveryMap
+	newGeminiDiscoveryMap = func(ctx context.Context) (*discoveryDiskMap, error) {
+		diskMapBuilds++
+		return newDiscoveryDiskMapForContext(ctx)
+	}
+	t.Cleanup(func() { newGeminiDiscoveryMap = orig })
+
+	provider, ok := NewProvider(AgentGemini, ProviderConfig{Roots: []string{root}})
+	require.True(t, ok)
+	discoverer, ok := provider.(StreamingDiscoverer)
+	require.True(t, ok)
+	var discovered []SourceRef
+	err := discoverer.DiscoverEach(t.Context(), func(source SourceRef) error {
+		discovered = append(discovered, source)
+		return nil
+	})
+	require.NoError(t, err)
+	require.Len(t, discovered, 2)
+	assert.Equal(t, "used", discovered[0].ProjectHint)
+	assert.Equal(t, "used", discovered[1].ProjectHint)
+	assert.Equal(t, 1, diskMapBuilds)
 }
 
 func TestGeminiProviderReconciliationProjectMapWorkIsArchiveBounded(t *testing.T) {
@@ -507,10 +599,14 @@ func TestCopilotProviderSourceMethods(t *testing.T) {
 
 	plan, err := provider.WatchPlan(context.Background())
 	require.NoError(t, err)
-	require.Len(t, plan.Roots, 1)
+	require.Len(t, plan.Roots, 2)
 	assert.Equal(t, filepath.Join(root, copilotStateDir), plan.Roots[0].Path)
 	assert.True(t, plan.Roots[0].Recursive)
 	assert.Equal(t, []string{"*.jsonl", "workspace.yaml"}, plan.Roots[0].IncludeGlobs)
+	assert.Equal(t, root, plan.Roots[1].Path)
+	assert.False(t, plan.Roots[1].Recursive)
+	assert.Equal(t, []string{"session-store.db", "session-store.db-wal"},
+		plan.Roots[1].IncludeGlobs)
 
 	discovered, err := provider.Discover(context.Background())
 	require.NoError(t, err)
@@ -562,6 +658,9 @@ func TestCopilotProviderSourceMethods(t *testing.T) {
 	assert.NotEmpty(t, fingerprint.Hash)
 
 	writeSourceFile(t, workspacePath, "name: Workspace other\n")
+	// Equal-size writes can share a filesystem timestamp tick on Windows.
+	workspaceTime := time.Unix(0, fingerprint.MTimeNS).Add(time.Second)
+	require.NoError(t, os.Chtimes(workspacePath, workspaceTime, workspaceTime))
 	renamedFingerprint, err := provider.Fingerprint(context.Background(), found)
 	require.NoError(t, err)
 	assert.NotEqual(t, fingerprint.Hash, renamedFingerprint.Hash)

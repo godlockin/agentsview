@@ -9,11 +9,15 @@ accounts, everything local.
 
 ## Install
 
-```bash
-# macOS / Linux
-curl -fsSL https://agentsview.io/install.sh | bash
+**macOS and Linux:**
 
-# Windows
+```bash
+curl -fsSL https://agentsview.io/install.sh | bash
+```
+
+**Windows (PowerShell):**
+
+```powershell
 powershell -ExecutionPolicy ByPass -c "irm https://agentsview.io/install.ps1 | iex"
 ```
 
@@ -37,10 +41,10 @@ docker run --rm -p 127.0.0.1:8080:8080 \
 
 ```bash
 agentsview serve           # start the server in the foreground
-agentsview daemon start    # start the writable SQLite daemon
+agentsview daemon start    # alternatively, start the same server in the background
 agentsview daemon status   # show daemon status
 agentsview daemon restart  # restart from current configuration
-agentsview daemon stop     # stop the writable daemon
+agentsview daemon stop     # stop the server, web UI, and sync
 agentsview session list    # read from the daemon if warm, otherwise SQLite
 agentsview usage daily     # print daily cost summary
 ```
@@ -49,8 +53,15 @@ On first run, agentsview discovers sessions from every supported agent on your
 machine, syncs them into a local SQLite database, and serves a web UI at
 `http://127.0.0.1:8080`.
 
-For Devin CLI, point `DEVIN_DIR` or `devin_dirs` at the local root that contains
-`cli/` — for example `~/Library/Application Support/devin` on macOS,
+The daemon is the server: the web UI, API, session sync, and file watchers share
+one process. Choose `serve` for a foreground process or `daemon start` for a
+background process. Running `serve` when a compatible daemon is already running
+reports its URL and exits. `daemon stop` and `serve stop` both stop that
+writable server, including sync; `serve stop` also stops read-only mirror
+servers for the same data directory.
+
+For Devin CLI, point `DEVIN_DIR` or `agents.devin.dirs` at the local root that
+contains `cli/` — for example `~/Library/Application Support/devin` on macOS,
 `~/.local/share/devin` on Linux, or a redacted path like
 `.../Application Support/devin`. AgentsView reads session data under
 `<root>/cli/...` and intentionally ignores copied config or OAuth paths. Do not
@@ -58,16 +69,19 @@ paste tokens, OAuth files, or other secrets into bug reports.
 
 Claude and Codex sources can also be configured as `s3://` roots, so a central
 AgentsView instance can read sessions that other machines push to S3-compatible
-object storage. Add those roots to `claude_project_dirs` or
-`codex_sessions_dirs`; AgentsView lists object metadata and only downloads
-changed sessions during sync. S3 change detection uses size, modified time, and
-available object fingerprints such as ETag, version ID, or checksums.
+object storage. Add those roots to `agents.claude.dirs` or `agents.codex.dirs`;
+AgentsView lists object metadata and only downloads changed sessions during
+sync. S3 change detection uses size, modified time, and available object
+fingerprints such as ETag, version ID, or checksums.
 
-The desktop app and freshness-sensitive CLI commands share a detached local
-daemon. Read-only CLI commands attach to it when it is already running, but fall
-back to direct read-only SQLite on a cold archive so one-off scripts stay fast.
-Commands that need fresh data or need to write, such as `sync`, `usage`,
+The desktop app and ordinary session CLI commands share a detached local daemon
+and start one when needed. Dedicated diagnostics such as
+`db adopt-machine --list` and `doctor sync` read the archive without starting
+it. Commands that need fresh data or need to write, such as `sync`, `usage`,
 `token-use`, `pg push`, and `duckdb push`, auto-start the daemon when needed.
+The server remains running after these commands exit and also serves the web UI.
+For a one-shot sync with no background server, stop the daemon first and run
+`AGENTSVIEW_NO_DAEMON=1 agentsview sync`.
 
 Use `agentsview daemon start` when you want to start the writable SQLite daemon
 explicitly. It loads the normal effective configuration from `config.toml` and
@@ -99,9 +113,13 @@ agentsview serve --public-url http://127.0.0.1:18080
 agentsview serve --public-url https://your-workspace.exe.dev
 ```
 
-Use `--public-origin` (repeatable or comma-separated) to trust additional
-browser origins. If you expose the UI beyond loopback, also enable
-`--require-auth`.
+`--public-url` also selects the URL opened on startup; it does not configure a
+listener or external proxy. Use `--no-browser` on a headless server, or use
+`--public-origin` (repeatable or comma-separated) on its own for trust-only
+configuration. If you expose the UI beyond loopback, also enable
+`--require-auth`. See
+[Remote Access](https://agentsview.io/remote-access/#public-url-and-trusted-origins)
+for the listener, browser URL, and managed Caddy port rules.
 
 ## Docker
 
@@ -183,11 +201,9 @@ reverse proxy.
 
 ## Token Usage and Cost Tracking
 
-`agentsview usage` is a fast, local replacement for ccusage and similar tools.
-It tracks token consumption and compute costs across **all** your coding agents
--- not just Claude Code. Because session data is already indexed in SQLite,
-queries are over 100x faster than tools that re-parse raw session files on every
-run.
+`agentsview usage` tracks token consumption and compute costs across **all**
+your coding agents -- not just Claude Code. Reports read from the same local
+SQLite archive that powers the UI.
 
 ```bash
 # Daily cost summary (default: last 30 days)
@@ -206,7 +222,7 @@ agentsview usage statusline
 
 Features:
 
-- Automatic pricing via LiteLLM rates (with offline fallback)
+- Automatic pricing via LiteLLM and OpenRouter rates (with offline fallback)
 - Authoritative Copilot CLI billing totals when session logs provide them
 - Prompt-caching-aware cost calculation (cache creation / read tokens)
 - Per-model breakdown with `--breakdown`
@@ -250,6 +266,12 @@ return `404`.
 The deprecated alias `agentsview token-use <id>` remains available for
 compatibility and now also reports cost estimates.
 
+For one exact non-interactive `claude -p` or `codex exec --json` execution in
+CI, use `agentsview capture run`. It preserves the child streams and exit
+outcome, writes a separate versioned usage result, and starts no daemon, web
+server, or watcher. See
+[One-shot CI capture](https://agentsview.io/one-shot-capture/).
+
 ## Session Stats
 
 `agentsview stats` emits window-scoped analytics over recorded sessions: totals,
@@ -289,7 +311,9 @@ agentsview stats --include-git-outcomes
 | -------------------------------------------------------------------------------- | -------------------------------------------------------------------------- |
 | ![Search](https://agentsview.io/assets/generated/screenshots/search-results.png) | ![Heatmap](https://agentsview.io/assets/generated/screenshots/heatmap.png) |
 
-- **Full-text search** across all message content (FTS5)
+- **Full-text search** across all message content (FTS5), with optional CJK
+  character and phrase search for Chinese, Japanese, and Korean text in
+  SQLite, including Chinese word segmentation through `simple`/cppjieba
 - **Semantic search** (opt-in) -- index session content with any
   OpenAI-compatible embeddings endpoint and search by meaning with
   `agentsview session search --semantic` or `--hybrid`; every content-search
@@ -302,6 +326,10 @@ agentsview stats --include-git-outcomes
 - **Recent Edits feed** -- the files your agents changed most recently across
   every session, grouped by project and path, each linking to the message that
   made the change
+- **Data workspace** -- inspect project inventory and observed folders, preview
+  reclassification impact, and manage worktree mapping rules
+- **Recall corpus browser** -- explore experimental distilled knowledge and jump
+  from entries to their supporting transcript evidence
 - **Live updates** via SSE as active sessions receive new messages
 - **Keyboard-first** navigation (`j`/`k`/`[`/`]`, `Cmd+K` search, `?` for all
   shortcuts)
@@ -310,14 +338,14 @@ agentsview stats --include-git-outcomes
 ## Supported Agents
 
 agentsview discovers sessions from all of these. Aider is opt-in because it has
-no central session directory; set `AIDER_DIR` or `aider_dirs` to enable it. Amp
-support is deprecated because current Amp releases may store threads server-side
-and leave only local stubs; agentsview can still parse historical local Amp
-thread JSON files.
+no central session directory; set `AIDER_DIR` or `agents.aider.dirs` to enable
+it. Amp support is deprecated because current Amp releases may store threads
+server-side and leave only local stubs; agentsview can still parse historical
+local Amp thread JSON files.
 
 | Agent                 | Session Directory                                                                                                                                                                                                                                    |
 | --------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Aider                 | `<repo>/.aider.chat.history.md` (per repo; opt in with `AIDER_DIR` or `aider_dirs`)                                                                                                                                                                  |
+| Aider                 | `<repo>/.aider.chat.history.md` (per repo; opt in with `AIDER_DIR` or `agents.aider.dirs`)                                                                                                                                                           |
 | Amp (deprecated)      | `~/.local/share/amp/threads/` (historical local thread JSON only)                                                                                                                                                                                    |
 | Antigravity           | `~/.gemini/antigravity/`                                                                                                                                                                                                                             |
 | Antigravity CLI       | `~/.gemini/antigravity-cli/` (see note below)                                                                                                                                                                                                        |
@@ -326,12 +354,15 @@ thread JSON files.
 | Claude Cowork         | `~/Library/Application Support/Claude/local-agent-mode-sessions/` (macOS)                                                                                                                                                                            |
 | Codex                 | `~/.codex/sessions/`                                                                                                                                                                                                                                 |
 | Copilot CLI           | `~/.copilot/`                                                                                                                                                                                                                                        |
-| Devin CLI             | `~/.local/share/devin/` (Linux), `~/Library/Application Support/devin/` (macOS); point `DEVIN_DIR` / `devin_dirs` at the root that contains `cli/`                                                                                                   |
+| Devin CLI             | `~/.local/share/devin/` (Linux), `~/Library/Application Support/devin/` (macOS); point `DEVIN_DIR` / `agents.devin.dirs` at the root that contains `cli/`                                                                                            |
+| Evener                | `~/.local/state/evener/projects/` (or `$XDG_STATE_HOME/evener/projects/`; semantic transcript v2)                                                                                                                                                    |
 | Cortex Code           | `~/.snowflake/cortex/conversations/`                                                                                                                                                                                                                 |
 | Cursor                | `~/.cursor/projects/`                                                                                                                                                                                                                                |
 | DeepSeek TUI          | `~/.codewhale/sessions/`, `~/.deepseek/sessions/`                                                                                                                                                                                                    |
+| DeepSeek Harness      | `~/.dsh/sessions/` (or `$DSH_HOME/sessions/`)                                                                                                                                                                                                        |
 | Forge                 | `~/.forge/`                                                                                                                                                                                                                                          |
 | Gemini CLI            | `~/.gemini/`                                                                                                                                                                                                                                         |
+| Goose                 | `~/.local/share/goose/sessions/` (macOS and Linux), `%APPDATA%\\Block\\goose\\data\\sessions\\` (Windows)                                                                                                                                            |
 | gptme                 | `~/.local/share/gptme/logs/`                                                                                                                                                                                                                         |
 | Grok                  | `~/.grok/sessions/`                                                                                                                                                                                                                                  |
 | Hermes Agent          | `~/.hermes/sessions/`                                                                                                                                                                                                                                |
@@ -339,17 +370,20 @@ thread JSON files.
 | Kilo                  | `~/.local/share/kilo/`                                                                                                                                                                                                                               |
 | Kilo (legacy)         | `~/Library/Application Support/Code/User/globalStorage/kilocode.kilo-code/` (macOS), `~/.config/Code/User/globalStorage/kilocode.kilo-code/` (Linux)                                                                                                 |
 | Kimi                  | `~/.kimi/sessions/`                                                                                                                                                                                                                                  |
-| Kimi Work             | `~/Library/Application Support/kimi-desktop/daimon-share/daimon/runtime/kimi-code/home/sessions/` (macOS)                                                                                                                 |
+| Kimi Work             | `~/Library/Application Support/kimi-desktop/daimon-share/daimon/runtime/kimi-code/home/sessions/` (macOS)                                                                                                                                            |
 | Kiro CLI              | `~/.kiro/sessions/cli/`, `~/.local/share/kiro-cli/`                                                                                                                                                                                                  |
 | Kiro IDE              | `~/Library/Application Support/Kiro/` (macOS)                                                                                                                                                                                                        |
 | MiMoCode              | `~/.local/share/mimocode/`                                                                                                                                                                                                                           |
 | Mistral Vibe          | `~/.vibe/logs/session/`                                                                                                                                                                                                                              |
 | OpenClaw              | `~/.openclaw/agents/`                                                                                                                                                                                                                                |
 | OpenCode              | `~/.local/share/opencode/`                                                                                                                                                                                                                           |
+| Open Code Review      | `~/.opencodereview/sessions/`                                                                                                                                                                                                                        |
 | OpenHands CLI         | `~/.openhands/conversations/`                                                                                                                                                                                                                        |
 | OhMyPi                | `~/.omp/agent/sessions/`                                                                                                                                                                                                                             |
 | Omnigent              | `~/.omnigent/chat.db`                                                                                                                                                                                                                                |
 | Pi                    | `~/.pi/agent/sessions/`                                                                                                                                                                                                                              |
+| Tau                   | `~/.tau/sessions/`                                                                                                                                                                                                                                   |
+| Prime Agent           | `~/.prime/agent/sessions/`                                                                                                                                                                                                                           |
 | Poolside              | `~/Library/Application Support/poolside/trajectories/` (macOS), `~/.local/state/poolside/trajectories/` (Linux), `%APPDATA%\\poolside\\trajectories\\` (Windows)                                                                                     |
 | Piebald               | `~/.local/share/piebald/`                                                                                                                                                                                                                            |
 | Posit Assistant       | `~/.posit/assistant/workspaces/`                                                                                                                                                                                                                     |
@@ -364,6 +398,7 @@ thread JSON files.
 | Visual Studio Copilot | `%LOCALAPPDATA%\\Temp\\VSGitHubCopilotLogs\\traces\\` (Windows), `~/Library/Caches/VSGitHubCopilotLogs/traces/` (macOS), `~/.cache/VSGitHubCopilotLogs/traces/` (Linux)                                                                              |
 | Windsurf              | `~/Library/Application Support/Windsurf/User/` (macOS), `~/.config/Windsurf/User/` (Linux), `%APPDATA%\\Windsurf\\User\\` (Windows)                                                                                                                  |
 | Trae                  | `%APPDATA%\\Trae\\User\\` (Windows), `~/Library/Application Support/Trae/User/` (macOS), `~/.config/Trae/User/` (Linux)                                                                                                                              |
+| TraeX (TRAE CLI)      | `~/.trae/cli/sessions/`, `~/.trae/cli/archived_sessions/`                                                                                                                                                                                            |
 | Warp                  | `~/.warp/` (platform-dependent)                                                                                                                                                                                                                      |
 | WorkBuddy             | `~/.workbuddy/projects/`                                                                                                                                                                                                                             |
 | ZCode                 | `~/.zcode/cli/db/`, `~/.zcode/cli/`                                                                                                                                                                                                                  |
@@ -374,8 +409,14 @@ Grok sessions are read from `summary.json` (title, timestamps, project),
 optional `signals.json` (token counters), and `chat_history.jsonl` when present
 for the full transcript (user turns, assistant replies, thinking, and tool
 calls). If `chat_history.jsonl` is missing, AgentsView falls back to
-summary-only mode. Set `GROK_DIR` or `grok_dirs` to override the default
+summary-only mode. Set `GROK_DIR` or `agents.grok.dirs` to override the default
 directory.
+
+Goose sessions are read from its shared SQLite `sessions.db`, including
+transcript content, thinking, tool calls and results, session relationships,
+models, token usage, and recorded costs. Set `GOOSE_PATH_ROOT` to a Goose path
+root (sessions are read from `<root>/data/sessions/`), or `agents.goose.dirs` to
+one or more data or sessions directories.
 
 Each directory can be overridden with an environment variable. See the
 [configuration docs](https://agentsview.io/configuration/) for details. Cursor
@@ -395,8 +436,8 @@ AgentsView does not scan for Aider logs by default. Earlier builds attempted an
 always-on bounded scan of the home directory, but that was not trustworthy:
 desktop launches and background usage refreshes could still trigger macOS
 privacy prompts for protected folders. To enable Aider, point `AIDER_DIR` (or
-the `aider_dirs` config key) at a code root you explicitly want scanned. The
-scan descends at most four levels below each configured root, skips
+the `agents.aider.dirs` config key) at a code root you explicitly want scanned.
+The scan descends at most four levels below each configured root, skips
 vendor/build/VCS directories by name (`node_modules`, `target`, `.git`,
 `Library`, `go`, `.cargo`, and similar), and stops after a two-second wall-clock
 budget. On macOS, broad home roots still skip protected top-level folders unless
@@ -427,7 +468,8 @@ export COPILOT_DIR=~/.copilot/jetbrains-sessions
 Or in `~/.agentsview/config.toml`:
 
 ```toml
-copilot_dirs = ["~/.copilot/jetbrains-sessions"]
+[agents.copilot]
+dirs = ["~/.copilot/jetbrains-sessions"]
 ```
 
 Re-run the exporter after new JetBrains Copilot sessions if you want agentsview
@@ -480,6 +522,39 @@ March 2026), which shares that same database. *Kilo (legacy)* is the legacy
 RooCode-derived VS Code extension that wrote per-task JSON under
 `kilocode.kilo-code/tasks/`.
 
+## Filesystem Session Sync
+
+Local imports use a persisted installation ID, so updates and network changes do
+not split sessions across machine identities. `telemetry-install-id` stores the
+ID independently of telemetry. The display label defaults to the current
+hostname; set `local_machine_name` in `config.toml` for a fixed label after a
+daemon restart. Upgrades adopt historical local sessions when the archive has
+saved ownership. Older archives keep historical keys until you select the local
+ones with `agentsview db adopt-machine`; see the
+[upgrade guide](https://agentsview.io/configuration/#upgrading-historical-machine-keys).
+
+One primary AgentsView instance can ingest native agent session directories
+copied or mounted from other machines without PostgreSQL:
+
+```toml
+[[session_sources]]
+agent = "copilot"
+dir = "/srv/session-archive/buildbox/copilot"
+machine = "0123456789abcdef0123456789abcdef" # Peer installation ID
+```
+
+Structured sources are additive to existing `agents.copilot.dirs`,
+`agents.claude.dirs`, and other per-agent settings. They label sessions by
+source machine without namespacing native session IDs. Transport source session
+files only -- never copy `sessions.db` or its WAL files. Machine keys are
+captured at first ingestion; ordinary sync and `agentsview sync --full` preserve
+the stored key. Use a peer's ID from `telemetry-install-id` for remote roots.
+For local roots, omit `machine`, removing any existing hostname setting. Adopted
+old keys remain aliases for existing filters and URLs.
+
+See the [Filesystem Session Sync guide](https://agentsview.io/filesystem-sync/)
+for Git, rsync, shared-mount, freshness, and operational guidance.
+
 ## PostgreSQL Sync
 
 Push session data to a shared PostgreSQL instance for team dashboards:
@@ -503,11 +578,9 @@ default_pg = "work"
 
 [pg.work]
 url = "postgres://user:pass@work-db/agentsview"
-machine_name = "laptop"
 
 [pg.archive]
 url = "postgres://user:pass@archive-db/agentsview"
-machine_name = "laptop-archive"
 exclude_projects = ["scratch"]
 ```
 
@@ -633,13 +706,14 @@ Full docs at **[agentsview.io](https://agentsview.io)**:
 [Usage Guide](https://agentsview.io/usage/) --
 [CLI Reference](https://agentsview.io/commands/) --
 [Configuration](https://agentsview.io/configuration/) --
+[Filesystem Sync](https://agentsview.io/filesystem-sync/) --
 [Architecture](https://agentsview.io/architecture/)
 
 ______________________________________________________________________
 
 ## Development
 
-Requires Go 1.26+ (CGO), Node.js 22+.
+Requires Go 1.27+ (CGO), Node.js 24.11+.
 
 ```bash
 make dev            # Go server (dev mode)

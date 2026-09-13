@@ -131,6 +131,49 @@ func TestSecretFindingsSchema(t *testing.T) {
 	}
 }
 
+// TestEnsureSchemaCreatesMappingMirrorAndSessionProvenance verifies that
+// EnsureSchema creates the source_worktree_project_mappings mirror table
+// with all required columns, and that sessions gains the
+// source_archive_id and file_path provenance columns. Also asserts
+// idempotency across two EnsureSchema runs.
+func TestEnsureSchemaCreatesMappingMirrorAndSessionProvenance(t *testing.T) {
+	pgURL := testPGURL(t)
+	cleanSchemaTestPG(t, pgURL)
+	t.Cleanup(func() { cleanSchemaTestPG(t, pgURL) })
+
+	pg, err := Open(pgURL, schemaTestSchema, true)
+	require.NoError(t, err, "connecting to pg")
+	defer pg.Close()
+
+	ctx := context.Background()
+
+	// Run EnsureSchema twice to verify idempotency.
+	require.NoError(t, EnsureSchema(ctx, pg, schemaTestSchema),
+		"EnsureSchema (first)")
+	require.NoError(t, EnsureSchema(ctx, pg, schemaTestSchema),
+		"EnsureSchema (second, idempotency check)")
+
+	var count int
+	require.NoError(t, pg.QueryRowContext(ctx, `
+		SELECT COUNT(*) FROM information_schema.columns
+		WHERE table_schema = $1
+		  AND table_name = 'source_worktree_project_mappings'
+		  AND column_name IN ('source_archive_id','machine','path_prefix',
+		      'layout','project','original_project','enabled','updated_at')`,
+		schemaTestSchema,
+	).Scan(&count))
+	assert.Equal(t, 8, count)
+
+	require.NoError(t, pg.QueryRowContext(ctx, `
+		SELECT COUNT(*) FROM information_schema.columns
+		WHERE table_schema = $1
+		  AND table_name = 'sessions'
+		  AND column_name IN ('source_archive_id','file_path')`,
+		schemaTestSchema,
+	).Scan(&count))
+	assert.Equal(t, 2, count)
+}
+
 // TestToolCallsFilePathIndex verifies EnsureSchema creates the partial
 // idx_tool_calls_file_path index that backs the cross-session Recent Edits
 // feed, mirroring SQLite's index so the query surface has parity on PG.
@@ -425,4 +468,26 @@ func TestEnsureSchemaRejectsInvalidLegacyMoneyWithoutChangingSchema(t *testing.T
 		`SELECT cost_usd FROM usage_events WHERE session_id = 'invalid-legacy-money'`,
 	).Scan(&cost))
 	assert.Equal(t, -0.01, cost)
+}
+
+func TestPromptEvidenceMigrationPreservesSessions(t *testing.T) {
+	pgURL := testPGURL(t)
+	cleanSchemaTestPG(t, pgURL)
+	t.Cleanup(func() { cleanSchemaTestPG(t, pgURL) })
+	pg, err := Open(pgURL, schemaTestSchema, true)
+	require.NoError(t, err)
+	defer pg.Close()
+	require.NoError(t, EnsureSchema(t.Context(), pg, schemaTestSchema))
+	// Reproduce the previously shipped schema, which has no policy marker.
+	_, err = pg.Exec(`ALTER TABLE sessions DROP COLUMN prompt_evidence_discarded`)
+	require.NoError(t, err)
+	_, err = pg.Exec(`INSERT INTO sessions (id, machine, project, agent, first_message) VALUES ('full-session', 'machine', 'project', 'claude', 'Explain this code')`)
+	require.NoError(t, err)
+	sync := &Sync{pg: pg, schema: schemaTestSchema}
+	require.NoError(t, sync.EnsureSchema(t.Context()))
+	var prompt string
+	var discarded bool
+	require.NoError(t, pg.QueryRow(`SELECT first_message, prompt_evidence_discarded FROM sessions WHERE id = 'full-session'`).Scan(&prompt, &discarded))
+	assert.Equal(t, "Explain this code", prompt)
+	assert.False(t, discarded)
 }

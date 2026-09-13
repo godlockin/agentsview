@@ -122,6 +122,150 @@ func TestProcessFileProviderForgeVirtualSource(t *testing.T) {
 	assert.Len(t, res.results[0].Messages, 2)
 }
 
+func TestProviderChangedPathUsesSourceMachine(t *testing.T) {
+	root := t.TempDir()
+	dbPath := writeProcessProviderForgeDB(t, root)
+	database := openTestDB(t)
+	engine := NewEngine(database, EngineConfig{
+		AgentDirs: map[parser.AgentType][]string{
+			parser.AgentForge: {root},
+		},
+		SourceMachines: map[parser.AgentType]map[string]string{
+			parser.AgentForge: {root: "archivebox"},
+		},
+		Machine: "localbox",
+	})
+
+	files, err := engine.classifyProviderChangedPath(t.Context(), dbPath)
+	require.NoError(t, err)
+	require.Len(t, files, 1)
+	assert.Equal(t, "archivebox", files[0].Machine)
+
+	res := engine.processFile(context.Background(), files[0])
+
+	require.NoError(t, res.err)
+	require.Len(t, res.results, 1)
+	assert.Equal(t, "archivebox", res.results[0].Session.Machine)
+	assert.Equal(t, "forge:conv-001", res.results[0].Session.ID)
+
+	engine.SyncPathsContext(context.Background(), []string{dbPath})
+	sess, err := database.GetSessionFull(context.Background(), "forge:conv-001")
+	require.NoError(t, err)
+	require.NotNil(t, sess)
+	assert.Equal(t, "archivebox", sess.Machine)
+}
+
+func TestProviderPeriodicSyncUsesSourceMachine(t *testing.T) {
+	root := t.TempDir()
+	writeProcessProviderForgeDB(t, root)
+	database := openTestDB(t)
+	engine := NewEngine(database, EngineConfig{
+		AgentDirs: map[parser.AgentType][]string{
+			parser.AgentForge: {root},
+		},
+		SourceMachines: map[parser.AgentType]map[string]string{
+			parser.AgentForge: {root: "archivebox"},
+		},
+		Machine: "localbox",
+	})
+
+	stats := engine.SyncAll(context.Background(), nil)
+
+	assert.False(t, stats.Aborted)
+	sess, err := database.GetSessionFull(context.Background(), "forge:conv-001")
+	require.NoError(t, err)
+	require.NotNil(t, sess)
+	assert.Equal(t, "archivebox", sess.Machine)
+}
+
+func TestProviderPeriodicSyncPreservesFreshDBBackedSourceMachine(t *testing.T) {
+	root := t.TempDir()
+	writeProcessProviderForgeDB(t, root)
+	database := openTestDB(t)
+	newEngine := func(machine string) *Engine {
+		return NewEngine(database, EngineConfig{
+			AgentDirs: map[parser.AgentType][]string{
+				parser.AgentForge: {root},
+			},
+			SourceMachines: map[parser.AgentType]map[string]string{
+				parser.AgentForge: {root: machine},
+			},
+			Machine: "localbox",
+		})
+	}
+
+	first := newEngine("oldbox").SyncAll(context.Background(), nil)
+	require.Equal(t, 1, first.Synced)
+	second := newEngine("newbox").SyncAll(context.Background(), nil)
+	require.Zero(t, second.Synced)
+
+	sess, err := database.GetSessionFull(context.Background(), "forge:conv-001")
+	require.NoError(t, err)
+	require.NotNil(t, sess)
+	assert.Equal(t, "oldbox", sess.Machine)
+	assert.Equal(t, 2, sess.MessageCount)
+}
+
+func TestProviderPeriodicSyncPreservesTrashedDBBackedSourceMachine(t *testing.T) {
+	root := t.TempDir()
+	writeProcessProviderForgeDB(t, root)
+	database := openTestDB(t)
+	newEngine := func(machine string) *Engine {
+		return NewEngine(database, EngineConfig{
+			AgentDirs: map[parser.AgentType][]string{
+				parser.AgentForge: {root},
+			},
+			SourceMachines: map[parser.AgentType]map[string]string{
+				parser.AgentForge: {root: machine},
+			},
+			Machine: "localbox",
+		})
+	}
+
+	require.Equal(t, 1, newEngine("oldbox").SyncAll(t.Context(), nil).Synced)
+	require.NoError(t, database.SoftDeleteSession("forge:conv-001"))
+	require.Zero(t, newEngine("newbox").SyncAll(t.Context(), nil).Synced)
+
+	active, err := database.GetSession(t.Context(), "forge:conv-001")
+	require.NoError(t, err)
+	assert.Nil(t, active)
+	trashed, err := database.GetSessionFull(t.Context(), "forge:conv-001")
+	require.NoError(t, err)
+	require.NotNil(t, trashed)
+	assert.Equal(t, "oldbox", trashed.Machine)
+	assert.NotNil(t, trashed.DeletedAt)
+	assert.Nil(t, trashed.DeletionCause)
+	assert.Zero(t, newEngine("newbox").SyncAll(t.Context(), nil).Synced)
+}
+
+func TestProviderResyncPreservesTrashedDBBackedSourceMachine(t *testing.T) {
+	root := t.TempDir()
+	writeProcessProviderForgeDB(t, root)
+	database := openTestDB(t)
+	newEngine := func(machine string) *Engine {
+		return NewEngine(database, EngineConfig{
+			AgentDirs: map[parser.AgentType][]string{
+				parser.AgentForge: {root},
+			},
+			SourceMachines: map[parser.AgentType]map[string]string{
+				parser.AgentForge: {root: machine},
+			},
+			Machine: "localbox",
+		})
+	}
+
+	require.Equal(t, 1, newEngine("oldbox").SyncAll(t.Context(), nil).Synced)
+	require.NoError(t, database.SoftDeleteSession("forge:conv-001"))
+	stats := newEngine("newbox").ResyncAll(t.Context(), nil)
+	require.False(t, stats.Aborted)
+
+	trashed, err := database.GetSessionFull(t.Context(), "forge:conv-001")
+	require.NoError(t, err)
+	require.NotNil(t, trashed)
+	assert.Equal(t, "oldbox", trashed.Machine)
+	assert.NotNil(t, trashed.DeletedAt)
+}
+
 func TestProcessFileProviderSkipsStoredFreshSource(t *testing.T) {
 
 	root := t.TempDir()
@@ -316,6 +460,7 @@ func TestProcessFileUsesProviderDBBackedFamily(t *testing.T) {
 
 	for _, agent := range []parser.AgentType{
 		parser.AgentForge,
+		parser.AgentGoose,
 		parser.AgentPiebald,
 		parser.AgentWarp,
 		parser.AgentZCode,
@@ -376,7 +521,6 @@ func TestProcessFileProviderAuthoritativeUsesInjectedProvider(t *testing.T) {
 }
 
 func TestProcessFileProviderAuthoritativeKeepsRetryStatePerResult(t *testing.T) {
-
 	root := t.TempDir()
 	sourcePath, fingerprint := writeProcessProviderSource(t, root, "retry.jsonl")
 	provider := newProcessFixtureProvider(
@@ -420,6 +564,236 @@ func TestProcessFileProviderAuthoritativeKeepsRetryStatePerResult(t *testing.T) 
 	assert.False(t, res.needsRetryForSession("cowork:current"))
 	assert.True(t, res.needsRetryForSession("cowork:retry"))
 	assert.False(t, res.suppressesPresenceSweepForRetry())
+}
+
+func TestSyncSingleSessionKeepsRetryStatePerResult(t *testing.T) {
+	root := t.TempDir()
+	sourcePath, fingerprint := writeProcessProviderSource(t, root, "retry.jsonl")
+	provider := newProcessFixtureProvider(
+		processFixtureSource(sourcePath),
+		fingerprint,
+		parser.ParseOutcome{
+			Results: []parser.ParseResultOutcome{
+				{
+					Result: processFixtureResult(
+						"cowork:current",
+						parser.AgentCowork,
+						"fixture-project",
+						sourcePath,
+						fingerprint,
+					),
+					DataVersion: parser.DataVersionCurrent,
+				},
+				{
+					Result: processFixtureResult(
+						"cowork:retry",
+						parser.AgentCowork,
+						"fixture-project",
+						sourcePath,
+						fingerprint,
+					),
+					DataVersion: parser.DataVersionNeedsRetry,
+				},
+			},
+			ResultSetComplete: true,
+		},
+	)
+	engine := newProcessFixtureEngine(t, root, provider)
+
+	_, _, err := engine.processAndWriteSessionFile(
+		context.Background(),
+		parser.DiscoveredFile{Path: sourcePath, Agent: parser.AgentCowork},
+		"cowork:current",
+	)
+	require.NoError(t, err)
+	assert.Equal(t, db.CurrentDataVersion(),
+		engine.db.GetSessionDataVersion("cowork:current"),
+		"a sibling retry must not leave the valid session stale")
+	assert.Less(t, engine.db.GetSessionDataVersion("cowork:retry"),
+		db.CurrentDataVersion(),
+		"the retrying session must remain stale")
+}
+
+func TestSyncSingleSessionPartialFullWritesQueueNewChild(t *testing.T) {
+	for _, tc := range []struct {
+		name         string
+		includeLater bool
+		failureSQL   string
+		wantError    string
+	}{
+		{
+			name:         "later member fails",
+			includeLater: true,
+			failureSQL: `
+				CREATE TRIGGER fail_later_member_write
+				BEFORE INSERT ON sessions
+				WHEN NEW.id = 'cowork:later'
+				BEGIN
+					SELECT RAISE(FAIL, 'injected later member write failure');
+				END`,
+			wantError: "injected later member write failure",
+		},
+		{
+			name: "spawner completion fails after content commit",
+			failureSQL: fmt.Sprintf(`
+				CREATE TRIGGER fail_spawner_write_completion
+				BEFORE UPDATE OF data_version ON sessions
+				WHEN NEW.id = 'cowork:spawner' AND NEW.data_version = %d
+				BEGIN
+					SELECT RAISE(FAIL, 'injected spawner completion failure');
+				END`, db.CurrentDataVersion()),
+			wantError: "injected spawner completion failure",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			root := t.TempDir()
+			sourcePath, fingerprint := writeProcessProviderSource(
+				t, root, "partial-write.jsonl",
+			)
+			spawner := processFixtureResult(
+				"cowork:spawner", parser.AgentCowork, "fixture-project",
+				sourcePath, fingerprint,
+			)
+			spawner.Messages[0] = parser.ParsedMessage{
+				Ordinal: 0, Role: parser.RoleAssistant,
+				Content: "spawn child", Timestamp: spawner.Session.StartedAt,
+				HasToolUse: true,
+				ToolCalls: []parser.ParsedToolCall{{
+					ToolUseID: "spawn-child", ToolName: "Agent", Category: "Task",
+					SubagentSessionID: "cowork:child",
+				}},
+			}
+			results := []parser.ParseResultOutcome{{
+				Result: spawner, DataVersion: parser.DataVersionCurrent,
+			}}
+			if tc.includeLater {
+				results = append(results, parser.ParseResultOutcome{
+					Result: processFixtureResult(
+						"cowork:later", parser.AgentCowork, "fixture-project",
+						sourcePath, fingerprint,
+					),
+					DataVersion: parser.DataVersionCurrent,
+				})
+			}
+			provider := newProcessFixtureProvider(
+				processFixtureSource(sourcePath), fingerprint,
+				parser.ParseOutcome{
+					Results: results, ResultSetComplete: true, ForceReplace: true,
+				},
+			)
+			provider.Caps.Source.MultiSessionSource = parser.CapabilitySupported
+			engine := newProcessFixtureEngine(t, root, provider)
+			database := engine.db
+			require.NoError(t, database.UpsertSession(db.Session{
+				ID: "cowork:spawner", Agent: string(parser.AgentCowork),
+				Project: "fixture-project", Machine: "devbox", FilePath: &sourcePath,
+			}))
+			require.NoError(t, database.UpsertSession(db.Session{
+				ID: "cowork:child", Agent: string(parser.AgentCowork),
+				Project: "fixture-project", Machine: "devbox",
+			}))
+
+			raw, err := sql.Open("sqlite3", database.Path())
+			require.NoError(t, err)
+			t.Cleanup(func() { require.NoError(t, raw.Close()) })
+			_, err = raw.Exec(tc.failureSQL + `;
+				CREATE TRIGGER fail_partial_parent_repair
+				BEFORE UPDATE OF parent_session_id ON sessions
+				WHEN NEW.id = 'cowork:child'
+				BEGIN
+					SELECT RAISE(FAIL, 'injected partial parent repair failure');
+				END`)
+			require.NoError(t, err)
+
+			syncErr := engine.SyncSingleSession("cowork:spawner")
+
+			require.ErrorContains(t, syncErr, tc.wantError)
+			assert.ErrorContains(t, syncErr, "injected partial parent repair failure",
+				"committed message content must activate deferred repair")
+			var edgeCount int
+			require.NoError(t, database.Reader().QueryRow(`
+				SELECT count(*) FROM tool_calls
+				WHERE session_id = 'cowork:spawner'
+				  AND subagent_session_id = 'cowork:child'`,
+			).Scan(&edgeCount))
+			assert.Equal(t, 1, edgeCount,
+				"the partial write must commit its new spawn edge")
+			var queuedRepairs int
+			require.NoError(t, database.Reader().QueryRow(`
+				SELECT count(*) FROM subagent_parent_repair_queue
+				WHERE session_id = 'cowork:child'`,
+			).Scan(&queuedRepairs))
+			assert.Equal(t, 1, queuedRepairs,
+				"the new child must remain durable after partial failure")
+		})
+	}
+}
+
+func TestSyncSingleSessionPartialFullWriteRepairsAttemptedSession(t *testing.T) {
+	root := t.TempDir()
+	sourcePath, fingerprint := writeProcessProviderSource(
+		t, root, "partial-parent-write.jsonl",
+	)
+	child := processFixtureResult(
+		"cowork:child", parser.AgentCowork, "fixture-project",
+		sourcePath, fingerprint,
+	)
+	child.Session.ParentSessionID = "cowork:path-parent"
+	child.Session.RelationshipType = parser.RelSubagent
+	provider := newProcessFixtureProvider(
+		processFixtureSource(sourcePath), fingerprint,
+		parser.ParseOutcome{
+			Results: []parser.ParseResultOutcome{{
+				Result: child, DataVersion: parser.DataVersionCurrent,
+			}},
+			ResultSetComplete: true,
+			ForceReplace:      true,
+		},
+	)
+	engine := newProcessFixtureEngine(t, root, provider)
+	database := engine.db
+	actualParent := "cowork:spawner"
+	started := "2026-01-01T00:00:00Z"
+	require.NoError(t, database.UpsertSession(db.Session{
+		ID: actualParent, Agent: string(parser.AgentCowork),
+		Project: "fixture-project", Machine: "devbox", StartedAt: &started,
+		MessageCount: 1,
+	}))
+	require.NoError(t, database.UpsertSession(db.Session{
+		ID: "cowork:child", Agent: string(parser.AgentCowork),
+		Project: "fixture-project", Machine: "devbox",
+		ParentSessionID: &actualParent, RelationshipType: string(parser.RelSubagent),
+	}))
+	require.NoError(t, database.InsertMessages([]db.Message{{
+		SessionID: actualParent, Ordinal: 0, Role: string(parser.RoleAssistant),
+		Content: "spawn child", HasToolUse: true,
+		ToolCalls: []db.ToolCall{{
+			ToolUseID: "spawn-child", ToolName: "Agent",
+			SubagentSessionID: "cowork:child",
+		}},
+	}}))
+
+	raw, err := sql.Open("sqlite3", database.Path())
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, raw.Close()) })
+	_, err = raw.Exec(fmt.Sprintf(`
+		CREATE TRIGGER fail_child_write_completion
+		BEFORE UPDATE OF data_version ON sessions
+		WHEN NEW.id = 'cowork:child' AND NEW.data_version = %d
+		BEGIN
+			SELECT RAISE(FAIL, 'injected child completion failure');
+		END`, db.CurrentDataVersion()))
+	require.NoError(t, err)
+
+	syncErr := engine.SyncSingleSession("cowork:child")
+
+	require.ErrorContains(t, syncErr, "injected child completion failure")
+	stored, err := database.GetSession(t.Context(), "cowork:child")
+	require.NoError(t, err)
+	require.NotNil(t, stored)
+	require.NotNil(t, stored.ParentSessionID)
+	assert.Equal(t, actualParent, *stored.ParentSessionID,
+		"deferred repair must reconcile the partially written session itself")
 }
 
 func TestProcessFileProviderAuthoritativeSuppressesUncleanSkipCache(t *testing.T) {
@@ -481,7 +855,10 @@ func TestProcessFileProviderAuthoritativeUsesSkipReasonCacheKey(t *testing.T) {
 	assert.True(t, res.skip)
 	assert.True(t, res.cacheSkip)
 	assert.False(t, res.noCacheSkip)
-	assert.Equal(t, source.FingerprintKey, res.skipCacheKey(sourcePath))
+	assert.Equal(t,
+		providerAgentSkipCacheKey(source.FingerprintKey, parser.AgentCowork),
+		res.skipCacheKey(sourcePath),
+	)
 }
 
 func TestProcessFileProviderAuthoritativeForceParseAllowsStaleSourceLookup(t *testing.T) {
@@ -796,8 +1173,8 @@ func TestProcessFileProviderDevinSkipsStoredFreshSource(t *testing.T) {
 		root,
 		"session-001",
 		"Initial reply",
-		1700000000000,
-		1700000005000,
+		1700000000,
+		1700000005,
 	)
 	virtualPath := parser.VirtualSourcePath(dbPath, "session-001")
 	database := dbtest.OpenTestDB(t)
@@ -856,8 +1233,8 @@ func TestProcessFileProviderDevinReparsesTranscriptOnlyChange(t *testing.T) {
 		root,
 		"session-002",
 		"Initial reply",
-		1700000000000,
-		1700000005000,
+		1700000000,
+		1700000005,
 	)
 	virtualPath := parser.VirtualSourcePath(dbPath, "session-002")
 	database := dbtest.OpenTestDB(t)
@@ -924,8 +1301,8 @@ func TestProcessFileProviderDevinSameSizeSameMtimeTranscriptRewriteReparses(t *t
 				root,
 				"session-same-mtime",
 				"Initial reply",
-				1700000000000,
-				1700000005000,
+				1700000000,
+				1700000005,
 			)
 			virtualPath := parser.VirtualSourcePath(dbPath, "session-same-mtime")
 			database := dbtest.OpenTestDB(t)
@@ -1005,8 +1382,8 @@ func TestProcessFileProviderDevinRepeatedHashRewriteIgnoresStaleHashedCache(t *t
 		root,
 		"session-repeated-hash",
 		"Initial reply",
-		1700000000000,
-		1700000005000,
+		1700000000,
+		1700000005,
 	)
 	virtualPath := parser.VirtualSourcePath(dbPath, "session-repeated-hash")
 	file := parser.DiscoveredFile{
@@ -1070,8 +1447,8 @@ func TestSyncAllProviderDevinMissingDBPreservesArchive(t *testing.T) {
 		root,
 		"session-003",
 		"Archived reply",
-		1700000000000,
-		1700000005000,
+		1700000000,
+		1700000005,
 	)
 	database := dbtest.OpenTestDB(t)
 	engine := NewEngine(database, EngineConfig{
@@ -1168,8 +1545,8 @@ func writeProcessProviderDevinFixture(
 	root string,
 	sessionID string,
 	assistantReply string,
-	createdAtMS int64,
-	lastActivityAtMS int64,
+	createdAtSec int64,
+	lastActivityAtSec int64,
 ) (string, string) {
 	t.Helper()
 	cliDir := filepath.Join(root, "cli")
@@ -1186,6 +1563,7 @@ func writeProcessProviderDevinFixture(
 			model TEXT,
 			created_at INTEGER,
 			last_activity_at INTEGER,
+			main_chain_id INTEGER,
 			hidden INTEGER NOT NULL DEFAULT 0
 		);
 	`)
@@ -1198,8 +1576,8 @@ func writeProcessProviderDevinFixture(
 		"Devin fixture",
 		"/Users/devbox/src/agentsview",
 		"devin-1",
-		createdAtMS,
-		lastActivityAtMS,
+		createdAtSec,
+		lastActivityAtSec,
 	)
 	require.NoError(t, err)
 	require.NoError(t, database.Close())
@@ -1343,18 +1721,16 @@ func newProcessFixtureProvider(
 	outcome parser.ParseOutcome,
 ) *processFixtureProvider {
 	return &processFixtureProvider{
-		ProviderBase: parser.ProviderBase{
-			Def: parser.AgentDef{
-				Type:        parser.AgentCowork,
-				DisplayName: "Cowork",
-				IDPrefix:    "cowork:",
-				FileBased:   true,
-			},
-			Caps: parser.Capabilities{
-				Source: parser.SourceCapabilities{
-					FindSource:           parser.CapabilitySupported,
-					CompositeFingerprint: parser.CapabilitySupported,
-				},
+		Def: parser.AgentDef{
+			Type:        parser.AgentCowork,
+			DisplayName: "Cowork",
+			IDPrefix:    "cowork:",
+			FileBased:   true,
+		},
+		Caps: parser.Capabilities{
+			Source: parser.SourceCapabilities{
+				FindSource:           parser.CapabilitySupported,
+				CompositeFingerprint: parser.CapabilitySupported,
 			},
 		},
 		source:      source,
@@ -1384,12 +1760,17 @@ type processFixtureProvider struct {
 	parser.ProviderBase
 
 	source        parser.SourceRef
+	discovered    []parser.SourceRef
 	findFound     bool
 	fingerprint   parser.SourceFingerprint
 	outcome       parser.ParseOutcome
 	calls         []string
 	findRequests  []parser.FindSourceRequest
 	parseRequests []parser.ParseRequest
+}
+
+func (p *processFixtureProvider) Discover(context.Context) ([]parser.SourceRef, error) {
+	return append([]parser.SourceRef(nil), p.discovered...), nil
 }
 
 func (p *processFixtureProvider) FindSource(

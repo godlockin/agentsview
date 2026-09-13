@@ -29,9 +29,8 @@ func (f hintRecordingFactory) Definition() parser.AgentDef {
 func (f hintRecordingFactory) Capabilities() parser.Capabilities { return f.caps }
 
 func (f hintRecordingFactory) NewProvider(cfg parser.ProviderConfig) parser.Provider {
-	return &hintRecordingProvider{ProviderBase: parser.ProviderBase{
-		Def: f.Definition(), Caps: f.caps, Config: cfg.Clone(),
-	}, seen: f.seen}
+	return &hintRecordingProvider{
+		Def: f.Definition(), Caps: f.caps, Config: cfg.Clone(), seen: f.seen}
 }
 
 type hintRecordingProvider struct {
@@ -197,7 +196,7 @@ func TestClassifyProviderChangedPathPreservesHintDependentTombstones(t *testing.
 					folder_paths TEXT, folder_paths_order TEXT, created_at TEXT)`)
 				require.NoError(t, err)
 				require.NoError(t, store.Close())
-				return root, path + "-shm", parser.ZedSQLiteVirtualPath(path, "deleted")
+				return root, path + "-wal", parser.ZedSQLiteVirtualPath(path, "deleted")
 			},
 		},
 		{
@@ -205,7 +204,7 @@ func TestClassifyProviderChangedPathPreservesHintDependentTombstones(t *testing.
 			setup: func(t *testing.T) (string, string, string) {
 				root := t.TempDir()
 				path, _ := writeProcessProviderDevinFixture(
-					t, root, "deleted", "reply", 1710000000000, 1710000005000,
+					t, root, "deleted", "reply", 1710000000, 1710000005,
 				)
 				conn, err := sql.Open("sqlite3", path)
 				require.NoError(t, err)
@@ -239,7 +238,7 @@ func TestClassifyProviderChangedPathPreservesHintDependentTombstones(t *testing.
 				_, err = store.Exec(`DELETE FROM conversations_v2 WHERE conversation_id = 'deleted'`)
 				require.NoError(t, err)
 				require.NoError(t, store.Close())
-				return root, path + "-shm", parser.KiroSQLiteVirtualPath(path, "deleted")
+				return root, path + "-wal", parser.KiroSQLiteVirtualPath(path, "deleted")
 			},
 		},
 		{

@@ -1,7 +1,8 @@
 package parser
 
 import (
-	"encoding/json"
+	"encoding/json/jsontext"
+	"encoding/json/v2"
 	"errors"
 	"fmt"
 	"os"
@@ -59,9 +60,9 @@ type cortexContentBlock struct {
 
 // cortexToolUse is the payload for a tool_use content block.
 type cortexToolUse struct {
-	ToolUseID string          `json:"tool_use_id"`
-	Name      string          `json:"name"`
-	Input     json.RawMessage `json:"input"`
+	ToolUseID string         `json:"tool_use_id"`
+	Name      string         `json:"name"`
+	Input     jsontext.Value `json:"input"`
 }
 
 // cortexToolResult is the payload for a tool_result content block.
@@ -122,7 +123,8 @@ func hasRealUserContent(msg cortexMessage) bool {
 // into ParsedMessage entries. It skips:
 //   - the entire first user turn (it contains only system reminders),
 //     unless the message has actual user text
-//   - user messages that consist solely of tool_result blocks
+//
+// Tool-result-only user rows are retained and marked as tool results.
 //
 // Returns messages and the first real user prompt string.
 func parseCortexMessages(
@@ -196,8 +198,8 @@ func parseCortexMessages(
 			}
 		}
 
-		// User messages that only contain tool results are responses
-		// to prior tool calls — include them but with empty content.
+		// Keep tool-result-only rows so their results can be attached to
+		// prior calls; skip user rows with no text or tool content.
 		if role == RoleUser &&
 			text == "" &&
 			len(toolCalls) == 0 &&
@@ -215,15 +217,21 @@ func parseCortexMessages(
 		// Build the content for display: use text if available,
 		// otherwise synthesize from tool calls.
 		content := text
+		sourceSubtype := ""
 		if content == "" && len(toolCalls) > 0 {
 			var labels []string
-			for _, tc := range toolCalls {
-				labels = append(labels, formatCortexToolHeader(tc))
+			for i, tc := range toolCalls {
+				label := formatCortexToolHeader(tc)
+				toolCalls[i].Rendering = label
+				labels = append(labels, label)
 			}
 			content = strings.Join(labels, "\n")
 		}
 
 		if content == "" && len(toolResults) > 0 {
+			if role == RoleUser {
+				sourceSubtype = SourceSubtypeToolResult
+			}
 			content = fmt.Sprintf("[%d tool result(s)]", len(toolResults))
 		}
 
@@ -234,6 +242,7 @@ func parseCortexMessages(
 		msgs = append(msgs, ParsedMessage{
 			Ordinal:       ordinal,
 			Role:          role,
+			SourceSubtype: sourceSubtype,
 			Content:       content,
 			Timestamp:     ts,
 			HasToolUse:    hasToolUse,
@@ -262,7 +271,7 @@ func cortexToolDetail(name, inputJSON string) string {
 	if !strings.HasPrefix(strings.TrimSpace(inputJSON), "{") {
 		return name
 	}
-	input := make(map[string]json.RawMessage)
+	input := make(map[string]jsontext.Value)
 	if err := json.Unmarshal([]byte(inputJSON), &input); err != nil {
 		return name
 	}
@@ -418,7 +427,7 @@ func (p *cortexProvider) parseSession(
 
 	userCount := 0
 	for _, m := range msgs {
-		if m.Role == RoleUser {
+		if m.Role == RoleUser && m.SourceSubtype != SourceSubtypeToolResult {
 			userCount++
 		}
 	}
@@ -509,4 +518,17 @@ func IsCortexSessionFile(name string) bool {
 	}
 	stem := strings.TrimSuffix(name, ".json")
 	return IsValidSessionID(stem)
+}
+
+// CortexToolUseRendering returns the header Cortex inlines into assistant
+// text for a tool call, which folds the call's main argument into the label.
+func CortexToolUseRendering(category, name, inputJSON string) string {
+	return formatCortexToolHeader(ParsedToolCall{
+		Category: category, ToolName: name, InputJSON: inputJSON,
+	})
+}
+
+// CortexRedactedToolUseRendering is the same header without the argument.
+func CortexRedactedToolUseRendering(category, name string) string {
+	return formatToolHeader(category, name)
 }

@@ -4,7 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
-	"encoding/json"
+	"encoding/json/v2"
 	"errors"
 	"fmt"
 	"strings"
@@ -30,6 +30,10 @@ const (
 	maxUnitDistillCalls = 256
 )
 
+// ErrPassRunning reports that an explicit lifecycle action could not acquire
+// the manager's pass lock. Callers retry after the current extraction pass.
+var ErrPassRunning = errors.New("recall extraction pass is running")
+
 // ManagerConfig assembles one extraction configuration. Its identity-bearing
 // parts (Identity, Segmenter, Prompts, Client.Request) are fingerprinted at
 // construction, so a Manager is bound to exactly one generation.
@@ -47,6 +51,14 @@ type ManagerConfig struct {
 	FailureBackoff time.Duration
 	// MaxAttempts bounds transient retries per model call. Defaults to 3.
 	MaxAttempts int
+	// AllowCandidateFindings narrows the secret gate to definite-confidence
+	// findings: candidate-tier matches (high-entropy assignments, JWT-shaped
+	// tokens, basic-auth URLs) stay recorded for review but no longer keep a
+	// session out of extraction, in discovery, the pre-send transcript
+	// re-scan, commit-time drift checks, and ineligibility reconciliation.
+	// Off by default: every recorded finding blocks. NewManager applies the
+	// same policy to the archive so the SQL boundaries agree with it.
+	AllowCandidateFindings bool
 }
 
 // Manager drives extraction for one generation: it scans for eligible
@@ -152,6 +164,7 @@ func NewManager(cfg ManagerConfig) (*Manager, error) {
 	if cfg.FailureBackoff <= 0 {
 		cfg.FailureBackoff = defaultFailureBackoff
 	}
+	cfg.DB.SetExtractCandidateFindingsAllowed(cfg.AllowCandidateFindings)
 	if cfg.MaxAttempts <= 0 {
 		cfg.MaxAttempts = defaultMaxAttempts
 	}
@@ -215,6 +228,9 @@ func (m *Manager) runPassLocked(
 	ctx context.Context, opts PassOptions,
 ) (PassResult, error) {
 	var result PassResult
+	if m.cfg.DB.ArchiveContent().UsageOnly() {
+		return result, fmt.Errorf("%w: recall extraction is unavailable with archive_content=usage", db.ErrArchiveContentExcluded)
+	}
 	passStart := time.Now()
 	if err := m.ensureGeneration(ctx); err != nil {
 		return result, err
@@ -400,13 +416,29 @@ func (m *Manager) refuseSecretFindings(
 	if err != nil {
 		return err
 	}
-	if len(findings) > 0 {
+	if n := m.blockingFindings(findings); n > 0 {
 		return &ineligibleSessionError{err: fmt.Errorf(
 			"session %s has %d recorded secret findings and is excluded "+
-				"from extraction", sessionID, len(findings),
+				"from extraction", sessionID, n,
 		)}
 	}
 	return nil
+}
+
+// blockingFindings counts the recorded findings that exclude a session:
+// all of them by default, definite-confidence ones only when candidate
+// findings are allowed.
+func (m *Manager) blockingFindings(findings []db.SecretFinding) int {
+	if !m.cfg.AllowCandidateFindings {
+		return len(findings)
+	}
+	n := 0
+	for _, f := range findings {
+		if f.Confidence == secrets.ConfidenceDefinite {
+			n++
+		}
+	}
+	return n
 }
 
 // settledPastQuietPeriod refuses a session whose ended_at falls inside
@@ -587,7 +619,7 @@ func (m *Manager) extractSession(
 	// incremental append whose deferred rescan crashed before it landed).
 	// Re-scanning the content this function is about to send makes the
 	// boundary independent of that history.
-	secretMatches := transcriptSecretMatches(rows)
+	secretMatches := transcriptSecretMatches(rows, m.cfg.AllowCandidateFindings)
 	messages := make([]Message, 0, len(rows))
 	for _, row := range rows {
 		messages = append(messages, Message{
@@ -606,7 +638,7 @@ func (m *Manager) extractSession(
 	// token in the scan that the endpoint still receives contiguously. Raw
 	// contents, not formatted unit texts, so interposed formatting cannot
 	// push a straddling key under the scanner's payload-purity gate.
-	secretMatches += aggregateModelSecretMatches(messages)
+	secretMatches += aggregateModelSecretMatches(messages, m.cfg.AllowCandidateFindings)
 	units := m.cfg.Segmenter.Units(messages)
 	digest := unitsDigest(units)
 	// A digest change means previously extracted units may have different
@@ -803,8 +835,7 @@ func (m *Manager) extractSession(
 				return outcome, markErr
 			}
 			outcome.failed = true
-			var transient *transientError
-			if errors.As(err, &transient) {
+			if _, ok := errors.AsType[*transientError](err); ok {
 				// An exhausted retry ladder means the endpoint is down or
 				// saturated, not that this unit is poisoned: every
 				// remaining session would burn its own full ladder
@@ -911,7 +942,7 @@ func (m *Manager) recheckExtraction(
 	if err != nil {
 		return false, false, err
 	}
-	if len(findings) > 0 {
+	if m.blockingFindings(findings) > 0 {
 		return false, false, nil
 	}
 	return true, !sessionSnapshotChanged(before, recheck), nil
@@ -981,17 +1012,29 @@ func (m *Manager) discardSessionOutput(
 // single-token credential split mid-token across messages, which the newline
 // would otherwise break so a regex needing contiguous characters could not
 // match. Either matching means the material is present.
-func aggregateModelSecretMatches(messages []Message) int {
+func aggregateModelSecretMatches(messages []Message, allowCandidates bool) int {
 	texts := VisibleContents(messages)
-	matches := len(secrets.Scan(strings.Join(texts, "\n")))
-	matches += len(secrets.Scan(strings.Join(texts, "")))
+	scan := gateScanner(allowCandidates)
+	matches := len(scan(strings.Join(texts, "\n")))
+	matches += len(scan(strings.Join(texts, "")))
 	return matches
 }
 
-func transcriptSecretMatches(rows []db.Message) int {
+// gateScanner picks the ruleset the pre-send re-scan applies: the full
+// ruleset by default, definite rules only when candidate findings are
+// allowed — the same tier split the archive's eligibility SQL uses.
+func gateScanner(allowCandidates bool) func(string) []secrets.Match {
+	if allowCandidates {
+		return secrets.ScanDefinite
+	}
+	return secrets.Scan
+}
+
+func transcriptSecretMatches(rows []db.Message, allowCandidates bool) int {
+	scan := gateScanner(allowCandidates)
 	matches := 0
 	for _, row := range rows {
-		matches += len(secrets.Scan(row.Content))
+		matches += len(scan(row.Content))
 	}
 	return matches
 }
@@ -1156,26 +1199,44 @@ func (m *Manager) maybeActivate(ctx context.Context) (bool, error) {
 // has produced nothing: an empty active generation would serve an empty
 // corpus while looking healthy.
 func (m *Manager) Activate(ctx context.Context) error {
+	if !m.passMu.TryLock() {
+		return ErrPassRunning
+	}
+	defer m.passMu.Unlock()
+
 	stats, err := m.cfg.DB.ExtractProgressStats(ctx, m.fingerprint)
 	if err != nil {
 		return err
 	}
 	if stats.Done == 0 {
 		return fmt.Errorf(
-			"refusing to activate generation %s: no completed sessions",
-			m.fingerprint,
+			"refusing to activate generation %s: no completed sessions: %w",
+			m.fingerprint, db.ErrExtractActivationBlocked,
 		)
 	}
 	if stats.Entries == 0 {
 		return fmt.Errorf(
 			"refusing to activate generation %s: no extracted entries — "+
-				"activating would serve an empty corpus", m.fingerprint,
+				"activating would serve an empty corpus: %w", m.fingerprint,
+			db.ErrExtractActivationBlocked,
 		)
 	}
 	return m.cfg.DB.ActivateExtractGeneration(
 		ctx, m.fingerprint, []string{secrets.RulesVersion()},
 		time.Now().Add(-m.cfg.QuietPeriod),
 	)
+}
+
+// Retire marks a non-active extraction generation retired. The manager never
+// exposes the database force option: retiring the served generation would
+// leave no machine-distilled corpus active.
+func (m *Manager) Retire(ctx context.Context, fingerprint string) error {
+	if !m.passMu.TryLock() {
+		return ErrPassRunning
+	}
+	defer m.passMu.Unlock()
+
+	return m.cfg.DB.RetireExtractGeneration(ctx, fingerprint, false)
 }
 
 // Status reports this generation's coverage and the current backlog.

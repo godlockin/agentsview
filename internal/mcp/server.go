@@ -8,10 +8,13 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"os"
 	"strings"
 	"time"
+
+	"go.kenn.io/agentsview/internal/mcpdiscovery"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 
@@ -35,9 +38,11 @@ const (
 // tests can control the self-reference exclusion window (defaults to
 // time.Now).
 type ServeOptions struct {
-	Service service.SessionService
-	Version string
-	Now     func() time.Time
+	DiscoveryDirectory string
+	BackendURL         string
+	Service            service.SessionService
+	Version            string
+	Now                func() time.Time
 	// Token, when non-empty, requires every StreamableHTTP request to
 	// carry "Authorization: Bearer <Token>". It has no effect on stdio.
 	// The command layer sets it for non-loopback HTTP binds so the
@@ -65,8 +70,9 @@ func newServer(opts ServeOptions) *mcp.Server {
 		Name: ToolSearchSessions,
 		Description: "Full-text search across all recorded AI agent sessions (Claude Code, Codex, Gemini, " +
 			"Antigravity, and others) from every project and machine. Returns ranked snippets with a " +
-			"match_ordinal usable with get_messages to read the surrounding conversation. Use this to " +
-			"answer questions like 'have I solved this before?' or to find prior work on a topic. " +
+			"match_ordinal usable with get_messages to read the surrounding conversation. For prior-work " +
+			"questions, prefer search_content with mode hybrid or semantic when a vector search index " +
+			"is configured. Use this tool for keyword search, with optional date_from/date_to bounds. " +
 			"Every term must appear (AND); wrap the query in double quotes for an exact phrase. " +
 			"Sessions active in the last 10 minutes (including the current conversation) are excluded " +
 			"unless include_active is set.",
@@ -87,8 +93,9 @@ func newServer(opts ServeOptions) *mcp.Server {
 	mcp.AddTool(s, &mcp.Tool{
 		Name: ToolListSessions,
 		Description: "List recorded agent sessions with filters (project, agent, machine, date range). " +
-			"Returns compact metadata rows, newest first. Use search_sessions instead when looking for " +
-			"specific content.",
+			"Returns compact metadata rows, newest first. For prior-work questions, prefer search_content " +
+			"with mode hybrid or semantic when a vector search index is configured; use search_sessions " +
+			"for keyword search.",
 		Annotations: readOnly,
 	}, t.listSessions)
 
@@ -114,10 +121,12 @@ func newServer(opts ServeOptions) *mcp.Server {
 
 	mcp.AddTool(s, &mcp.Tool{
 		Name: ToolSearchContent,
-		Description: "Substring, regex, or semantic/hybrid embedding search over raw session text, including " +
-			"tool inputs and results. Slower but more precise than search_sessions; use it for error " +
-			"messages, identifiers, and code fragments (substring/regex), or a natural-language query when " +
-			"the exact wording is unknown (semantic/hybrid). Set context to include N messages of " +
+		Description: "Search raw session text, including tool inputs and results. When a vector search index is " +
+			"configured, prefer mode hybrid (semantic similarity plus keywords) or semantic for finding " +
+			"prior work and answering contextual questions, especially when the exact wording is unknown. " +
+			"If these modes report not available, use search_sessions for keywords or this tool with " +
+			"substring/regex for exact error messages, identifiers, and code fragments. " +
+			"The default mode remains substring. Set context to include N messages of " +
 			"surrounding conversation with each match. Matches from the last 10 minutes (including the " +
 			"current conversation) are excluded unless include_active is set.",
 		Annotations: readOnly,
@@ -205,13 +214,25 @@ func isCleanStdioShutdown(err error) bool {
 // cancelled the HTTP server is shut down gracefully so in-flight tool
 // calls can finish. addr must already be validated as a safe bind
 // address (see the cmd layer's loopback guard).
-func ServeHTTP(ctx context.Context, opts ServeOptions, addr string) error {
+func ServeHTTP(ctx context.Context, opts ServeOptions, addr string) (result error) {
+	listener, err := net.Listen("tcp", addr)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = listener.Close() }()
+	if opts.DiscoveryDirectory != "" {
+		cleanup, err := mcpdiscovery.Publish(opts.DiscoveryDirectory, listener.Addr().String(), opts.Token, opts.BackendURL)
+		if err != nil {
+			return err
+		}
+		defer func() { result = errors.Join(result, cleanup()) }()
+	}
 	httpServer := &http.Server{Addr: addr, Handler: newHTTPHandler(opts)}
 	fmt.Fprintf(os.Stderr, "agentsview mcp: serving on %s\n", addr)
 
 	errCh := make(chan error, 1)
 	go func() {
-		err := httpServer.ListenAndServe()
+		err := httpServer.Serve(listener)
 		if err != nil && !errors.Is(err, http.ErrServerClosed) {
 			errCh <- err
 			return

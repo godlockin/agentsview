@@ -14,7 +14,6 @@ import (
 	"github.com/spf13/cobra"
 	"go.kenn.io/agentsview/internal/config"
 	"go.kenn.io/agentsview/internal/db"
-	"go.kenn.io/agentsview/internal/db/driver"
 	"go.kenn.io/agentsview/internal/postgres"
 )
 
@@ -166,7 +165,7 @@ func clearSQLiteClassifierHash(dbPath string) error {
 		// Nothing to clear; first open will write the hash.
 		return nil
 	}
-	conn, err := sql.Open(driver.DriverName, dbPath)
+	conn, err := sql.Open("sqlite3", dbPath)
 	if err != nil {
 		return err
 	}

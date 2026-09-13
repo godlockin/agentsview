@@ -1,7 +1,7 @@
 import { rollingRange } from "../utils/dates.js";
 import type { PanelDateState } from "./yokedDates.svelte.js";
 
-export type AnalyticsDatePage = "sessions" | "insights";
+export type AnalyticsDatePage = "sessions" | "quality";
 
 export interface RetainedAnalyticsPageDate {
   state: PanelDateState;
@@ -10,20 +10,14 @@ export interface RetainedAnalyticsPageDate {
 
 const DEFAULT_WINDOW_DAYS = 365;
 
-// Sessions and Insights share analytics results and filters, but an opted-out
+// Sessions and Quality share analytics results and filters, but an opted-out
 // date selection and its explicit-intent provenance must survive navigation
 // without becoming the other page's selection. Rolling ranges are
 // rematerialized so retained presets stay fresh.
 class AnalyticsPageDatesStore {
-  #retained: Partial<
-    Record<AnalyticsDatePage, RetainedAnalyticsPageDate>
-  > = {};
+  #retained: Partial<Record<AnalyticsDatePage, RetainedAnalyticsPageDate>> = {};
 
-  retain(
-    page: AnalyticsDatePage,
-    state: PanelDateState,
-    explicitDateIntent = false,
-  ): void {
+  retain(page: AnalyticsDatePage, state: PanelDateState, explicitDateIntent = false): void {
     this.#retained[page] = {
       state: { ...state },
       explicitDateIntent,
@@ -34,9 +28,7 @@ class AnalyticsPageDatesStore {
     return this.restoreWithIntent(page).state;
   }
 
-  restoreWithIntent(
-    page: AnalyticsDatePage,
-  ): RetainedAnalyticsPageDate {
+  restoreWithIntent(page: AnalyticsDatePage): RetainedAnalyticsPageDate {
     const retained = this.#retained[page];
     if (retained?.state.mode === "fixed") {
       return {
@@ -45,8 +37,7 @@ class AnalyticsPageDatesStore {
       };
     }
 
-    const windowDays =
-      retained?.state.windowDays ?? DEFAULT_WINDOW_DAYS;
+    const windowDays = retained?.state.windowDays ?? DEFAULT_WINDOW_DAYS;
     const range = rollingRange(windowDays);
     return {
       state: {

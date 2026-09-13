@@ -5,7 +5,7 @@ package service
 
 import (
 	"context"
-	"encoding/json"
+	"encoding/json/v2"
 	"errors"
 	"io"
 
@@ -140,11 +140,13 @@ type SecretFindingList struct {
 // It mirrors the GET /api/v1/search query parameters so both transports
 // produce identical results.
 type SearchRequest struct {
-	Query   string `json:"query"`
-	Project string `json:"project,omitempty"`
-	Sort    string `json:"sort,omitempty"` // "relevance" (default) or "recency"
-	Cursor  int    `json:"cursor,omitempty"`
-	Limit   int    `json:"limit,omitempty"`
+	DateFrom string `json:"date_from,omitempty"`
+	DateTo   string `json:"date_to,omitempty"`
+	Query    string `json:"query"`
+	Project  string `json:"project,omitempty"`
+	Sort     string `json:"sort,omitempty"` // "relevance" (default) or "recency"
+	Cursor   int    `json:"cursor,omitempty"`
+	Limit    int    `json:"limit,omitempty"`
 }
 
 // SessionSearchResult mirrors db.SearchPage for transport: ranked
@@ -168,6 +170,7 @@ type ContentSearchRequest struct {
 	Project, ExcludeProject, Machine, Agent           string
 	Date, DateFrom, DateTo, Timezone, ActiveSince     string
 	IncludeChildren, IncludeAutomated, IncludeOneShot bool
+	ExcludeSessionIDs                                 []string
 	// GitBranch is a branchListSep-joined list of opaque (project, branch) tokens (EncodeBranchFilterToken).
 	GitBranch string
 
@@ -324,7 +327,7 @@ type SessionDetail struct {
 func (d SessionDetail) MarshalJSON() ([]byte, error) {
 	type sessionAlias db.Session
 	return json.Marshal(struct {
-		sessionAlias
+		sessionAlias     `json:",inline"`
 		QualitySignals   *db.QualitySignals `json:"quality_signals,omitempty"`
 		HealthScoreBasis []string           `json:"health_score_basis,omitempty"`
 		HealthPenalties  map[string]int     `json:"health_penalties,omitempty"`
@@ -344,7 +347,7 @@ func (d SessionDetail) MarshalJSON() ([]byte, error) {
 func (d *SessionDetail) UnmarshalJSON(data []byte) error {
 	type sessionAlias db.Session
 	var v struct {
-		sessionAlias
+		sessionAlias     `json:",inline"`
 		QualitySignals   *db.QualitySignals `json:"quality_signals"`
 		HealthScoreBasis []string           `json:"health_score_basis"`
 		HealthPenalties  map[string]int     `json:"health_penalties"`
@@ -387,6 +390,7 @@ type ListFilter struct {
 	IncludeOneShot   bool   `json:"include_one_shot,omitempty"`
 	IncludeAutomated bool   `json:"include_automated,omitempty"`
 	IncludeChildren  bool   `json:"include_children,omitempty"`
+	IncludeSource    bool   `json:"include_source,omitempty"`
 	Outcome          string `json:"outcome,omitempty"`      // comma-separated
 	HealthGrade      string `json:"health_grade,omitempty"` // comma-separated
 	Termination      string `json:"termination,omitempty"`  // comma-separated
@@ -453,8 +457,9 @@ type ToolCallList struct {
 // SyncInput carries the payload for a per-session sync.
 // Exactly one of Path or ID must be set.
 type SyncInput struct {
-	Path string `json:"path,omitempty"`
-	ID   string `json:"id,omitempty"`
+	Path      string `json:"path,omitempty"`
+	ID        string `json:"id,omitempty"`
+	Subagents bool   `json:"subagents,omitempty"`
 }
 
 // Event is the CLI-side NDJSON wrapper for SSE events from

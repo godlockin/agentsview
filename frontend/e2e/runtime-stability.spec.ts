@@ -2,8 +2,7 @@ import { expect, test } from "@playwright/test";
 import { RuntimeErrorMonitor } from "./helpers/runtime-error-monitor";
 import { SessionsPage } from "./pages/sessions-page";
 
-const DEPTH_ERROR_RE =
-  /effect_update_depth_exceeded|Maximum update depth exceeded/i;
+const DEPTH_ERROR_RE = /effect_update_depth_exceeded|Maximum update depth exceeded/i;
 
 // Svelte 5 fires each_key_duplicate warnings when virtual-scroll
 // items shift keys during rapid filter/sort transitions. These
@@ -15,11 +14,11 @@ const KNOWN_SVELTE_WARNINGS_RE =
   /each_key_duplicate|ResizeObserver loop completed with undelivered notifications/;
 
 // Test-fixture assumptions: project-alpha has sessions with 2
-// and 5+ messages, totalling 10 sessions across all projects
-// (including the project-duration showcase and project-edits fixture).
+// and 5+ messages, totalling 12 sessions across all projects (including
+// the duration, recent-edits, and project-reclassification fixtures).
 const TEST_PROJECT = "project-alpha";
 const FILTERED_SESSION_COUNT = 2;
-const TOTAL_SESSION_COUNT = 10;
+const TOTAL_SESSION_COUNT = 12;
 
 // Session deep in the list to exercise virtualizer scroll.
 const TARGET_SESSION_INDEX = 6;
@@ -31,51 +30,44 @@ const SORT_TOGGLE_CLICKS = 2;
 const MAX_DEPTH_ERRORS = 4;
 
 test.describe("Runtime stability", () => {
-  test(
-    "effect update-depth errors stay bounded during core interactions",
-    async ({ page }) => {
-      const monitor = new RuntimeErrorMonitor(page);
-      const sp = new SessionsPage(page);
+  test("effect update-depth errors stay bounded during core interactions", async ({ page }) => {
+    const monitor = new RuntimeErrorMonitor(page);
+    const sp = new SessionsPage(page);
 
-      try {
-        await sp.goto();
-      } catch (error) {
-        const startupErrors = monitor.all();
-        if (startupErrors.length === 0) {
-          throw error;
-        }
-        throw new Error(
-          `session startup failed after browser errors:\n${startupErrors.join("\n")}`,
-          { cause: error },
-        );
+    try {
+      await sp.goto();
+    } catch (error) {
+      const startupErrors = monitor.all();
+      if (startupErrors.length === 0) {
+        throw error;
       }
-
-      // Exercise the highest-churn flows: session open,
-      // sort toggle, and project filtering.
-      await sp.selectSession(TARGET_SESSION_INDEX);
-
-      await sp.toggleSortOrder(SORT_TOGGLE_CLICKS);
-
-      await sp.filterByProject(TEST_PROJECT);
-      await expect(sp.sessionListHeader).toContainText(
-        `${FILTERED_SESSION_COUNT} sessions`,
+      throw new Error(
+        `session startup failed after browser errors:\n${startupErrors.join("\n")}\n${monitor.diagnosticSummary()}`,
+        { cause: error },
       );
+    }
 
-      await sp.clearProjectFilter();
-      await expect(sp.sessionListHeader).toContainText(
-        `${TOTAL_SESSION_COUNT} sessions`,
-      );
+    // Exercise the highest-churn flows: session open,
+    // sort toggle, and project filtering.
+    await sp.selectSession(TARGET_SESSION_INDEX);
 
-      const depthErrors = monitor.matching(DEPTH_ERROR_RE);
-      expect(
-        depthErrors.length,
-        `depth errors (${depthErrors.length}) should be <= ${MAX_DEPTH_ERRORS}`,
-      ).toBeLessThanOrEqual(MAX_DEPTH_ERRORS);
+    await sp.toggleSortOrder(SORT_TOGGLE_CLICKS);
 
-      const otherErrors = monitor
-        .excluding(DEPTH_ERROR_RE)
-        .filter((m) => !KNOWN_SVELTE_WARNINGS_RE.test(m));
-      expect(otherErrors).toEqual([]);
-    },
-  );
+    await sp.filterByProject(TEST_PROJECT);
+    await expect(sp.sessionListHeader).toContainText(`${FILTERED_SESSION_COUNT} sessions`);
+
+    await sp.clearProjectFilter();
+    await expect(sp.sessionListHeader).toContainText(`${TOTAL_SESSION_COUNT} sessions`);
+
+    const depthErrors = monitor.matching(DEPTH_ERROR_RE);
+    expect(
+      depthErrors.length,
+      `depth errors (${depthErrors.length}) should be <= ${MAX_DEPTH_ERRORS}`,
+    ).toBeLessThanOrEqual(MAX_DEPTH_ERRORS);
+
+    const otherErrors = monitor
+      .excluding(DEPTH_ERROR_RE)
+      .filter((m) => !KNOWN_SVELTE_WARNINGS_RE.test(m));
+    expect(otherErrors, monitor.diagnosticSummary()).toEqual([]);
+  });
 });

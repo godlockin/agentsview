@@ -27,7 +27,7 @@ func cleanPGSchema(t *testing.T, pgURL string) {
 	)
 }
 
-func cleanNamedPGSchema(t *testing.T, pgURL, schema string) {
+func cleanNamedPGSchema(t testing.TB, pgURL, schema string) {
 	t.Helper()
 	pg, err := sql.Open("pgx", pgURL)
 	require.NoError(t, err, "connecting to pg")
@@ -394,9 +394,11 @@ func TestPushWithToolCalls(t *testing.T) {
 			HasToolUse: true,
 			ToolCalls: []db.ToolCall{
 				{
-					ToolName:            "Read",
-					Category:            "Read",
-					ToolUseID:           "toolu_001",
+					ToolName:  "Read",
+					Category:  "Read",
+					ToolUseID: "toolu_001",
+					// The archive stores the measured length of any
+					// non-empty summary, whatever the caller supplies.
 					ResultContentLength: 42,
 					ResultContent:       "file content here",
 				},
@@ -416,7 +418,7 @@ func TestPushWithToolCalls(t *testing.T) {
 	).Scan(&toolName, &resultLen)
 	require.NoError(t, err, "querying pg tool_call")
 	assert.Equal(t, "Read", toolName)
-	assert.Equal(t, 42, resultLen)
+	assert.Equal(t, len("file content here"), resultLen)
 }
 
 func TestPushWithToolResultEvents(t *testing.T) {

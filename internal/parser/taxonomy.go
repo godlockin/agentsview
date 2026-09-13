@@ -93,6 +93,8 @@ func NormalizeToolCategory(rawName string) string {
 	// Note: "grep" is handled above in the Gemini section.
 	case "read":
 		return "Read"
+	case "file_read", "file_read_diff":
+		return "Read"
 	case "edit":
 		return "Edit"
 	case "write":
@@ -101,6 +103,12 @@ func NormalizeToolCategory(rawName string) string {
 		return "Bash"
 	case "glob":
 		return "Glob"
+	case "file_find":
+		return "Glob"
+	case "code_search":
+		return "Grep"
+	case "code_comment":
+		return "Tool"
 	case "task":
 		return "Task"
 
@@ -121,6 +129,8 @@ func NormalizeToolCategory(rawName string) string {
 		return "Edit"
 	case "LS":
 		return "Read"
+	case "Subagent":
+		return "Task"
 
 	// Amp tools (not already covered above)
 	// Note: "create_file" is also used by Pi.
@@ -216,6 +226,22 @@ func NormalizeToolCategory(rawName string) string {
 		return "Task"
 	case "zencoder-rag-mcp__web_search":
 		return "Read"
+
+	// Codebuff / Freebuff tools
+	// Note: "read_files" (Warp→Read), "list_directory" (Gemini→Read),
+	// "write_file" (Gemini→Write), "str_replace" (Pi→Edit),
+	// "skill" (Amp→Tool) are handled in earlier sections.
+	case "read_subtree", "file-picker":
+		return "Read"
+	case "suggest_followups", "write_todos", "read_url", "ask_user",
+		"render_ui", "gravity_index":
+		return "Tool"
+	case "run_terminal_command", "basher":
+		return "Bash"
+	case "code-searcher", "code-reviewer":
+		return "Tool"
+	case "spawn_agents":
+		return "Task"
 
 	// ChatGPT tools
 	case "code_interpreter":

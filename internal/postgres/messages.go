@@ -29,19 +29,11 @@ func (s *Store) GetMessages(
 	}
 
 	query := fmt.Sprintf(`
-		SELECT session_id, ordinal, role, content, thinking_text,
-			timestamp, has_thinking, has_tool_use,
-			content_length, is_system, model, token_usage,
-			context_tokens, output_tokens,
-			has_context_tokens, has_output_tokens,
-			claude_message_id, claude_request_id,
-			source_type, source_subtype, source_uuid,
-			source_parent_uuid, is_sidechain,
-			is_compact_boundary
+		SELECT %s
 		FROM messages
 		WHERE session_id = $1 AND ordinal %s $2
 		ORDER BY ordinal %s
-		LIMIT $3`, op, dir)
+		LIMIT $3`, pgMessageCols, op, dir)
 
 	rows, err := s.pg.QueryContext(
 		ctx, query, sessionID, from, limit,
@@ -65,11 +57,11 @@ func (s *Store) GetMessages(
 
 const pgMessageCols = `session_id, ordinal, role, content, thinking_text,
 	timestamp, has_thinking, has_tool_use,
-	content_length, is_system, model, token_usage,
-	context_tokens, output_tokens,
+	content_length, is_system, model, reasoning_effort, token_usage,
+	context_tokens, output_tokens, provider_id,
 	has_context_tokens, has_output_tokens,
 	claude_message_id, claude_request_id,
-	source_type, source_subtype, source_uuid,
+	source_type, source_subtype, prompt_source, source_uuid,
 	source_parent_uuid, is_sidechain,
 	is_compact_boundary`
 
@@ -219,19 +211,11 @@ func pgRoleFilterClause(roles []string, startAt int) (string, []any) {
 func (s *Store) GetAllMessages(
 	ctx context.Context, sessionID string,
 ) ([]db.Message, error) {
-	rows, err := s.pg.QueryContext(ctx, `
-		SELECT session_id, ordinal, role, content, thinking_text,
-			timestamp, has_thinking, has_tool_use,
-			content_length, is_system, model, token_usage,
-			context_tokens, output_tokens,
-			has_context_tokens, has_output_tokens,
-			claude_message_id, claude_request_id,
-			source_type, source_subtype, source_uuid,
-			source_parent_uuid, is_sidechain,
-			is_compact_boundary
+	rows, err := s.pg.QueryContext(ctx, fmt.Sprintf(`
+		SELECT %s
 		FROM messages
 		WHERE session_id = $1
-		ORDER BY ordinal ASC`, sessionID)
+		ORDER BY ordinal ASC`, pgMessageCols), sessionID)
 	if err != nil {
 		return nil, fmt.Errorf(
 			"querying all messages: %w", err,
@@ -295,11 +279,16 @@ func (s *Store) SearchSession(
 		LEFT JOIN tool_calls tc
 			ON tc.session_id = m.session_id
 			AND tc.message_ordinal = m.ordinal
+		LEFT JOIN tool_result_events tre
+			ON tre.session_id = tc.session_id
+			AND tre.tool_call_message_ordinal = m.ordinal
+			AND tre.call_index = tc.call_index
 		WHERE m.session_id = $1
 			AND m.is_system = FALSE
 			AND `+db.PostgresSystemPrefixSQL("m.content", "m.role")+`
 			AND (m.content ILIKE $2
-				OR tc.result_content ILIKE $2)
+				OR tc.result_content ILIKE $2
+				OR tre.content ILIKE $2)
 		ORDER BY m.ordinal ASC`,
 		sessionID, like,
 	)
@@ -356,6 +345,7 @@ func (s *Store) Search(
 	// user query behaves identically across backends. An explicit exact phrase
 	// (user-supplied leading quote) collapses to a single term, preserving the
 	// exact-phrase opt-in.
+	f.Query = db.PrepareFTSQuery(f.Query)
 	plainTerm := db.StripFTSQuotes(f.Query)
 	terms := db.FTSTerms(f.Query)
 	if plainTerm == "" || len(terms) == 0 {
@@ -407,6 +397,14 @@ func (s *Store) Search(
 		args = append(args, f.Project)
 		argIdx++
 	}
+
+	dateBuilder := db.NewQueryBuilder(db.PostgresQueryDialect(), argIdx-1)
+	for _, pred := range dateBuilder.SessionDateRangePredicates(f.DateFrom, f.DateTo, "", func(col string) string { return "s." + col }) {
+		msgProjectClause += " AND " + pred
+		nameProjectClause += " AND " + pred
+	}
+	args = append(args, dateBuilder.Args()...)
+	argIdx += len(dateBuilder.Args())
 
 	query := fmt.Sprintf(`
 		WITH msg_matches AS (
@@ -559,6 +557,9 @@ func (s *Store) attachToolCalls(
 	); err != nil {
 		return err
 	}
+	// Mirrors the SQLite load boundary: a summary the call's single result
+	// event already carries is not stored, so refill it here.
+	db.RestoreMessageResultContent(msgs)
 	return nil
 }
 
@@ -745,11 +746,12 @@ func scanPGMessages(rows interface {
 			&m.SessionID, &m.Ordinal, &m.Role,
 			&m.Content, &m.ThinkingText, &ts, &m.HasThinking,
 			&m.HasToolUse, &m.ContentLength, &m.IsSystem,
-			&m.Model, &tokenUsage,
+			&m.Model, &m.ReasoningEffort, &tokenUsage,
 			&m.ContextTokens, &m.OutputTokens,
+			&m.ProviderID,
 			&m.HasContextTokens, &m.HasOutputTokens,
 			&m.ClaudeMessageID, &m.ClaudeRequestID,
-			&m.SourceType, &m.SourceSubtype, &m.SourceUUID,
+			&m.SourceType, &m.SourceSubtype, &m.PromptSource, &m.SourceUUID,
 			&m.SourceParentUUID, &m.IsSidechain,
 			&m.IsCompactBoundary,
 		); err != nil {
@@ -761,9 +763,12 @@ func scanPGMessages(rows interface {
 		if ts != nil {
 			m.Timestamp = FormatISO8601(*ts)
 		}
-		if tokenUsage != "" {
-			m.TokenUsage = []byte(tokenUsage)
-		}
+		// Shares one guard with the other backends so they cannot drift:
+		// "" must yield nil, since a zero-length jsontext.Value fails to
+		// marshal and pg serve reaches the same response encoder.
+		// Validation happens only here, on read (see
+		// db.DecodeStoredTokenUsage).
+		m.TokenUsage = db.DecodeStoredTokenUsage(tokenUsage)
 		msgs = append(msgs, m)
 	}
 	return msgs, rows.Err()

@@ -13,8 +13,6 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-
-	"go.kenn.io/agentsview/internal/db/driver"
 )
 
 const largeSessionPerfCeiling = 10 * time.Second
@@ -95,7 +93,7 @@ func buildLargeSessionFixtureTemplate(
 	dir, err := os.MkdirTemp("", "agentsview-large-session-*")
 	require.NoError(t, err, "create large-session fixture dir")
 	path := filepath.Join(dir, "test.db")
-	require.NoError(t, copyTestDBTemplate(path),
+	require.NoError(t, copyTestDBTemplate(t, path),
 		"copy base db template for large-session fixture")
 
 	d, err := OpenPreparedTestDB(path)
@@ -365,6 +363,35 @@ func TestWriteSessionBatchCommitsGoodRowsAndSkipsBadRows(t *testing.T) {
 	assert.Nil(t, excluded, "excluded session should not be written")
 }
 
+func TestWriteSessionBatchContextDoesNotWriteAfterCancellation(t *testing.T) {
+	d := testDB(t)
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+
+	result, err := d.WriteSessionBatchContext(ctx, []SessionBatchWrite{{
+		Session: Session{
+			ID:      "cancelled-batch",
+			Project: "proj",
+			Machine: defaultMachine,
+			Agent:   defaultAgent,
+		},
+		Messages: []Message{userMsg("cancelled-batch", 0, "prompt")},
+		UsageEvents: []UsageEvent{{
+			SessionID:   "cancelled-batch",
+			Source:      "message",
+			Model:       "model-a",
+			InputTokens: 10,
+		}},
+		DataVersion: CurrentDataVersion(),
+	}})
+
+	require.ErrorIs(t, err, context.Canceled)
+	assert.Zero(t, result.WrittenSessions)
+	session, readErr := d.GetSessionFull(t.Context(), "cancelled-batch")
+	require.NoError(t, readErr)
+	assert.Nil(t, session)
+}
+
 func TestMigration_ThinkingTextColumn(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "test.db")
@@ -388,7 +415,7 @@ func TestMigration_ThinkingTextColumn(t *testing.T) {
 
 	// Remove thinking_text via ALTER TABLE DROP COLUMN
 	// (SQLite 3.35+) to simulate a legacy schema.
-	conn, err := sql.Open(driver.DriverName, path)
+	conn, err := sql.Open("sqlite3", path)
 	require.NoError(t, err, "raw open")
 	_, err = conn.Exec(
 		`ALTER TABLE messages DROP COLUMN thinking_text`,

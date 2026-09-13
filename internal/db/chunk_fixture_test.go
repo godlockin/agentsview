@@ -2,7 +2,7 @@ package db
 
 import (
 	"context"
-	"encoding/json"
+	"encoding/json/jsontext"
 	"os"
 	"path/filepath"
 	"sync"
@@ -48,7 +48,7 @@ func buildChunkedAnalyticsFixtureTemplate(t *testing.T) (string, string) {
 	dir, err := os.MkdirTemp("", "agentsview-chunked-analytics-*")
 	require.NoError(t, err, "create chunked analytics fixture dir")
 	path := filepath.Join(dir, "test.db")
-	require.NoError(t, copyTestDBTemplate(path),
+	require.NoError(t, copyTestDBTemplate(t, path),
 		"copy base db template for chunked analytics fixture")
 
 	d, err := OpenPreparedTestDB(path)
@@ -95,7 +95,7 @@ func seedChunkedAnalyticsFixture(t *testing.T, d *DB) {
 					ContentLength: 1,
 					Timestamp:     "2024-06-01T09:00:10Z",
 					Model:         "claude-sonnet-4-20250514",
-					TokenUsage: json.RawMessage(
+					TokenUsage: jsontext.Value(
 						`{"input_tokens":100,"output_tokens":10}`,
 					),
 				},

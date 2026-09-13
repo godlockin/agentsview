@@ -2,24 +2,76 @@ package parser
 
 import (
 	"context"
+	"encoding/json/v2"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"slices"
 	"strings"
+	"time"
+
+	"go.kenn.io/agentsview/internal/pathutil"
 )
 
 var _ Provider = (*codexProvider)(nil)
+var _ ActivityHintProvider = (*codexProvider)(nil)
+var _ S3Provider = (*codexProvider)(nil)
+var _ RawCaptureProvider = (*codexProvider)(nil)
+var _ RawCaptureSourceProvider = (*codexProvider)(nil)
+var _ StreamingRawCaptureSourceProvider = (*codexProvider)(nil)
+
+// codexProviderSpec parameterizes the one shared Codex-format provider
+// implementation for Codex and its TraeX fork. Both reuse the same
+// discovery, source-lookup, fingerprinting, and parsing code; they differ
+// only in the agent label and ID prefix applied via relabel. TraeX parses
+// through the Codex rollout reader and then relabels the result onto its
+// own agent and ID prefix.
+type codexProviderSpec struct {
+	agent AgentType
+	// relabel rewrites a parsed Codex-format result onto this agent's
+	// identity, and is nil for Codex itself. The session is nil on the
+	// incremental path, which keeps the stored session ID and only needs
+	// the appended message rows relabeled.
+	relabel func(*ParsedSession, []ParsedMessage)
+}
+
+func codexProviderSpecForAgent(agent AgentType) codexProviderSpec {
+	switch agent {
+	case AgentTraeX:
+		return codexProviderSpec{
+			agent:   AgentTraeX,
+			relabel: relabelCodexResultAsTraeX,
+		}
+	default:
+		return codexProviderSpec{agent: AgentCodex}
+	}
+}
 
 type codexProviderFactory struct {
-	def         AgentDef
-	cursorCache *codexCursorCache
+	def             AgentDef
+	spec            codexProviderSpec
+	cursorCache     *codexCursorCache
+	parentTurnCache *codexParentTurnCache
 }
 
 func newCodexProviderFactory(def AgentDef) ProviderFactory {
 	return &codexProviderFactory{
-		def:         cloneAgentDef(def),
-		cursorCache: newProductionCodexCursorCache(),
+		def:             cloneAgentDef(def),
+		spec:            codexProviderSpecForAgent(AgentCodex),
+		cursorCache:     newProductionCodexCursorCache(),
+		parentTurnCache: newCodexProductionParentTurnCache(),
+	}
+}
+
+// newTraeXProviderFactory serves TRAE CLI's rollout archive with the Codex
+// provider, relabeling every parsed session onto the traex: ID prefix.
+func newTraeXProviderFactory(def AgentDef) ProviderFactory {
+	return &codexProviderFactory{
+		def:             cloneAgentDef(def),
+		spec:            codexProviderSpecForAgent(AgentTraeX),
+		cursorCache:     newProductionCodexCursorCache(),
+		parentTurnCache: newCodexProductionParentTurnCache(),
 	}
 }
 
@@ -28,26 +80,36 @@ func (f *codexProviderFactory) Definition() AgentDef {
 }
 
 func (f *codexProviderFactory) Capabilities() Capabilities {
-	return codexProviderCapabilities()
+	caps := codexProviderCapabilities()
+	if f.spec.agent == AgentCodex {
+		caps.Source.S3Discovery = CapabilitySupported
+	} else {
+		caps.RawCapture = RawCaptureCapabilities{}
+	}
+	return caps
 }
 
 func (f *codexProviderFactory) NewProvider(cfg ProviderConfig) Provider {
 	cfg = cfg.Clone()
+	sources := newCodexSourceSet(f.spec.agent, cfg.Roots)
+	sources.metadata = CodexMetadata{roots: cfg.MetadataDirs}
 	return &codexProvider{
-		ProviderBase: ProviderBase{
-			Def:    cloneAgentDef(f.def),
-			Caps:   codexProviderCapabilities(),
-			Config: cfg,
-		},
-		sources:     newCodexSourceSet(cfg.Roots),
-		cursorCache: f.cursorCache,
+		Def:             cloneAgentDef(f.def),
+		Caps:            f.Capabilities(),
+		Config:          cfg,
+		spec:            f.spec,
+		sources:         sources,
+		cursorCache:     f.cursorCache,
+		parentTurnCache: f.parentTurnCache,
 	}
 }
 
 type codexProvider struct {
 	ProviderBase
-	sources     codexSourceSet
-	cursorCache *codexCursorCache
+	spec            codexProviderSpec
+	sources         codexSourceSet
+	cursorCache     *codexCursorCache
+	parentTurnCache *codexParentTurnCache
 }
 
 func (p *codexProvider) Discover(ctx context.Context) ([]SourceRef, error) {
@@ -58,8 +120,137 @@ func (p *codexProvider) DiscoverEach(ctx context.Context, yield func(SourceRef) 
 	return p.sources.DiscoverEach(ctx, yield)
 }
 
+func (p *codexProvider) DiscoverRawCaptureSourcesEach(
+	ctx context.Context,
+	yield func(SourceRef) error,
+) (bool, error) {
+	ctx = withRawCaptureStreamingTraversal(ctx)
+	var incomplete error
+	for _, root := range p.sources.roots {
+		if err := ReportRawCaptureDiscoveryProgress(ctx); err != nil {
+			return false, err
+		}
+		if isS3URI(root) {
+			continue
+		}
+		err := p.sources.discoverEachRoot(ctx, root, yield)
+		if err == nil {
+			continue
+		}
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return false, ctxErr
+		}
+		rootErr, ok := rawCaptureIncompleteRootError(p.Def.Type, root, err)
+		if !ok {
+			return false, err
+		}
+		incomplete = errors.Join(incomplete, rootErr)
+	}
+	return incomplete == nil, incomplete
+}
+
+func (p *codexProvider) RawCaptureSourcesForChangedPath(
+	ctx context.Context,
+	req ChangedPathRequest,
+) ([]SourceRef, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if p.sources.ownsCodexSidecars() &&
+		filepath.Base(req.Path) == CodexSessionIndexFilename {
+		return nil, nil
+	}
+	roots := p.sources.roots
+	if req.WatchRoot != "" {
+		roots = nil
+		for _, root := range p.sources.roots {
+			if samePath(root, req.WatchRoot) {
+				roots = append(roots, root)
+			}
+		}
+	}
+	for _, root := range roots {
+		source, ok := p.sources.sourceRef(root, req.Path, true)
+		if !ok {
+			source, ok = p.sources.directPathSource(root, req.Path, true)
+		}
+		if ok {
+			return []SourceRef{source}, nil
+		}
+	}
+	return nil, nil
+}
+
 func (p *codexProvider) WatchPlan(ctx context.Context) (WatchPlan, error) {
 	return p.sources.WatchPlan(ctx)
+}
+
+func (p *codexProvider) ActivityHintSources(
+	ctx context.Context,
+) ([]ActivityHintSource, error) {
+	seen := make(map[string]struct{}, len(p.sources.roots))
+	sources := make([]ActivityHintSource, 0, len(p.sources.roots))
+	for _, root := range p.sources.roots {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		if strings.HasPrefix(root, "s3://") {
+			continue
+		}
+		// Alias homes share the transcripts but may keep their own hint
+		// log, so every sidecar directory contributes. Resolve links so a
+		// shared history.jsonl is read once.
+		for _, dir := range p.sources.metadata.dirs(root) {
+			path := filepath.Join(dir, "history.jsonl")
+			key := path
+			if resolved, err := filepath.EvalSymlinks(path); err == nil {
+				key = resolved
+			}
+			if _, ok := seen[key]; ok {
+				continue
+			}
+			seen[key] = struct{}{}
+			sources = append(sources, ActivityHintSource{Path: path})
+		}
+	}
+	return sources, nil
+}
+
+func (p *codexProvider) DecodeActivityHint(line []byte) (ActivityHint, bool) {
+	var row struct {
+		SessionID string `json:"session_id"`
+		Timestamp int64  `json:"ts"`
+	}
+	if json.Unmarshal(line, &row) != nil ||
+		!isCodexHistorySessionID(row.SessionID) ||
+		row.Timestamp <= 0 {
+		return ActivityHint{}, false
+	}
+	return ActivityHint{
+		RawSessionID: row.SessionID,
+		Timestamp:    time.Unix(row.Timestamp, 0).UTC(),
+	}, true
+}
+
+func isCodexHistorySessionID(id string) bool {
+	if len(id) != 36 {
+		return false
+	}
+	for i, c := range id {
+		switch i {
+		case 8, 13, 18, 23:
+			if c != '-' {
+				return false
+			}
+		default:
+			if (c < '0' || c > '9') &&
+				(c < 'a' || c > 'f') &&
+				(c < 'A' || c > 'F') {
+				return false
+			}
+		}
+	}
+	return true
 }
 
 func (p *codexProvider) SourcesForChangedPath(
@@ -132,6 +323,138 @@ func (p *codexProvider) Fingerprint(
 	return p.sources.Fingerprint(ctx, source)
 }
 
+func (p *codexProvider) PlanRawCapture(
+	ctx context.Context,
+	source SourceRef,
+) (RawCapturePlan, error) {
+	if err := ctx.Err(); err != nil {
+		return RawCapturePlan{}, err
+	}
+	if p.spec.agent != AgentCodex {
+		return RawCapturePlan{}, invalidRawCapturePlan("provider does not own Codex raw companions")
+	}
+	src, ok := source.Opaque.(codexSource)
+	if !ok || src.Root == "" || src.Path == "" || isS3URI(src.Root) {
+		return RawCapturePlan{}, invalidRawCapturePlan("codex source is not a local discovered transcript")
+	}
+	captureRoot := filepath.Clean(src.Root)
+	indexPath := codexSessionIndexPath(src.Path)
+	if indexPath != "" {
+		// The provider reads this named sibling as session metadata, so raw
+		// capture widens only far enough to preserve the same parse inputs.
+		captureRoot = filepath.Dir(indexPath)
+	}
+	rel, err := filepath.Rel(captureRoot, src.Path)
+	if err != nil {
+		return RawCapturePlan{}, invalidRawCapturePlan(
+			"resolve Codex source path: %s", rawCaptureFilesystemError(err),
+		)
+	}
+	entries := []RawCaptureEntry{{
+		Path:       filepath.ToSlash(rel),
+		LocalPath:  src.Path,
+		Appendable: true,
+	}}
+	var sidecarRoots []string
+	if parentID, needed := codexReplayParentIDContext(ctx, src.Path); needed {
+		parentPath := ""
+		for _, root := range p.sources.roots {
+			if err := ctx.Err(); err != nil {
+				return RawCapturePlan{}, err
+			}
+			candidate := p.sources.findSourceFile(root, parentID)
+			if candidate == "" || samePath(candidate, src.Path) {
+				continue
+			}
+			parentPath = candidate
+			break
+		}
+		// Missing parents preserve the child's history, matching local parsing.
+		if parentPath != "" {
+			// One named parent may come from any configured root. Give an
+			// external parent its own flat root so it cannot collide with the
+			// child's layout, and hosted lookup can find it by session UUID.
+			parentRel := filepath.Join("replay-parent", filepath.Base(parentPath))
+			if rawCapturePathWithin(captureRoot, parentPath) {
+				parentRel, err = filepath.Rel(captureRoot, parentPath)
+				if err != nil {
+					return RawCapturePlan{}, invalidRawCapturePlan(
+						"resolve Codex replay parent: %s", rawCaptureFilesystemError(err),
+					)
+				}
+			} else {
+				sidecarRoots = append(sidecarRoots, filepath.Dir(parentPath))
+			}
+			entries = append(entries, RawCaptureEntry{
+				Path: filepath.ToSlash(parentRel), LocalPath: parentPath,
+			})
+		}
+	}
+	for i, candidate := range p.sources.metadata.IndexPaths(src.Path) {
+		info, err := os.Stat(candidate)
+		switch {
+		case err == nil && info.Mode().IsRegular():
+			// The home's own index keeps its name; each alias home's index
+			// is captured under a distinct logical path so parse inputs
+			// that came from another home travel with the transcript.
+			logical := CodexSessionIndexFilename
+			if i > 0 {
+				logical = fmt.Sprintf("alias-homes/%d/%s", i, CodexSessionIndexFilename)
+			}
+			if p.Config.StableSourceSnapshots && rawCapturePathWithin(captureRoot, candidate) {
+				// Materialized aliases already have custody paths. Keep their
+				// original ordinals even when missing indexes left gaps.
+				rel, err := filepath.Rel(captureRoot, candidate)
+				if err != nil {
+					return RawCapturePlan{}, invalidRawCapturePlan(
+						"resolve Codex session index: %s", rawCaptureFilesystemError(err),
+					)
+				}
+				logical = filepath.ToSlash(rel)
+			}
+			if filepath.Dir(candidate) != captureRoot {
+				sidecarRoots = append(sidecarRoots, filepath.Dir(candidate))
+			}
+			entries = append(entries, RawCaptureEntry{
+				Path:      logical,
+				LocalPath: candidate,
+			})
+		case errors.Is(err, os.ErrNotExist):
+		case err != nil:
+			return RawCapturePlan{}, invalidRawCapturePlan(
+				"stat Codex session index: %s", rawCaptureFilesystemError(err),
+			)
+		default:
+			return RawCapturePlan{}, invalidRawCapturePlan("Codex session index is not a regular file")
+		}
+	}
+	return RawCapturePlan{
+		ConfiguredRoot: src.Root,
+		CaptureRoot:    captureRoot,
+		SourceKey:      source.Key,
+		Entries:        entries,
+		SidecarRoots:   sidecarRoots,
+	}, nil
+}
+
+// ComputeMultiFileStatHash implements parser.MultiFileStatHasher over the
+// rollout transcript plus its session_index.jsonl sidecar, mirroring the
+// sidecar folding of the verified-source gate: an index-only change (a
+// thread title rename) breaks the digest even when the transcript is
+// byte-identical, so the warm short-circuit can never mask a metadata
+// refresh. An absent index contributes a stable (0, 0, 0) tuple, which
+// matches modern Codex releases that no longer write the index. The
+// digest persists stat-verified freshness in provider_freshness across
+// process restarts, sparing a fresh engine the full-content hash that
+// Fingerprint performs for every unchanged rollout.
+func (p *codexProvider) ComputeMultiFileStatHash(chatPath string) uint64 {
+	paths := append([]string{chatPath}, p.sources.metadata.IndexPaths(chatPath)...)
+	if len(paths) == 1 {
+		paths = append(paths, "")
+	}
+	return fileStatTupleDigest(0xC2, paths...)
+}
+
 func (p *codexProvider) Parse(
 	ctx context.Context,
 	req ParseRequest,
@@ -143,11 +466,14 @@ func (p *codexProvider) Parse(
 	if !ok {
 		return ParseOutcome{}, fmt.Errorf("codex source path unavailable")
 	}
-	if req.ForceParse {
-		EvictCodexSessionIndexForSession(path)
+	if req.ForceParse && p.spec.agent == AgentCodex {
+		for _, index := range p.sources.metadata.IndexPaths(path) {
+			EvictCodexSessionIndex(index)
+		}
 	}
 	machine := firstNonEmptyJSONLString(req.Machine, p.Config.Machine)
-	sess, msgs, err := p.parseSession(path, machine, false)
+	sess, msgs, cursor, safe, hashState, anchorDigest, retryReason, err :=
+		p.parseSessionWithCursor(ctx, path, machine, false)
 	if err != nil {
 		return ParseOutcome{}, err
 	}
@@ -157,17 +483,37 @@ func (p *codexProvider) Parse(
 			SkipReason:        SkipNoSession,
 		}, nil
 	}
+	if p.spec.relabel != nil {
+		p.spec.relabel(sess, msgs)
+	}
 	if req.Fingerprint.Hash != "" {
 		sess.File.Hash = req.Fingerprint.Hash
 	}
+	var checkpoint []byte
+	if safe {
+		checkpoint, err = cursor.MarshalBinary()
+		if err != nil {
+			return ParseOutcome{}, fmt.Errorf(
+				"encoding codex checkpoint %s: %w", path, err,
+			)
+		}
+	}
+	result := ParseResultOutcome{
+		Result: ParseResult{
+			Session:                *sess,
+			Messages:               msgs,
+			Checkpoint:             checkpoint,
+			CheckpointHashState:    hashState,
+			CheckpointAnchorDigest: anchorDigest,
+		},
+		DataVersion: DataVersionCurrent,
+	}
+	if retryReason != "" {
+		result.DataVersion = DataVersionNeedsRetry
+		result.RetryReason = retryReason
+	}
 	return ParseOutcome{
-		Results: []ParseResultOutcome{{
-			Result: ParseResult{
-				Session:  *sess,
-				Messages: msgs,
-			},
-			DataVersion: DataVersionCurrent,
-		}},
+		Results:           []ParseResultOutcome{result},
 		ResultSetComplete: true,
 		// A requested full parse is the authoritative message set, so
 		// force-replace the stored rows; this remains distinct from the provider's
@@ -177,6 +523,71 @@ func (p *codexProvider) Parse(
 		// an append-only write.
 		ForceReplace: true,
 	}, nil
+}
+
+// ParseCodexSessionStreaming decodes one Codex snapshot, emitting every
+// normalized operation into sink instead of accumulating the message slice
+// inside the parser. It returns the assembled session, the finalized
+// message slice (result-event content omitted for staging sinks), the
+// marshaled continuation cursor, the single-pass hash state and anchor
+// digest covering the snapshot, and a retry reason when an explicit fork
+// parent could not be resolved. The cursor, hash state, and anchor digest
+// are empty when the snapshot does not end at a safe resume boundary.
+func ParseCodexSessionStreaming(
+	ctx context.Context,
+	cfg ProviderConfig,
+	source SourceRef,
+	sink CodexSessionSink,
+) (*ParsedSession, []ParsedMessage, []byte, []byte, string, string, error) {
+	provider, ok := NewProvider(AgentCodex, cfg)
+	if !ok {
+		return nil, nil, nil, nil, "", "",
+			fmt.Errorf("constructing codex provider")
+	}
+	cp, ok := provider.(*codexProvider)
+	if !ok {
+		return nil, nil, nil, nil, "", "",
+			fmt.Errorf("unexpected codex provider type %T", provider)
+	}
+	path, ok := cp.sources.pathFromSource(source)
+	if !ok {
+		return nil, nil, nil, nil, "", "",
+			fmt.Errorf("codex source path unavailable")
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, nil, nil, nil, "", "", fmt.Errorf("open %s: %w", path, err)
+	}
+	defer f.Close()
+	info, err := f.Stat()
+	if err != nil {
+		return nil, nil, nil, nil, "", "", fmt.Errorf("stat %s: %w", path, err)
+	}
+	sess, msgs, cursor, safe, hashState, anchorDigest, retryReason, err :=
+		cp.parseCodexSessionSnapshotStreaming(
+			ctx, path,
+			firstNonEmptyJSONLString("", cfg.Machine),
+			false, f, info, sink,
+		)
+	if err != nil {
+		return nil, nil, nil, nil, "", "", err
+	}
+	if sess == nil {
+		return nil, nil, nil, nil, "", "", fmt.Errorf(
+			"codex session unavailable in %s", path,
+		)
+	}
+	var cursorBlob []byte
+	if safe {
+		cursorBlob, err = cursor.MarshalBinary()
+		if err != nil {
+			return nil, nil, nil, nil, "", "", fmt.Errorf(
+				"encoding codex checkpoint %s: %w", path, err,
+			)
+		}
+	}
+	return sess, msgs, cursorBlob, hashState, anchorDigest,
+		retryReason, nil
 }
 
 func (p *codexProvider) ParseIncremental(
@@ -204,7 +615,7 @@ func (p *codexProvider) ParseIncremental(
 	if err != nil {
 		return IncrementalOutcome{}, IncrementalNeedsFullParse, err
 	}
-	inode, device := sourceFileIdentity(info)
+	inode, device := sourceFileIdentityForFile(f, info)
 	if (req.Fingerprint.Inode != 0 && req.Fingerprint.Inode != inode) ||
 		(req.Fingerprint.Device != 0 && req.Fingerprint.Device != device) ||
 		info.Size() < req.Fingerprint.Size {
@@ -223,15 +634,38 @@ func (p *codexProvider) ParseIncremental(
 		return IncrementalOutcome{}, IncrementalNoNewData, nil
 	}
 
-	result, err := p.parseSessionFromSnapshot(
-		path,
-		req.Offset,
-		req.StartOrdinal,
-		false,
-		f,
-		info,
-		req.Fingerprint.Size,
-	)
+	var result codexIncrementalParseResult
+	if len(req.Seed) > 0 {
+		var seed codexCursorState
+		if err := seed.UnmarshalBinary(req.Seed); err != nil {
+			// A persisted cursor the current binary cannot decode must not
+			// resume; rebuild the transcript authoritatively.
+			return IncrementalOutcome{ForceReplace: true},
+				IncrementalNeedsFullParse, nil
+		}
+		result, err = p.parseSessionFromCheckpoint(
+			path,
+			req.Offset,
+			req.StartOrdinal,
+			false,
+			f,
+			info,
+			req.Fingerprint.Size,
+			seed,
+			req.StoredPendingUsageOrdinal,
+		)
+	} else {
+		result, err = p.parseSessionFromSnapshot(
+			path,
+			req.Offset,
+			req.StartOrdinal,
+			false,
+			f,
+			info,
+			req.Fingerprint.Size,
+			req.StoredPendingUsageOrdinal,
+		)
+	}
 	if err != nil {
 		if IsIncrementalFullParseFallback(err) {
 			return IncrementalOutcome{ForceReplace: true},
@@ -264,21 +698,37 @@ func (p *codexProvider) ParseIncremental(
 		result.cursor,
 	)
 
+	if p.spec.relabel != nil {
+		p.spec.relabel(nil, result.messages)
+	}
+
 	totalOut, peakCtx, hasTotalOut, hasPeakCtx :=
 		codexProviderTokenTotals(result.messages)
 	termination := codexIncrementalTermination(result.cursor.lastTaskEvent)
+	var nextCursor []byte
+	if !result.cursor.pendingCallsOverflow {
+		nextCursor, err = result.cursor.MarshalBinary()
+		if err != nil {
+			return IncrementalOutcome{}, IncrementalNeedsFullParse, fmt.Errorf(
+				"encoding codex cursor %s: %w", path, err,
+			)
+		}
+	}
 	return IncrementalOutcome{
-		SessionID:            req.SessionID,
-		Messages:             result.messages,
-		EndedAt:              result.endedAt,
-		ConsumedBytes:        result.consumedBytes,
-		MessageCount:         len(result.messages),
-		UserMessageCount:     codexProviderUserMessageCount(result.messages),
-		TotalOutputTokens:    totalOut,
-		PeakContextTokens:    peakCtx,
-		HasTotalOutputTokens: hasTotalOut,
-		HasPeakContextTokens: hasPeakCtx,
-		TerminationStatus:    termination,
+		SessionID:                req.SessionID,
+		Messages:                 result.messages,
+		ToolCallUpdates:          result.toolCallUpdates,
+		MessageTokenUsageUpdates: result.messageUsageUpdates,
+		NextCursor:               nextCursor,
+		EndedAt:                  result.endedAt,
+		ConsumedBytes:            result.consumedBytes,
+		MessageCount:             len(result.messages),
+		UserMessageCount:         codexProviderUserMessageCount(result.messages),
+		TotalOutputTokens:        totalOut,
+		PeakContextTokens:        peakCtx,
+		HasTotalOutputTokens:     hasTotalOut,
+		HasPeakContextTokens:     hasPeakCtx,
+		TerminationStatus:        termination,
 	}, IncrementalApplied, nil
 }
 
@@ -290,11 +740,29 @@ type codexSource struct {
 }
 
 type codexSourceSet struct {
-	roots []string
+	// agent labels the sources this set emits. Codex-format forks share
+	// the layout but must not share a discovery namespace: keying sources
+	// by agent keeps a TraeX UUID from colliding with a Codex one.
+	agent    AgentType
+	roots    []string
+	metadata CodexMetadata
 }
 
-func newCodexSourceSet(roots []string) codexSourceSet {
-	return codexSourceSet{roots: cleanJSONLRoots(roots)}
+func newCodexSourceSet(agent AgentType, roots []string) codexSourceSet {
+	if agent == "" {
+		agent = AgentCodex
+	}
+	return codexSourceSet{agent: agent, roots: cleanJSONLRoots(roots)}
+}
+
+// ownsCodexSidecars reports whether this source set's agent is the one that
+// owns Codex's out-of-band files: the session_index.jsonl sidecar and the
+// s3://.../raw/codex/... archive layout. Only Codex does. A fork writes
+// neither, so it must not watch, fan out on, or import them -- importing an
+// s3:// root through the Codex S3 scanner would stamp AgentCodex and silently
+// move the sessions into Codex's identity namespace.
+func (s codexSourceSet) ownsCodexSidecars() bool {
+	return s.agent == AgentCodex
 }
 
 func (s codexSourceSet) Discover(ctx context.Context) ([]SourceRef, error) {
@@ -308,37 +776,49 @@ func (s codexSourceSet) DiscoverEach(
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		if strings.HasPrefix(root, "s3://") {
-			for _, file := range discoverCodexS3(root) {
-				if err := yield(s3SourceRefFromDiscoveredFile(file)); err != nil {
-					return err
-				}
-			}
-			continue
-		}
-		err := streamDirectoryTree(ctx, root, func(path string, entry os.DirEntry) error {
-			if err := ctx.Err(); err != nil {
-				return err
-			}
-			if !isCodexSessionFilename(entry.Name()) {
-				return nil
-			}
-			source, ok := s.sourceRef(root, path, true)
-			if !ok {
-				if _, _, supported := CodexSessionPathInfo(root, path); supported {
-					source, ok = s.directPathSource(root, path, true)
-				}
-			}
-			if !ok {
-				return nil
-			}
-			return yield(source)
-		})
-		if err != nil {
+		if err := s.discoverEachRoot(ctx, root, yield); err != nil {
 			return err
 		}
 	}
 	return nil
+}
+
+func (s codexSourceSet) discoverEachRoot(
+	ctx context.Context,
+	root string,
+	yield func(SourceRef) error,
+) error {
+	if strings.HasPrefix(root, "s3://") {
+		if !s.ownsCodexSidecars() {
+			return nil
+		}
+		for _, file := range s3PrefixScan(root, codexS3Scanner()) {
+			if err := yield(s3SourceRefFromDiscoveredFile(root, file)); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+	return streamDirectoryTree(ctx, root, func(path string, entry os.DirEntry) error {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if !isCodexSessionFilename(entry.Name()) || !entry.Type().IsRegular() {
+			return nil
+		}
+		// ReadDir already classified the entry without following symlinks.
+		// Reuse that result instead of issuing another lstat per rollout.
+		source, ok := s.sourceRef(root, path, false)
+		if !ok {
+			if _, _, supported := CodexSessionPathInfo(root, path); supported {
+				source, ok = s.directPathSource(root, path, false)
+			}
+		}
+		if !ok {
+			return nil
+		}
+		return yield(source)
+	})
 }
 
 func (s codexSourceSet) discover(
@@ -360,8 +840,11 @@ func (s codexSourceSet) discover(
 			// payload. Each object is its own session keyed by URI, so the
 			// live-over-archived preference (which inspects a local codexSource
 			// layout) does not apply here.
-			for _, file := range discoverCodexS3(root) {
-				source := s3SourceRefFromDiscoveredFile(file)
+			if !s.ownsCodexSidecars() {
+				continue
+			}
+			for _, file := range s3PrefixScan(root, codexS3Scanner()) {
+				source := s3SourceRefFromDiscoveredFile(root, file)
 				if _, ok := byKey[source.Key]; ok {
 					continue
 				}
@@ -494,13 +977,20 @@ func (s codexSourceSet) WatchPlan(context.Context) (WatchPlan, error) {
 	roots := make([]WatchRoot, 0, len(s.roots)*2)
 	seenShallow := make(map[string]struct{})
 	for _, root := range s.roots {
+		if isS3URI(root) {
+			continue
+		}
 		roots = append(roots, WatchRoot{
 			Path:         root,
 			Recursive:    true,
 			IncludeGlobs: []string{"*.jsonl"},
-			DebounceKey:  string(AgentCodex) + ":sessions:" + root,
+			DebounceKey:  string(s.agent) + ":sessions:" + root,
 		})
-		for _, shallow := range ResolveCodexShallowWatchRoots(root) {
+		if !s.ownsCodexSidecars() {
+			continue
+		}
+		shallowRoots := s.metadata.dirs(root)
+		for _, shallow := range shallowRoots {
 			shallow = filepath.Clean(shallow)
 			if _, ok := seenShallow[shallow]; ok {
 				continue
@@ -510,7 +1000,7 @@ func (s codexSourceSet) WatchPlan(context.Context) (WatchPlan, error) {
 				Path:         shallow,
 				Recursive:    false,
 				IncludeGlobs: []string{CodexSessionIndexFilename},
-				DebounceKey:  string(AgentCodex) + ":index:" + shallow,
+				DebounceKey:  string(s.agent) + ":index:" + shallow,
 			})
 		}
 	}
@@ -524,7 +1014,8 @@ func (s codexSourceSet) SourcesForChangedPath(
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	if filepath.Base(req.Path) == CodexSessionIndexFilename {
+	if s.ownsCodexSidecars() &&
+		filepath.Base(req.Path) == CodexSessionIndexFilename {
 		return s.sourcesForIndexPath(ctx, req.Path)
 	}
 	for _, root := range s.roots {
@@ -608,15 +1099,19 @@ func (s codexSourceSet) Fingerprint(
 	if info.IsDir() {
 		return SourceFingerprint{}, fmt.Errorf("stat %s: source is a directory", path)
 	}
-	hash, err := hashJSONLSourceFile(path)
+	hash, err := hashJSONLSourceFileContext(ctx, path)
 	if err != nil {
 		return SourceFingerprint{}, err
 	}
-	inode, device := sourceFileIdentity(info)
+	inode, device := sourceFileIdentityForPath(path, info)
+	mtime := info.ModTime().UnixNano()
+	if s.agent == AgentCodex {
+		mtime = s.metadata.EffectiveMtime(path, mtime)
+	}
 	return SourceFingerprint{
 		Key:     firstNonEmptyJSONLString(source.FingerprintKey, source.Key, path),
 		Size:    info.Size(),
-		MTimeNS: CodexEffectiveMtime(path, info.ModTime().UnixNano()),
+		MTimeNS: mtime,
 		Inode:   inode,
 		Device:  device,
 		Hash:    hash,
@@ -662,7 +1157,7 @@ func (s codexSourceSet) sourcesForIndexPath(
 	}
 	indexDir := filepath.Dir(indexPath)
 	return s.discover(ctx, func(root string) bool {
-		return filepath.Dir(root) == indexDir
+		return slices.Contains(s.metadata.dirs(root), indexDir)
 	})
 }
 
@@ -681,8 +1176,8 @@ func (s codexSourceSet) sourceRef(
 		return SourceRef{}, false
 	}
 	return SourceRef{
-		Provider:       AgentCodex,
-		Key:            codexSourceKey(uuid),
+		Provider:       s.agent,
+		Key:            codexSourceKey(s.agent, uuid),
 		DisplayPath:    path,
 		FingerprintKey: path,
 		Opaque: codexSource{
@@ -708,7 +1203,7 @@ func (s codexSourceSet) directPathSource(
 		return SourceRef{}, false
 	}
 	return SourceRef{
-		Provider:       AgentCodex,
+		Provider:       s.agent,
 		Key:            path,
 		DisplayPath:    path,
 		FingerprintKey: path,
@@ -727,7 +1222,8 @@ func (s codexSourceSet) canonicalSource(
 	if !ok || src.UUID == "" {
 		return source, true, nil
 	}
-	best := source
+	var best SourceRef
+	foundExisting := false
 	for _, root := range s.roots {
 		if err := ctx.Err(); err != nil {
 			return SourceRef{}, false, err
@@ -740,23 +1236,29 @@ func (s codexSourceSet) canonicalSource(
 		if !ok {
 			continue
 		}
-		if preferCodexSource(candidate, best) {
+		if !foundExisting || preferCodexSource(candidate, best) {
 			best = candidate
+			foundExisting = true
 		}
+	}
+	if !foundExisting {
+		return source, true, nil
 	}
 	return best, true, nil
 }
 
-func codexSourceKey(uuid string) string {
-	return string(AgentCodex) + ":" + uuid
+func codexSourceKey(agent AgentType, uuid string) string {
+	return string(agent) + ":" + uuid
 }
 
-// CodexSourceKey is the discovery identity of a Codex session UUID. Every
-// on-disk copy of a duplicated UUID shares this key, so the sync engine's
-// reconciliation index resolves same-UUID replacements with one bounded
-// lookup instead of an archive walk.
-func CodexSourceKey(uuid string) string {
-	return codexSourceKey(uuid)
+// CodexSourceKey is the discovery identity of a Codex-format session UUID
+// under the given agent. Every on-disk copy of a duplicated UUID shares this
+// key, so the sync engine's reconciliation index resolves same-UUID
+// replacements with one bounded lookup instead of an archive walk. The agent
+// keeps Codex and its TraeX fork in separate identity namespaces even when
+// both archives happen to hold the same UUID.
+func CodexSourceKey(agent AgentType, uuid string) string {
+	return codexSourceKey(agent, uuid)
 }
 
 func preferCodexSource(candidate, current SourceRef) bool {
@@ -771,7 +1273,7 @@ func preferCodexSource(candidate, current SourceRef) bool {
 func codexProviderUserMessageCount(messages []ParsedMessage) int {
 	count := 0
 	for _, message := range messages {
-		if message.Role == RoleUser && message.Content != "" {
+		if message.Role == RoleUser && message.SourceSubtype != SourceSubtypeToolResult && message.Content != "" {
 			count++
 		}
 	}
@@ -811,6 +1313,7 @@ func codexProviderCapabilities() Capabilities {
 			DiscoverSources:      CapabilitySupported,
 			StreamingDiscovery:   CapabilitySupported,
 			WatchSources:         CapabilitySupported,
+			ActivityHints:        CapabilitySupported,
 			ClassifyChangedPath:  CapabilitySupported,
 			FindSource:           CapabilitySupported,
 			CompositeFingerprint: CapabilitySupported,
@@ -820,6 +1323,7 @@ func codexProviderCapabilities() Capabilities {
 			ExcludedSessions:     CapabilityNotApplicable,
 			ForceReplaceOnParse:  CapabilitySupported,
 			VerifiedLocalStat:    CapabilitySupported,
+			MultiFileStatHash:    CapabilitySupported,
 		},
 		Content: ContentCapabilities{
 			FirstMessage:         CapabilitySupported,
@@ -841,5 +1345,20 @@ func codexProviderCapabilities() Capabilities {
 			FingerprintHashRequiredForFreshness: true,
 			SkipCacheFreshWithoutStoredRow:      true,
 		},
+		RawCapture: RawCaptureCapabilities{
+			Support:  CapabilitySupported,
+			Shape:    RawCaptureShapeFiles,
+			Append:   RawCaptureAppendOne,
+			Snapshot: RawCaptureSnapshotNone,
+		},
 	}
+}
+
+func (p *codexProvider) Metadata() CodexMetadata { return p.sources.metadata }
+
+func (f *codexProviderFactory) ResolveMetadataDir(path string) (string, error) {
+	if f.spec.agent != AgentCodex {
+		return "", nil
+	}
+	return pathutil.ResolveAbsolute(filepath.Dir(path))
 }

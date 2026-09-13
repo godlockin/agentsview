@@ -1,17 +1,18 @@
 // @vitest-environment jsdom
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test";
 import { mount, tick, unmount } from "svelte";
+import { dismissFlash } from "@kenn-io/kit-ui";
 // @ts-ignore
 import SettingsPage from "./SettingsPage.svelte";
 import { SettingsService } from "../../api/generated/index";
 import { settings } from "../../stores/settings.svelte.js";
+import { router } from "../../stores/router.svelte.js";
 import { initI18n, LOCALE_STORAGE_KEY, setLocale } from "../../i18n/index.js";
 
 vi.mock("../../api/runtime.js", async (importOriginal) => {
   const orig = await importOriginal<typeof import("../../api/runtime.js")>();
   return {
     ...orig,
-    configureGeneratedClient: vi.fn(),
     getAuthToken: vi.fn(() => ""),
     isRemoteConnection: vi.fn(() => false),
     setAuthToken: vi.fn(),
@@ -25,14 +26,14 @@ vi.mock("../../api/generated/index", async (importOriginal) => {
     ...orig,
     SettingsService: {
       getApiV1Settings: vi.fn(),
-      getApiV1SettingsWorktreeMappings: vi.fn(),
+      putApiV1Settings: vi.fn(),
     },
   };
 });
 
 const settingsService = SettingsService as unknown as {
   getApiV1Settings: ReturnType<typeof vi.fn>;
-  getApiV1SettingsWorktreeMappings: ReturnType<typeof vi.fn>;
+  putApiV1Settings: ReturnType<typeof vi.fn>;
 };
 
 beforeEach(() => {
@@ -43,21 +44,26 @@ beforeEach(() => {
   settings.loaded = false;
   settings.needsAuth = false;
   settings.error = null;
+  settings.saveError = null;
   settings.readOnly = false;
+  settings.saving = false;
+  dismissFlash();
 });
 
 afterEach(() => {
+  dismissFlash();
   document.body.innerHTML = "";
 });
 
 describe("SettingsPage", () => {
-  it("renders browser-local settings with the read-only worktree status", async () => {
+  it("renders browser-local settings with the Data-mode worktree pointer", async () => {
     let resolveSettings!: (value: unknown) => void;
     settingsService.getApiV1Settings.mockReturnValue(
       new Promise((resolve) => {
         resolveSettings = resolve;
       }),
     );
+    const navigate = vi.spyOn(router, "navigate").mockReturnValue(true);
 
     const component = mount(SettingsPage, {
       target: document.body,
@@ -66,7 +72,6 @@ describe("SettingsPage", () => {
 
     expect(document.body.textContent).toContain("Loading settings");
     expect(document.body.textContent).not.toContain("Date ranges");
-    expect(settingsService.getApiV1SettingsWorktreeMappings).not.toHaveBeenCalled();
 
     resolveSettings({
       agent_dirs: {},
@@ -83,13 +88,21 @@ describe("SettingsPage", () => {
 
     expect(document.body.textContent).toContain("Date ranges");
     expect(document.body.textContent).toContain("Link date ranges across pages");
+    // The mapping manager moved to Data; Settings keeps only a pointer.
     expect(document.body.textContent).toContain("Worktree mappings");
-    expect(document.body.textContent).toContain(
-      "Worktree mappings are available in local mode only.",
+    expect(document.body.textContent).toContain("Project classification rules have moved to Data.");
+    expect(document.body.textContent).not.toContain("available in local mode only");
+
+    const pointer = Array.from(document.body.querySelectorAll("button")).find((b) =>
+      b.textContent?.includes("Open Data › Rules"),
     );
-    expect(settingsService.getApiV1SettingsWorktreeMappings).not.toHaveBeenCalled();
+    expect(pointer).toBeTruthy();
+    pointer!.click();
+    await tick();
+    expect(navigate).toHaveBeenCalledWith("data", { view: "rules" });
 
     unmount(component);
+    navigate.mockRestore();
   });
 
   it("persists the selected interface language for reload", async () => {
@@ -102,9 +115,6 @@ describe("SettingsPage", () => {
       read_only: false,
       require_auth: false,
       terminal: { mode: "auto" },
-    });
-    settingsService.getApiV1SettingsWorktreeMappings.mockResolvedValue({
-      mappings: [],
     });
 
     const component = mount(SettingsPage, {
@@ -124,15 +134,15 @@ describe("SettingsPage", () => {
     trigger!.click();
     await tick();
 
-    const option = Array.from(
-      document.body.querySelectorAll('[role="option"]'),
-    ).find((el) => el.textContent?.includes("简体中文"));
+    const option = Array.from(document.body.querySelectorAll('[role="option"]')).find((el) =>
+      el.textContent?.includes("日本語"),
+    );
     expect(option).toBeTruthy();
 
     (option as HTMLElement).dispatchEvent(new MouseEvent("mousedown", { bubbles: true }));
     await tick();
 
-    expect(localStorage.getItem(LOCALE_STORAGE_KEY)).toBe("zh-CN");
+    expect(localStorage.getItem(LOCALE_STORAGE_KEY)).toBe("ja");
     expect(document.body.textContent).toContain("Settings");
 
     unmount(component);
@@ -149,10 +159,6 @@ describe("SettingsPage", () => {
       require_auth: false,
       terminal: { mode: "auto" },
     });
-    settingsService.getApiV1SettingsWorktreeMappings.mockResolvedValue({
-      mappings: [],
-    });
-
     const component = mount(SettingsPage, {
       target: document.body,
     });
@@ -167,6 +173,8 @@ describe("SettingsPage", () => {
     expect(nav!.textContent).toContain("Preferences");
     expect(nav!.textContent).toContain("Data");
     expect(nav!.textContent).toContain("Connections");
+    expect(nav!.textContent).toContain("Session Providers");
+    expect(nav!.textContent).not.toContain("Agent Directories");
 
     const visiblePanel = () =>
       document.body.querySelector<HTMLElement>(".settings-panel:not([hidden])");
@@ -200,10 +208,6 @@ describe("SettingsPage", () => {
       require_auth: false,
       terminal: { mode: "auto" },
     });
-    settingsService.getApiV1SettingsWorktreeMappings.mockResolvedValue({
-      mappings: [],
-    });
-
     const component = mount(SettingsPage, {
       target: document.body,
     });
@@ -235,9 +239,7 @@ describe("SettingsPage", () => {
 
     expect(document.body.textContent).toContain("No matching settings");
     expect(
-      document.body.querySelector(".settings-page")?.classList.contains(
-        "settings-no-results",
-      ),
+      document.body.querySelector(".settings-page")?.classList.contains("settings-no-results"),
     ).toBe(true);
 
     settings.loading = true;
@@ -247,9 +249,7 @@ describe("SettingsPage", () => {
     await tick();
 
     expect(
-      document.body.querySelector(".settings-page")?.classList.contains(
-        "settings-no-results",
-      ),
+      document.body.querySelector(".settings-page")?.classList.contains("settings-no-results"),
     ).toBe(true);
     expect(document.body.querySelector(".kit-settings__panel")).not.toBeNull();
 
@@ -261,15 +261,11 @@ describe("SettingsPage", () => {
     restoredSearch.dispatchEvent(new Event("input", { bubbles: true }));
     await tick();
 
-    expect(restoredNav.querySelectorAll("button")).toHaveLength(9);
+    expect(restoredNav.querySelectorAll("button")).toHaveLength(11);
     expect(
-      document.body.querySelector(".settings-page")?.classList.contains(
-        "settings-no-results",
-      ),
+      document.body.querySelector(".settings-page")?.classList.contains("settings-no-results"),
     ).toBe(false);
-    expect(restoredNav.querySelector('[aria-current="true"]')?.textContent).toContain(
-      "Terminal",
-    );
+    expect(restoredNav.querySelector('[aria-current="true"]')?.textContent).toContain("Terminal");
 
     unmount(component);
   });
@@ -285,10 +281,6 @@ describe("SettingsPage", () => {
       require_auth: false,
       terminal: { mode: "auto" },
     });
-    settingsService.getApiV1SettingsWorktreeMappings.mockResolvedValue({
-      mappings: [],
-    });
-
     const component = mount(SettingsPage, {
       target: document.body,
     });
@@ -322,9 +314,7 @@ describe("SettingsPage", () => {
     await tick();
     expect(document.body.textContent).toContain("No matching settings");
     expect(
-      document.body.querySelector(".settings-page")?.classList.contains(
-        "settings-no-results",
-      ),
+      document.body.querySelector(".settings-page")?.classList.contains("settings-no-results"),
     ).toBe(true);
     expect(document.body.querySelector("#terminal-bin")).toBe(binary);
 
@@ -359,10 +349,6 @@ describe("SettingsPage", () => {
       require_auth: false,
       terminal: { mode: "auto" },
     });
-    settingsService.getApiV1SettingsWorktreeMappings.mockResolvedValue({
-      mappings: [],
-    });
-
     const component = mount(SettingsPage, {
       target: document.body,
     });
@@ -387,9 +373,7 @@ describe("SettingsPage", () => {
 
     expect(nav.querySelectorAll("button")).toHaveLength(1);
     expect(nav.textContent).toContain("语义嵌入");
-    expect(document.body.querySelector('[role="status"]')?.textContent).toContain(
-      "显示：语义嵌入",
-    );
+    expect(document.body.querySelector('[role="status"]')?.textContent).toContain("显示：语义嵌入");
 
     unmount(component);
   });
@@ -406,10 +390,6 @@ describe("SettingsPage", () => {
       require_auth: false,
       terminal: { mode: "auto" },
     });
-    settingsService.getApiV1SettingsWorktreeMappings.mockResolvedValue({
-      mappings: [],
-    });
-
     const component = mount(SettingsPage, {
       target: document.body,
     });
@@ -429,4 +409,5 @@ describe("SettingsPage", () => {
 
     unmount(component);
   });
+
 });

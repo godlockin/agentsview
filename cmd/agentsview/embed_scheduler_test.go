@@ -3,7 +3,7 @@ package main
 import (
 	"context"
 	"database/sql"
-	"encoding/json"
+	"encoding/json/v2"
 	"errors"
 	"fmt"
 	"io"
@@ -16,6 +16,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/stretchr/testify/assert"
@@ -116,27 +117,24 @@ func waitForSchedulerConditionWithin(
 }
 
 func TestEmbedSchedulerBurstOfNotifyProducesExactlyOneBuild(t *testing.T) {
-	fake := &fakeEmbedManager{}
-	s := newEmbedScheduler(fake, 20*time.Millisecond, 0, false, nil)
+	synctest.Test(t, func(t *testing.T) {
+		fake := &fakeEmbedManager{}
+		s := newEmbedScheduler(fake, 20*time.Millisecond, 0, false, nil)
 
-	// Queue the whole burst before Run starts so the test exercises the
-	// scheduler's documented pre-reader coalescing without racing the debounce
-	// interval on slow or coarsely scheduled runners.
-	for range 10 {
-		s.Notify()
-	}
+		// Queue the whole burst before Run starts so the test exercises the
+		// scheduler's documented pre-reader coalescing without racing the debounce
+		// interval on slow or coarsely scheduled runners.
+		for range 10 {
+			s.Notify()
+		}
 
-	ctx := t.Context()
-	go s.Run(ctx)
-	defer s.Stop()
+		go s.Run(t.Context())
+		defer s.Stop()
 
-	waitForSchedulerCondition(t, func() bool { return fake.callCount() >= 1 },
-		"expected a build after the burst quieted")
-	// Give any spurious extra build a chance to show up before asserting
-	// there is exactly one.
-	time.Sleep(60 * time.Millisecond)
-	assert.Equal(t, 1, fake.callCount(), "a burst of Notify must collapse to one build")
-	assert.Equal(t, []vector.BuildRequest{{}}, fake.callsSnapshot())
+		synctest.Sleep(60 * time.Millisecond)
+		assert.Equal(t, 1, fake.callCount(), "a burst of Notify must collapse to one build")
+		assert.Equal(t, []vector.BuildRequest{{}}, fake.callsSnapshot())
+	})
 }
 
 // TestEmbedSchedulerIncludeAutomatedThreadsIntoBuildRequests asserts the
@@ -357,20 +355,24 @@ func TestEmbedSchedulerPendingBackstopRetriesBeforeNextTick(
 			}}
 			idled := make(chan struct{})
 			ctx, cancel := context.WithCancel(t.Context())
-			tracker := server.NewIdleTracker(450*time.Millisecond, func() {
+			tracker := server.NewIdleTracker(300*time.Millisecond, func() {
 				close(idled)
 				cancel()
 			})
 			s := newEmbedScheduler(
-				fake, 200*time.Millisecond, 300*time.Millisecond, false, tracker,
+				fake, 200*time.Millisecond, time.Second, false, tracker,
 			)
-			go tracker.Run(ctx)
 			go s.Run(ctx)
 			defer s.Stop()
 
 			waitForSchedulerCondition(t, func() bool { return fake.callCount() >= 1 },
 				"expected the initial backstop attempt")
-			waitForSchedulerConditionWithin(t, 250*time.Millisecond,
+			// Start idle observation only after the deliberately delayed backstop
+			// acquires its lease. Otherwise the idle timeout can cancel the test
+			// before the first tick when the tick interval is kept well clear of
+			// the retry and idle deadlines.
+			go tracker.Run(ctx)
+			waitForSchedulerConditionWithin(t, 500*time.Millisecond,
 				func() bool { return fake.callCount() >= 2 },
 				"a pending backstop must retry before the next backstop tick")
 			select {
@@ -421,35 +423,33 @@ func TestEmbedSchedulerRepeatedBackstopFailuresReleaseIdleLease(
 		fake.callsSnapshot(), "one backstop tick should get one bounded retry")
 }
 
-func TestEmbedSchedulerBackstopTicksDoNotRestartPendingRetry(t *testing.T) {
+func TestEmbedSchedulerLaterBackstopStartsFreshLifecycle(t *testing.T) {
 	buildErr := errors.New("embedding request rejected")
 	fake := &fakeEmbedManager{results: []fakeTryBuildResult{
 		{started: true, err: buildErr},
+		{started: true, err: buildErr},
+		{started: true},
 	}}
-	idled := make(chan struct{})
-	ctx, cancel := context.WithCancel(t.Context())
-	tracker := server.NewIdleTracker(5*time.Millisecond, func() {
-		close(idled)
-		cancel()
-	})
-	s := newEmbedScheduler(
-		fake, 70*time.Millisecond, 20*time.Millisecond, false, tracker,
-	)
-	go s.Run(ctx)
+	ticks := make(chan time.Time, 1)
+	s := newEmbedScheduler(fake, 200*time.Millisecond, 0, false, nil)
+	go s.run(t.Context(), ticks)
 	defer s.Stop()
 
+	ticks <- time.Now()
 	waitForSchedulerCondition(t, func() bool { return fake.callCount() >= 1 },
-		"expected the initial backstop attempt")
-	go tracker.Run(ctx)
-	select {
-	case <-idled:
-	case <-time.After(500 * time.Millisecond):
-		require.Fail(t,
-			"frequent backstop ticks restarted the retry lifecycle and retained the idle lease")
-	}
+		"expected the first backstop attempt")
+	ticks <- time.Now()
+	waitForSchedulerCondition(t, func() bool { return fake.callCount() >= 2 },
+		"expected exactly one bounded retry")
+	assert.Equal(t, 2, fake.callCount(),
+		"a tick during the retry lifecycle must be coalesced")
+
+	ticks <- time.Now()
+	waitForSchedulerCondition(t, func() bool { return fake.callCount() >= 3 },
+		"a later backstop tick must start a fresh lifecycle")
 	assert.Equal(t, []vector.BuildRequest{
-		{Backstop: true}, {Backstop: true},
-	}, fake.callsSnapshot(), "one backstop work item should get one bounded retry")
+		{Backstop: true}, {Backstop: true}, {Backstop: true},
+	}, fake.callsSnapshot())
 }
 
 func TestEmbedSchedulerExhaustedBackstopCarriesIntoNextNotification(
@@ -486,48 +486,41 @@ func TestEmbedSchedulerExhaustedBackstopCarriesIntoNextNotification(
 // interval (24h in production). The scheduler must remember it and fold
 // Backstop: true into the next debounced build request instead.
 func TestEmbedSchedulerDroppedBackstopRetriesOnNextDebouncedBuild(t *testing.T) {
-	fake := &fakeEmbedManager{
-		results: []fakeTryBuildResult{
-			{started: false, err: nil}, // the backstop tick collides with a build elsewhere
-			{started: true, err: nil},  // the following debounced build recovers it
-		},
-	}
-	// A long backstop interval relative to the debounce interval and the
-	// test's own buffers keeps a second, unrelated backstop tick from
-	// firing mid-test and making the call count non-deterministic.
-	s := newEmbedScheduler(fake, 10*time.Millisecond, 500*time.Millisecond, false, nil)
+	synctest.Test(t, func(t *testing.T) {
+		fake := &fakeEmbedManager{
+			results: []fakeTryBuildResult{
+				{started: false, err: nil}, // the backstop tick collides with a build elsewhere
+				{started: true, err: nil},  // the following debounced build recovers it
+			},
+		}
+		s := newEmbedScheduler(fake, 10*time.Millisecond, 500*time.Millisecond, false, nil)
+		go s.Run(t.Context())
+		defer s.Stop()
 
-	ctx := t.Context()
-	go s.Run(ctx)
-	defer s.Stop()
+		synctest.Sleep(500 * time.Millisecond)
+		require.Equal(t, 1, fake.callCount(), "expected the backstop tick to collide")
 
-	waitForSchedulerCondition(t, func() bool { return fake.callCount() >= 1 },
-		"expected the backstop tick to fire and be dropped")
+		// Let the automatic retry finish without a new notification, keeping
+		// the clock before the next periodic backstop tick.
+		synctest.Sleep(50 * time.Millisecond)
 
-	s.Notify()
+		calls := fake.callsSnapshot()
+		require.Len(t, calls, 2, "the dropped backstop must be retried exactly once, not repeatedly")
+		assert.True(t, calls[0].Backstop, "the original (dropped) backstop tick request")
+		assert.True(t, calls[1].Backstop,
+			"the debounced build must carry the pending backstop forward instead of dropping it")
 
-	waitForSchedulerCondition(t, func() bool { return fake.callCount() >= 2 },
-		"expected the debounced build to recover the dropped backstop")
-	time.Sleep(50 * time.Millisecond)
+		// Once the recovered build actually succeeded, the pending flag must
+		// clear: a further, unrelated debounced build must not keep carrying
+		// Backstop: true forever.
+		s.Notify()
+		synctest.Sleep(50 * time.Millisecond)
 
-	calls := fake.callsSnapshot()
-	require.Len(t, calls, 2, "the dropped backstop must be retried exactly once, not repeatedly")
-	assert.True(t, calls[0].Backstop, "the original (dropped) backstop tick request")
-	assert.True(t, calls[1].Backstop,
-		"the debounced build must carry the pending backstop forward instead of dropping it")
-
-	// Once the recovered build actually started, the pending flag must
-	// clear: a further, unrelated debounced build must not keep carrying
-	// Backstop: true forever.
-	s.Notify()
-	waitForSchedulerCondition(t, func() bool { return fake.callCount() >= 3 },
-		"expected a further debounced build after the recovered one")
-	time.Sleep(50 * time.Millisecond)
-
-	calls = fake.callsSnapshot()
-	require.Len(t, calls, 3)
-	assert.False(t, calls[2].Backstop,
-		"the recovered backstop must not leak into a later unrelated debounced build")
+		calls = fake.callsSnapshot()
+		require.Len(t, calls, 3)
+		assert.False(t, calls[2].Backstop,
+			"the recovered backstop must not leak into a later unrelated debounced build")
+	})
 }
 
 // TestEmbedSchedulerBackstopTickStartedButFailedKeepsPendingBackstop is the
@@ -537,45 +530,42 @@ func TestEmbedSchedulerDroppedBackstopRetriesOnNextDebouncedBuild(t *testing.T) 
 // very next debounced build rather than silently deferred to the next
 // backstop interval (24h in production).
 func TestEmbedSchedulerBackstopTickStartedButFailedKeepsPendingBackstop(t *testing.T) {
-	buildErr := errors.New("embeddings endpoint unreachable")
-	fake := &fakeEmbedManager{
-		results: []fakeTryBuildResult{
-			{started: true, err: buildErr}, // the backstop tick starts but fails
-			{started: true, err: nil},      // the following debounced build recovers it
-		},
-	}
-	s := newEmbedScheduler(fake, 10*time.Millisecond, 500*time.Millisecond, false, nil)
+	synctest.Test(t, func(t *testing.T) {
+		buildErr := errors.New("embeddings endpoint unreachable")
+		fake := &fakeEmbedManager{
+			results: []fakeTryBuildResult{
+				{started: true, err: buildErr}, // the backstop tick starts but fails
+				{started: true, err: nil},      // the following debounced build recovers it
+			},
+		}
+		s := newEmbedScheduler(fake, 10*time.Millisecond, 500*time.Millisecond, false, nil)
+		go s.Run(t.Context())
+		defer s.Stop()
 
-	ctx := t.Context()
-	go s.Run(ctx)
-	defer s.Stop()
+		synctest.Sleep(500 * time.Millisecond)
+		require.Equal(t, 1, fake.callCount(), "expected the backstop tick to fail")
 
-	waitForSchedulerCondition(t, func() bool { return fake.callCount() >= 1 },
-		"expected the backstop tick to fire and fail")
+		// Let the automatic retry finish without a new notification, keeping
+		// the clock before the next periodic backstop tick.
+		synctest.Sleep(50 * time.Millisecond)
 
-	s.Notify()
-	waitForSchedulerCondition(t, func() bool { return fake.callCount() >= 2 },
-		"expected the debounced build to retry the failed backstop")
-	time.Sleep(50 * time.Millisecond)
+		calls := fake.callsSnapshot()
+		require.Len(t, calls, 2, "the failed backstop must be retried exactly once, not repeatedly")
+		assert.True(t, calls[0].Backstop, "the original (started-but-failed) backstop tick request")
+		assert.True(t, calls[1].Backstop,
+			"the debounced build must carry the failed backstop forward instead of dropping it")
 
-	calls := fake.callsSnapshot()
-	require.Len(t, calls, 2, "the failed backstop must be retried exactly once, not repeatedly")
-	assert.True(t, calls[0].Backstop, "the original (started-but-failed) backstop tick request")
-	assert.True(t, calls[1].Backstop,
-		"the debounced build must carry the failed backstop forward instead of dropping it")
+		// Once the recovered build actually succeeded, the pending flag must
+		// clear: a further, unrelated debounced build must not keep carrying
+		// Backstop: true forever.
+		s.Notify()
+		synctest.Sleep(50 * time.Millisecond)
 
-	// Once the recovered build actually succeeded, the pending flag must
-	// clear: a further, unrelated debounced build must not keep carrying
-	// Backstop: true forever.
-	s.Notify()
-	waitForSchedulerCondition(t, func() bool { return fake.callCount() >= 3 },
-		"expected a further debounced build after the recovered one")
-	time.Sleep(50 * time.Millisecond)
-
-	calls = fake.callsSnapshot()
-	require.Len(t, calls, 3)
-	assert.False(t, calls[2].Backstop,
-		"the recovered backstop must not leak into a later unrelated debounced build")
+		calls = fake.callsSnapshot()
+		require.Len(t, calls, 3)
+		assert.False(t, calls[2].Backstop,
+			"the recovered backstop must not leak into a later unrelated debounced build")
+	})
 }
 
 // TestEmbedSchedulerDebouncedBuildStartedButFailedKeepsPendingBackstop is the
@@ -584,38 +574,34 @@ func TestEmbedSchedulerBackstopTickStartedButFailedKeepsPendingBackstop(t *testi
 // starts but then fails must not clear it either -- the same
 // started-but-failed rule applies on both paths that can clear the flag.
 func TestEmbedSchedulerDebouncedBuildStartedButFailedKeepsPendingBackstop(t *testing.T) {
-	buildErr := errors.New("embeddings endpoint unreachable")
-	fake := &fakeEmbedManager{
-		results: []fakeTryBuildResult{
-			{started: false, err: nil},     // the backstop tick collides with a build elsewhere
-			{started: true, err: buildErr}, // the recovering debounced build starts but fails
-			{started: true, err: nil},      // a further debounced build finally succeeds
-		},
-	}
-	s := newEmbedScheduler(fake, 10*time.Millisecond, 500*time.Millisecond, false, nil)
+	synctest.Test(t, func(t *testing.T) {
+		buildErr := errors.New("embeddings endpoint unreachable")
+		fake := &fakeEmbedManager{
+			results: []fakeTryBuildResult{
+				{started: false, err: nil},     // the backstop tick collides with a build elsewhere
+				{started: true, err: buildErr}, // the recovering debounced build starts but fails
+				{started: true, err: nil},      // a further debounced build finally succeeds
+			},
+		}
+		s := newEmbedScheduler(fake, 10*time.Millisecond, 500*time.Millisecond, false, nil)
+		go s.Run(t.Context())
+		defer s.Stop()
 
-	ctx := t.Context()
-	go s.Run(ctx)
-	defer s.Stop()
+		synctest.Sleep(500 * time.Millisecond)
+		require.Equal(t, 1, fake.callCount(), "expected the backstop tick to collide")
 
-	waitForSchedulerCondition(t, func() bool { return fake.callCount() >= 1 },
-		"expected the backstop tick to fire and be dropped")
+		// Both retries are automatic. Extra notifications could arrive after
+		// recovery and trigger an unrelated build. Advance past the retries,
+		// but stop before the next periodic backstop tick.
+		synctest.Sleep(50 * time.Millisecond)
 
-	s.Notify()
-	waitForSchedulerCondition(t, func() bool { return fake.callCount() >= 2 },
-		"expected the debounced build to attempt recovering the dropped backstop")
-
-	s.Notify()
-	waitForSchedulerCondition(t, func() bool { return fake.callCount() >= 3 },
-		"expected a further debounced build to retry after the recovering build failed")
-	time.Sleep(50 * time.Millisecond)
-
-	calls := fake.callsSnapshot()
-	require.Len(t, calls, 3)
-	assert.True(t, calls[0].Backstop, "the original (dropped) backstop tick request")
-	assert.True(t, calls[1].Backstop, "the recovering (started-but-failed) debounced build")
-	assert.True(t, calls[2].Backstop,
-		"a started-but-failed build must not clear pendingBackstop: the retry must still carry it")
+		calls := fake.callsSnapshot()
+		require.Len(t, calls, 3)
+		assert.True(t, calls[0].Backstop, "the original (dropped) backstop tick request")
+		assert.True(t, calls[1].Backstop, "the recovering (started-but-failed) debounced build")
+		assert.True(t, calls[2].Backstop,
+			"a started-but-failed build must not clear pendingBackstop: the retry must still carry it")
+	})
 }
 
 func TestEmbedSchedulerStopTerminatesRun(t *testing.T) {
@@ -678,24 +664,25 @@ func (e *recordingEmitter) count() int {
 }
 
 func TestTeeEmitterAlwaysCallsPrimaryAndGatesSchedulerOnRunAfterSync(t *testing.T) {
-	primary := &recordingEmitter{}
-	fake := &fakeEmbedManager{}
-	s := newEmbedScheduler(fake, 10*time.Millisecond, 0, false, nil)
-	ctx := t.Context()
-	go s.Run(ctx)
-	defer s.Stop()
+	synctest.Test(t, func(t *testing.T) {
+		primary := &recordingEmitter{}
+		fake := &fakeEmbedManager{}
+		s := newEmbedScheduler(fake, 10*time.Millisecond, 0, false, nil)
+		go s.Run(t.Context())
+		defer s.Stop()
 
-	disabled := teeEmitter{primary: primary, scheduler: s, runAfterSync: false}
-	disabled.Emit("sessions")
-	assert.Equal(t, 1, primary.count())
-	time.Sleep(30 * time.Millisecond)
-	assert.Equal(t, 0, fake.callCount(), "runAfterSync=false must not notify the scheduler")
+		disabled := teeEmitter{primary: primary, scheduler: s, runAfterSync: false}
+		disabled.Emit("sessions")
+		assert.Equal(t, 1, primary.count())
+		synctest.Sleep(30 * time.Millisecond)
+		assert.Equal(t, 0, fake.callCount(), "runAfterSync=false must not notify the scheduler")
 
-	enabled := teeEmitter{primary: primary, scheduler: s, runAfterSync: true}
-	enabled.Emit("sessions")
-	assert.Equal(t, 2, primary.count())
-	waitForSchedulerCondition(t, func() bool { return fake.callCount() >= 1 },
-		"runAfterSync=true must notify the scheduler")
+		enabled := teeEmitter{primary: primary, scheduler: s, runAfterSync: true}
+		enabled.Emit("sessions")
+		assert.Equal(t, 2, primary.count())
+		synctest.Sleep(30 * time.Millisecond)
+		require.Equal(t, 1, fake.callCount(), "runAfterSync=true must notify the scheduler")
+	})
 }
 
 // TestRunRemoteHostSyncLoop_EmitsThroughTeeNotifiesScheduler is a
@@ -1348,7 +1335,7 @@ func TestRecallSchedulerRequiresExplicitOptInForAutomaticBuilds(t *testing.T) {
 	defer resp.Body.Close()
 	assert.Equal(t, http.StatusOK, resp.StatusCode)
 	var imported db.RecallImportResult
-	require.NoError(t, json.NewDecoder(resp.Body).Decode(&imported))
+	require.NoError(t, json.UnmarshalRead(resp.Body, &imported))
 	assert.Equal(t, 1, imported.Imported)
 
 	assert.Never(t, func() bool {
@@ -1408,7 +1395,7 @@ func TestRecallImportSchedulesEmbeddingRefresh(t *testing.T) {
 	defer resp.Body.Close()
 	assert.Equal(t, http.StatusOK, resp.StatusCode)
 	var imported db.RecallImportResult
-	require.NoError(t, json.NewDecoder(resp.Body).Decode(&imported))
+	require.NoError(t, json.UnmarshalRead(resp.Body, &imported))
 	assert.Equal(t, 1, imported.Imported)
 
 	waitForSchedulerCondition(t, func() bool {
@@ -1447,7 +1434,12 @@ func TestEmbeddingsDaemonClientBuildSucceedsThroughRealMiddleware(t *testing.T) 
 		"a POST build must succeed once the client sets Origin to satisfy the CSRF guard")
 }
 
-func TestVectorServingCloseWaitsForAPIStartedRecallBuild(t *testing.T) {
+// TestVectorServingCloseCancelsAPIStartedRecallBuild pins the shutdown
+// contract for detached API builds: Close cancels an in-flight build rather
+// than waiting for it, because a document build may be waiting out provider
+// rate limits indefinitely (EncoderConfig.RetryRateLimits) and progress is
+// durable across restarts anyway.
+func TestVectorServingCloseCancelsAPIStartedRecallBuild(t *testing.T) {
 	dataDir := t.TempDir()
 	database := dbtest.OpenTestDBAt(t, filepath.Join(dataDir, "sessions.db"))
 	dbtest.SeedSession(t, database, "s1", "agentsview")
@@ -1467,7 +1459,7 @@ func TestVectorServingCloseWaitsForAPIStartedRecallBuild(t *testing.T) {
 		var req struct {
 			Input []string `json:"input"`
 		}
-		require.NoError(t, json.NewDecoder(r.Body).Decode(&req))
+		require.NoError(t, json.UnmarshalRead(r.Body, &req))
 		startedOnce.Do(func() { close(encodeStarted) })
 		<-encodeRelease
 		data := make([]map[string]any, len(req.Input))
@@ -1477,7 +1469,9 @@ func TestVectorServingCloseWaitsForAPIStartedRecallBuild(t *testing.T) {
 			}
 		}
 		w.Header().Set("Content-Type", "application/json")
-		require.NoError(t, json.NewEncoder(w).Encode(map[string]any{"data": data}))
+		// Best-effort: once Close cancels the build, the client has already
+		// aborted this request and the write fails with a dead connection.
+		_ = json.MarshalWrite(w, map[string]any{"data": data})
 	}))
 	t.Cleanup(stub.Close)
 
@@ -1510,20 +1504,15 @@ func TestVectorServingCloseWaitsForAPIStartedRecallBuild(t *testing.T) {
 		require.Fail(t, "manual Recall build never reached the encoder")
 	}
 
+	// The encoder is never released before Close: Close itself must cancel
+	// the detached build to return.
 	closeDone := make(chan error, 1)
 	go func() { closeDone <- closeVectorServing() }()
 	select {
 	case closeErr := <-closeDone:
 		require.NoError(t, closeErr)
-		require.Fail(t, "vector serving closed while the API build was active")
-	case <-time.After(100 * time.Millisecond):
-	}
-	releaseEncode()
-	select {
-	case closeErr := <-closeDone:
-		require.NoError(t, closeErr)
 	case <-time.After(10 * time.Second):
-		require.Fail(t, "vector serving did not close after the API build completed")
+		require.Fail(t, "vector serving did not cancel the in-flight API build on Close")
 	}
 }
 

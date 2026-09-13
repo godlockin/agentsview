@@ -159,7 +159,7 @@ func loadImportedSession(
 func validateImportedManifest(
 	m manifest, origin, gid string, limits artifactLimits,
 ) error {
-	if m.Version != manifestFormatVersion {
+	if m.Version < manifestMinDecodeVersion || m.Version > manifestFormatVersion {
 		return errors.New("manifest version is unsupported")
 	}
 	if m.Origin != origin {
@@ -338,6 +338,7 @@ func importedUsageEvents(
 		out[i] = db.UsageEvent{
 			SessionID: sessionID, MessageOrdinal: event.MessageOrdinal,
 			Source: event.Source, Model: event.Model,
+			ProviderID:  event.ProviderID,
 			InputTokens: event.InputTokens, OutputTokens: event.OutputTokens,
 			CacheCreationInputTokens: event.CacheCreationInputTokens,
 			CacheReadInputTokens:     event.CacheReadInputTokens,

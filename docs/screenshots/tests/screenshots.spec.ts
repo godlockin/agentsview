@@ -24,6 +24,34 @@ async function snapEl(loc: Locator, name: string) {
   });
 }
 
+async function snapRange(
+  page: Page,
+  first: Locator,
+  last: Locator,
+  name: string
+) {
+  const firstBox = await first.boundingBox();
+  const lastBox = await last.boundingBox();
+  if (!firstBox || !lastBox) {
+    throw new Error(`cannot resolve screenshot bounds for ${name}`);
+  }
+  const x = Math.min(firstBox.x, lastBox.x);
+  const right = Math.max(
+    firstBox.x + firstBox.width,
+    lastBox.x + lastBox.width
+  );
+  await page.screenshot({
+    path: join(DIR, `${name}.png`),
+    type: 'png',
+    clip: {
+      x,
+      y: firstBox.y,
+      width: right - x,
+      height: lastBox.y + lastBox.height - firstBox.y,
+    },
+  });
+}
+
 async function waitForApp(page: Page) {
   await page.goto('/');
   await page.waitForSelector('.session-item', {
@@ -131,7 +159,7 @@ test.describe('Dashboard', () => {
     const timeline = page.locator('.timeline-container');
     if (await timeline.count() > 0) {
       await timeline.scrollIntoViewIfNeeded();
-      await page.waitForSelector('.timeline-svg', {
+      await timeline.locator('.timeline-chart').waitFor({
         timeout: 10_000,
       });
       await page.waitForTimeout(500);
@@ -392,7 +420,220 @@ test.describe('Activity dashboard', () => {
   });
 });
 
-// ── Session browser ─────────────────────────────────────
+// ── Data workspace ───────────────────────────────────────
+
+test.describe('Data workspace', () => {
+  test.beforeEach(async ({ page }) => {
+    await page.setViewportSize(FULL);
+    await waitForApp(page);
+    await page.goto('/data');
+    await expect(page.locator('.data-page')).toBeVisible({
+      timeout: 10_000,
+    });
+    await expect(page.locator('.project-row').first()).toBeVisible({
+      timeout: 10_000,
+    });
+  });
+
+  test('project inventory', async ({ page }) => {
+    await expect(page.locator('.summary-strip')).toContainText(
+      'projects'
+    );
+    await snap(page, 'data-inventory');
+  });
+
+  test('selected project workspace', async ({ page }) => {
+    await page.route(
+      '**/api/v1/data/project-reclassification/candidates?*',
+      async (route) => {
+        await route.fulfill({
+          status: 200,
+          contentType: 'application/json',
+          body: JSON.stringify({
+            candidates: [
+              {
+                id: 'agentsview-main',
+                machine: 'dev-laptop',
+                suggested_prefix: '/workspace/agentsview/main',
+                evidence_kind: 'worktree_root',
+                evidence_root: '/workspace/agentsview/main',
+                contributing_sessions: 126,
+                distinct_cwds: 4,
+                available: true,
+                examples: [
+                  {
+                    session_id: 'data-session-1',
+                    cwd: '/workspace/agentsview/main',
+                  },
+                ],
+              },
+              {
+                id: 'agentsview-release-docs',
+                machine: 'dev-laptop',
+                suggested_prefix: '/workspace/agentsview/release-docs',
+                evidence_kind: 'worktree_root',
+                evidence_root: '/workspace/agentsview/release-docs',
+                contributing_sessions: 38,
+                distinct_cwds: 2,
+                available: true,
+                examples: [
+                  {
+                    session_id: 'data-session-2',
+                    cwd: '/workspace/agentsview/release-docs',
+                  },
+                ],
+              },
+              {
+                id: 'agentsview-recall-browser',
+                machine: 'dev-laptop',
+                suggested_prefix: '/workspace/agentsview/recall-browser',
+                evidence_kind: 'worktree_root',
+                evidence_root: '/workspace/agentsview/recall-browser',
+                contributing_sessions: 17,
+                distinct_cwds: 1,
+                available: true,
+                examples: [
+                  {
+                    session_id: 'data-session-3',
+                    cwd: '/workspace/agentsview/recall-browser',
+                  },
+                ],
+              },
+            ],
+          }),
+        });
+      }
+    );
+    const agentsviewRow = page.locator('.project-row', {
+      hasText: 'agentsview',
+    }).first();
+    await expect(agentsviewRow).toBeVisible();
+    await agentsviewRow.click();
+    await expect(page.locator('.pane-detail')).toBeVisible({
+      timeout: 10_000,
+    });
+    await expect(
+      page.getByText('Finding session folders…', { exact: true })
+    ).toBeHidden({ timeout: 10_000 });
+    await snap(page, 'data-workspace');
+  });
+});
+
+// ── Recall corpus browser ───────────────────────────────────
+
+test.describe('Recall corpus browser', () => {
+  test('corpus entries and extraction coverage', async ({ page }) => {
+    await page.setViewportSize(FULL);
+    await page.route('**/api/v1/recall/entries?*', async (route) => {
+      await route.fulfill({
+        status: 200,
+        contentType: 'application/json',
+        body: JSON.stringify({
+          entries: [
+            {
+              id: 'recall-docs-1',
+              type: 'procedure',
+              scope: 'project',
+              status: 'accepted',
+              review_state: 'human_reviewed',
+              title: 'Verify docs against source behavior',
+              body: 'Trace user-facing claims to implementation and tests before publishing release documentation.',
+              trigger: 'When documenting a release.',
+              uncertainty: 'Screenshots still require visual review.',
+              project: 'agentsview',
+              agent: 'claude',
+              source_session_id: 'docs-session-1',
+              source_run_id: 'release-docs-2026-08',
+              extractor_method: 'reviewed_import',
+              model: 'local-review-model',
+              transferable: true,
+              provenance_ok: true,
+              created_at: '2026-08-01T16:00:00Z',
+              updated_at: '2026-08-01T16:00:00Z',
+              evidence: [
+                {
+                  id: 1,
+                  entry_id: 'recall-docs-1',
+                  session_id: 'docs-session-1',
+                  message_start_ordinal: 12,
+                  message_end_ordinal: 18,
+                },
+              ],
+            },
+            {
+              id: 'recall-docs-2',
+              type: 'warning',
+              scope: 'global',
+              status: 'accepted',
+              review_state: 'unreviewed_auto',
+              title: 'Keep artifact transport limits visible',
+              body: 'Describe folder transport as an early workflow.',
+              source_session_id: 'docs-session-2',
+              transferable: false,
+              provenance_ok: true,
+              created_at: '2026-08-01T15:00:00Z',
+              updated_at: '2026-08-01T15:00:00Z',
+            },
+          ],
+          trusted_only: false,
+          next_cursor: '',
+        }),
+      });
+    });
+    await page.route(
+      '**/api/v1/recall/extraction/status',
+      async (route) => {
+        await route.fulfill({
+          status: 200,
+          contentType: 'application/json',
+          body: JSON.stringify({
+            configured: true,
+            fingerprint: 'release-docs-2026-08',
+            generations: [
+              {
+                fingerprint: 'release-docs-2026-08',
+                state: 'active',
+                model: 'local-review-model',
+                segmenter: 'conversation-v1',
+                created_at: '2026-08-01T14:00:00Z',
+                updated_at: '2026-08-01T16:00:00Z',
+              },
+            ],
+            source_runs: ['release-docs-2026-08'],
+            stats: {
+              pending: 3,
+              partial: 1,
+              done: 42,
+              failed: 0,
+              units_done: 128,
+              units_total: 132,
+              entries: 57,
+            },
+            eligible_backlog: 4,
+          }),
+        });
+      }
+    );
+
+    await page.goto('/recall');
+    const pageRoot = page.locator('.recall-page');
+    await expect(pageRoot).toBeVisible({ timeout: 10_000 });
+    await expect(pageRoot).toContainText(
+      'Verify docs against source behavior'
+    );
+    await expect(pageRoot).toContainText('42 done');
+
+    await page.getByRole('button', {
+      name: 'Expand Verify docs against source behavior',
+    }).click();
+    await expect(pageRoot).toContainText(
+      'Trace user-facing claims to implementation and tests'
+    );
+    await snap(page, 'recall-corpus');
+  });
+});
+
+// ── Session browser ─────────────────────────────────────────
 
 test.describe('Session browser', () => {
   test.beforeEach(async ({ page }) => {
@@ -540,6 +781,34 @@ test.describe('Message viewer', () => {
     throw new Error('no visible .tool-block found in selected session');
   }
 
+  async function findVisibleToolBlockWithOutput(
+    scope: Page | Locator
+  ): Promise<Locator> {
+    const tools = scope.locator('.tool-block');
+    const toolCount = await tools.count();
+    for (let i = 0; i < toolCount; i++) {
+      const tool = tools.nth(i);
+      if (!(await tool.isVisible())) continue;
+
+      const header = tool.locator('.tool-header');
+      const isExpanded =
+        (await tool.locator('.tool-chevron.open').count()) > 0;
+      if (!isExpanded && (await header.count()) > 0) {
+        await header.click();
+        await tool.page().waitForTimeout(100);
+      }
+      if (
+        await tool.locator('.output-header').isVisible().catch(() => false)
+      ) {
+        return tool;
+      }
+    }
+
+    throw new Error(
+      'no visible .tool-block with output found in selected session'
+    );
+  }
+
   test('full message view', async ({ page }) => {
     await selectRichSession(page);
     await snap(page, 'message-viewer');
@@ -639,6 +908,59 @@ test.describe('Message viewer', () => {
         }
       }
     }
+  });
+
+  test('formatted tool output', async ({ page }) => {
+    const toolOutputId = process.env.SCREENSHOT_TOOL_OUTPUT_SESSION_ID;
+    const toolOutputOrdinal =
+      process.env.SCREENSHOT_TOOL_OUTPUT_MESSAGE_ORDINAL;
+    let toolScope: Page | Locator = page;
+    if (toolOutputId || toolOutputOrdinal) {
+      if (!toolOutputId || toolOutputOrdinal === undefined) {
+        throw new Error(
+          'tool-output screenshot requires both session id and message ordinal'
+        );
+      }
+      const ordinal = Number(toolOutputOrdinal);
+      if (!Number.isSafeInteger(ordinal) || ordinal < 0) {
+        throw new Error('tool-output screenshot ordinal must be non-negative');
+      }
+      await page.goto(
+        '/sessions/' + encodeURIComponent(toolOutputId) +
+          '?msg=' + encodeURIComponent(String(ordinal))
+      );
+      const selectedRow = page.locator('.virtual-row.selected');
+      await expect(selectedRow).toBeVisible({ timeout: 15_000 });
+      toolScope = selectedRow;
+    } else {
+      await selectRichSession(page);
+    }
+
+    const tool = await findVisibleToolBlockWithOutput(toolScope);
+
+    const outputHeader = tool.locator('.output-header');
+    await expect(outputHeader).toBeVisible({ timeout: 5_000 });
+    if (!(await tool.locator('.output-mode').isVisible().catch(() => false))) {
+      await outputHeader.click();
+      await page.waitForTimeout(300);
+    }
+
+    const formatted = tool.getByRole('radio', {
+      name: 'Formatted',
+      exact: true,
+    });
+    await expect(formatted).toBeVisible({ timeout: 5_000 });
+    await formatted.click();
+    await expect(tool.locator('.formatted-output')).toBeVisible({
+      timeout: 5_000,
+    });
+    await page.waitForTimeout(500);
+    await snapRange(
+      page,
+      tool.locator('.output-header-row'),
+      tool.locator('.formatted-output'),
+      'tool-output-formatted'
+    );
   });
 
   test('copy buttons on tool block', async ({ page }) => {
@@ -752,27 +1074,36 @@ test.describe('Message viewer', () => {
   });
 
   test('copy button on code block', async ({ page }) => {
+    const codeBlockId = process.env.SCREENSHOT_CODE_BLOCK_SESSION_ID;
+    if (codeBlockId) {
+      await page.goto('/sessions/' + encodeURIComponent(codeBlockId));
+      await page.waitForSelector('.code-block', { timeout: 15_000 });
+      await page.waitForTimeout(500);
+    }
+
     // Walk sessions until we find one with at least one fenced
     // code block. We scan more aggressively than selectRichSession
     // because most sessions have only inline code or no code at
     // all, and we need a `.code-block` (CodeBlock.svelte:34) for
     // this test to be meaningful.
-    const items = page.locator('.session-item');
-    const total = await items.count();
-    const max = Math.min(40, total);
-    let found = false;
-    for (let i = 0; i < max; i++) {
-      await items.nth(i).click();
-      await page.waitForSelector('.message', { timeout: 10_000 });
-      await page.waitForTimeout(400);
-      if (await page.locator('.code-block').first().count() > 0) {
-        found = true;
-        break;
+    if (!codeBlockId) {
+      const items = page.locator('.session-item');
+      const total = await items.count();
+      const max = Math.min(40, total);
+      let found = false;
+      for (let i = 0; i < max; i++) {
+        await items.nth(i).click();
+        await page.waitForSelector('.message', { timeout: 10_000 });
+        await page.waitForTimeout(400);
+        if (await page.locator('.code-block').first().count() > 0) {
+          found = true;
+          break;
+        }
       }
-    }
-    if (!found) {
-      test.skip(true,
-        `No .code-block found in the first ${max} sessions`);
+      if (!found) {
+        test.skip(true,
+          `No .code-block found in the first ${max} sessions`);
+      }
     }
 
     // Capture just the top of a code block where the copy
@@ -881,8 +1212,10 @@ test.describe('Modals', () => {
     // Resync now lives in Settings: open it, then trigger the modal.
     await page.goto('/settings');
     await page.waitForSelector('.settings-page', { timeout: 5_000 });
-    await page.waitForSelector('.resync-btn', { timeout: 5_000 });
-    await page.locator('.resync-btn').click();
+    await page.getByRole('button', {
+      name: 'Full Resync',
+      exact: true,
+    }).click();
     const dialog = page.getByRole('dialog', { name: 'Full Resync' });
     await expect(dialog).toBeVisible({ timeout: 5_000 });
     await page.waitForTimeout(300);
@@ -913,39 +1246,32 @@ test.describe('Modals', () => {
   });
 });
 
-// ── Insights ────────────────────────────────────────────
+// ── Recall and Quality ──────────────────────────────────
 
-test.describe('Insights', () => {
+test.describe('Recall and Quality', () => {
   test.beforeEach(async ({ page }) => {
     await page.setViewportSize(FULL);
     await waitForApp(page);
   });
 
-  async function navigateToInsights(page: Page) {
-    await page.goto('/insights');
-    await page.waitForSelector('.insights-page', {
+  async function navigateToGeneratedInsights(page: Page) {
+    await page.goto('/recall?tab=generated');
+    await page.waitForSelector('.generated-insights-panel', {
       timeout: 10_000,
     });
     await page.waitForTimeout(1000);
   }
 
-  test('full insights page', async ({ page }) => {
-    await navigateToInsights(page);
-
-    // Select the first completed insight (weekly analysis)
-    const rows = page.locator('.insight-row');
-    if (await rows.count() > 0) {
-      await rows.first().click();
-      await page.waitForTimeout(500);
-    }
-    await snap(page, 'insights');
+  test('quality page', async ({ page }) => {
+    await page.goto('/quality');
+    await page.waitForSelector('.quality-page', { timeout: 10_000 });
+    await page.waitForTimeout(1000);
+    await snap(page, 'quality');
   });
 
-  test('insight content', async ({ page }) => {
-    await navigateToInsights(page);
+  test('generated insights', async ({ page }) => {
+    await navigateToGeneratedInsights(page);
 
-    // Select the first generated insight and snap its rendered detail.
-    // extract-db.sh seeds the archive with safe, synthetic reports.
     const items = page.locator('.generated-list button');
     await items.first().waitFor({ state: 'visible', timeout: 10_000 });
     await items.first().click();
@@ -953,7 +1279,10 @@ test.describe('Insights', () => {
       timeout: 10_000,
     });
     await page.waitForTimeout(400);
-    await snapEl(page.locator('.generated-detail'), 'insight-content');
+    await snapEl(
+      page.locator('.recall-page'),
+      'recall-generated-insights'
+    );
   });
 
   test('session insight action in header', async ({ page }) => {
@@ -1093,6 +1422,24 @@ test.describe('Settings', () => {
     await snapEl(remoteSection, 'settings-remote');
   });
 
+  test('settings chart color palette', async ({ page }) => {
+    await openSettings(page);
+    const appearanceSection = await openSettingsPanel(
+      page,
+      'Appearance'
+    );
+    await appearanceSection.scrollIntoViewIfNeeded();
+    await expect(
+      appearanceSection.getByText('Chart colors', { exact: true })
+    ).toBeVisible();
+    await expect(
+      appearanceSection.getByRole('radio', {
+        name: 'Matplotlib',
+      })
+    ).toBeVisible();
+    await snapEl(appearanceSection, 'settings-chart-colors');
+  });
+
   test('settings embedding build progress', async ({ page }) => {
     let statusPolls = 0;
     const startedAt = new Date(Date.now() - 65_000).toISOString();
@@ -1160,18 +1507,20 @@ test.describe('Settings', () => {
   });
 
   test('worktree project mappings section', async ({ page }) => {
-    await openSettings(page);
-    const worktreeSection = await openSettingsPanel(
-      page,
-      'Worktree mappings'
-    );
-    await worktreeSection.scrollIntoViewIfNeeded();
-    const mappingPath = worktreeSection.getByRole('textbox').first();
+    // Mapping rules moved from Settings to the Data page's Rules view.
+    await page.goto('/data?view=rules');
+
+    const rulesView = page.locator('section.rules-view');
+    await expect(rulesView).toBeVisible({ timeout: 5_000 });
+    await rulesView.scrollIntoViewIfNeeded();
+    const mappingPath = rulesView.getByRole('textbox', {
+      name: 'Path prefix',
+    });
     await mappingPath.fill('~/code/project.worktrees');
     await expect(mappingPath).toHaveValue('~/code/project.worktrees');
     await page.waitForTimeout(500);
 
-    await snapEl(worktreeSection, 'worktree-mappings');
+    await snapEl(rulesView, 'worktree-mappings');
   });
 });
 

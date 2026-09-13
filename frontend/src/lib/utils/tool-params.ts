@@ -3,6 +3,33 @@
 export interface MetaTag {
   label: string;
   value: string;
+  /** Short visual text for paths; value remains the canonical copy value. */
+  displayValue?: string;
+}
+
+export function isAbsolutePath(value: string): boolean {
+  return value.startsWith("/") || /^[A-Za-z]:[\\/]/.test(value) || /^\\\\/.test(value);
+}
+
+export function pathDisplayValue(value: string): string {
+  if (!isAbsolutePath(value)) return truncate(value, 100);
+  if (value.length <= 80) return value;
+  const parts = value.split(/[\\/]+/).filter(Boolean);
+  const rootParts = value.startsWith("/")
+    ? 0
+    : /^[A-Za-z]:[\\/]/.test(value)
+      ? 1
+      : /^\\\\/.test(value)
+        ? 2
+        : 0;
+  if (parts.length <= rootParts + 2) return value;
+  return parts.slice(-2).join("/");
+}
+
+function pathMetaValue(value: unknown): Pick<MetaTag, "value" | "displayValue"> {
+  const canonical = String(value);
+  const displayValue = pathDisplayValue(canonical);
+  return displayValue === canonical ? { value: canonical } : { value: canonical, displayValue };
 }
 
 export function truncate(s: string, max: number): string {
@@ -32,7 +59,7 @@ export function extractToolParamMeta(
     if (filePath)
       meta.push({
         label: "file",
-        value: truncate(String(filePath), 80),
+        ...pathMetaValue(filePath),
       });
     if (params.offset != null)
       meta.push({
@@ -54,16 +81,15 @@ export function extractToolParamMeta(
     if (filePath)
       meta.push({
         label: "file",
-        value: truncate(String(filePath), 80),
+        ...pathMetaValue(filePath),
       });
-    if (params.replace_all)
-      meta.push({ label: "mode", value: "replace_all" });
+    if (params.replace_all) meta.push({ label: "mode", value: "replace_all" });
   } else if (cat === "Write") {
     const filePath = params.file_path ?? params.path ?? params.file;
     if (filePath)
       meta.push({
         label: "file",
-        value: truncate(String(filePath), 80),
+        ...pathMetaValue(filePath),
       });
   } else if (cat === "Grep") {
     const pattern = params.pattern ?? params.query;
@@ -75,10 +101,9 @@ export function extractToolParamMeta(
     if (params.path)
       meta.push({
         label: "path",
-        value: truncate(String(params.path), 80),
+        ...pathMetaValue(params.path),
       });
-    if (params.glob)
-      meta.push({ label: "glob", value: String(params.glob) });
+    if (params.glob) meta.push({ label: "glob", value: String(params.glob) });
     if (params.output_mode)
       meta.push({
         label: "mode",
@@ -93,7 +118,7 @@ export function extractToolParamMeta(
     if (params.path)
       meta.push({
         label: "path",
-        value: truncate(String(params.path), 80),
+        ...pathMetaValue(params.path),
       });
   } else if (cat === "Bash") {
     if (params.description)
@@ -124,18 +149,12 @@ export function extractToolParamMeta(
  *  These should not appear in the expanded content display. */
 const INTERNAL_PARAMS = new Set(["agent__intent", "_i"]);
 
-function visibleParamLines(
-  params: Params,
-  excluded = new Set<string>(),
-): string[] {
+function visibleParamLines(params: Params, excluded = new Set<string>()): string[] {
   const lines: string[] = [];
   for (const [key, value] of Object.entries(params)) {
     if (INTERNAL_PARAMS.has(key) || excluded.has(key)) continue;
     if (value == null || value === "") continue;
-    const strVal =
-      typeof value === "string"
-        ? value
-        : JSON.stringify(value);
+    const strVal = typeof value === "string" ? value : JSON.stringify(value);
     lines.push(`${key}: ${strVal}`);
   }
   return lines;
@@ -143,50 +162,39 @@ function visibleParamLines(
 
 /** Generate displayable content from input params when
  *  the regex-captured content is empty. */
-export function generateFallbackContent(
-  toolName: string,
-  params: Params,
-): string | null {
+export function generateFallbackContent(toolName: string, params: Params): string | null {
   if (toolName === "Task" || toolName === "Agent") return null;
   if (toolName === "Bash" || toolName === "run_command") {
     const cmd = params.command ?? params.cmd;
     if (cmd != null) {
       const text = String(cmd);
       const lines: string[] = [];
-      if (params.description)
-        lines.push(`description: ${String(params.description)}`);
+      if (params.description) lines.push(`description: ${String(params.description)}`);
       lines.push(`command: ${text}`);
-      lines.push(
-        ...visibleParamLines(
-          params,
-          new Set(["description", "command", "cmd"]),
-        ),
-      );
+      lines.push(...visibleParamLines(params, new Set(["description", "command", "cmd"])));
       const allLines = lines.join("\n").split("\n");
       if (allLines.length > MAX_DIFF_LINES) {
-        return allLines.slice(0, MAX_DIFF_LINES).join("\n")
-          + `\n... (${allLines.length} lines total)`;
+        return (
+          allLines.slice(0, MAX_DIFF_LINES).join("\n") + `\n... (${allLines.length} lines total)`
+        );
       }
       return lines.join("\n");
     }
   }
-  const isEdit =
-    toolName === "Edit" ||
-    params.command === "strReplace";
+  const isEdit = toolName === "Edit" || params.command === "strReplace";
   if (isEdit) {
     const lines: string[] = [];
     // Claude Code: old_string/new_string; OpenCode: oldString/newString (camelCase)
-    const oldStr =
-      params.old_string ?? params.old_str ?? params.oldString ?? params.oldStr;
-    const newStr =
-      params.new_string ?? params.new_str ?? params.newString ?? params.newStr;
+    const oldStr = params.old_string ?? params.old_str ?? params.oldString ?? params.oldStr;
+    const newStr = params.new_string ?? params.new_str ?? params.newString ?? params.newStr;
     // Kiro IDE: pre-computed unified diff from Go parser
     const diffText = params.diff;
     if (!lines.length && typeof diffText === "string" && diffText) {
       const diffLines = diffText.split("\n");
       if (diffLines.length > MAX_DIFF_LINES) {
-        return diffLines.slice(0, MAX_DIFF_LINES).join("\n")
-          + `\n... (${diffLines.length} lines total)`;
+        return (
+          diffLines.slice(0, MAX_DIFF_LINES).join("\n") + `\n... (${diffLines.length} lines total)`
+        );
       }
       return diffText;
     }
@@ -194,8 +202,10 @@ export function generateFallbackContent(
     if (!lines.length && typeof patchText === "string" && patchText) {
       const patchLines = patchText.split("\n");
       if (patchLines.length > MAX_DIFF_LINES) {
-        return patchLines.slice(0, MAX_DIFF_LINES).join("\n")
-          + `\n... (${patchLines.length} lines total)`;
+        return (
+          patchLines.slice(0, MAX_DIFF_LINES).join("\n") +
+          `\n... (${patchLines.length} lines total)`
+        );
       }
       return patchText;
     }
@@ -215,15 +225,9 @@ export function generateFallbackContent(
     // Pi: edits[] array with set_line, replace_lines, insert_after, or op-based operations
     if (!lines.length && Array.isArray(params.edits)) {
       for (const edit of params.edits as Record<string, unknown>[]) {
-        const setLine = edit.set_line as
-          | Record<string, unknown>
-          | undefined;
-        const replaceLines = edit.replace_lines as
-          | Record<string, unknown>
-          | undefined;
-        const insertAfter = edit.insert_after as
-          | Record<string, unknown>
-          | undefined;
+        const setLine = edit.set_line as Record<string, unknown> | undefined;
+        const replaceLines = edit.replace_lines as Record<string, unknown> | undefined;
+        const insertAfter = edit.insert_after as Record<string, unknown> | undefined;
         if (setLine) {
           // {set_line: {anchor, new_text}} format
           if (setLine.anchor) lines.push(`@ ${setLine.anchor}`);
@@ -252,17 +256,13 @@ export function generateFallbackContent(
           // {op, tag, content} format — legacy/alternative Pi format
           if (edit.tag) lines.push(`tag: ${edit.tag}`);
           const content = edit.content;
-          if (Array.isArray(content))
-            lines.push(truncate(content.join("\n"), 400));
+          if (Array.isArray(content)) lines.push(truncate(content.join("\n"), 400));
         }
       }
     }
     return lines.length ? lines.join("\n") : null;
   }
-  if (
-    toolName === "Write" ||
-    (toolName === "write" && params.command === "create")
-  ) {
+  if (toolName === "Write" || (toolName === "write" && params.command === "create")) {
     if (params.content != null) {
       const text = String(params.content);
       if (!text) return "(empty file)";
@@ -270,7 +270,7 @@ export function generateFallbackContent(
       const capped = allLines.length > MAX_DIFF_LINES;
       const show = capped ? allLines.slice(0, MAX_DIFF_LINES) : allLines;
       const header = `@@ -0,0 +1,${allLines.length} @@\n`;
-      const body = show.map(l => `+${l}`).join("\n");
+      const body = show.map((l) => `+${l}`).join("\n");
       const suffix = capped ? `\n... (${allLines.length} lines total)` : "";
       return header + body + suffix;
     }
@@ -279,8 +279,7 @@ export function generateFallbackContent(
   if (!lines.length) return null;
   const allLines = lines.join("\n").split("\n");
   if (allLines.length > MAX_DIFF_LINES) {
-    return allLines.slice(0, MAX_DIFF_LINES).join("\n")
-      + `\n... (${allLines.length} lines total)`;
+    return allLines.slice(0, MAX_DIFF_LINES).join("\n") + `\n... (${allLines.length} lines total)`;
   }
   return lines.join("\n");
 }

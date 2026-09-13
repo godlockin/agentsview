@@ -4,11 +4,13 @@ import (
 	"bytes"
 	"context"
 	"database/sql"
-	"encoding/json"
+	"encoding/json/jsontext"
+	"encoding/json/v2"
 	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -26,6 +28,7 @@ import (
 type exportSessionsDocument struct {
 	Type          string                 `json:"type"`
 	SchemaVersion int                    `json:"schema_version"`
+	ArchiveID     string                 `json:"archive_id"`
 	DatabaseID    string                 `json:"database_id"`
 	Cursor        exportSessionsCursor   `json:"cursor"`
 	Pricing       map[string]any         `json:"pricing"`
@@ -38,6 +41,42 @@ type exportSessionsDocument struct {
 
 type exportSessionsCursor struct {
 	Next string `json:"next"`
+}
+
+func TestExportSessionsPublishesArchiveIdentity(t *testing.T) {
+	for _, format := range []string{"json", "ndjson"} {
+		for _, empty := range []bool{false, true} {
+			t.Run(format+"/empty="+strconv.FormatBool(empty), func(t *testing.T) {
+				database := seedExportSessionsArchive(t)
+				require.NoError(t, database.SetArchiveIdentityForTest(
+					t.Context(), "stable-archive", strings.Repeat("a", 64),
+				))
+				args := []string{"export", "sessions", "--format", format, "--limit", "1"}
+				if empty {
+					args = append(args, "--project", "absent")
+				}
+				stdout, stderr, err := executeExportSessionsCommand(newRootCommand(), args...)
+				require.NoError(t, err)
+				require.Empty(t, stderr)
+				if format == "ndjson" {
+					stdout, _, _ = strings.Cut(stdout, "\n")
+				}
+				doc := decodeExportSessionsDocument(t, stdout)
+				assert.Equal(t, "stable-archive", doc.ArchiveID)
+				assert.Equal(t, "export-sessions-test-db", doc.DatabaseID)
+				if !empty {
+					require.NotEmpty(t, doc.Cursor.Next)
+					stdout, stderr, err = executeExportSessionsCommand(newRootCommand(),
+						"export", "sessions", "--cursor", doc.Cursor.Next)
+					require.NoError(t, err)
+					require.Empty(t, stderr)
+					resumed := decodeExportSessionsDocument(t, stdout)
+					assert.Equal(t, "stable-archive", resumed.ArchiveID)
+					assert.Equal(t, doc.DatabaseID, resumed.DatabaseID)
+				}
+			})
+		}
+	}
 }
 
 func TestExportSessionsJSONEmitsOneDocument(t *testing.T) {
@@ -186,7 +225,7 @@ func TestExportSessionsAllJSONPreservesCostOnlyReportedPricingAcrossPages(
 	require.NoError(t, database.InsertMessages([]db.Message{{
 		SessionID: "computed", Ordinal: 0, Role: "assistant",
 		Timestamp: "2026-06-16T11:05:00Z", Model: "computed-model",
-		TokenUsage: json.RawMessage(`{"input_tokens":1000000}`),
+		TokenUsage: jsontext.Value(`{"input_tokens":1000000}`),
 	}}))
 	insertExportSessionsTestSession(t, database, db.Session{
 		ID: "cost-only-reported", Project: "alpha", Machine: "local",
@@ -234,7 +273,7 @@ func TestBuildExportSessionsOutputMarksCrossPageProjectConflictAmbiguous(t *test
 		}}
 	}
 
-	got := buildExportSessionsOutput("database", []db.SessionExportResult{
+	got := buildExportSessionsOutput([]db.SessionExportResult{
 		page("p1:sha256:first"), page("p1:sha256:second"),
 	})
 
@@ -325,6 +364,45 @@ func TestMergeExportSessionsPricingCombinesReportedModelResolutions(t *testing.T
 		provenance.Resolutions[1].PricedModel)
 	assert.Equal(t, export.CostSourceComputed,
 		provenance.Resolutions[1].CostSource)
+}
+
+func TestMergeExportSessionsModelRateSumsPricingApplications(t *testing.T) {
+	base := export.EffectiveModelRate{
+		Bands: []export.PricingBand{{AboveInputTokens: 200_000}},
+		Application: export.PricingApplication{
+			BaseRequestCount:  1,
+			AggregateRowCount: 2,
+			Bands: []export.AppliedPricingBand{{
+				AboveInputTokens: 200_000,
+				RequestCount:     3,
+			}},
+		},
+	}
+	next := export.EffectiveModelRate{
+		Bands: []export.PricingBand{{AboveInputTokens: 200_000}},
+		Application: export.PricingApplication{
+			BaseRequestCount:  4,
+			AggregateRowCount: 5,
+			Bands: []export.AppliedPricingBand{
+				{AboveInputTokens: 200_000, RequestCount: 6},
+				{AboveInputTokens: 272_000, RequestCount: 7},
+			},
+		},
+	}
+
+	got := mergeExportSessionsModelRate(base, next)
+	next.Bands[0].AboveInputTokens = 1
+	next.Application.Bands[0].RequestCount = 99
+
+	assert.Equal(t, []export.PricingBand{{AboveInputTokens: 200_000}}, got.Bands)
+	assert.Equal(t, export.PricingApplication{
+		BaseRequestCount:  5,
+		AggregateRowCount: 7,
+		Bands: []export.AppliedPricingBand{
+			{AboveInputTokens: 200_000, RequestCount: 9},
+			{AboveInputTokens: 272_000, RequestCount: 7},
+		},
+	}, got.Application)
 }
 
 func TestExportSessionsAllNDJSONCursorNextEmpty(t *testing.T) {
@@ -714,7 +792,7 @@ func TestExportSessionsJSONGolden(t *testing.T) {
 	assert.NotContains(t, stdout, `"machine":"golden-host"`)
 	assert.NotContains(t, stdout, `"root_path":"/`)
 
-	assertGoldenBytes(t, "session_export_v4.json", []byte(stdout))
+	assertGoldenBytes(t, "session_export_v6.json", []byte(stdout))
 }
 
 func TestExportSessionsNDJSONGolden(t *testing.T) {
@@ -729,7 +807,7 @@ func TestExportSessionsNDJSONGolden(t *testing.T) {
 	require.NoError(t, err, "export sessions ndjson golden")
 	require.Empty(t, stderr)
 
-	assertGoldenBytes(t, "session_export_v4.ndjson", []byte(stdout))
+	assertGoldenBytes(t, "session_export_v6.ndjson", []byte(stdout))
 }
 
 func firstExportSessionsCursor(t *testing.T) string {
@@ -771,7 +849,7 @@ func TestExportSessionsFallbackPricingOnUnseededArchive(t *testing.T) {
 			SessionID: "fallback-priced", Ordinal: 1, Role: "assistant",
 			Content: "answer", ContentLength: len("answer"),
 			Timestamp: "2026-06-01T10:05:00Z", Model: model,
-			TokenUsage: json.RawMessage(
+			TokenUsage: jsontext.Value(
 				`{"input_tokens":1000,"output_tokens":500}`),
 		},
 		{
@@ -890,10 +968,13 @@ func decodeExportSessionsDocument(
 
 func decoderRemainder(t *testing.T, input string) string {
 	t.Helper()
-	dec := json.NewDecoder(strings.NewReader(input))
+	reader := strings.NewReader(input)
+	dec := jsontext.NewDecoder(reader)
 	var doc any
-	require.NoError(t, dec.Decode(&doc))
-	rest, err := io.ReadAll(dec.Buffered())
+	require.NoError(t, json.UnmarshalDecode(dec, &doc))
+	rest, err := io.ReadAll(io.MultiReader(
+		bytes.NewReader(dec.UnreadBuffer()), reader,
+	))
 	require.NoError(t, err)
 	return string(rest)
 }

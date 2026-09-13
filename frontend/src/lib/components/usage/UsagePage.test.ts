@@ -1,10 +1,4 @@
-import {
-  afterEach,
-  describe,
-  expect,
-  it,
-  vi,
-} from "vite-plus/test";
+import { afterEach, describe, expect, it, vi } from "vite-plus/test";
 import { mount, tick, unmount } from "svelte";
 import { router } from "../../stores/router.svelte.js";
 import { sessions } from "../../stores/sessions.svelte.js";
@@ -12,7 +6,7 @@ import { usage } from "../../stores/usage.svelte.js";
 import { settings } from "../../stores/settings.svelte.js";
 import { yokedDates } from "../../stores/yokedDates.svelte.js";
 import { testMoney } from "../../test/money.js";
-import type { UsageSummaryResponse } from "../../api/types/usage.js";
+import type { UsageSummaryResponse } from "../../api/generated/index";
 import source from "./UsagePage.svelte?raw";
 import UsagePage from "./UsagePage.svelte";
 
@@ -24,16 +18,18 @@ async function flushEffects() {
 
 let component: ReturnType<typeof mount> | undefined;
 
-function usageSummaryWithUnsupported(kind?: string) {
+function usageSummaryWithUnsupported(kind?: string): UsageSummaryResponse {
   return {
     from: "2024-06-01",
     to: "2024-06-01",
+    projects: {},
     totals: {
       inputTokens: 0,
       outputTokens: 0,
       cacheCreationTokens: 0,
       cacheReadTokens: 0,
       totalCost: testMoney(0),
+      cacheSavings: testMoney(0),
     },
     daily: [],
     projectTotals: [],
@@ -77,24 +73,30 @@ function tenModelUsageSummary(): UsageSummaryResponse {
       cacheCreationTokens: 0,
       cacheReadTokens: 0,
       totalCost: testMoney(55),
+      cacheSavings: testMoney(0),
     },
-    daily: [{
-      date: "2026-07-01",
-      inputTokens: 100,
-      outputTokens: 50,
-      cacheCreationTokens: 0,
-      cacheReadTokens: 0,
-      totalCost: testMoney(55),
-      modelsUsed: models,
-      modelBreakdowns: models.map((modelName, index) => ({
-        modelName,
-        inputTokens: 10,
-        outputTokens: 5,
+    daily: [
+      {
+        date: "2026-07-01",
+        inputTokens: 100,
+        outputTokens: 50,
         cacheCreationTokens: 0,
         cacheReadTokens: 0,
-        cost: testMoney(index + 1),
-      })),
-    }],
+        totalCost: testMoney(55),
+        modelsUsed: models,
+        modelBreakdowns: models.map((modelName, index) => ({
+          modelName,
+          inputTokens: 10,
+          outputTokens: 5,
+          cacheCreationTokens: 0,
+          cacheReadTokens: 0,
+          cost: testMoney(index + 1),
+        })),
+        projectBreakdowns: [],
+        agentBreakdowns: [],
+        machineBreakdowns: [],
+      },
+    ],
     modelTotals: models.map((model, index) => ({
       model,
       inputTokens: 10,
@@ -125,12 +127,7 @@ afterEach(() => {
   usage.errors.summary = null;
   usage.errors.topSessions = null;
   usage.mode = "cost";
-  usage.setSelectedTokenTypes([
-    "input",
-    "cache_write",
-    "cache_read",
-    "output",
-  ]);
+  usage.setSelectedTokenTypes(["input", "cache_write", "cache_read", "output"]);
   usage.isPinned = false;
   usage.windowDays = 30;
   usage.from = "";
@@ -138,6 +135,10 @@ afterEach(() => {
   usage.toggles.timeSeries.groupBy = "project";
   usage.toggles.attribution.groupBy = "project";
   usage.toggles.attribution.view = "treemap";
+  usage.excludedProjects = "";
+  usage.excludedProjectKeys = "";
+  usage.excludedModels = "";
+  usage.knownProjects = [];
   settings.chartPalette = "agentsview";
   sessions.projects = [];
   yokedDates.setEnabled(false);
@@ -145,11 +146,159 @@ afterEach(() => {
 });
 
 describe("UsagePage refresh behavior", () => {
+  it("restores hidden models from a shared URL", async () => {
+    vi.spyOn(usage, "fetchAll").mockResolvedValue();
+    vi.spyOn(sessions, "loadAgents").mockResolvedValue();
+    router.route = "usage";
+    router.params = { exclude_model: "model-alpha" };
+    usage.summary = usageSummaryWithUnsupported();
+
+    component = mount(UsagePage, { target: document.body });
+    await flushEffects();
+
+    expect(usage.excludedModels).toBe("model-alpha");
+    expect(router.params.exclude_model).toBe("model-alpha");
+    expect(usage.hasActiveFilters).toBe(true);
+  });
+
+  it("uses stable project keys in the Project filter", async () => {
+    vi.stubGlobal(
+      "ResizeObserver",
+      class {
+        observe() {}
+        unobserve() {}
+        disconnect() {}
+      },
+    );
+    vi.spyOn(usage, "fetchAll").mockResolvedValue();
+    vi.spyOn(sessions, "loadAgents").mockResolvedValue();
+    router.route = "usage";
+    router.params = {};
+    const summary = usageSummaryWithUnsupported();
+    summary.projectTotals = [
+      {
+        project_key: "project-key-1",
+        project: "shared-label",
+        inputTokens: 80,
+        outputTokens: 40,
+        cacheCreationTokens: 0,
+        cacheReadTokens: 0,
+        cost: testMoney(8),
+      },
+      {
+        project_key: "project-key-2",
+        project: "shared-label",
+        inputTokens: 20,
+        outputTokens: 10,
+        cacheCreationTokens: 0,
+        cacheReadTokens: 0,
+        cost: testMoney(2),
+      },
+    ];
+    usage.summary = summary;
+
+    component = mount(UsagePage, { target: document.body });
+    await flushEffects();
+
+    const projectFilter = document.querySelector<HTMLButtonElement>(
+      '.kit-filter-dropdown__btn[aria-label="Project: All"]',
+    );
+    expect(projectFilter).not.toBeNull();
+
+    projectFilter!.click();
+    await tick();
+    const projectOptions = document.querySelectorAll<HTMLButtonElement>(
+      ".kit-filter-dropdown__item",
+    );
+    expect(projectOptions).toHaveLength(2);
+    expect(projectOptions[0]?.textContent).toContain("shared-label");
+    expect(projectOptions[1]?.textContent).toContain("shared-label");
+
+    projectOptions[1]!.click();
+    expect(usage.excludedProjectKeys).toBe("project-key-2");
+    expect(usage.excludedProjects).toBe("");
+
+    usage.summary = {
+      ...summary,
+      projectTotals: [summary.projectTotals[0]!],
+    };
+    await unmount(component);
+    component = mount(UsagePage, { target: document.body });
+    await flushEffects();
+
+    const remountedProjectFilter = document.querySelector<HTMLButtonElement>(
+      ".usage-toolbar .kit-filter-dropdown__btn",
+    );
+    expect(remountedProjectFilter).not.toBeNull();
+    remountedProjectFilter!.click();
+    await tick();
+    expect(document.querySelectorAll(".kit-filter-dropdown__item")).toHaveLength(2);
+    const remountedOptions = document.querySelectorAll<HTMLButtonElement>(
+      ".kit-filter-dropdown__item",
+    );
+    remountedOptions[1]!.click();
+    expect(usage.excludedProjectKeys).toBe("");
+
+    usage.excludedProjectKeys = "unlisted-project-key";
+
+    const deselectAll = Array.from(
+      document.querySelectorAll<HTMLButtonElement>(".kit-filter-dropdown__bulk-btn"),
+    ).find((button) => button.textContent?.trim() === "Deselect all");
+    expect(deselectAll).not.toBeUndefined();
+
+    deselectAll!.click();
+    expect(usage.excludedProjectKeys).toBe("unlisted-project-key,project-key-1,project-key-2");
+
+    const selectAll = Array.from(
+      document.querySelectorAll<HTMLButtonElement>(".kit-filter-dropdown__bulk-btn"),
+    ).find((button) => button.textContent?.trim() === "Select all");
+    expect(selectAll).not.toBeUndefined();
+
+    selectAll!.click();
+    expect(usage.excludedProjectKeys).toBe("");
+  });
+
+  it("shows legacy project-name exclusions until they are cleared", async () => {
+    vi.stubGlobal(
+      "ResizeObserver",
+      class {
+        observe() {}
+        unobserve() {}
+        disconnect() {}
+      },
+    );
+    vi.spyOn(usage, "fetchAll").mockResolvedValue();
+    vi.spyOn(sessions, "loadAgents").mockResolvedValue();
+    router.route = "usage";
+    router.params = {};
+    usage.excludedProjects = "legacy-project";
+    usage.summary = usageSummaryWithUnsupported();
+
+    component = mount(UsagePage, { target: document.body });
+    await flushEffects();
+
+    const projectFilter = document.querySelector<HTMLButtonElement>(
+      '.kit-filter-dropdown__btn[aria-label="Project: 1 hidden"]',
+    );
+    expect(projectFilter).not.toBeNull();
+
+    projectFilter!.click();
+    await tick();
+    const selectAll = Array.from(
+      document.querySelectorAll<HTMLButtonElement>(".kit-filter-dropdown__bulk-btn"),
+    ).find((button) => button.textContent?.trim() === "Select all");
+    expect(selectAll).not.toBeUndefined();
+
+    selectAll!.click();
+    expect(usage.excludedProjects).toBe("");
+  });
+
   it("hydrates token mode from the canonical URL before fetching", async () => {
     vi.stubGlobal(
       "ResizeObserver",
       class {
         observe() {}
+        unobserve() {}
         disconnect() {}
       },
     );
@@ -162,10 +311,13 @@ describe("UsagePage refresh behavior", () => {
     await flushEffects();
 
     expect(usage.mode).toBe("token");
-    expect(document.querySelector(
-      '[role="radiogroup"][aria-label="Usage metric"] '
-        + '[role="radio"][aria-checked="true"]',
-    )?.textContent?.trim()).toBe("Tokens");
+    expect(
+      document
+        .querySelector(
+          '[role="radiogroup"][aria-label="Usage metric"] ' + '[role="radio"][aria-checked="true"]',
+        )
+        ?.textContent?.trim(),
+    ).toBe("Tokens");
     expect(fetchAll).toHaveBeenCalled();
   });
 
@@ -174,6 +326,7 @@ describe("UsagePage refresh behavior", () => {
       "ResizeObserver",
       class {
         observe() {}
+        unobserve() {}
         disconnect() {}
       },
     );
@@ -190,14 +343,14 @@ describe("UsagePage refresh behavior", () => {
     await flushEffects();
 
     expect(usage.selectedTokenTypes).toEqual(["output"]);
-    expect(document.querySelector(
-      'button[aria-label="Token types: Output"]',
-    )).not.toBeNull();
-    expect(router.params).toEqual(expect.objectContaining({
-      view: "tokens",
-      token_types: "output",
-      project: "demo",
-    }));
+    expect(document.querySelector('button[aria-label="Token types: Output"]')).not.toBeNull();
+    expect(router.params).toEqual(
+      expect.objectContaining({
+        view: "tokens",
+        token_types: "output",
+        project: "demo",
+      }),
+    );
   });
 
   it("switches metrics without dropping filters", async () => {
@@ -205,19 +358,15 @@ describe("UsagePage refresh behavior", () => {
       "ResizeObserver",
       class {
         observe() {}
+        unobserve() {}
         disconnect() {}
       },
     );
     vi.spyOn(usage, "fetchAll").mockResolvedValue();
     vi.spyOn(sessions, "loadAgents").mockResolvedValue();
-    const fetchTopSessions = vi.spyOn(usage, "fetchTopSessions")
-      .mockResolvedValue("ok");
+    const fetchTopSessions = vi.spyOn(usage, "fetchTopSessions").mockResolvedValue("ok");
     const replaceParams = vi.spyOn(router, "replaceParams");
-    window.history.replaceState(
-      null,
-      "",
-      "/usage?view=tokens&project=demo&window_days=90",
-    );
+    window.history.replaceState(null, "", "/usage?view=tokens&project=demo&window_days=90");
     router.route = "usage";
     router.params = {
       view: "tokens",
@@ -229,8 +378,7 @@ describe("UsagePage refresh behavior", () => {
     component = mount(UsagePage, { target: document.body });
     await flushEffects();
     const costOption = document.querySelector<HTMLButtonElement>(
-      '[role="radiogroup"][aria-label="Usage metric"] '
-        + '[role="radio"]:first-child',
+      '[role="radiogroup"][aria-label="Usage metric"] ' + '[role="radio"]:first-child',
     );
     expect(costOption).not.toBeNull();
 
@@ -253,17 +401,14 @@ describe("UsagePage refresh behavior", () => {
       "ResizeObserver",
       class {
         observe() {}
+        unobserve() {}
         disconnect() {}
       },
     );
     vi.spyOn(usage, "fetchAll").mockResolvedValue();
     vi.spyOn(sessions, "loadAgents").mockResolvedValue();
     const replace = vi.spyOn(router, "replace");
-    window.history.replaceState(
-      null,
-      "",
-      "/token-usage?project=demo&window_days=90",
-    );
+    window.history.replaceState(null, "", "/token-usage?project=demo&window_days=90");
     router.route = "token-usage";
     router.params = {
       project: "demo",
@@ -287,6 +432,7 @@ describe("UsagePage refresh behavior", () => {
       "ResizeObserver",
       class {
         observe() {}
+        unobserve() {}
         disconnect() {}
       },
     );
@@ -316,6 +462,7 @@ describe("UsagePage refresh behavior", () => {
       "ResizeObserver",
       class {
         observe() {}
+        unobserve() {}
         disconnect() {}
       },
     );
@@ -357,6 +504,7 @@ describe("UsagePage refresh behavior", () => {
       "ResizeObserver",
       class {
         observe() {}
+        unobserve() {}
         disconnect() {}
       },
     );
@@ -390,6 +538,7 @@ describe("UsagePage refresh behavior", () => {
       "ResizeObserver",
       class {
         observe() {}
+        unobserve() {}
         disconnect() {}
       },
     );
@@ -402,19 +551,10 @@ describe("UsagePage refresh behavior", () => {
     component = mount(UsagePage, { target: document.body });
     await flushEffects();
 
-    expect(document.body.textContent).toContain(
-      "Copilot sessions matched this range",
-    );
+    expect(document.body.textContent).toContain("Copilot sessions matched this range");
   });
 
   it("shares full-universe model colors across Usage panels and palette changes", async () => {
-    vi.stubGlobal(
-      "ResizeObserver",
-      class {
-        observe() {}
-        disconnect() {}
-      },
-    );
     vi.spyOn(usage, "fetchAll").mockResolvedValue();
     vi.spyOn(sessions, "loadAgents").mockResolvedValue();
     router.route = "usage";
@@ -428,18 +568,17 @@ describe("UsagePage refresh behavior", () => {
     component = mount(UsagePage, { target: document.body });
     await flushEffects();
 
-    const firstPath = () => document.querySelector<SVGPathElement>(
-      "path[opacity='0.7']",
-    );
+    const firstMark = () =>
+      document.querySelector<SVGElement>(".chart-svg .lc-bar, .chart-svg .lc-area-path");
     const firstDot = () => document.querySelector<HTMLElement>(".list-dot");
-    expect(firstPath()?.getAttribute("fill")).toBe("var(--accent-sky)");
-    expect(firstDot()?.style.background).toBe("var(--accent-sky)");
+    expect(firstMark()?.getAttribute("fill")).toBe("var(--accent-blue)");
+    expect(firstDot()?.style.background).toBe("var(--accent-blue)");
 
     settings.chartPalette = "matplotlib";
     await tick();
 
-    expect(firstPath()?.getAttribute("fill")).toBe("#c5b0d5");
-    expect(firstDot()?.style.background).toBe("rgb(197, 176, 213)");
+    expect(firstMark()?.getAttribute("fill")).toBe("#1f77b4");
+    expect(firstDot()?.style.background).toBe("rgb(31, 119, 180)");
   });
 
   it("loads agent metadata on mount for the Agent dropdown", async () => {
@@ -447,12 +586,12 @@ describe("UsagePage refresh behavior", () => {
       "ResizeObserver",
       class {
         observe() {}
+        unobserve() {}
         disconnect() {}
       },
     );
     vi.spyOn(usage, "fetchAll").mockResolvedValue();
-    const loadAgents = vi.spyOn(sessions, "loadAgents")
-      .mockResolvedValue();
+    const loadAgents = vi.spyOn(sessions, "loadAgents").mockResolvedValue();
 
     router.route = "usage";
     router.params = {};
@@ -468,6 +607,7 @@ describe("UsagePage refresh behavior", () => {
       "ResizeObserver",
       class {
         observe() {}
+        unobserve() {}
         disconnect() {}
       },
     );
@@ -475,17 +615,17 @@ describe("UsagePage refresh behavior", () => {
 
     router.route = "usage";
     router.params = {
-      model: "fixture-model",
+      exclude_model: "fixture-model",
       exclude_project_key: "pl1:sha256:stale",
     };
     usage.excludedProjectKeys = "";
-    usage.selectedModels = "";
+    usage.excludedModels = "";
 
     component = mount(UsagePage, { target: document.body });
     await flushEffects();
 
     expect(usage.excludedProjectKeys).toBe("");
-    expect(usage.selectedModels).toBe("fixture-model");
+    expect(usage.excludedModels).toBe("fixture-model");
   });
 
   it("seeds bare Usage from an enabled fixed range", async () => {
@@ -498,6 +638,7 @@ describe("UsagePage refresh behavior", () => {
       "ResizeObserver",
       class {
         observe() {}
+        unobserve() {}
         disconnect() {}
       },
     );
@@ -541,6 +682,7 @@ describe("UsagePage refresh behavior", () => {
       "ResizeObserver",
       class {
         observe() {}
+        unobserve() {}
         disconnect() {}
       },
     );
@@ -553,9 +695,7 @@ describe("UsagePage refresh behavior", () => {
     component = mount(UsagePage, { target: document.body });
     await flushEffects();
 
-    expect(document.body.textContent).not.toContain(
-      "Copilot sessions matched this range",
-    );
+    expect(document.body.textContent).not.toContain("Copilot sessions matched this range");
   });
 
   it("renders a generic unsupported usage note for unknown kinds", async () => {
@@ -563,6 +703,7 @@ describe("UsagePage refresh behavior", () => {
       "ResizeObserver",
       class {
         observe() {}
+        unobserve() {}
         disconnect() {}
       },
     );
@@ -575,12 +716,8 @@ describe("UsagePage refresh behavior", () => {
     component = mount(UsagePage, { target: document.body });
     await flushEffects();
 
-    expect(document.body.textContent).toContain(
-      "Matching sessions do not expose token usage data",
-    );
-    expect(document.body.textContent).not.toContain(
-      "Copilot sessions matched this range",
-    );
+    expect(document.body.textContent).toContain("Matching sessions do not expose token usage data");
+    expect(document.body.textContent).not.toContain("Copilot sessions matched this range");
   });
 
   it("does not auto-refresh usage scans from SSE updates", () => {
@@ -616,8 +753,7 @@ describe("UsagePage refresh behavior", () => {
   });
 
   it("keeps refresh progress out of content layout flow", () => {
-    const queryProgress =
-      source.match(/\.query-progress\s*{[^}]+}/)?.[0] ?? "";
+    const queryProgress = source.match(/\.query-progress\s*{[^}]+}/)?.[0] ?? "";
 
     expect(queryProgress).toContain("position: absolute");
     expect(queryProgress).toContain("left: 0;");
@@ -664,12 +800,8 @@ describe("UsagePage refresh behavior", () => {
     const initBlock = source.slice(initStart, initEnd);
 
     expect(source).toContain("function usageSupportedSessionParams");
-    expect(initBlock).toContain(
-      "parseFiltersFromParams(supportedSessionParams)",
-    );
-    expect(initBlock).toContain(
-      "sessions.initFromParams(supportedSessionParams)",
-    );
+    expect(initBlock).toContain("parseFiltersFromParams(supportedSessionParams)");
+    expect(initBlock).toContain("sessions.initFromParams(supportedSessionParams)");
     expect(initBlock).not.toContain("parseFiltersFromParams(params)");
     expect(initBlock).not.toContain("sessions.initFromParams(params)");
   });

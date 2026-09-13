@@ -80,6 +80,8 @@ func (t *toolset) lookupActivity(
 // --- search_sessions ---
 
 type searchSessionsIn struct {
+	DateFrom      string `json:"date_from,omitempty" jsonschema:"Only sessions on or after this date (YYYY-MM-DD)."`
+	DateTo        string `json:"date_to,omitempty" jsonschema:"Only sessions on or before this date (YYYY-MM-DD)."`
 	Query         string `json:"query" jsonschema:"Search terms across all agent sessions. Every term must appear (AND), not an exact phrase; wrap the whole query in double quotes for an exact phrase, e.g. \"build failed\". Punctuation in a term (hyphens, colons) is handled safely."`
 	Project       string `json:"project,omitempty" jsonschema:"Restrict to one project (repo/directory name)."`
 	Sort          string `json:"sort,omitempty" jsonschema:"relevance (default) or recency."`
@@ -108,11 +110,13 @@ func (t *toolset) searchSessions(
 	ctx context.Context, _ *mcp.CallToolRequest, in searchSessionsIn,
 ) (*mcp.CallToolResult, searchSessionsOut, error) {
 	res, err := t.svc.Search(ctx, service.SearchRequest{
-		Query:   buildSearchQuery(in.Query),
-		Project: in.Project,
-		Sort:    in.Sort,
-		Cursor:  in.Cursor,
-		Limit:   clampLimit(in.Limit, defaultSearchLimit, maxSearchLimit),
+		DateFrom: in.DateFrom,
+		DateTo:   in.DateTo,
+		Query:    in.Query,
+		Project:  in.Project,
+		Sort:     in.Sort,
+		Cursor:   in.Cursor,
+		Limit:    clampLimit(in.Limit, defaultSearchLimit, maxSearchLimit),
 	})
 	if err != nil {
 		return nil, searchSessionsOut{}, err
@@ -516,8 +520,8 @@ func (t *toolset) getMessagesAround(
 // --- search_content ---
 
 type searchContentIn struct {
-	Pattern       string `json:"pattern" jsonschema:"Exact substring or regex to find across message text and tool inputs/results."`
-	Mode          string `json:"mode,omitempty" jsonschema:"substring (default), regex, semantic, or hybrid."`
+	Pattern       string `json:"pattern" jsonschema:"Natural-language query for semantic/hybrid, or exact substring/regex for lexical search across message text and tool inputs/results."`
+	Mode          string `json:"mode,omitempty" jsonschema:"substring (default), regex, semantic, or hybrid. Prefer hybrid or semantic for contextual questions when a vector search index is configured."`
 	Scope         string `json:"scope,omitempty" jsonschema:"Semantic/hybrid result scope: top, all, or subordinate (default all). Only valid with mode semantic or hybrid."`
 	Project       string `json:"project,omitempty" jsonschema:"Restrict to one project."`
 	Agent         string `json:"agent,omitempty" jsonschema:"Restrict to one agent."`
@@ -562,10 +566,10 @@ type contentMatch struct {
 	Snippet         string   `json:"snippet"`
 	Score           *float64 `json:"score,omitempty" jsonschema:"Relevance score for semantic/hybrid modes; omitted for substring/regex/fts."`
 	OrdinalRange    [2]int   `json:"ordinal_range" jsonschema:"[start, end] ordinals of the conversation unit containing this match; equal to the match ordinal for single-message units."`
-	Subordinate     bool     `json:"subordinate,omitempty" jsonschema:"True when this match belongs to a subordinate unit: a sidechain run, or a subagent/fork session."`
+	Subordinate     bool     `json:"subordinate,omitzero" jsonschema:"True when this match belongs to a subordinate unit: a sidechain run, or a subagent/fork session."`
 	Relationship    string   `json:"relationship,omitempty" jsonschema:"The matched session's relationship to its parent (for example subagent or fork), when it has one."`
 	ParentSessionID string   `json:"parent_session_id,omitempty" jsonschema:"The parent session ID, when the matched session has one."`
-	Sidechain       bool     `json:"is_sidechain,omitempty" jsonschema:"True when the matched message itself is flagged as a sidechain message."`
+	Sidechain       bool     `json:"is_sidechain,omitzero" jsonschema:"True when the matched message itself is flagged as a sidechain message."`
 	// ContextBefore/ContextAfter are populated when Context > 0: the N
 	// messages immediately before/after this match, content truncated to
 	// 500 characters.

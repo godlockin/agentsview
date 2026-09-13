@@ -3,7 +3,7 @@ package main
 import (
 	"bytes"
 	"database/sql"
-	"encoding/json"
+	"encoding/json/v2"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -13,7 +13,6 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.kenn.io/agentsview/internal/db"
-	"go.kenn.io/agentsview/internal/db/driver"
 )
 
 func executeCommand(root *cobra.Command, args ...string) (string, error) {
@@ -40,7 +39,7 @@ func TestRootHelpShowsKeySectionsAndCommands(t *testing.T) {
 		"Data Commands:",
 		"Usage Commands:",
 		"Other Commands:",
-		"serve                  Start server",
+		"serve                  Start the web UI and sync server",
 		"duckdb status          Show DuckDB sync status",
 		"pg push                Push local data to PostgreSQL",
 		"duckdb quack           Quack remote protocol commands",
@@ -48,6 +47,10 @@ func TestRootHelpShowsKeySectionsAndCommands(t *testing.T) {
 		"completion             Generate the autocompletion script for the specified shell",
 		"Flags:",
 		"--version",
+		"[agents.claude]",
+		"dirs = [\"/path/one\", \"/path/two\"]",
+		"[agents.codex]",
+		"dirs = [\"/codex/a\", \"/codex/b\"]",
 	} {
 		assert.Contains(t, help, want, "help missing %q", want)
 	}
@@ -116,6 +119,27 @@ func TestPGStatusHelpShowsProjectFlags(t *testing.T) {
 	}
 }
 
+func TestRawSyncCommandsKeepCredentialOutOfArguments(t *testing.T) {
+	help, err := executeCommand(newRootCommand(), "raw-sync", "watch", "--help")
+	require.NoError(t, err)
+	for _, want := range []string{
+		"--server", "--device-id", "--allow-insecure-http", "--debounce", "--interval",
+		"AGENTSVIEW_RAW_SYNC_CREDENTIAL",
+	} {
+		assert.Contains(t, help, want)
+	}
+	assert.NotContains(t, help, "--credential")
+	_, err = executeCommand(
+		newRootCommand(), "raw-sync", "watch", "--credential=private-value",
+	)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "unknown flag: --credential")
+	assert.NotContains(t, err.Error(), "private-value")
+	status, err := executeCommand(newRootCommand(), "raw-sync", "status", "--help")
+	require.NoError(t, err)
+	assert.Contains(t, status, "Show durable laptop raw-sync status")
+}
+
 func TestDuckDBQuackServeHelpShowsSafetyFlags(t *testing.T) {
 	help, err := executeCommand(newRootCommand(), "duckdb", "quack", "serve", "--help")
 	require.NoError(t, err, "Execute")
@@ -156,7 +180,7 @@ func TestServeCheckDataVersionRejectsNewerDatabase(t *testing.T) {
 	require.NoError(t, database.Close(), "close db")
 
 	futureVersion := db.CurrentDataVersion() + 10
-	conn, err := sql.Open(driver.DriverName, dbPath)
+	conn, err := sql.Open("sqlite3", dbPath)
 	require.NoError(t, err, "raw sqlite open")
 	_, err = conn.Exec(fmt.Sprintf("PRAGMA user_version = %d", futureVersion))
 	require.NoError(t, err, "set future user_version")
@@ -195,7 +219,7 @@ func TestRootNoArgsShowsHelp(t *testing.T) {
 	for _, want := range []string{
 		"Usage:\n  agentsview [flags]\n  agentsview <command> [flags]",
 		"Core Commands:",
-		"serve                  Start server",
+		"serve                  Start the web UI and sync server",
 	} {
 		assert.Contains(t, out, want, "output missing %q", want)
 	}

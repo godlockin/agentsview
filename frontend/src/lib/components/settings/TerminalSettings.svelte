@@ -4,9 +4,8 @@
   import { settings } from "../../stores/settings.svelte.js";
   import {
     ConfigService,
-    TerminalConfigBody,
+    type TerminalConfigBody,
   } from "../../api/generated/index";
-  import { configureGeneratedClient } from "../../api/runtime.js";
 
   const MODES = $derived([
     { value: "auto", label: m.settings_terminal_mode_auto() },
@@ -25,15 +24,15 @@
   });
 
   async function saveTerminal() {
-    configureGeneratedClient();
-    await ConfigService.postApiV1ConfigTerminal({
-      requestBody: {
-        mode: localMode as TerminalConfigBody.mode,
+    if (settings.saving) return;
+    await settings.runMutation(async () => {
+      await ConfigService.postApiV1ConfigTerminal({
+        mode: localMode as TerminalConfigBody["mode"],
         custom_bin: localBin || undefined,
         custom_args: localArgs || undefined,
-      },
+      });
     });
-    // Reload settings to pick up the saved values
+    // Reload settings after the mutation so hydration sees the saved config.
     await settings.load();
   }
 

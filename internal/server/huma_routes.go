@@ -2,7 +2,8 @@ package server
 
 import (
 	"context"
-	"encoding/json"
+	"encoding/json/jsontext"
+	"encoding/json/v2"
 	"errors"
 	"io"
 	"log"
@@ -44,9 +45,13 @@ type bytesOutput struct {
 }
 
 type apiErrorResponse struct {
-	Status  int    `json:"-"`
-	Code    string `json:"code,omitempty"`
-	Message string `json:"error"`
+	Status              int    `json:"-"`
+	Code                string `json:"code,omitempty"`
+	Message             string `json:"error"`
+	CurrentManifestID   string `json:"current_manifest_id,omitempty"`
+	CurrentReceipt      string `json:"current_receipt,omitempty"`
+	CurrentGeneration   int64  `json:"current_generation,omitzero"`
+	CurrentUploadOffset *int64 `json:"upload_offset,omitempty"`
 }
 
 func (e *apiErrorResponse) Error() string {
@@ -65,10 +70,13 @@ func apiErrorWithCode(status int, code, message string) error {
 	return &apiErrorResponse{Status: status, Code: code, Message: message}
 }
 
-var configureHumaErrorsOnce stdsync.Once
+var configureHumaOnce stdsync.Once
 
-func configureHumaErrors() {
-	configureHumaErrorsOnce.Do(func() {
+func configureHuma() {
+	configureHumaOnce.Do(func() {
+		// AgentsView uses encoding/json/v2, which encodes nil slices as empty
+		// arrays. Keep Huma's schemas aligned with that wire contract.
+		huma.DefaultArrayNullable = false
 		huma.NewError = func(status int, message string, errs ...error) huma.StatusError {
 			if status == http.StatusUnprocessableEntity {
 				status = http.StatusBadRequest
@@ -218,69 +226,69 @@ func pascalASCII(s string) string {
 	return string(s[0]-('a'-'A')) + s[1:]
 }
 
-func get[I, O any](
-	s *Server, group routeGroup, path, summary string,
+func (s *Server) get[I, O any](
+	group routeGroup, path, summary string,
 	handler func(context.Context, *I) (*O, error),
 ) {
-	registerRoute(group, http.MethodGet, path, summary, handler, s.humaTimeout())
+	group.register(http.MethodGet, path, summary, handler, s.humaTimeout())
 }
 
-func getLong[I, O any](
-	_ *Server, group routeGroup, path, summary string,
+func (*Server) getLong[I, O any](
+	group routeGroup, path, summary string,
 	handler func(context.Context, *I) (*O, error),
 ) {
-	registerRoute(group, http.MethodGet, path, summary, handler)
+	group.register(http.MethodGet, path, summary, handler)
 }
 
-func post[I, O any](
-	s *Server, group routeGroup, path, summary string,
+func (s *Server) post[I, O any](
+	group routeGroup, path, summary string,
 	handler func(context.Context, *I) (*O, error),
 ) {
-	registerRoute(group, http.MethodPost, path, summary, handler, s.humaTimeout())
+	group.register(http.MethodPost, path, summary, handler, s.humaTimeout())
 }
 
-func postLong[I, O any](
-	_ *Server, group routeGroup, path, summary string,
+func (*Server) postLong[I, O any](
+	group routeGroup, path, summary string,
 	handler func(context.Context, *I) (*O, error),
 ) {
-	registerRoute(group, http.MethodPost, path, summary, handler)
+	group.register(http.MethodPost, path, summary, handler)
 }
 
-func put[I, O any](
-	s *Server, group routeGroup, path, summary string,
+func (s *Server) put[I, O any](
+	group routeGroup, path, summary string,
 	handler func(context.Context, *I) (*O, error),
 ) {
-	registerRoute(group, http.MethodPut, path, summary, handler, s.humaTimeout())
+	group.register(http.MethodPut, path, summary, handler, s.humaTimeout())
 }
 
-func patch[I, O any](
-	s *Server, group routeGroup, path, summary string,
+func (s *Server) patch[I, O any](
+	group routeGroup, path, summary string,
 	handler func(context.Context, *I) (*O, error),
 ) {
-	registerRoute(group, http.MethodPatch, path, summary, handler, s.humaTimeout())
+	group.register(http.MethodPatch, path, summary, handler, s.humaTimeout())
 }
 
-func deleteRoute[I, O any](
-	s *Server, group routeGroup, path, summary string,
+func (s *Server) deleteRoute[I, O any](
+	group routeGroup, path, summary string,
 	handler func(context.Context, *I) (*O, error),
 ) {
-	registerRoute(group, http.MethodDelete, path, summary, handler, s.humaTimeout())
+	group.register(http.MethodDelete, path, summary, handler, s.humaTimeout())
 }
 
-func stream[I any](
-	_ *Server, group routeGroup, method, path, summary string,
+func (*Server) stream[I any](
+	group routeGroup, method, path, summary string,
 	handler func(context.Context, *I) (*huma.StreamResponse, error),
 	options ...func(*huma.Operation),
 ) {
 	routeOptions := append([]func(*huma.Operation){streamResponse()}, options...)
-	registerRoute(group, method, path, summary, handler, routeOptions...)
+	group.register(method, path, summary, handler, routeOptions...)
 }
 
-func raw[I any](
-	_ *Server, group routeGroup, method, path, summary string,
+func (*Server) raw[I any](
+	group routeGroup, method, path, summary string,
 	handler func(context.Context, *I) (*bytesOutput, error),
 ) {
-	registerRoute(group, method, path, summary, handler)
+	group.register(method, path, summary, handler)
 }
 
 func operationID(method, path string) string {
@@ -305,8 +313,8 @@ func operationID(method, path string) string {
 	return strings.Trim(b.String(), "-")
 }
 
-func registerRoute[I, O any](
-	group routeGroup, method, path, summary string,
+func (group routeGroup) register[I, O any](
+	method, path, summary string,
 	handler func(context.Context, *I) (*O, error),
 	options ...func(*huma.Operation),
 ) {
@@ -332,6 +340,12 @@ func registerRoute[I, O any](
 		option(&op)
 	}
 	huma.Register(group.api, op, handler)
+}
+
+func maxBodyBytes(limit int64) func(*huma.Operation) {
+	return func(op *huma.Operation) {
+		op.MaxBodyBytes = limit
+	}
 }
 
 func streamResponse() func(*huma.Operation) {
@@ -362,6 +376,15 @@ func streamJSONResponse() func(*huma.Operation) {
 		}
 		resp.Content["application/json"] = &huma.MediaType{
 			Schema: &huma.Schema{Type: huma.TypeObject},
+		}
+	}
+}
+
+func streamJSONResponseSchema(schemaRef string) func(*huma.Operation) {
+	return func(op *huma.Operation) {
+		streamJSONResponse()(op)
+		op.Responses["200"].Content["application/json"].Schema = &huma.Schema{
+			Ref: "#/components/schemas/" + schemaRef,
 		}
 	}
 }
@@ -404,6 +427,26 @@ func (s *Server) humaTimeout() func(*huma.Operation) {
 				triggerStatus:  http.StatusServiceUnavailable,
 			}
 			timeoutHandler.ServeHTTP(tw, req.WithContext(ctx.Context()))
+		})
+	}
+}
+
+func (s *Server) humaReadDeadline(timeout time.Duration) func(*huma.Operation) {
+	return func(op *huma.Operation) {
+		op.Middlewares = append(op.Middlewares, func(ctx huma.Context, next func(huma.Context)) {
+			_, writer := humago.Unwrap(ctx)
+			err := http.NewResponseController(writer).SetReadDeadline(
+				time.Now().Add(timeout),
+			)
+			if err != nil && !errors.Is(err, http.ErrNotSupported) {
+				log.Printf("extending request read deadline: %v", err)
+				_ = huma.WriteErr(
+					s.api, ctx, http.StatusInternalServerError,
+					"Unable to prepare request upload",
+				)
+				return
+			}
+			next(ctx)
 		})
 	}
 }
@@ -465,11 +508,29 @@ func (s *Server) rejectWriterClosedWrite() error {
 // serializeArchiveWrite runs work under the daemon engine's exclusive lock —
 // the same mutex a worker pass holds while the writer is closed — so a write
 // that passed the pre-stream writer gate cannot race a maintenance pass
-// closing the writer mid-operation. Servers without a daemon engine have no
-// worker passes to serialize with, so work runs directly.
+// closing the writer mid-operation. Local servers without a daemon engine
+// share the on-demand sync engine's lock.
 func (s *Server) serializeArchiveWrite(work func() error) error {
 	if s.engine != nil {
 		return s.engine.RunExclusive(work)
+	}
+	if local, ok := s.db.(*db.DB); ok {
+		return s.syncEngineForLocal(local).RunExclusive(work)
+	}
+	return work()
+}
+
+// tryArchiveWrite runs user-triggered archive maintenance under the daemon
+// engine's exclusive lock without waiting for it, which is the barrier
+// newForegroundCompactRunner puts compaction behind. Background work keeps
+// serializeArchiveWrite so scheduled obligations are not lost. Local servers
+// without a daemon engine share the on-demand sync engine's lock.
+func (s *Server) tryArchiveWrite(work func() error) error {
+	if s.engine != nil {
+		return s.engine.TryRunExclusive(work)
+	}
+	if local, ok := s.db.(*db.DB); ok {
+		return s.syncEngineForLocal(local).TryRunExclusive(work)
 	}
 	return work()
 }
@@ -553,5 +614,5 @@ func writeHumaJSON(ctx huma.Context, status int, value any) {
 }
 
 func sjson(w io.Writer, value any) error {
-	return json.NewEncoder(w).Encode(value)
+	return json.MarshalEncode(jsontext.NewEncoder(w), value)
 }

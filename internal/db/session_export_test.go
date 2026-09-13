@@ -6,7 +6,8 @@ import (
 	"crypto/sha256"
 	"database/sql"
 	"encoding/base64"
-	"encoding/json"
+	"encoding/json/jsontext"
+	"encoding/json/v2"
 	"errors"
 	"fmt"
 	"slices"
@@ -82,7 +83,7 @@ func TestSessionSummaryExportRowsAreContentFreeAndMetadataScoped(t *testing.T) {
 			SessionID: "alpha-parent", Ordinal: 1, Role: "assistant",
 			Timestamp: "2026-05-01T10:01:00Z",
 			Model:     "model-computed",
-			TokenUsage: json.RawMessage(
+			TokenUsage: jsontext.Value(
 				`{"input_tokens":1000,"output_tokens":500,` +
 					`"cache_creation_input_tokens":200,` +
 					`"cache_read_input_tokens":300}`),
@@ -92,7 +93,7 @@ func TestSessionSummaryExportRowsAreContentFreeAndMetadataScoped(t *testing.T) {
 			SessionID: "alpha-parent", Ordinal: 2, Role: "assistant",
 			Timestamp: "2026-05-01T10:02:00Z",
 			Model:     "model-reported",
-			TokenUsage: json.RawMessage(
+			TokenUsage: jsontext.Value(
 				`{"input_tokens":20,"output_tokens":10}`),
 			HasContextTokens: true, HasOutputTokens: true,
 		},
@@ -137,7 +138,7 @@ func TestSessionSummaryExportRowsAreContentFreeAndMetadataScoped(t *testing.T) {
 		SessionID: "beta-root", Ordinal: 0, Role: "assistant",
 		Timestamp: "2026-05-01T09:10:00Z",
 		Model:     "model-reported",
-		TokenUsage: json.RawMessage(
+		TokenUsage: jsontext.Value(
 			`{"input_tokens":10,"output_tokens":20}`),
 		HasContextTokens: true, HasOutputTokens: true,
 	})
@@ -454,7 +455,7 @@ func TestSessionSummaryExportIncludesMessageReasoningTokens(t *testing.T) {
 		Role:      "assistant",
 		Timestamp: "2026-05-01T10:00:30Z",
 		Model:     "model-computed",
-		TokenUsage: json.RawMessage(
+		TokenUsage: jsontext.Value(
 			`{"input_tokens":10,"output_tokens":0,"reasoning_tokens":25}`),
 	})
 
@@ -500,6 +501,98 @@ func TestSessionSummaryExportRequiresExistingDatabaseID(t *testing.T) {
 		Limit: 10,
 	})
 	require.ErrorIs(t, err, ErrDatabaseIDMissing)
+}
+
+func TestSessionSummaryExportIdentitySurvivesRebuild(t *testing.T) {
+	ctx := t.Context()
+	source := testDB(t)
+	require.NoError(t, source.SetArchiveIdentityForTest(ctx, "archive-a", strings.Repeat("a", 64)))
+	require.NoError(t, source.SetDatabaseIDForTest(ctx, "generation-one"))
+	insertExportSession(t, source, Session{
+		ID: "retained-session", Project: "project-a", UserMessageCount: 1,
+		EndedAt: Ptr("2026-05-01T10:00:00Z"),
+	})
+	before, err := source.ExportSessionSummaries(ctx, SessionExportOptions{})
+	require.NoError(t, err)
+	require.Len(t, before.Rows, 1)
+	require.NoError(t, source.CloseConnections())
+
+	rebuilt := testDB(t)
+	require.NoError(t, rebuilt.SetDatabaseIDForTest(ctx, "generation-two"))
+	require.NoError(t, rebuilt.CopyArchiveIdentityFrom(source.Path()))
+	count, err := rebuilt.CopyOrphanedDataFrom(source.Path())
+	require.NoError(t, err)
+	require.Equal(t, 1, count)
+	require.NoError(t, rebuilt.CopySessionMetadataFrom(source.Path()))
+	after, err := rebuilt.ExportSessionSummaries(ctx, SessionExportOptions{})
+	require.NoError(t, err)
+	require.Len(t, after.Rows, 1)
+	assert.Equal(t, "archive-a", before.ArchiveID)
+	assert.Equal(t, "archive-a", after.ArchiveID)
+	assert.Equal(t, "generation-one", before.DatabaseID)
+	assert.Equal(t, "generation-two", after.DatabaseID)
+	assert.Equal(t, "retained-session", after.Rows[0].ID)
+	assert.Equal(t, before.Rows[0].ProjectReference.ProjectKey, after.Rows[0].ProjectReference.ProjectKey)
+}
+
+func TestSessionSummaryExportEmptyArchiveRequiresIdentity(t *testing.T) {
+	d := testDB(t)
+	_, err := d.rawWriter().Exec(`DELETE FROM archive_metadata WHERE key = ?`, archiveMetadataArchiveIDKey)
+	require.NoError(t, err)
+	_, err = d.ExportSessionSummaries(t.Context(), SessionExportOptions{})
+	require.ErrorIs(t, err, ErrArchiveIDMissing)
+	var count int
+	require.NoError(t, d.rawWriter().QueryRow(`SELECT count(*) FROM archive_metadata WHERE key = ?`,
+		archiveMetadataArchiveIDKey).Scan(&count))
+	assert.Zero(t, count, "export must not initialize missing identity")
+}
+
+func TestAllSessionExportIdentityUsesRowSnapshot(t *testing.T) {
+	d := testDB(t)
+	ctx := t.Context()
+	require.NoError(t, d.SetArchiveIdentityForTest(ctx, "archive-before", strings.Repeat("a", 64)))
+	require.NoError(t, d.SetDatabaseIDForTest(ctx, "generation-before"))
+	for _, id := range []string{"session-a", "session-b"} {
+		insertExportSession(t, d, Session{
+			ID: id, Project: "project-a", UserMessageCount: 1,
+			EndedAt: Ptr("2026-05-01T10:00:00Z"),
+		})
+	}
+	_, err := d.getWriter().Exec(`UPDATE sessions
+		SET transcript_revision = '7', local_modified_at = '2026-05-01T10:01:00Z'`)
+	require.NoError(t, err)
+	pages, err := d.exportAllSessionSummaries(ctx, SessionExportOptions{Limit: 1}, func(page int) error {
+		if page == 1 {
+			if _, err := d.getWriter().Exec(`UPDATE sessions
+				SET transcript_revision = '8', local_modified_at = '2026-05-01T10:02:00Z'`); err != nil {
+				return err
+			}
+			if err := d.SetArchiveIdentityForTest(ctx, "archive-after", strings.Repeat("b", 64)); err != nil {
+				return err
+			}
+			return d.SetDatabaseIDForTest(ctx, "generation-after")
+		}
+		return nil
+	})
+	require.NoError(t, err)
+	require.Len(t, pages, 2)
+	for _, page := range pages {
+		assert.Equal(t, "archive-before", page.ArchiveID)
+		assert.Equal(t, "generation-before", page.DatabaseID)
+		require.Len(t, page.Rows, 1)
+		assert.Equal(t, "7", page.Rows[0].TranscriptRevision)
+		require.NotNil(t, page.Rows[0].LocalModifiedAt)
+		assert.Equal(t, "2026-05-01T10:01:00Z", *page.Rows[0].LocalModifiedAt)
+	}
+	current, err := d.ExportSessionSummaries(ctx, SessionExportOptions{})
+	require.NoError(t, err)
+	assert.Equal(t, "archive-after", current.ArchiveID)
+	assert.Equal(t, "generation-after", current.DatabaseID)
+	for _, row := range current.Rows {
+		assert.Equal(t, "8", row.TranscriptRevision)
+		require.NotNil(t, row.LocalModifiedAt)
+		assert.Equal(t, "2026-05-01T10:02:00Z", *row.LocalModifiedAt)
+	}
 }
 
 func TestSessionSummaryExportUsesMessageActivityForOpenSessions(t *testing.T) {
@@ -1036,7 +1129,7 @@ func TestSessionExportUsageUsesPageReadSnapshot(t *testing.T) {
 	insertMessages(t, d, Message{
 		SessionID: "usage-snapshot", Ordinal: 0, Role: "assistant",
 		Timestamp: "2026-05-01T10:00:00Z", Model: "model-computed",
-		TokenUsage:       json.RawMessage(`{"input_tokens":100,"output_tokens":10}`),
+		TokenUsage:       jsontext.Value(`{"input_tokens":100,"output_tokens":10}`),
 		HasContextTokens: true,
 		HasOutputTokens:  true,
 	})
@@ -1062,6 +1155,176 @@ func TestSessionExportUsageUsesPageReadSnapshot(t *testing.T) {
 	require.NotNil(t, rows[0].ModelUsage)
 	assert.Equal(t, 100, rows[0].ModelUsage.InputTokens)
 	assert.Equal(t, 10, rows[0].ModelUsage.OutputTokens)
+}
+
+func TestSessionSummaryExportSelectsCompleteClaudeSnapshotBeforeDedup(t *testing.T) {
+	d := testSessionExportDB(t)
+	ctx := context.Background()
+	seedSessionExportPricing(t, d)
+	for _, session := range []Session{
+		{
+			ID: "a-parent", Project: "snapshot", Machine: "local",
+			Agent: "claude", StartedAt: Ptr("2026-05-01T10:00:00Z"),
+		},
+		{
+			ID: "z-child", Project: "snapshot", Machine: "local",
+			Agent: "claude", StartedAt: Ptr("2026-05-01T10:01:00Z"),
+		},
+	} {
+		insertExportSession(t, d, session)
+	}
+	insertMessages(t, d,
+		Message{
+			SessionID: "a-parent", Ordinal: 0, Role: "assistant",
+			Timestamp: "2026-05-01T10:00:00Z", Model: "model-computed",
+			ClaudeMessageID: "shared-message", ClaudeRequestID: "shared-request",
+			TokenUsage: jsontext.Value(
+				`{"input_tokens":100,"output_tokens":5,` +
+					`"server_tool_use":{"web_search_requests":2}}`),
+		},
+		Message{
+			SessionID: "z-child", Ordinal: 0, Role: "assistant",
+			Timestamp: "2026-05-01T10:01:00Z", Model: "model-computed",
+			ClaudeMessageID: "shared-message", ClaudeRequestID: "shared-request",
+			TokenUsage: jsontext.Value(
+				`{"input_tokens":1000,"output_tokens":100}`),
+		},
+	)
+
+	result, err := d.ExportSessionSummaries(ctx, SessionExportOptions{
+		Filter: SessionFilter{Project: "snapshot"}, Limit: 10, Format: "json",
+	})
+	require.NoError(t, err)
+	require.Len(t, result.Rows, 2)
+	rows := sessionExportRowsByID(result.Rows)
+
+	parent := rows["a-parent"].ModelUsage
+	require.NotNil(t, parent)
+	assert.Equal(t, 1000, parent.InputTokens)
+	assert.Equal(t, 100, parent.OutputTokens)
+	assert.Equal(t, money.Money{Microdollars: 32_000}, parent.Cost)
+	assert.True(t, parent.HasCost)
+	require.Contains(t, parent.ByModel, "model-computed")
+	assert.Equal(t, money.Money{Microdollars: 32_000},
+		parent.ByModel["model-computed"].Cost)
+
+	child := rows["z-child"].ModelUsage
+	require.NotNil(t, child)
+	assert.Zero(t, child.InputTokens)
+	assert.Zero(t, child.OutputTokens)
+	assert.Zero(t, child.Cost.Microdollars)
+	assert.False(t, child.HasCost)
+}
+
+func TestSessionSummaryExportSelectsClaudeSnapshotFromExcludedSubagent(t *testing.T) {
+	d := testSessionExportDB(t)
+	ctx := context.Background()
+	seedSessionExportPricing(t, d)
+	parentID := "snapshot-parent"
+	insertExportSession(t, d, Session{
+		ID: parentID, Project: "snapshot-excluded", Machine: "local",
+		Agent: "claude", StartedAt: Ptr("2026-05-01T10:00:00Z"),
+		EndedAt: Ptr("2026-05-01T10:02:00Z"),
+	})
+	insertExportSession(t, d, Session{
+		ID: "snapshot-child", Project: "snapshot-excluded", Machine: "local",
+		Agent: "claude", StartedAt: Ptr("2026-05-01T10:01:00Z"),
+		EndedAt: Ptr("2026-05-01T10:02:00Z"), ParentSessionID: &parentID,
+		RelationshipType: "subagent",
+	})
+	insertMessages(t, d,
+		Message{
+			SessionID: parentID, Ordinal: 0, Role: "assistant",
+			Timestamp: "2026-05-01T10:00:00Z", Model: "model-computed",
+			ClaudeMessageID: "excluded-message", ClaudeRequestID: "excluded-request",
+			TokenUsage: jsontext.Value(
+				`{"input_tokens":100,"output_tokens":5,` +
+					`"server_tool_use":{"web_search_requests":2}}`),
+		},
+		Message{
+			SessionID: "snapshot-child", Ordinal: 0, Role: "assistant",
+			Timestamp: "2026-05-01T10:01:00Z", Model: "model-computed",
+			ClaudeMessageID: "excluded-message", ClaudeRequestID: "excluded-request",
+			TokenUsage: jsontext.Value(
+				`{"input_tokens":1000,"output_tokens":100}`),
+		},
+	)
+
+	result, err := d.ExportSessionSummaries(ctx, SessionExportOptions{
+		Filter: SessionFilter{Project: "snapshot-excluded"},
+		Limit:  10,
+		Format: "json",
+	})
+	require.NoError(t, err)
+	require.Len(t, result.Rows, 1)
+	assert.Equal(t, parentID, result.Rows[0].ID)
+	usage := result.Rows[0].ModelUsage
+	require.NotNil(t, usage)
+	assert.Equal(t, 1000, usage.InputTokens)
+	assert.Equal(t, 100, usage.OutputTokens)
+	assert.Equal(t, money.Money{Microdollars: 32_000}, usage.Cost)
+	assert.True(t, usage.HasCost)
+}
+
+func TestSessionSummaryExportSelectsClaudeSnapshotAcrossPages(t *testing.T) {
+	d := testSessionExportDB(t)
+	ctx := context.Background()
+	seedSessionExportPricing(t, d)
+	for _, session := range []Session{
+		{
+			ID: "snapshot-page-parent", Project: "snapshot-pages", Machine: "local",
+			Agent: "claude", StartedAt: Ptr("2026-05-01T10:00:00Z"),
+			EndedAt: Ptr("2026-05-01T12:00:00Z"),
+		},
+		{
+			ID: "snapshot-page-peer", Project: "snapshot-pages", Machine: "local",
+			Agent: "claude", StartedAt: Ptr("2026-05-01T10:01:00Z"),
+			EndedAt: Ptr("2026-05-01T11:00:00Z"),
+		},
+	} {
+		insertExportSession(t, d, session)
+	}
+	insertMessages(t, d,
+		Message{
+			SessionID: "snapshot-page-parent", Ordinal: 0, Role: "assistant",
+			Timestamp: "2026-05-01T10:00:00Z", Model: "model-computed",
+			ClaudeMessageID: "paged-message", ClaudeRequestID: "paged-request",
+			TokenUsage: jsontext.Value(
+				`{"input_tokens":100,"output_tokens":5,` +
+					`"server_tool_use":{"web_search_requests":2}}`),
+		},
+		Message{
+			SessionID: "snapshot-page-peer", Ordinal: 0, Role: "assistant",
+			Timestamp: "2026-05-01T10:01:00Z", Model: "model-computed",
+			ClaudeMessageID: "paged-message", ClaudeRequestID: "paged-request",
+			TokenUsage: jsontext.Value(
+				`{"input_tokens":1000,"output_tokens":100}`),
+		},
+	)
+
+	pages, err := d.ExportAllSessionSummaries(ctx, SessionExportOptions{
+		Filter: SessionFilter{Project: "snapshot-pages"}, Limit: 1, Format: "json",
+	})
+	require.NoError(t, err)
+	require.Len(t, pages, 2)
+	require.Len(t, pages[0].Rows, 1)
+	require.Len(t, pages[1].Rows, 1)
+	assert.Equal(t, "snapshot-page-parent", pages[0].Rows[0].ID)
+	assert.Equal(t, "snapshot-page-peer", pages[1].Rows[0].ID)
+
+	parentUsage := pages[0].Rows[0].ModelUsage
+	require.NotNil(t, parentUsage)
+	assert.Equal(t, 1000, parentUsage.InputTokens)
+	assert.Equal(t, 100, parentUsage.OutputTokens)
+	assert.Equal(t, money.Money{Microdollars: 32_000}, parentUsage.Cost)
+	assert.True(t, parentUsage.HasCost)
+
+	peerUsage := pages[1].Rows[0].ModelUsage
+	require.NotNil(t, peerUsage)
+	assert.Zero(t, peerUsage.InputTokens)
+	assert.Zero(t, peerUsage.OutputTokens)
+	assert.Zero(t, peerUsage.Cost.Microdollars)
+	assert.False(t, peerUsage.HasCost)
 }
 
 func TestSessionExportCopilotReportedCostReplacesSessionEstimates(t *testing.T) {
@@ -1137,7 +1400,7 @@ func TestAllSessionExportKeepsOnePricingSnapshotAcrossPages(t *testing.T) {
 		insertMessages(t, d, Message{
 			SessionID: id, Ordinal: 0, Role: "assistant",
 			Timestamp: endedAt, Model: "snapshot-model",
-			TokenUsage:       json.RawMessage(`{"input_tokens":1000000}`),
+			TokenUsage:       jsontext.Value(`{"input_tokens":1000000}`),
 			HasContextTokens: true,
 		})
 	}

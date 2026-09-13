@@ -32,6 +32,20 @@ func TestExtractProjectFromCwd_Git(t *testing.T) {
 			want: "my_app",
 		},
 		{
+			name: "SupersetStandaloneBranchRepoUsesAnchoredProject",
+			setup: func(t *testing.T, root string) string {
+				branchRepo := filepath.Join(
+					root, ".superset", "worktrees",
+					"sample-service", "feature-branch",
+				)
+				subdir := filepath.Join(branchRepo, "internal", "parser")
+				mustMkdirAll(t, filepath.Join(branchRepo, ".git"))
+				mustMkdirAll(t, subdir)
+				return subdir
+			},
+			want: "sample_service",
+		},
+		{
 			name: "GitWorktree",
 			setup: func(t *testing.T, root string) string {
 				mainRepo := filepath.Join(root, "agentsview")
@@ -69,6 +83,29 @@ func TestExtractProjectFromCwd_Git(t *testing.T) {
 			},
 			want: "my_repo",
 		},
+		{
+			name: "CodexCustomNamedWorktreeUsesLinkedGitIdentity",
+			setup: func(t *testing.T, root string) string {
+				mainRepo := filepath.Join(root, "sample-service")
+				worktree := filepath.Join(
+					root, ".codex", "worktrees",
+					"sample-service-graph-retry-20260820",
+				)
+				worktreeGitDir := filepath.Join(
+					mainRepo, ".git", "worktrees", "graph-retry",
+				)
+
+				mustMkdirAll(t, filepath.Join(mainRepo, ".git"))
+				mustMkdirAll(t, worktreeGitDir)
+				mustMkdirAll(t, filepath.Join(worktree, "docs", "reviews", "run"))
+				mustWriteFile(t, filepath.Join(worktree, ".git"),
+					"gitdir: "+worktreeGitDir+"\n")
+				mustWriteFile(t, filepath.Join(worktreeGitDir, "commondir"), "../..\n")
+
+				return filepath.Join(worktree, "docs", "reviews", "run")
+			},
+			want: "sample_service",
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -76,6 +113,68 @@ func TestExtractProjectFromCwd_Git(t *testing.T) {
 			cwd := tt.setup(t, root)
 			assert.Equal(t, tt.want, ExtractProjectFromCwd(cwd),
 				"ExtractProjectFromCwd(%q)", cwd)
+		})
+	}
+}
+
+func TestExtractProjectFromCwd_MissingAnchoredPathRequiresAssociatedWorktree(
+	t *testing.T,
+) {
+	tests := []struct {
+		name               string
+		containerParts     []string
+		missingParts       []string
+		associatedWorktree string
+		want               string
+	}{
+		{
+			name:           "Superset",
+			containerParts: []string{".superset", "worktrees", "sample-service"},
+			missingParts:   []string{"missing-branch", "internal"},
+			want:           "sample_service",
+		},
+		{
+			name:           "Codex",
+			containerParts: []string{".codex", "worktrees", "worktree-id"},
+			missingParts:   []string{"sample-service", "internal"},
+			want:           "sample_service",
+		},
+		{
+			name:               "SupersetAssociated",
+			containerParts:     []string{".superset", "worktrees", "sample-service"},
+			missingParts:       []string{"missing-branch", "internal"},
+			associatedWorktree: "missing-branch",
+			want:               "canonical_repo",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			root := t.TempDir()
+			canonicalRepo := filepath.Join(root, "canonical-repo")
+			worktreeGitDir := filepath.Join(
+				canonicalRepo, ".git", "worktrees", "existing",
+			)
+			container := filepath.Join(
+				append([]string{root}, tt.containerParts...)...,
+			)
+			sibling := filepath.Join(container, "existing")
+			mustMkdirAll(t, sibling)
+			mustMkdirAll(t, worktreeGitDir)
+			mustWriteFile(t, filepath.Join(sibling, ".git"),
+				"gitdir: "+worktreeGitDir+"\n")
+			mustWriteFile(t, filepath.Join(worktreeGitDir, "commondir"), "../..\n")
+			if tt.associatedWorktree != "" {
+				mustMkdirAll(t, filepath.Join(
+					canonicalRepo, ".git", "worktrees", tt.associatedWorktree,
+				))
+			}
+
+			cwd := filepath.Join(
+				append([]string{container}, tt.missingParts...)...,
+			)
+			assert.Equal(t, tt.want, ExtractProjectFromCwd(cwd),
+				"a sibling may override the anchor only when Git records the missing worktree")
 		})
 	}
 }
@@ -177,7 +276,13 @@ func TestExtractProjectFromCwdPlainRepoDoesNotInvokeGit(t *testing.T) {
 	assert.NoFileExists(t, marker, "plain .git directory should resolve without invoking git")
 }
 
-func TestExtractProjectFromCwdFallsBackToGitWhenLocalWalkMisses(t *testing.T) {
+// TestExtractProjectFromCwdNoGitInvocationWhenLocalWalkMisses pins that a
+// cwd with no discoverable .git falls back to its basename without spawning
+// git: passive discovery must not let git follow config-derived paths such
+// as [include] path into locations the probe policy never vetted. The shim
+// would happily resolve the repo, so a reintroduced fallback is caught by
+// both the name and the invocation log.
+func TestExtractProjectFromCwdNoGitInvocationWhenLocalWalkMisses(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("test uses a POSIX shell git shim")
 	}
@@ -202,12 +307,18 @@ func TestExtractProjectFromCwdFallsBackToGitWhenLocalWalkMisses(t *testing.T) {
 	require.NoError(t, os.Chmod(fakeGit, 0o755), "chmod fake git")
 	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
 
-	assert.Equal(t, "virtual_repo",
+	assert.Equal(t, "parser",
 		ExtractProjectFromCwdWithBranchContext(context.Background(), cwd, ""))
-	assert.FileExists(t, gitLog, "git fallback should be used when local walk misses")
+	assert.NoFileExists(t, gitLog,
+		"passive discovery must not invoke git when the local walk misses")
 }
 
-func TestExtractProjectFromCwdTriesGitBeforeConservativeGitFileFallback(
+// TestExtractProjectFromCwdConservativeGitFileRootWithoutGit pins that a
+// gitfile whose external gitdir has no commondir resolves to the worktree
+// itself without spawning git. The shim would resolve the main repository,
+// so a reintroduced git fallback is caught by both the name and the
+// invocation log.
+func TestExtractProjectFromCwdConservativeGitFileRootWithoutGit(
 	t *testing.T,
 ) {
 	if runtime.GOOS == "windows" {
@@ -240,10 +351,10 @@ func TestExtractProjectFromCwdTriesGitBeforeConservativeGitFileFallback(
 	require.NoError(t, os.Chmod(fakeGit, 0o755), "chmod fake git")
 	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
 
-	assert.Equal(t, "main_repo",
+	assert.Equal(t, "feature_worktree",
 		ExtractProjectFromCwdWithBranchContext(context.Background(), cwd, ""))
-	assert.FileExists(t, gitLog,
-		"git fallback should run before accepting conservative gitfile root")
+	assert.NoFileExists(t, gitLog,
+		"passive discovery must not invoke git for a conservative gitfile root")
 }
 
 func TestExtractProjectFromCwd_DeletedNestedWorktree(t *testing.T) {
@@ -752,6 +863,28 @@ func TestExtractProjectFromCwdWithBranch(t *testing.T) {
 			),
 			branch: "fix-exited-agent-session-cleanup",
 			want:   "middleman",
+		},
+		{
+			name: "GenericGitHubWorktreeNested",
+			cwd: filepath.FromSlash(
+				"/srv/worktrees/github.com/example-org/sample-service/fix-123/cmd/server",
+			),
+			branch: "fix-123",
+			want:   "sample_service",
+		},
+		{
+			name: "GenericGitHubRepositoryRootUsesFallback",
+			cwd: filepath.FromSlash(
+				"/srv/worktrees/github.com/example-org/sample-service",
+			),
+			want: "sample_service",
+		},
+		{
+			name: "AdjacentGitHubWorktreesNameDoesNotMatch",
+			cwd: filepath.FromSlash(
+				"/srv/not-worktrees/github.com/example-org/sample-service/fix-123",
+			),
+			want: "fix_123",
 		},
 		{
 			name: "CodexAppWorktree",

@@ -277,6 +277,10 @@ func appendSessionMetadataDiffs(
 		stored.Entrypoint, prepared.Entrypoint,
 	)
 	diffs = appendScalarSessionDiff(
+		diffs, FieldSessionKind, agent,
+		stored.SessionKind, prepared.SessionKind,
+	)
+	diffs = appendScalarSessionDiff(
 		diffs, FieldCwd, agent, stored.Cwd, prepared.Cwd,
 	)
 	diffs = appendScalarSessionDiff(
@@ -366,11 +370,11 @@ func markIncrementalHistory(d *FieldDiff, agent string) {
 
 // usesIncrementalAppend reports whether an agent's sync path can clear
 // termination_status to NULL via UpdateSessionIncremental. Only the
-// JSONL-tail agents (Claude, Codex) take that path; see
+// JSONL-tail agents (Claude and the Codex format family) take that path; see
 // tryIncrementalJSONL call sites in engine.go.
 func usesIncrementalAppend(agent string) bool {
 	return agent == string(parser.AgentClaude) ||
-		agent == string(parser.AgentCodex)
+		isCodexFormatAgent(parser.AgentType(agent))
 }
 
 // incrementalArtifactField reports whether a non-informational diff on
@@ -509,24 +513,30 @@ func messageTokenFingerprintTwin(msgs []db.Message) string {
 	var b strings.Builder
 	for _, m := range ordered {
 		model := db.SanitizeUTF8(m.Model)
+		reasoningEffort := db.SanitizeUTF8(m.ReasoningEffort)
+		providerID := db.SanitizeUTF8(m.ProviderID)
 		tokenUsage := db.SanitizeUTF8(string(m.TokenUsage))
 		claudeMsgID := db.SanitizeUTF8(m.ClaudeMessageID)
 		claudeReqID := db.SanitizeUTF8(m.ClaudeRequestID)
 		srcType := db.SanitizeUTF8(m.SourceType)
 		srcSubtype := db.SanitizeUTF8(m.SourceSubtype)
+		promptSource := db.SanitizeUTF8(m.PromptSource)
 		srcUUID := db.SanitizeUTF8(m.SourceUUID)
 		srcParentUUID := db.SanitizeUTF8(m.SourceParentUUID)
 		fmt.Fprintf(&b,
-			"%d|%d:%s|%d:%s|%d|%d|%t|%t|%s|%s|"+
-				"%d:%s|%d:%s|%d:%s|%d:%s|%t|%t;",
+			"%d|%d:%s|%d:%s|%d:%s|%d:%s|%d|%d|%t|%t|%s|%s|"+
+				"%d:%s|%d:%s|%d:%s|%d:%s|%d:%s|%t|%t;",
 			m.Ordinal,
 			len(model), model,
+			len(reasoningEffort), reasoningEffort,
+			len(providerID), providerID,
 			len(tokenUsage), tokenUsage,
 			m.ContextTokens, m.OutputTokens,
 			m.HasContextTokens, m.HasOutputTokens,
 			claudeMsgID, claudeReqID,
 			len(srcType), srcType,
 			len(srcSubtype), srcSubtype,
+			len(promptSource), promptSource,
 			len(srcUUID), srcUUID,
 			len(srcParentUUID), srcParentUUID,
 			m.IsSidechain, m.IsCompactBoundary,
@@ -850,6 +860,11 @@ func messageMetadataDiff(stored, parsed db.Message) string {
 	switch {
 	case db.SanitizeUTF8(stored.Role) != db.SanitizeUTF8(parsed.Role):
 		return fmt.Sprintf("role %q -> %q", stored.Role, parsed.Role)
+	case db.SanitizeUTF8(stored.ReasoningEffort) !=
+		db.SanitizeUTF8(parsed.ReasoningEffort):
+		return fmt.Sprintf(
+			"reasoning_effort %q -> %q", stored.ReasoningEffort, parsed.ReasoningEffort,
+		)
 	case stored.Timestamp != parsed.Timestamp:
 		return fmt.Sprintf(
 			"timestamp %q -> %q", stored.Timestamp, parsed.Timestamp,
@@ -885,6 +900,9 @@ func messageMetadataDiff(stored, parsed db.Message) string {
 	case db.SanitizeUTF8(stored.SourceSubtype) !=
 		db.SanitizeUTF8(parsed.SourceSubtype):
 		return "source_subtype differs"
+	case db.SanitizeUTF8(stored.PromptSource) !=
+		db.SanitizeUTF8(parsed.PromptSource):
+		return "prompt_source differs"
 	case db.SanitizeUTF8(stored.SourceUUID) !=
 		db.SanitizeUTF8(parsed.SourceUUID):
 		return "source_uuid differs"

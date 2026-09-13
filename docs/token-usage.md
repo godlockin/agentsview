@@ -9,14 +9,11 @@ already knows the input, output, cache-creation, and cache-read tokens those
 agents have logged, and the `agentsview usage` commands turn that into daily
 cost reports and a one-line today's-spend summary without re-reading source
 files. To see that same cost attributed to specific time ranges and concurrent
-agent activity, see the [Activity](/activity/) dashboard.
+agent activity, see the [Activity](/docs/activity/) dashboard.
 
 If you've used [`ccusage`](https://github.com/ryoppippi/ccusage) this will feel
 familiar. AgentsView covers the same core job — "how much did I spend on AI
-coding yesterday?" — across multiple coding agents from one archive. Because it
-reads from pre-indexed SQLite instead of re-parsing JSONL on every invocation,
-it's also dramatically faster on large histories (see
-[benchmarks](#how-it-compares-to-ccusage) below).
+coding yesterday?" — across multiple coding agents from one archive.
 
 !!! warning "Experimental"
 
@@ -30,12 +27,13 @@ it's also dramatically faster on large histories (see
 
 !!! note
 
-    **As of 0.34.0**, usage totals are populated when the source session includes
+    **As of 0.42.0**, usage totals are populated when the source session includes
     token metadata for **Claude Code**, **Codex**, **Copilot CLI**, **OpenCode** and
-    OpenCode-format forks such as **Kilo** and **MiMoCode**, **Pi**, **Gemini**,
-    **Qwen Code**, **OpenClaw**, **QClaw**, **Hermes**, **WorkBuddy**, **Forge**,
+    OpenCode-format forks such as **IcodeMate**, **Kilo**, and **MiMoCode**,
+    **Cursor IDE**, **Posit Assistant**, **Pi**, **Prime Agent**, **Gemini**, **Qwen
+    Code**, **OpenClaw**, **QClaw**, **Hermes**, **WorkBuddy**, **Forge**,
     **Piebald**, **Antigravity IDE/CLI**, **Zed**, **VS Code Copilot**, **Visual
-    Studio Copilot**, **Mistral Vibe**, and **gptme**.
+    Studio Copilot**, **Mistral Vibe**, **gptme**, and **Amp**.
 
     Coverage is opportunistic rather than guaranteed for every session from those
     agents: rows contribute to cost only when the local transcript includes usable
@@ -105,7 +103,7 @@ AgentsView includes a dedicated **Usage** page in the web UI, reachable from the
 **Usage** button in the header or directly at `/usage`. It's a focused view of
 cost and token totals, driven by the same data the CLI commands read.
 
-![Token usage dashboard](/assets/generated/screenshots/usage-page.png)
+![Token usage dashboard](/docs/assets/generated/screenshots/usage-page.png)
 
 The page is built around four panels: summary cards, a cost trend over time, a
 cost attribution treemap, and a bottom grid with top sessions by cost and a
@@ -144,13 +142,23 @@ Project-key exclusions are the exception. Shared-store project keys are scoped
 to the current aggregate archive set, so the page keeps those exclusions in
 memory and does not write or restore them through the URL.
 
-![Usage toolbar with filters](/assets/generated/screenshots/usage-toolbar.png)
+![Usage toolbar with filters](/docs/assets/generated/screenshots/usage-toolbar.png)
 
 Each filter dropdown supports multi-select with a search box, Select all /
 Deselect all shortcuts, and a colored dot for agents so you can tell them apart
 at a glance.
 
-![Model filter dropdown](/assets/generated/screenshots/usage-filter-dropdown.png)
+In the Model picker, checked models are visible and unchecked models are
+hidden. Clicking a model in the attribution chart unchecks it in the picker.
+Recheck it to show it again without changing the other models. Hidden models
+remain in the picker after a reload or when opening a shared URL.
+
+Usage saves model visibility with `exclude_model`. The previous Usage-only
+`model` URL parameter and saved inclusion selections no longer restrict the
+view; choose hidden models in the picker instead. The Analytics model filter
+and API model filters are unchanged.
+
+![Model filter dropdown](/docs/assets/generated/screenshots/usage-filter-dropdown.png)
 
 ### Summary Cards
 
@@ -160,7 +168,7 @@ peak day, cache hit rate, project and model counts, and active days. When
 Copilot-family sessions have priced usage, an additional **Copilot AI Credits**
 card shows the same spend converted at 100 credits per dollar.
 
-![Usage summary cards](/assets/generated/screenshots/usage-summary-cards.png)
+![Usage summary cards](/docs/assets/generated/screenshots/usage-summary-cards.png)
 
 ### Cost Over Time
 
@@ -169,7 +177,7 @@ or agent — toggle the grouping with the segment buttons in the panel header.
 Each series is colored consistently with the attribution panel below so you can
 cross-reference them.
 
-![Cost over time chart](/assets/generated/screenshots/usage-cost-trend.png)
+![Cost over time chart](/docs/assets/generated/screenshots/usage-cost-trend.png)
 
 ### Cost Attribution
 
@@ -180,7 +188,7 @@ readout. Click any cell (or row) to hide it from the chart above, which is the
 primary drill-down mechanic — hide the obvious outliers and the remaining
 breakdown tells you where the smaller spend is going.
 
-![Cost attribution treemap](/assets/generated/screenshots/usage-attribution.png)
+![Cost attribution treemap](/docs/assets/generated/screenshots/usage-attribution.png)
 
 ### Pairwise Cost Comparison
 
@@ -213,7 +221,7 @@ A ranked list of the most expensive sessions in the window, with the agent pill,
 session name, project, token total, and cost. Click any row to jump straight to
 that session in the message viewer.
 
-![Top sessions by cost](/assets/generated/screenshots/usage-top-sessions.png)
+![Top sessions by cost](/docs/assets/generated/screenshots/usage-top-sessions.png)
 
 ### Cache Efficiency
 
@@ -222,7 +230,7 @@ output tokens, plus a savings callout showing how much you saved (or overspent)
 versus a no-cache baseline. Useful for spotting prompts that are blowing through
 cache creation without earning the reads back.
 
-![Cache efficiency panel](/assets/generated/screenshots/usage-cache-efficiency.png)
+![Cache efficiency panel](/docs/assets/generated/screenshots/usage-cache-efficiency.png)
 
 The dashboard reads from the same `model_pricing` table that backs the CLI
 commands below, so the numbers line up exactly with what
@@ -231,7 +239,7 @@ commands below, so the numbers line up exactly with what
 ### PostgreSQL-Backed Usage
 
 As of 0.23.0, the Usage page and usage API also work when the UI is served from
-PostgreSQL via [`agentsview pg serve`](/pg-sync/). That means shared or
+PostgreSQL via [`agentsview pg serve`](/docs/pg-sync/). That means shared or
 multi-machine deployments can browse the same cost and token dashboards without
 relying on a local SQLite archive.
 
@@ -286,20 +294,33 @@ populates per-project, per-agent, and per-machine breakdown arrays for every
 day, making costs from shared multi-machine archives separable without another
 query.
 
+On large archives, aggregate usage reads are served from a local cache of daily
+totals that stays exact as sessions sync. The first query after an install,
+upgrade, or cache deletion is slower while that cache builds; subsequent queries
+are fast.
+
 ## How Costs Are Computed
 
 Every message parsed from a session file stores its raw `token_usage` JSON
 (input, output, cache creation, cache read) and the model name reported by the
 agent. The usage command:
 
-1. Loads the `model_pricing` table into memory once per invocation. The table
-   holds per-million-token rates for input, output, cache creation, and cache
-   read.
+1. Loads `model_pricing` and its `model_pricing_bands` children into memory once
+   per invocation. They hold base per-million-token rates and any
+   whole-request input thresholds published by the pricing catalog.
 1. Scans `messages` filtered by the requested date range and agent, parsing each
    row's `token_usage` blob in Go with `gjson` — faster than SQLite's per-row
    `json_extract`.
-1. Multiplies each row's tokens by the model's rates, buckets the result by
-   local-time day, and aggregates per model.
+1. Selects the applicable complete rate tuple for each request, multiplies that
+   row's tokens by the selected rates, then buckets and aggregates the result.
+
+Message usage and usage events tied to a `message_ordinal` represent individual
+requests. For those rows, AgentsView adds uncached input, cache creation, and
+cache-read input, then selects the highest catalog band whose threshold is
+strictly below that total. Exactly 272,000 tokens therefore retain a 272K base
+rate while 272,001 select its band. Unbound usage events may summarize several
+requests, so they conservatively use the base rate instead of applying a
+threshold to an aggregate.
 
 The default window is the last 30 days; pass `--all` to scan the full history.
 
@@ -312,15 +333,45 @@ The default window is the last 30 days; pass `--all` to scan the full history.
 ### Pricing Source
 
 Model rates come from the
-[LiteLLM model pricing catalog](https://github.com/BerriAI/litellm), which is
-fetched on each `usage` invocation and upserted into the `model_pricing` table.
-If the fetch fails — no network, or LiteLLM is down — AgentsView falls back to
-an embedded copy of the catalog so offline use keeps working. Pass `--offline`
-to skip the fetch entirely and always use the embedded fallback.
+[LiteLLM model pricing catalog](https://github.com/BerriAI/litellm), with the
+[OpenRouter model catalog](https://openrouter.ai/docs/api/api-reference/models/get-models)
+layered underneath for models LiteLLM does not list. Both are fetched together
+(hourly at most on `usage` invocations, daily by the server) and merged into the
+`model_pricing` table; when both catalogs list a model, LiteLLM's rate wins, and
+an OpenRouter row is dropped once LiteLLM picks the model up. If the LiteLLM
+fetch fails, AgentsView keeps the last stored rates; if only the OpenRouter
+fetch fails, the fresh LiteLLM rates are still stored and the stored OpenRouter
+rates are kept. Fresh databases are seeded from an embedded LiteLLM snapshot so
+offline use works before any refresh completes. Pass `--offline` to skip the
+fetch entirely and always use the embedded fallback.
 
 The embedded fallback is updated with AgentsView releases, so the numbers are as
 current as your installed version. For up-to-the-minute rates, leave `--offline`
 off.
+
+LiteLLM's standard whole-request 200K and 272K token rates are preserved in both
+fetched and embedded catalogs. Processing variants such as Batch, Flex,
+Priority, regional, and one-hour cache pricing are not inferred when the stored
+usage does not identify that service tier.
+
+### Anthropic Web Search Fee
+
+Anthropic charges a flat
+\[$10 per 1,000 server-side web search requests](https://docs.claude.com/en/docs/agents-and-tools/tool-use/web-search-tool)
+on top of tokens. That fee is not a per-token rate, so it lives outside the
+`model_pricing` catalog as a fixed $0.01 per request. AgentsView adds it to any
+usage row whose stored `token_usage` reports
+`server_tool_use.web_search_requests`, and `session usage --format json` reports
+the per-row count as `web_search_requests` so the charge is auditable. A row
+that carries an authoritative reported cost is left alone, since that cost
+already settles the whole row.
+
+Claude Code runs each `WebSearch` in an out-of-band side call and writes a zero
+counter on the assistant message, so AgentsView takes the count from the linked
+tool result instead. That side call's own tokens — tens of thousands of input
+tokens on a Haiku model per search — are not written to the transcript at all
+and are therefore a known undercount: AgentsView records the fee, not the hidden
+tokens.
 
 As of 0.32.0, the embedded fallback includes `claude-opus-4-7` at the same Opus
 tier used for 4.6 and 4.8, so offline reports and fresh installs price Opus 4.7
@@ -346,32 +397,56 @@ input_microdollars_per_mtok = 200_000
 output_microdollars_per_mtok = 800_000
 ```
 
-| Field                                  | Description                                                                 |
-| -------------------------------------- | --------------------------------------------------------------------------- |
-| `input_microdollars_per_mtok`          | Integer microdollars per million input tokens (defaults to `0` if omitted)  |
-| `output_microdollars_per_mtok`         | Integer microdollars per million output tokens (defaults to `0` if omitted) |
-| `cache_creation_microdollars_per_mtok` | Integer microdollars per million cache-creation tokens (optional)           |
-| `cache_read_microdollars_per_mtok`     | Integer microdollars per million cache-read tokens (optional)               |
+| Field                                     | Description                                                                                                                                                 |
+| ----------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `input_microdollars_per_mtok`             | Integer microdollars per million input tokens (defaults to `0` if omitted)                                                                                  |
+| `output_microdollars_per_mtok`            | Integer microdollars per million output tokens (defaults to `0` if omitted)                                                                                 |
+| `cache_creation_microdollars_per_mtok`    | Integer microdollars per million cache-creation tokens (optional)                                                                                           |
+| `cache_creation_1h_microdollars_per_mtok` | Integer microdollars per million 1-hour-TTL cache-creation tokens (optional; when omitted or `0`, 1h writes bill at `cache_creation_microdollars_per_mtok`) |
+| `cache_read_microdollars_per_mtok`        | Integer microdollars per million cache-read tokens (optional)                                                                                               |
 
 The table key is the model name as it appears in your session data (match the
 string the agent itself writes, dots and all — quote the key if it contains
-special characters). Custom rates take precedence over both the LiteLLM fetch
-and the embedded fallback, and apply to the Usage dashboard, the
-`agentsview usage` CLI, and `pg serve` alike. A custom entry replaces the full
-rate row for that model, so omitted fields are treated as zero rather than
-falling through to LiteLLM. Models without a custom entry continue to resolve
-through LiteLLM as before.
+special characters). Custom rates take precedence over LiteLLM, OpenRouter, and
+the embedded fallback, and apply to the Usage dashboard, the `agentsview usage`
+CLI, and `pg serve` alike. A custom entry replaces the full rate row for that
+model, so omitted fields are treated as zero rather than falling through to
+another catalog. A custom row is flat and suppresses any fetched request bands
+for that model. Models without a custom entry continue to resolve through the
+stored catalog.
+
+### Posit Assistant Billing
+
+For usage rows whose stored provider ID is exactly `positai`, AgentsView
+estimates computed token costs and cache savings at 110% of the selected catalog
+rates. Model, timestamp, and request-band selection happen before the
+adjustment. Rows with empty or other provider IDs — including observed
+`anthropic` bring-your-own-provider rows in the same session — use base rates.
+
+Custom pricing overrides are not adjusted. Explicit reported costs remain
+authoritative, and fixed web-search fees remain at their published face value.
 
 ### Copilot CLI Token Metrics
 
 As of 0.32.0, Copilot CLI sessions contribute to usage and cost reports.
 AgentsView reads per-message assistant output tokens from
 `assistant.message.outputTokens`, then reads model-level session totals from
-`session.shutdown.modelMetrics`. Fresh input tokens are computed as total input
-minus cache reads and cache writes; cache writes map to cache-creation tokens,
-and cache reads map to cache-read tokens. Copilot's Claude model IDs use dotted
-version numbers, so the parser normalizes names such as `claude-sonnet-4.6` to
-`claude-sonnet-4-6` before pricing lookup.
+`session.shutdown.modelMetrics`. When Copilot has not written a usable shutdown
+summary, known per-message output tokens still appear in usage reports. That
+partial fallback cannot report input, cache, reasoning, or Copilot AI Credit
+totals. Fresh input tokens are computed as total input minus cache reads and
+cache writes; cache writes map to cache-creation tokens, and cache reads map to
+cache-read tokens. Copilot's Claude model IDs use dotted version numbers, so the
+parser normalizes names such as `claude-sonnet-4.6` to `claude-sonnet-4-6`
+before pricing lookup.
+
+For sessions starting June 1, 2026 or later, available per-call usage from
+`session-store.db` supplies input, output, cache, and reasoning counts before
+shutdown. Store updates refresh the affected sessions without rereading
+unchanged transcripts. Overlapping transcript output contributes only its
+positive per-model difference from store totals; missing input cannot be
+reconstructed. Store tokens use catalog estimates, while the latest shutdown
+reported cost retains the treatment described below.
 
 Upgrading to 0.32.0 bumps the parser data version so existing Copilot CLI
 sessions are re-indexed with the new usage rows.
@@ -458,52 +533,54 @@ so the input side of the equation is accurate:
 If you upgraded from an earlier version, the first `usage` invocation triggers a
 full resync so these corrections apply to historical sessions.
 
-## How It Compares to `ccusage`
+### Amp Token Metrics
 
-`ccusage` re-walks every Claude Code JSONL file and re-parses from scratch on
-every invocation. `agentsview usage` queries pre-indexed SQLite with an
-in-memory pricing join, so the cost of reporting drops dramatically as history
-grows.
+Amp thread documents carry a `usage` object on each assistant message with the
+model and its input, output, cache-creation, and cache-read token counts.
+AgentsView reads them per inference, so a thread that switches models keeps each
+model's own tokens rather than collapsing to one.
 
-Measured on a real 22,000-session database (~310,000 token-bearing messages) on
-an M5 Max, median of 5 steady-state runs:
+Amp routes every prompt token into one of three input buckets. Anthropic-backed
+threads already use Anthropic's cache semantics and are read as-is.
+OpenAI-backed threads report `inputTokens` as zero and classify the whole
+uncached prompt as cache creation; because OpenAI does not bill cache writes,
+those tokens are recorded as uncached input and no cache-creation bucket is
+emitted — the same normalization the Codex parser applies for the same reason.
 
-| Command                                                  |    Time | Speedup vs `ccusage` |
-| -------------------------------------------------------- | ------: | -------------------: |
-| `npx ccusage@latest daily --json --offline`              | 44.59 s |                   1× |
-| `agentsview usage daily --json --all --offline`          |  0.53 s |              **84×** |
-| `agentsview usage daily --json --offline` (default 30 d) |  0.41 s |             **109×** |
-| `agentsview usage daily --json --offline --no-sync`      |  0.20 s |             **223×** |
+Two limits are worth knowing. Older threads can omit the model entirely. Usage
+reporting counts only rows that carry a model, so those inferences are absent
+from daily totals and model breakdowns rather than appearing at a guessed rate —
+their tokens are still stored and visible in the session's own usage view. And
+Amp's exports record only main-thread inference, so tokens spent by `oracle`,
+`librarian`, and other subagents are not included in a thread's totals.
 
-!!! note
+Note that recent Amp versions keep complete threads server-side and leave only
+stub files on disk. AgentsView reports usage for whatever complete threads are
+present locally; threads that exist only as stubs have nothing to read.
 
-    These numbers are from a large local database (22k sessions, 310k token-bearing
-    messages). The speedup scales with session count — smaller databases will see
-    smaller absolute differences because `ccusage` has less JSONL to re-parse, but
-    AgentsView stays in the sub-second range either way. The ratios above are an
-    upper bound, not a universal guarantee.
+## Reporting Model
 
-Apples-to-apples: `ccusage` scans all history by default, so the `--all` row is
-the matched comparison. The default 30-day window is faster still because most
-invocations don't need four months of history, and `--no-sync` skips the
-refresh-recent-files pass entirely (useful when you just want to re-render an
-existing report).
+`agentsview usage` reads token and cost facts from the same SQLite archive as
+the UI, then joins them with the applicable pricing data.
 
-Beyond raw speed, `agentsview usage`:
+Version 0.42.0 also keeps an exact daily rollup cache for repeated reports. The
+cache is disposable rather than authoritative: AgentsView rebuilds any missing
+or stale day from the archived usage rows before returning it. The reporting
+workflow also:
 
 - **Works beyond Claude Code** — coverage includes Claude Code, Codex, Copilot
-  CLI, OpenCode-format tools, Pi, Gemini, Qwen Code, OpenClaw/QClaw, Hermes,
-  WorkBuddy, Forge, Piebald, Antigravity, Zed, VS Code Copilot, Visual Studio
-  Copilot, Mistral Vibe, and gptme from the same database and command whenever
-  those sessions log token metadata. Filter with `--agent <name>` when you want
-  a single-agent view.
+  CLI, OpenCode-format tools, Pi, Prime Agent, Gemini, Qwen Code,
+  OpenClaw/QClaw, Hermes, WorkBuddy, Forge, Piebald, Antigravity, Zed, VS Code
+  Copilot, Visual Studio Copilot, Mistral Vibe, and gptme from the same
+  database and command whenever those sessions log token metadata. Filter with
+  `--agent <name>` when you want a single-agent view.
 - **Shares one database with the UI** — the same data powers
-  [Analytics](/usage/#dashboard) and session detail views, so there's no second
-  index to keep fresh.
+  [Analytics](/docs/usage/#dashboard) and session detail views, so there's no
+  second index to keep fresh.
 - **Includes on-demand sync** — when no AgentsView server is running, `usage`
   does a quick incremental sync scoped to files modified since the last sync
-  start time so reports always reflect current state. Skip with `--no-sync` for
-  the fastest path.
+  start time so reports always reflect current state. Skip with `--no-sync`
+  when you want to report only from the existing archive.
 
 ## `agentsview usage daily`
 
@@ -535,7 +612,7 @@ to X" still works.
 
 ```json
 {
-  "schema_version": 4,
+  "schema_version": 6,
   "pricing": {
     "source": "fetched",
     "table_version": "2026-07-03T12:00:00Z",
@@ -549,17 +626,35 @@ to X" still works.
       "models": []
     },
     "models": {
-      "claude-opus-4-6": {
+      "gpt-5.4": {
         "cost_source": "computed",
         "resolutions": [
           {
-            "priced_model": "claude-opus-4-6",
-            "matched_pattern": "claude-opus-4-6",
-            "input_cost_per_mtok": {"microdollars": 15000000},
-            "output_cost_per_mtok": {"microdollars": 75000000},
-            "cache_write_cost_per_mtok": {"microdollars": 18750000},
-            "cache_read_cost_per_mtok": {"microdollars": 1500000},
-            "cost_source": "computed"
+            "priced_model": "gpt-5.4",
+            "matched_pattern": "gpt-5.4",
+            "input_cost_per_mtok": {"microdollars": 2500000},
+            "output_cost_per_mtok": {"microdollars": 15000000},
+            "cache_write_cost_per_mtok": {"microdollars": 0},
+            "cache_write_1h_cost_per_mtok": {"microdollars": 0},
+            "cache_read_cost_per_mtok": {"microdollars": 250000},
+            "cost_source": "computed",
+            "bands": [
+              {
+                "above_input_tokens": 272000,
+                "input_cost_per_mtok": {"microdollars": 5000000},
+                "output_cost_per_mtok": {"microdollars": 22500000},
+                "cache_write_cost_per_mtok": {"microdollars": 0},
+                "cache_write_1h_cost_per_mtok": {"microdollars": 0},
+                "cache_read_cost_per_mtok": {"microdollars": 500000}
+              }
+            ],
+            "application": {
+              "base_request_count": 14,
+              "aggregate_row_count": 0,
+              "bands": [
+                {"above_input_tokens": 272000, "request_count": 2}
+              ]
+            }
           }
         ]
       }
@@ -640,8 +735,15 @@ Usage and activity already emitted `schema_version: 1` before 0.38, and the
 session-summary v1 contract shipped in 0.37.1. Releases 0.38.0 and 0.38.1
 emitted the substantially revised project-evidence shape while still reporting
 version 1. Version 2 corrected those markers, version 3 introduced exact
-microdollar money objects, and current builds emit version 4 with resolved-model
-pricing provenance. The two transitional releases must not be treated as
+microdollar money objects, and version 4 adds resolved-model pricing provenance
+with request-pricing bands and application counts. Version 5 selects complete
+Claude snapshots before generic deduplication and charges the maximum observed
+server-side web-search count. Versions 4 and 5 are contract bumps because
+version 4 changed band-selection pricing semantics and digest canonicalization,
+while version 5 changes snapshot and server-tool accounting. Version 6 applies
+provider-specific billing identity to computed usage and preserves reported
+costs and custom pricing overrides; consumers must not treat v5 and v6 costs as
+interchangeable. The two transitional releases must not be treated as
 v1-compatible. The commands do not provide an earlier-version output mode.
 Consumers should require the expected `schema_version` and ignore unknown
 additive fields.
@@ -670,11 +772,34 @@ distinct model names reported in payload rows, not by canonical pricing names or
 every row in the pricing table. Each reported-model entry has an aggregate
 `cost_source` and a `resolutions` array. A resolution reports `priced_model`,
 `matched_pattern`, `input_cost_per_mtok`, `output_cost_per_mtok`,
-`cache_write_cost_per_mtok`, `cache_read_cost_per_mtok`, and `cost_source`.
-Resolutions are sorted by `priced_model` and then `matched_pattern`.
+`cache_write_cost_per_mtok`, `cache_write_1h_cost_per_mtok`,
+`cache_read_cost_per_mtok`, `cost_source`, `bands`, and `application`.
+`cache_write_1h_cost_per_mtok` is the 1-hour-TTL cache-write rate; zero means
+the catalog publishes no separate 1h rate and 1h writes bill at
+`cache_write_cost_per_mtok`. Resolutions are sorted by `priced_model` and then
+`matched_pattern`.
+
+Each `bands` item is a complete rate tuple with an exclusive
+`above_input_tokens` threshold. `application` reports how computed rows in this
+payload used those rates:
+
+- `base_request_count` counts request-scoped rows that selected no band.
+- `aggregate_row_count` counts unbound aggregate rows forced to base rates.
+- `bands` lists each selected threshold and its `request_count`.
+
+Reported-only rows do not increment application counts. These counts preserve
+the difference between one above-threshold request and several smaller requests
+after their tokens and costs have been aggregated.
+
+When no catalog bands or applied bands exist, their canonical JSON value is
+`null`, not `[]`. Consumers should accept future additive fields but can rely on
+that null-versus-nonempty-array representation within schema version 5.
 
 Ordinary models have one resolution whose `priced_model` is the reported model.
-Timestamp-aware aliases can have more than one resolution in a report. For
+Fixed aliases such as `k2d6-agent` and `gpt-reserve` keep that reported name
+and resolve `priced_model` to a catalog row (`moonshot/kimi-k2.6` and
+`gpt-5.6-luna`). Timestamp-aware aliases can have more than one resolution in a
+report. For
 example, one `kimi-for-coding` entry can contain both `moonshot/kimi-k2.6` and
 `kimi-k3` resolutions when its rows span the pricing cutoff. An exact
 custom-pricing row for the reported alias takes precedence before timestamp
@@ -682,7 +807,7 @@ canonicalization and produces one self-resolution. Fallback provenance also
 lists reported model names.
 
 `cost_source` is a closed enum everywhere it appears: `computed`, `reported`, or
-`mixed`. It was established in schema version 2 and is unchanged in version 4.
+`mixed`. It was established in schema version 2 and is unchanged in version 5.
 `computed` means AgentsView derived cost from token counts and the effective
 pricing resolver. `reported` means a source supplied explicit cost, such as
 Cursor Admin API billing data; those amounts may not be derivable from tokens
@@ -714,8 +839,12 @@ hashed with SHA-256 and prefixed with `sha256:`. The digest input is exactly a
 `{"rows":[...]}` object. Rows are sorted by `model_pattern` bytewise ascending,
 then row `source`, the four rate fields, and `updated_at`; each row contains
 exactly `model_pattern`, `input_per_mtok`, `output_per_mtok`,
-`cache_write_per_mtok`, `cache_read_per_mtok`, `source`, and `updated_at`.
-`updated_at` is `null` or a UTC RFC3339 timestamp such as
+`cache_write_per_mtok`, `cache_read_per_mtok`, `source`, `updated_at`, and
+`bands`. Bands are sorted by `above_input_tokens`; each canonical band contains
+exactly `above_input_tokens`, `input_per_mtok`, `output_per_mtok`,
+`cache_write_per_mtok`, `cache_read_per_mtok`, and `updated_at`. Application
+counts describe one report and are deliberately excluded from the catalog
+digest. `updated_at` is `null` or a UTC RFC3339 timestamp such as
 `2026-07-03T12:00:00Z`. Digest canonicalization errors fail the export instead
 of emitting an empty digest. The digest uses the resolver's internal canonical
 pricing-row keys; the public `pricing.models` block uses the `*_cost_per_mtok`
@@ -760,6 +889,8 @@ agentsview usage statusline [flags]
 
 | Flag        | Default | Description                        |
 | ----------- | ------- | ---------------------------------- |
+| `--format`  | `human` | Output format: `human` or `json`   |
+| `--json`    | `false` | Alias for `--format json`          |
 | `--agent`   |         | Filter by agent name               |
 | `--offline` | `false` | Use embedded fallback pricing only |
 | `--no-sync` | `false` | Skip on-demand sync                |
@@ -775,6 +906,20 @@ With `--agent claude`:
 ```
 $6.42 today (claude)
 ```
+
+With `--json`, the same facts are emitted for scripts, with the cost as exact
+microdollars rather than a formatted string:
+
+```json
+{
+  "date": "2026-08-04",
+  "cost": {
+    "microdollars": 9610000
+  }
+}
+```
+
+`agent` is included when `--agent` filtered the query.
 
 The command always scopes to the current local-time day. Use
 `agentsview usage daily --since $(date +%Y-%m-%d)` if you want the full row
@@ -826,8 +971,8 @@ incremental sync before querying so reports always include recent activity:
 1. If the parser data version has changed (i.e. you just upgraded), a full
    resync runs first.
 1. Otherwise, the sync scans only files modified since the last recorded sync
-   start time, minus a 10-second safety margin to catch files written during the
-   prior sync.
+   start time, minus a 10-second safety margin to catch files written during
+   the prior sync.
 
 If an `agentsview serve` process is already running, the file watcher already
 has you covered and the on-demand sync is skipped to avoid duplicate work. A
@@ -842,11 +987,14 @@ for prompt modules that must stay snappy.
 
 **Monthly spend for the current month:**
 
+Costs are reported as `money` objects, so read `.microdollars` and divide when
+you want dollars:
+
 ```bash
 agentsview usage daily \
   --since "$(date +%Y-%m-01)" \
   --json \
-  | jq '.totals.totalCost'
+  | jq '.totals.totalCost.microdollars / 1000000'
 ```
 
 **Per-agent totals for the last 7 days:**
@@ -863,7 +1011,7 @@ for a in claude codex copilot gemini; do
     --since "$since" \
     --agent "$a" \
     --json 2>/dev/null \
-    | jq '.totals.totalCost')
+    | jq -r '.totals.totalCost.microdollars / 1000000 | tostring')
   printf "%-8s  \$%s\n" "$a" "$total"
 done
 ```
@@ -872,13 +1020,19 @@ done
 
 The script writes to stderr and exits non-zero so you can wire it into whatever
 notifier fits your OS — cron's `MAILTO`, launchd's `StandardErrorPath`, a
-systemd timer's journal, or a Windows Task Scheduler action:
+systemd timer's journal, or a Windows Task Scheduler action.
+
+`--json` reports the cost as exact microdollars, so the threshold is an integer
+comparison instead of a parse of the formatted line. `jq -e` fails the script
+when the value is missing, so a broken read cannot pass for an under-budget day:
 
 ```bash
-today=$(agentsview usage statusline --offline --no-sync \
-  | tr -dc '0-9.')
-if awk -v t="$today" 'BEGIN {exit !(t+0 > 25)}'; then
-  echo "AgentsView: AI spend \$$today today (> \$25)" >&2
+budget_usd=25
+spent=$(agentsview usage statusline --json --offline --no-sync \
+  | jq -e '.cost.microdollars') || exit 1
+if [ "$spent" -gt $((budget_usd * 1000000)) ]; then
+  printf 'AgentsView: $%d.%02d today (over $%d)\n' \
+    $((spent / 1000000)) $((spent % 1000000 / 10000)) "$budget_usd" >&2
   exit 1
 fi
 ```
@@ -886,11 +1040,12 @@ fi
 ## Where the Data Lives
 
 Usage reports read from the same local SQLite database that powers the
-[web UI](/usage/) and [Analytics dashboard](/usage/#dashboard). Token usage is
-stored on each message row in the `messages` table; pricing is cached in a small
-`model_pricing` table that's refreshed on each `usage` invocation.
+[web UI](/docs/usage/) and [Analytics dashboard](/docs/usage/#dashboard). Token
+usage is stored on each message row in the `messages` table; pricing is cached
+in a small `model_pricing` table that's refreshed on each `usage` invocation.
 
-No data leaves your machine. The only outbound request is the LiteLLM pricing
-fetch, which you can disable with `--offline`. See
-[Privacy and Telemetry](/configuration/#privacy-and-telemetry) for the full
+Usage data stays on your machine unless you enable a sharing feature. The usage
+command's only outbound requests are the LiteLLM and OpenRouter pricing fetches,
+which you can disable with `--offline`. See
+[Privacy and Telemetry](/docs/configuration/#privacy-and-telemetry) for the full
 picture.

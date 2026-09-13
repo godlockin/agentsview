@@ -6,8 +6,10 @@ export type SettingsPanelId =
   | "date-ranges"
   | "terminal"
   | "agent-directories"
+  | "tool-result-images"
   | "worktree-mappings"
   | "embeddings"
+  | "archive-content"
   | "github"
   | "remote-access";
 
@@ -60,17 +62,25 @@ export function settingsPanels(): SettingsPanelMeta[] {
     },
     {
       id: "agent-directories",
-      label: m.settings_agent_dir_title(),
-      title: m.settings_agent_dir_title(),
-      description: m.settings_agent_dir_description(),
+      label: m.settings_session_providers_title(),
+      title: m.settings_session_providers_title(),
+      description: m.settings_session_providers_description(),
       group: data,
       keywords: m.settings_search_keywords_agent_directories(),
+    },
+    {
+      id: "tool-result-images",
+      label: m.settings_tool_images_title(),
+      title: m.settings_tool_images_title(),
+      description: m.settings_tool_images_description(),
+      group: data,
+      keywords: m.settings_search_keywords_tool_images(),
     },
     {
       id: "worktree-mappings",
       label: m.worktree_title(),
       title: m.worktree_title(),
-      description: m.worktree_description(),
+      description: m.settings_worktree_moved(),
       group: data,
       keywords: m.settings_search_keywords_worktree_mappings(),
     },
@@ -81,6 +91,14 @@ export function settingsPanels(): SettingsPanelMeta[] {
       description: m.settings_embeddings_description(),
       group: data,
       keywords: m.settings_search_keywords_embeddings(),
+    },
+    {
+      id: "archive-content",
+      label: m.settings_archive_content_title(),
+      title: m.settings_archive_content_title(),
+      description: m.settings_archive_content_description(),
+      group: data,
+      keywords: m.settings_search_keywords_archive_content(),
     },
     {
       id: "github",

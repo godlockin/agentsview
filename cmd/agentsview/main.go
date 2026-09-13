@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"runtime/debug"
 	"slices"
+	"sort"
 	"strings"
 	"syscall"
 	"testing"
@@ -23,6 +24,7 @@ import (
 	"go.kenn.io/agentsview/internal/config"
 	"go.kenn.io/agentsview/internal/db"
 	"go.kenn.io/agentsview/internal/parser"
+	"go.kenn.io/agentsview/internal/recall/extract"
 	"go.kenn.io/agentsview/internal/remotesync"
 	"go.kenn.io/agentsview/internal/secrets"
 	"go.kenn.io/agentsview/internal/server"
@@ -133,6 +135,7 @@ func runServe(cfg config.Config, opts serveOptions) {
 	start := time.Now()
 	setupLogFile(cfg.DataDir)
 	applyServeMemoryLimit()
+	applyServeMallocTuning()
 
 	if err := validateServeConfig(cfg); err != nil {
 		fatal("invalid serve config: %v", err)
@@ -246,9 +249,9 @@ func runServe(cfg config.Config, opts serveOptions) {
 	idleTracker := newDaemonIdleTracker(cfg, stop)
 
 	telemetryReporter := telemetry.NewReporterOrDisabled(telemetry.Options{
-		DataDir: cfg.DataDir,
-		Version: version,
-		Commit:  commit,
+		InstallationID: cfg.InstallationID,
+		Version:        version,
+		Commit:         commit,
 	})
 	defer func() {
 		if err := telemetryReporter.Close(); err != nil {
@@ -295,9 +298,14 @@ func runServe(cfg config.Config, opts serveOptions) {
 		var onStartupReconciled func(sync.SyncStats, error)
 		engine = sync.NewEngine(database, sync.EngineConfig{
 			AgentDirs:               cfg.AgentDirs,
+			SourceMachines:          cfg.SourceMachines,
+			ProviderMetadata:        cfg.ProviderMetadata,
+			DisabledAgents:          cfg.DisabledAgents,
 			IncludeCwdPrefixes:      cfg.SyncIncludeCwdPrefixes,
-			Machine:                 cfg.LocalMachineName,
+			ScanProtectedPaths:      cfg.ScanProtectedPaths,
+			Machine:                 cfg.InstallationID,
 			BlockedResultCategories: cfg.ResultContentBlockedCategories,
+			ArchiveContent:          cfg.ArchiveContent,
 			Emitter:                 emitter,
 			DeferStartupMaintenance: deferStartupMaintenance(
 				opts.SkipInitialSync, workerSyncDone,
@@ -323,17 +331,17 @@ func runServe(cfg config.Config, opts serveOptions) {
 				})
 			},
 			sync.WatcherOptions{
-				OnCoverageDegraded: func(roots []string) error {
+				OnCoverageDegraded: func(degradedRoots []string) error {
+					scopes := make([]pollingScope, 0, len(degradedRoots))
+					for _, r := range degradedRoots {
+						scopes = append(scopes, pollingScope{Root: r})
+					}
 					return unwatchedPoller.AddObligation(pollingObligation{
-						Key: "watcher-fallback", Roots: roots,
+						Key: "watcher-fallback", Scopes: scopes,
 					})
 				},
 				OnPollingRequired: func(obligation sync.PollingObligation) error {
-					return unwatchedPoller.AddObligation(pollingObligation{
-						Key:   obligation.Key,
-						Roots: obligation.Roots,
-						Probe: obligation.Probe,
-					})
+					return unwatchedPoller.AddObligation(syncObligationToPoller(obligation))
 				},
 				OnPollingReleased: unwatchedPoller.RemoveObligation,
 			},
@@ -364,20 +372,13 @@ func runServe(cfg config.Config, opts serveOptions) {
 				// startup maintenance keeps waiting until
 				// RecordStartupReconciled fires.
 				completeWorkerStartup = func() {
-					var gapErr error
-					if gapRoots := reconcileRootPaths(cfg); len(gapRoots) > 0 {
-						gapErr = engine.ReconcileWatchRoots(ctx, gapRoots, false)
-					}
-					if gapErr != nil && ctx.Err() == nil {
-						// Hand the failed gap reconciliation to the watcher's
-						// retry queue before dispatch opens, so the affected
-						// roots are re-reconciled with backoff instead of
-						// staying undiscovered until another event, manual
-						// sync, or the daily audit.
-						queueWatchRetry(gapReconciliationRetryBatch(gapErr))
-					}
-					engine.RecordStartupReconciled(
-						statsFromWorkerResult(workerStartupResult), gapErr,
+					completeWorkerStartupReconciliation(
+						ctx,
+						reconcileRootPaths(cfg),
+						statsFromWorkerResult(workerStartupResult),
+						engine.ReconcileWatchRoots,
+						queueWatchRetry,
+						engine.RecordStartupReconciled,
 					)
 				}
 			} else if database.NeedsResync() {
@@ -418,6 +419,10 @@ func runServe(cfg config.Config, opts serveOptions) {
 			log.Printf("warning: remote_hosts config invalid, skipping periodic remote sync: %v", err)
 			validRemotes = false
 		}
+		stopLiveActivity := startLiveActivityPoller(
+			ctx, cfg, database, engine, idleTracker,
+		)
+		defer stopLiveActivity()
 		go startPeriodicSync(
 			ctx, cfg, engine, database, writeLock, idleTracker, validRemotes, emitter,
 		)
@@ -426,7 +431,9 @@ func runServe(cfg config.Config, opts serveOptions) {
 	identityBackfillEngine := engine
 	if identityBackfillEngine == nil {
 		identityBackfillEngine = sync.NewEngine(database, sync.EngineConfig{
-			Machine: cfg.LocalMachineName,
+			Machine:            cfg.InstallationID,
+			ScanProtectedPaths: cfg.ScanProtectedPaths,
+			ArchiveContent:     cfg.ArchiveContent,
 		})
 	}
 	go idleTracker.Do(func() {
@@ -453,14 +460,6 @@ func runServe(cfg config.Config, opts serveOptions) {
 	seedPricing(database, pricingRefreshRunner)
 	go startPeriodicPricingRefresh(ctx, database, pricingRefreshRunner)
 
-	// After the startup refresh (kicked off inside seedPricing),
-	// keep model_pricing fresh with a 24 h loop so newly-released
-	// models get rates within a day without a restart. custom_model_pricing
-	// is layered in-memory via SetCustomPricing (see applyCustomPricing
-	// below) and is not touched by the refresh, so user overrides for
-	// fork/private models survive every tick.
-	go periodicPricingRefresh(ctx, database, &cfg, 24*time.Hour)
-
 	// Apply the config-driven custom pricing map on top of the
 	// pricing that seedPricing just wrote into model_pricing so
 	// fork-private models (e.g. MiniMax-M3, internal/private
@@ -472,8 +471,9 @@ func runServe(cfg config.Config, opts serveOptions) {
 	applyCustomPricing(database, cfg)
 
 	rtOpts := serveRuntimeOptions{
-		Mode:          "serve",
-		RequestedPort: cfg.Port,
+		Mode:           "serve",
+		RequestedPort:  cfg.Port,
+		OnCaddyStarted: startupProgress.SetCaddyProcess,
 	}
 	preparedCfg, prepErr := prepareServeRuntimeConfig(cfg, rtOpts)
 	if prepErr != nil {
@@ -504,6 +504,10 @@ func runServe(cfg config.Config, opts serveOptions) {
 		// no sync activity follows. Notify never blocks.
 		srvOpts = append(srvOpts,
 			server.WithSessionMutationNotifier(extractSched.Notify))
+		if manager, ok := extractSched.mgr.(*extract.Manager); ok {
+			srvOpts = append(srvOpts,
+				server.WithRecallExtractionStatusProvider(manager))
+		}
 	}
 	if engine != nil {
 		srvOpts = append(srvOpts, server.WithLocalSyncRunner(
@@ -513,6 +517,14 @@ func runServe(cfg config.Config, opts serveOptions) {
 			newForegroundResyncRunner(ctx, cfg, engine, database),
 		))
 	}
+	if engine != nil {
+		srvOpts = append(srvOpts, server.WithLocalCompactRunner(
+			newForegroundCompactRunner(engine, database),
+		))
+	}
+	srvOpts = append(srvOpts, server.WithArtifactExchangeRunner(
+		newDaemonArtifactExchangeRunner(cfg, database, engine, emitter),
+	))
 	srv := server.New(cfg, database, engine, srvOpts...)
 
 	startupProgress.SetPhase("starting HTTP server")
@@ -547,6 +559,7 @@ func runServe(cfg config.Config, opts serveOptions) {
 		idleTracker.Touch()
 		go idleTracker.Run(ctx)
 	}
+	startDaemonUsageCacheBackfill(ctx, database, idleTracker)
 	if engine != nil && opts.SkipInitialSync {
 		go func() {
 			timer := time.NewTimer(deferredStartupSyncGracePeriod)
@@ -572,7 +585,7 @@ func runServe(cfg config.Config, opts serveOptions) {
 		)
 	} else {
 		fmt.Printf(
-			"agentsview %s backend at %s, public at %s (started in %s)\n",
+			"agentsview %s listening at %s, browser URL: %s (started in %s)\n",
 			version, rt.LocalURL, rt.PublicURL,
 			time.Since(start).Round(time.Millisecond),
 		)
@@ -610,6 +623,34 @@ func runServe(cfg config.Config, opts serveOptions) {
 
 	if err := waitForServerRuntime(ctx, srv, rt); err != nil {
 		fatal("%v", err)
+	}
+}
+
+type usageCacheBackfiller interface {
+	StartUsageCacheBackfill(context.Context) error
+	WaitUsageCacheBackfill(context.Context) error
+	SetUsageCacheBackfillStarted(func())
+}
+
+func startDaemonUsageCacheBackfill(
+	ctx context.Context, backfiller usageCacheBackfiller,
+	idleTracker *server.IdleTracker,
+) {
+	backfiller.SetUsageCacheBackfillStarted(func() {
+		done, ok := idleTracker.BeginWork()
+		if !ok {
+			return
+		}
+		go func() {
+			defer done()
+			if err := backfiller.WaitUsageCacheBackfill(ctx); err != nil &&
+				ctx.Err() == nil {
+				log.Printf("usage cache backfill: %v", err)
+			}
+		}()
+	})
+	if err := backfiller.StartUsageCacheBackfill(ctx); err != nil && ctx.Err() == nil {
+		log.Printf("usage cache backfill: %v", err)
 	}
 }
 
@@ -684,6 +725,7 @@ func runStartupSyncViaWorker(
 	t := time.Now()
 	resyncAnnounced := false
 	progressShown := false
+	terminal := isTerminalWriter(os.Stdout)
 	onLine := func(l workerLine) {
 		if l.Progress == nil {
 			return
@@ -698,8 +740,9 @@ func runStartupSyncViaWorker(
 				fmt.Println("Data version changed, running full resync...")
 			}
 		}
-		printSyncProgress(p)
-		progressShown = true
+		if writeSyncProgress(os.Stdout, terminal, p) {
+			progressShown = true
+		}
 		progress.SetDetail(startupProgressDetail(p))
 	}
 	result, err := launchSyncWorker(ctx, cfg, "startup", onLine)
@@ -761,14 +804,18 @@ func deferStartupMaintenance(skipInitialSync, workerSyncDone bool) bool {
 func statsFromWorkerResult(r workerResult) sync.SyncStats {
 	if r.Stats != nil {
 		stats := *r.Stats
+		if r.Tombstoned > stats.Tombstoned {
+			stats.Tombstoned = r.Tombstoned
+		}
 		stats.Aborted = !r.DiscoveryComplete
 		return stats
 	}
 	return sync.SyncStats{
-		Synced:  r.Synced,
-		Skipped: r.Skipped,
-		Failed:  r.Failed,
-		Aborted: !r.DiscoveryComplete,
+		Synced:     r.Synced,
+		Skipped:    r.Skipped,
+		Failed:     r.Failed,
+		Tombstoned: r.Tombstoned,
+		Aborted:    !r.DiscoveryComplete,
 	}
 }
 
@@ -793,38 +840,21 @@ type watchRecoveryScope struct {
 	deferred  map[string]struct{}
 }
 
-// coversProviderRoot reports whether a configured provider root is currently
-// available for authoritative reconciliation: no deferred scope overlaps the
-// root's engine-side expansion, and at least one probed available path lies
-// at or under the root.
-func (s watchRecoveryScope) coversProviderRoot(root string) bool {
-	root = filepath.Clean(root)
-	if overlapsDeferredScope(root, s.deferred) {
-		return false
-	}
-	for _, path := range s.available {
-		if path == root || pathWithinRoot(path, root) {
-			return true
-		}
-	}
-	return false
-}
-
 // probeWatchRecoveryScope computes the probed reconciliation scope backing
 // reconcileRootPaths; see that function for the deferral semantics.
 func probeWatchRecoveryScope(cfg config.Config) watchRecoveryScope {
-	roots, unwatchedDirs, symlinkGatedDirs := collectWatchRoots(cfg)
+	roots, unwatchedDirs, symlinkGatedDirs, _ := collectWatchRoots(cfg)
 	deferred := make(map[string]struct{})
 	// A recursive symlink root never joins the watch roots, so its exact
 	// availability probe is the symlink target itself: os.Stat follows the
 	// link and fails while the target is gone, deferring the configured
 	// scope before an overlapping present path could expand into it.
-	for symRoot, dirs := range symlinkGatedDirs {
+	for symRoot, scopes := range symlinkGatedDirs {
 		if _, err := os.Stat(symRoot); err == nil {
 			continue
 		}
-		for _, dir := range dirs {
-			deferred[filepath.Clean(dir)] = struct{}{}
+		for _, scope := range scopes {
+			deferred[filepath.Clean(scope.syncDir)] = struct{}{}
 		}
 	}
 	for _, r := range roots {
@@ -898,6 +928,24 @@ func overlapsDeferredScope(path string, deferred map[string]struct{}) bool {
 	return false
 }
 
+// pollingObligationKey returns a reason-namespaced key so different reasons
+// over one physical root produce independent obligations. The reason argument
+// is required so a missing reason is a compile error rather than a silent
+// key collision.
+func pollingObligationKey(reason, path string) string {
+	return reason + ":" + path
+}
+
+// syncObligationToPoller converts a sync.PollingObligation to the local
+// pollingObligation type used by the coordinator.
+func syncObligationToPoller(o sync.PollingObligation) pollingObligation {
+	scopes := make([]pollingScope, 0, len(o.Scopes))
+	for _, s := range o.Scopes {
+		scopes = append(scopes, pollingScope{Agent: parser.AgentType(s.Agent), Root: s.Root})
+	}
+	return pollingObligation{Key: o.Key, Scopes: scopes, Probe: o.Probe}
+}
+
 // absRootPath mirrors the engine's cleanRootPath so daemon-side scope-overlap
 // checks compare the same path form the engine's root expansion uses.
 func absRootPath(path string) string {
@@ -945,8 +993,8 @@ func newForegroundSyncRunner(
 			// closes before the exclusive lock is released, and last-sync
 			// state plus the "sync" emit fire after it, so /sync/status and
 			// SSE subscribers observe the worker-backed pass.
-			stats, _, err := runWorkerSyncPass(
-				ctx, daemonCtx, cfg, engine, database, lock, false, onLine,
+			stats, _, err := runForegroundWorkerSyncPass(
+				ctx, daemonCtx, cfg, engine, database, lock, onLine,
 			)
 			if err == nil || !workerNeverRan(err) {
 				return stats, err
@@ -1010,6 +1058,24 @@ func newForegroundResyncRunner(
 	}
 }
 
+// newForegroundCompactRunner keeps archive compaction behind the same
+// non-blocking maintenance barrier as user-triggered sync and resync.
+func newForegroundCompactRunner(
+	engine *sync.Engine, database *db.DB,
+) server.LocalCompactRunner {
+	return func(
+		ctx context.Context, options db.CompactOptions,
+	) (db.CompactResult, error) {
+		var result db.CompactResult
+		err := engine.TryRunExclusive(func() error {
+			var err error
+			result, err = database.Compact(ctx, options)
+			return err
+		})
+		return result, err
+	}
+}
+
 // syncAllReleasingStartupMaintenance runs an incremental pass and, mirroring
 // SyncThenRun, releases startup maintenance when the pass was not cancelled.
 // SyncAll records startup reconciliation on its own but never releases the
@@ -1048,15 +1114,23 @@ func runWorkerResyncBuild(
 	database *db.DB,
 	progress func(sync.Progress),
 ) (workerResult, error, bool) {
-	relay := func(l workerLine) {
-		if l.Progress != nil && progress != nil {
-			progress(*l.Progress)
-		}
-	}
 	var result workerResult
 	var launchErr error
 	var doneStats sync.SyncStats
 	barrierErr := engine.RunExclusive(func() error {
+		engine.UpdateProgress(sync.Progress{
+			Phase:  sync.PhasePreparingResync,
+			Detail: "Starting resync worker",
+		})
+		defer engine.FinishProgress()
+		relay := func(line workerLine) {
+			if line.Progress != nil {
+				engine.UpdateProgress(*line.Progress)
+			}
+			if progress != nil && line.Progress != nil {
+				progress(*line.Progress)
+			}
+		}
 		if cerr := closeWriterForPass(
 			recoveryCtx, database, "resync build",
 		); cerr != nil {
@@ -1076,7 +1150,17 @@ func runWorkerResyncBuild(
 			}
 			return launchErr
 		}
-		if serr := engine.SwapResyncDatabase(engine.ResyncTempPath()); serr != nil {
+		installed, serr := engine.SwapResyncDatabase(engine.ResyncTempPath())
+		if serr != nil {
+			if !installed {
+				// The replacement was discarded, so its tombstones never
+				// reached the archive. A post-install failure keeps them:
+				// the replacement is the live archive there.
+				result.Tombstoned = 0
+				if result.Stats != nil {
+					result.Stats.Tombstoned = 0
+				}
+			}
 			// Swap failures happen at or after CloseConnections closed the
 			// reader pool, so when the swap's own recovery did not restore
 			// the archive only a full Reopen brings reads back; ReopenWriter
@@ -1253,18 +1337,32 @@ func truncateLogFile(path string, limit int64) {
 }
 
 func openDB(cfg config.Config) (*db.DB, error) {
+	if err := clearUsageOnlyVectors(context.Background(), cfg); err != nil {
+		return nil, err
+	}
 	applyClassifierConfig(cfg)
-	database, err := db.Open(cfg.DBPath)
+	database, err := db.OpenWithArchiveContent(cfg.DBPath, cfg.ArchiveContent)
 	if err != nil {
 		return nil, err
 	}
-	localMachine := cfg.LocalMachineName
-	if strings.TrimSpace(localMachine) == "" {
-		localMachine = "local"
+	database.SetToolResultImages(cfg.ToolResultImages)
+	if cfg.InstallationID != "" {
+		unowned, err := database.EnsureInstallationIdentity(context.Background(), cfg.InstallationID)
+		if err != nil {
+			database.Close()
+			return nil, fmt.Errorf("adopting installation identity: %w", err)
+		}
+		if len(unowned) > 0 {
+			log.Printf("archive has sessions under machine keys %q with no recorded local owner; "+
+				"they stay separate until you run `agentsview db adopt-machine` with the keys you own",
+				unowned)
+		}
 	}
-	if err := database.ConfigureArtifactLocalMachine(localMachine); err != nil {
-		database.Close()
-		return nil, fmt.Errorf("configuring artifact local machine: %w", err)
+	if cfg.InstallationID != "" && cfg.LocalMachineName != "" {
+		if err := database.SetSyncState(db.MachineLabelKeyPrefix+cfg.InstallationID, cfg.LocalMachineName); err != nil {
+			database.Close()
+			return nil, fmt.Errorf("recording installation display name: %w", err)
+		}
 	}
 	applyCustomPricing(database, cfg)
 	return database, nil
@@ -1314,6 +1412,16 @@ func openWriteDB(
 	ctx context.Context,
 	cfg config.Config,
 ) (*db.DB, *writeOwnerLock, error) {
+	return openWriteDBWith(ctx, cfg, openDB)
+}
+
+// Explicit ownership adoption uses the same writer exclusion and interrupted
+// compaction recovery as every other direct archive write, before normal
+// startup can require an ownership choice.
+func openWriteDBWith(
+	ctx context.Context, cfg config.Config,
+	openArchive func(config.Config) (*db.DB, error),
+) (*db.DB, *writeOwnerLock, error) {
 	if err := rejectLiveWritableDaemonBeforeDirectWrite(cfg); err != nil {
 		return nil, nil, err
 	}
@@ -1321,7 +1429,17 @@ func openWriteDB(
 	if err != nil {
 		return nil, nil, err
 	}
-	database, err := openDB(cfg)
+	// Settle any interrupted staged compaction before the archive is probed.
+	// Only the canonical archive under the write lock runs this: derived
+	// databases (resync temps, isolated imports) must not interpret the
+	// archive's recovery manifest.
+	if err := db.RecoverCompactManifest(cfg.DBPath); err != nil {
+		_ = lock.Close()
+		return nil, nil, fmt.Errorf(
+			"recovering interrupted archive compaction: %w", err,
+		)
+	}
+	database, err := openArchive(cfg)
 	if err != nil {
 		_ = lock.Close()
 		return nil, nil, err
@@ -1426,7 +1544,11 @@ func mustOpenWriteDB(
 	return database, lock
 }
 
-func applyCursorSecret(database *db.DB, cfg config.Config) error {
+type cursorSecretStore interface {
+	SetCursorSecret(secret []byte)
+}
+
+func applyCursorSecret(database cursorSecretStore, cfg config.Config) error {
 	if cfg.CursorSecret != "" {
 		secret, err := base64.StdEncoding.DecodeString(cfg.CursorSecret)
 		if err != nil {
@@ -1435,6 +1557,13 @@ func applyCursorSecret(database *db.DB, cfg config.Config) error {
 		database.SetCursorSecret(secret)
 	}
 	return nil
+}
+
+func applyRequiredCursorSecret(database cursorSecretStore, cfg config.Config) error {
+	if cfg.CursorSecret == "" {
+		return errors.New("cursor secret is not configured")
+	}
+	return applyCursorSecret(database, cfg)
 }
 
 // fatal prints a formatted error to stderr and exits.
@@ -1460,8 +1589,9 @@ func runInitialSync(
 ) sync.SyncStats {
 	fmt.Println("Running initial sync...")
 	t := time.Now()
+	progress := newSyncProgressPrinter(os.Stdout)
 	stats := engine.SyncAll(ctx, func(p sync.Progress) {
-		printSyncProgress(p)
+		progress(p)
 		startupProgress.SetDetail(startupProgressDetail(p))
 	})
 	printSyncSummary(stats, t)
@@ -1491,8 +1621,9 @@ func runInitialResync(
 	if stats.Aborted && ctx.Err() == nil {
 		fmt.Println("Resync incomplete, running incremental sync...")
 		t = time.Now()
+		progress := newSyncProgressPrinter(os.Stdout)
 		stats = engine.SyncAll(ctx, func(p sync.Progress) {
-			printSyncProgress(p)
+			progress(p)
 			startupProgress.SetDetail(startupProgressDetail(p))
 		})
 		printSyncSummary(stats, t)
@@ -1548,9 +1679,12 @@ func resyncCoversSignals(
 
 func printSyncSummary(stats sync.SyncStats, t time.Time) {
 	summary := fmt.Sprintf(
-		"\nSync complete: %d sessions synced",
+		"Sync complete: %d sessions synced",
 		stats.Synced,
 	)
+	if isTerminalWriter(os.Stdout) {
+		summary = "\n" + summary
+	}
 	if stats.OrphanedCopied > 0 {
 		summary += fmt.Sprintf(
 			", %d archived sessions preserved",
@@ -1573,6 +1707,7 @@ func printSyncSummary(stats sync.SyncStats, t time.Time) {
 type resyncProgressPrinter struct {
 	w        io.Writer
 	now      func() time.Time
+	terminal bool
 	label    string
 	started  time.Time
 	inPlace  bool
@@ -1582,7 +1717,9 @@ type resyncProgressPrinter struct {
 func newResyncProgressPrinter(
 	w io.Writer, now func() time.Time,
 ) *resyncProgressPrinter {
-	return &resyncProgressPrinter{w: w, now: now}
+	return &resyncProgressPrinter{
+		w: w, now: now, terminal: isTerminalWriter(w),
+	}
 }
 
 func (p *resyncProgressPrinter) Print(progress sync.Progress) {
@@ -1604,9 +1741,17 @@ func (p *resyncProgressPrinter) Print(progress sync.Progress) {
 			p.finishCurrent()
 			p.label = progress.Detail
 			p.started = p.now()
+			if !p.terminal {
+				fmt.Fprintf(
+					p.w, "  %s...\n",
+					strings.TrimSuffix(resyncProgressDisplayLabel(progress), "."),
+				)
+			}
 		}
-		p.inPlace = true
-		fmt.Fprintf(p.w, "\r  %s\x1b[K", formatSyncProgress(progress))
+		p.inPlace = p.terminal
+		if p.terminal {
+			fmt.Fprintf(p.w, "\r  %s\x1b[K", formatSyncProgress(progress))
+		}
 		return
 	}
 
@@ -1764,10 +1909,21 @@ func startupProgressDetail(p sync.Progress) string {
 	return resyncProgressDisplayLabel(p)
 }
 
-func printSyncProgress(p sync.Progress) {
+func writeSyncProgress(w io.Writer, terminal bool, p sync.Progress) bool {
+	if !terminal {
+		return false
+	}
 	if detail := formatSyncProgress(p); detail != "" {
-		fmt.Printf("\r  %s\x1b[K", detail)
-		return
+		fmt.Fprintf(w, "\r  %s\x1b[K", detail)
+		return true
+	}
+	return false
+}
+
+func newSyncProgressPrinter(w io.Writer) sync.ProgressFunc {
+	terminal := isTerminalWriter(w)
+	return func(p sync.Progress) {
+		writeSyncProgress(w, terminal, p)
 	}
 }
 
@@ -1818,7 +1974,7 @@ func startFileWatcher(
 	queueRetry func(sync.WatchBatch),
 ) {
 	t := time.Now()
-	roots, unwatchedDirs, symlinkGatedDirs := collectWatchRoots(cfg)
+	roots, unwatchedDirs, symlinkGatedDirs, persistentDirAgents := collectWatchRoots(cfg)
 	watcher, err := sync.NewWatcherWithCallback(
 		watcherBatchDelay,
 		watcherSyncMinInterval,
@@ -1831,7 +1987,7 @@ func startFileWatcher(
 			unwatchedDirs = appendUniqueStrings(unwatchedDirs, root.syncDirs()...)
 		}
 		if coverageErr := registerWatcherUnavailableObligations(
-			options, roots, unwatchedDirs, symlinkGatedDirs,
+			options, roots, unwatchedDirs, symlinkGatedDirs, persistentDirAgents,
 		); coverageErr != nil {
 			err = errors.Join(err, coverageErr)
 		}
@@ -1878,7 +2034,7 @@ func startFileWatcher(
 		}
 	}
 	if options.OnPollingRequired != nil {
-		obligations := watchPollingObligations(roots, results, unwatchedDirs)
+		obligations := watchPollingObligations(roots, results, unwatchedDirs, persistentDirAgents)
 		obligations = append(obligations, symlinkPollingObligations(symlinkGatedDirs)...)
 		for _, obligation := range obligations {
 			if err := options.OnPollingRequired(obligation); err != nil {
@@ -1911,68 +2067,118 @@ func startFileWatcher(
 		watcher.QueueRetryBatch
 }
 
+// watchPollingObligations builds the polling obligations for the watch plan.
+// persistentDirAgents maps each clean persistent-polling dir to the providers
+// that requested persistent polling for it (from collectWatchRoots); persistent
+// obligations carry scopes only for those requesters. Other agents that merely
+// share the configured dir are covered by their own watch results, and pulling
+// them into another provider's persistent poll would reconcile them
+// authoritatively — tombstoning sessions under a lifecycle-owned missing root.
 func watchPollingObligations(
 	roots []watchRoot,
 	results []sync.RecursiveWatchResult,
 	unwatchedDirs []string,
+	persistentDirAgents map[string][]parser.AgentType,
 ) []sync.PollingObligation {
-	byKey := make(map[string][]string)
-	probes := make(map[string]string)
+	type draft struct {
+		probe  string
+		scopes []pollingScope
+	}
+	byKey := make(map[string]*draft)
 	represented := make(map[string]struct{})
-	// The probe is the physical path whose availability gates the
-	// obligation's reconciliation roots: the watch root's own path for
-	// root-keyed groups, the dir itself for persistent dirs.
-	add := func(key, probe string, roots ...string) {
+
+	addScope := func(key, probe string, scopes ...pollingScope) {
 		if key == "" {
 			return
 		}
-		probes[key] = filepath.Clean(probe)
-		for _, root := range roots {
-			if root == "" {
+		probe = filepath.Clean(probe)
+		if _, ok := byKey[key]; !ok {
+			byKey[key] = &draft{probe: probe}
+		}
+		for _, scope := range scopes {
+			if scope.Root == "" {
 				continue
 			}
-			root = filepath.Clean(root)
-			byKey[key] = appendUniqueString(byKey[key], root)
-			represented[root] = struct{}{}
+			scope.Root = filepath.Clean(scope.Root)
+			if !slices.Contains(byKey[key].scopes, scope) {
+				byKey[key].scopes = append(byKey[key].scopes, scope)
+			}
+			represented[scope.Root] = struct{}{}
 		}
 	}
+
 	for i, root := range roots {
 		var result sync.RecursiveWatchResult
 		if i < len(results) {
 			result = results[i]
 		}
 		if !result.MissingRootLifecycleOwned {
-			add(root.path, root.path, root.pendingPollingDirs...)
+			// Pending dirs: keyed on the physical root path; derive agent from scopes.
+			addScope(root.path, root.path, root.pollingScopesForDirs(root.pendingPollingDirs)...)
 		}
 		for _, dir := range root.persistentPollingDirs {
-			add("persistent:"+filepath.Clean(dir), dir, dir)
+			cleanDir := filepath.Clean(dir)
+			agents := persistentDirAgents[cleanDir]
+			if len(agents) == 0 {
+				addScope(pollingObligationKey("persistent", cleanDir), dir,
+					pollingScope{Root: dir})
+			} else {
+				for _, agent := range agents {
+					addScope(pollingObligationKey("persistent", cleanDir), dir,
+						pollingScope{Agent: agent, Root: dir})
+				}
+			}
 		}
 		if i >= len(results) {
-			// No registration result exists for this root: the watcher was
-			// never constructed, so nothing covers the physical root. Gate
-			// its sync scopes on the root itself, or a root that disappears
-			// after the obligations are installed leaves its configured dir
-			// pollable and the fallback poll reconciles it as an
-			// authoritative empty discovery.
-			add(root.path, root.path, root.syncDirs()...)
+			// No watcher constructed: gate sync scopes on the physical root path,
+			// one obligation per agent so releases are independent.
+			for _, scope := range root.scopes {
+				key := pollingObligationKey("nowatcher:"+string(scope.agent), root.path)
+				addScope(key, root.path, pollingScope{Agent: scope.agent, Root: scope.syncDir})
+			}
 			continue
 		}
 		if result.Unwatched > 0 || result.BudgetExhausted ||
 			result.ResourceExhausted || result.Err != nil {
-			add(root.path, root.path, root.syncDirs()...)
+			for _, scope := range root.scopes {
+				key := pollingObligationKey("degraded:"+string(scope.agent), root.path)
+				addScope(key, root.path, pollingScope{Agent: scope.agent, Root: scope.syncDir})
+			}
 		}
 	}
 	for _, dir := range unwatchedDirs {
-		dir = filepath.Clean(dir)
-		if _, ok := represented[dir]; !ok {
-			add("persistent:"+dir, dir, dir)
+		cleanDir := filepath.Clean(dir)
+		if _, ok := represented[cleanDir]; !ok {
+			agents := persistentDirAgents[cleanDir]
+			if len(agents) == 0 {
+				addScope(pollingObligationKey("persistent", cleanDir), cleanDir,
+					pollingScope{Root: dir})
+			} else {
+				for _, agent := range agents {
+					addScope(pollingObligationKey("persistent", cleanDir), cleanDir,
+						pollingScope{Agent: agent, Root: dir})
+				}
+			}
 		}
 	}
+
 	obligations := make([]sync.PollingObligation, 0, len(byKey))
-	for key, roots := range byKey {
-		slices.Sort(roots)
+	for key, d := range byKey {
+		if len(d.scopes) == 0 {
+			continue
+		}
+		ps := make([]sync.PollingScope, 0, len(d.scopes))
+		for _, scope := range d.scopes {
+			ps = append(ps, sync.PollingScope{Agent: string(scope.Agent), Root: scope.Root})
+		}
+		slices.SortFunc(ps, func(a, b sync.PollingScope) int {
+			if a.Agent != b.Agent {
+				return strings.Compare(a.Agent, b.Agent)
+			}
+			return strings.Compare(a.Root, b.Root)
+		})
 		obligations = append(obligations, sync.PollingObligation{
-			Key: key, Roots: roots, Probe: probes[key],
+			Key: key, Scopes: ps, Probe: d.probe,
 		})
 	}
 	slices.SortFunc(obligations, func(a, b sync.PollingObligation) int {
@@ -2003,13 +2209,12 @@ func registerWatcherUnavailableObligations(
 	options sync.WatcherOptions,
 	roots []watchRoot,
 	unwatchedDirs []string,
-	symlinkGatedDirs map[string][]string,
+	symlinkGatedDirs map[string][]watchScope,
+	persistentDirAgents map[string][]parser.AgentType,
 ) error {
+	obligations := watchPollingObligations(roots, nil, unwatchedDirs, persistentDirAgents)
+	obligations = append(obligations, symlinkPollingObligations(symlinkGatedDirs)...)
 	if options.OnPollingRequired != nil {
-		obligations := watchPollingObligations(roots, nil, unwatchedDirs)
-		obligations = append(
-			obligations, symlinkPollingObligations(symlinkGatedDirs)...,
-		)
 		for _, obligation := range obligations {
 			if err := options.OnPollingRequired(obligation); err != nil {
 				log.Printf(
@@ -2021,7 +2226,35 @@ func registerWatcherUnavailableObligations(
 	if options.OnCoverageDegraded == nil {
 		return nil
 	}
-	return options.OnCoverageDegraded(unwatchedDirs)
+	// Exclude dirs already covered by probe-gated obligations so the empty-agent
+	// coverage-degraded fallback does not bypass per-agent probe gates. Only
+	// apply this exclusion when OnPollingRequired is set: the probe-gated
+	// obligations are only installed when OnPollingRequired is non-nil, so when
+	// it is nil the exclusion would silently drop every dir (all obligations have
+	// probes) and coverage-degraded would never fire — breaking archive-watch
+	// call sites that set only OnCoverageDegraded.
+	fallbackDirs := unwatchedDirs
+	if options.OnPollingRequired != nil {
+		probeGated := make(map[string]struct{})
+		for _, ob := range obligations {
+			if ob.Probe != "" {
+				for _, scope := range ob.Scopes {
+					probeGated[scope.Root] = struct{}{}
+				}
+			}
+		}
+		filtered := make([]string, 0, len(unwatchedDirs))
+		for _, dir := range unwatchedDirs {
+			if _, ok := probeGated[filepath.Clean(dir)]; !ok {
+				filtered = append(filtered, dir)
+			}
+		}
+		fallbackDirs = filtered
+	}
+	if len(fallbackDirs) == 0 {
+		return nil
+	}
+	return options.OnCoverageDegraded(fallbackDirs)
 }
 
 // symlinkPollingObligations gates persistent polling of dirs whose recursive
@@ -2033,19 +2266,30 @@ func registerWatcherUnavailableObligations(
 // referencing it has a missing probe, so this composes with the dir's own
 // persistent obligation.
 func symlinkPollingObligations(
-	symlinkGatedDirs map[string][]string,
+	symlinkGatedDirs map[string][]watchScope,
 ) []sync.PollingObligation {
 	obligations := make([]sync.PollingObligation, 0, len(symlinkGatedDirs))
-	for symRoot, dirs := range symlinkGatedDirs {
-		roots := make([]string, 0, len(dirs))
-		for _, dir := range dirs {
-			roots = appendUniqueString(roots, filepath.Clean(dir))
+	for symRoot, gatedScopes := range symlinkGatedDirs {
+		scopes := make([]sync.PollingScope, 0, len(gatedScopes))
+		for _, scope := range gatedScopes {
+			ps := sync.PollingScope{
+				Agent: string(scope.agent),
+				Root:  filepath.Clean(scope.syncDir),
+			}
+			if !slices.Contains(scopes, ps) {
+				scopes = append(scopes, ps)
+			}
 		}
-		slices.Sort(roots)
+		slices.SortFunc(scopes, func(a, b sync.PollingScope) int {
+			if a.Agent != b.Agent {
+				return strings.Compare(a.Agent, b.Agent)
+			}
+			return strings.Compare(a.Root, b.Root)
+		})
 		obligations = append(obligations, sync.PollingObligation{
-			Key:   "symlink:" + filepath.Clean(symRoot),
-			Roots: roots,
-			Probe: filepath.Clean(symRoot),
+			Key:    "symlink:" + filepath.Clean(symRoot),
+			Scopes: scopes,
+			Probe:  filepath.Clean(symRoot),
 		})
 	}
 	slices.SortFunc(obligations, func(a, b sync.PollingObligation) int {
@@ -2092,41 +2336,7 @@ func accountRegisteredWatchRoots(
 	})
 }
 
-type watchSyncer interface {
-	SyncPathsContext(context.Context, []string) error
-	HasActiveSessionSourceBelow(agent, path string) (bool, error)
-	ReconciliationRootsForAgent(agent string) []string
-	ReconcileWatchRoots(context.Context, []string, bool) error
-	ReconcileWatchRootsAfterLostEvents(context.Context, []string, bool) error
-}
-
-type watchReconciliationError struct {
-	cause error
-	retry sync.WatchBatch
-}
-
-func newWatchReconciliationError(
-	cause error, roots []string, full, lostEvents bool,
-) error {
-	var scoped interface{ ReconciliationRetryRoots() []string }
-	if errors.As(cause, &scoped) {
-		if failedRoots := deduplicateStrings(scoped.ReconciliationRetryRoots()); len(failedRoots) > 0 {
-			return &watchReconciliationError{
-				cause: cause,
-				retry: sync.WatchBatch{
-					ReconcileRoots: failedRoots,
-					LostEvents:     lostEvents,
-				},
-			}
-		}
-	}
-	retry := sync.WatchBatch{FullSync: full}
-	retry.LostEvents = lostEvents
-	if !full {
-		retry.ReconcileRoots = append([]string(nil), roots...)
-	}
-	return &watchReconciliationError{cause: cause, retry: retry}
-}
+type watchSyncer = sync.WatchBatchSyncer
 
 // gapReconciliationRetryBatch classifies a failed worker-to-watcher gap
 // reconciliation the same way the watcher callback path does: scoped retry
@@ -2134,24 +2344,23 @@ func newWatchReconciliationError(
 // The daemon queues the batch on the watcher before opening dispatch so the
 // affected roots re-reconcile with backoff.
 func gapReconciliationRetryBatch(gapErr error) sync.WatchBatch {
-	var scoped interface{ ReconciliationRetryRoots() []string }
-	if errors.As(gapErr, &scoped) {
-		if roots := deduplicateStrings(scoped.ReconciliationRetryRoots()); len(roots) > 0 {
-			return sync.WatchBatch{ReconcileRoots: roots}
-		}
+	var pathsSource interface{ ReconciliationRetryPaths() []string }
+	var rootsSource interface{ ReconciliationRetryRoots() []string }
+	var overflowSource interface{ ReconciliationRetryOverflow() bool }
+	var paths, roots []string
+	if errors.As(gapErr, &pathsSource) {
+		paths = deduplicateStrings(pathsSource.ReconciliationRetryPaths())
+	}
+	if errors.As(gapErr, &rootsSource) {
+		roots = deduplicateStrings(rootsSource.ReconciliationRetryRoots())
+	}
+	if errors.As(gapErr, &overflowSource) && overflowSource.ReconciliationRetryOverflow() {
+		return sync.WatchBatch{FullSync: true}
+	}
+	if len(paths) > 0 || len(roots) > 0 {
+		return sync.WatchBatch{Paths: paths, ReconcileRoots: roots}
 	}
 	return sync.WatchBatch{FullSync: true}
-}
-
-func (e *watchReconciliationError) Error() string { return e.cause.Error() }
-
-func (e *watchReconciliationError) Unwrap() error { return e.cause }
-
-func (e *watchReconciliationError) WatchRetryBatch() sync.WatchBatch {
-	retry := e.retry
-	retry.Paths = append([]string(nil), retry.Paths...)
-	retry.ReconcileRoots = append([]string(nil), retry.ReconcileRoots...)
-	return retry
 }
 
 // syncWatchBatch applies one watcher batch to the engine. recoveryScope
@@ -2167,140 +2376,20 @@ func syncWatchBatch(
 	batch sync.WatchBatch,
 	recoveryScope func() watchRecoveryScope,
 ) error {
-	paths := append([]string(nil), batch.Paths...)
-	full := batch.FullSync
-	reconcileRoots := append([]string(nil), batch.ReconcileRoots...)
-	lostEvents := batch.LostEvents
-	type renameOwner struct {
-		path  string
-		agent string
-	}
-	var scope watchRecoveryScope
-	scopeProbed := false
-	probeScope := func() watchRecoveryScope {
-		if !scopeProbed {
-			scope = recoveryScope()
-			scopeProbed = true
+	var recovery *sync.WatchRecoveryScope
+	if batch.FullSync || len(batch.Renames) > 0 {
+		probed := recoveryScope()
+		deferred := make([]string, 0, len(probed.deferred))
+		for root := range probed.deferred {
+			deferred = append(deferred, root)
 		}
-		return scope
-	}
-	authoritativePaths := make(map[string]struct{})
-	authoritativeRenames := make(map[renameOwner]struct{})
-	promoteDirectoryRename := func(rename sync.WatchRename) {
-		roots := engine.ReconciliationRootsForAgent(rename.Agent)
-		if rename.Agent == "" || len(roots) == 0 {
-			full = true
-			return
-		}
-		// FSEvents may report only one endpoint of a cross-root move, so
-		// the promotion covers every currently available root of the owning
-		// provider. Unavailable siblings are deferred to their polling
-		// probes: reconciling them would read an unmounted volume as an
-		// empty discovery and tombstone every baselined session beneath it.
-		for _, root := range roots {
-			if probeScope().coversProviderRoot(root) {
-				reconcileRoots = append(reconcileRoots, root)
-			}
+		sort.Strings(deferred)
+		recovery = &sync.WatchRecoveryScope{
+			AvailableRoots: append([]string(nil), probed.available...),
+			DeferredRoots:  deferred,
 		}
 	}
-	for _, rename := range batch.Renames {
-		owner := renameOwner{path: rename.Path, agent: rename.Agent}
-		if _, authoritative := authoritativeRenames[owner]; authoritative {
-			continue
-		}
-		switch rename.ItemType {
-		case sync.ItemIsFile:
-			paths = appendUniqueString(paths, rename.Path)
-		case sync.ItemIsDir:
-			promoteDirectoryRename(rename)
-			authoritativePaths[rename.Path] = struct{}{}
-			authoritativeRenames[owner] = struct{}{}
-			paths = removeString(paths, rename.Path)
-		default:
-			info, err := os.Stat(rename.Path)
-			if err == nil {
-				if info.IsDir() {
-					promoteDirectoryRename(rename)
-					authoritativePaths[rename.Path] = struct{}{}
-					authoritativeRenames[owner] = struct{}{}
-					paths = removeString(paths, rename.Path)
-				} else {
-					paths = appendUniqueString(paths, rename.Path)
-				}
-				continue
-			}
-			if !errors.Is(err, os.ErrNotExist) {
-				return fmt.Errorf("classifying watcher rename %q: %w", rename.Path, err)
-			}
-			hasDescendant, err := engine.HasActiveSessionSourceBelow(rename.Agent, rename.Path)
-			if err != nil {
-				return err
-			}
-			if hasDescendant {
-				promoteDirectoryRename(rename)
-				authoritativePaths[rename.Path] = struct{}{}
-				authoritativeRenames[owner] = struct{}{}
-				paths = removeString(paths, rename.Path)
-			} else {
-				if _, authoritative := authoritativePaths[rename.Path]; !authoritative {
-					paths = appendUniqueString(paths, rename.Path)
-				}
-			}
-		}
-	}
-	if len(paths) > 0 {
-		if err := engine.SyncPathsContext(ctx, paths); err != nil {
-			retry := sync.WatchBatch{FullSync: full, LostEvents: lostEvents}
-			if !full {
-				retry.Paths = append([]string(nil), paths...)
-				retry.ReconcileRoots = deduplicateStrings(reconcileRoots)
-			}
-			return &watchReconciliationError{
-				cause: err,
-				retry: retry,
-			}
-		}
-	}
-	if full {
-		// Scope the recovery to the currently available roots, exactly like
-		// the startup gap reconciliation and the archive audit. An engine-side
-		// full pass would expand to every configured dir without probing, read
-		// an unmounted volume or missing provider subtree as an empty
-		// discovery, and tombstone every baselined session beneath it.
-		// Unavailable scopes are deferred to their polling probes instead; a
-		// failed recovery retries as a full batch so availability is re-probed.
-		fullRoots := probeScope().available
-		if len(fullRoots) == 0 {
-			return nil
-		}
-		var err error
-		if lostEvents {
-			err = engine.ReconcileWatchRootsAfterLostEvents(ctx, fullRoots, false)
-		} else {
-			err = engine.ReconcileWatchRoots(ctx, fullRoots, false)
-		}
-		if err != nil {
-			return newWatchReconciliationError(err, nil, true, lostEvents)
-		}
-		return nil
-	}
-	roots := deduplicateStrings(reconcileRoots)
-	if len(roots) > 0 {
-		var err error
-		if lostEvents {
-			err = engine.ReconcileWatchRootsAfterLostEvents(ctx, roots, false)
-		} else {
-			err = engine.ReconcileWatchRoots(ctx, roots, false)
-		}
-		if err != nil {
-			return newWatchReconciliationError(err, roots, false, lostEvents)
-		}
-	}
-	return nil
-}
-
-func removeString(values []string, remove string) []string {
-	return slices.DeleteFunc(values, func(value string) bool { return value == remove })
+	return sync.ApplyWatchBatch(ctx, engine, batch, recovery)
 }
 
 func deduplicateStrings(values []string) []string {
@@ -2357,18 +2446,67 @@ func (r watchRoot) syncDirs() []string {
 	return dirs
 }
 
+// pollingScopesForDirs resolves pollingScope values for the given configured
+// dirs by matching against the root's scopes. Each dir emits one scope per
+// matching agent; dirs not matched by any scope use an empty agent.
+func (r watchRoot) pollingScopesForDirs(dirs []string) []pollingScope {
+	agentsByDir := make(map[string][]parser.AgentType, len(r.scopes))
+	for _, scope := range r.scopes {
+		if scope.syncDir != "" {
+			cleanDir := filepath.Clean(scope.syncDir)
+			if !slices.Contains(agentsByDir[cleanDir], scope.agent) {
+				agentsByDir[cleanDir] = append(agentsByDir[cleanDir], scope.agent)
+			}
+		}
+	}
+	var scopes []pollingScope
+	for _, dir := range dirs {
+		if dir == "" {
+			continue
+		}
+		agents := agentsByDir[filepath.Clean(dir)]
+		if len(agents) == 0 {
+			ps := pollingScope{Root: dir}
+			if !slices.Contains(scopes, ps) {
+				scopes = append(scopes, ps)
+			}
+		} else {
+			for _, agent := range agents {
+				ps := pollingScope{Agent: agent, Root: dir}
+				if !slices.Contains(scopes, ps) {
+					scopes = append(scopes, ps)
+				}
+			}
+		}
+	}
+	return scopes
+}
+
 // collectWatchRoots resolves the configured watch plan. symlinkGatedDirs maps
 // each recursive provider root skipped because it is a symlink to the
 // configured dirs whose reconciliation scope its target availability gates;
 // those roots never join the watcher plan or the returned roots.
+// persistentDirAgents maps each clean persistent-polling dir to the providers
+// that requested persistent polling for it, so obligation scopes can stay
+// limited to the owning providers rather than every agent sharing the dir.
 func collectWatchRoots(cfg config.Config) (
 	roots []watchRoot,
 	unwatchedDirs []string,
-	symlinkGatedDirs map[string][]string,
+	symlinkGatedDirs map[string][]watchScope,
+	persistentDirAgents map[string][]parser.AgentType,
 ) {
 	rootIndexes := make(map[string]int)
 	persistentPollingDirs := make(map[string]struct{})
-	symlinkGatedDirs = make(map[string][]string)
+	symlinkGatedDirs = make(map[string][]watchScope)
+	persistentDirAgents = make(map[string][]parser.AgentType)
+	addPersistent := func(agent parser.AgentType, dir string) {
+		persistentPollingDirs[dir] = struct{}{}
+		unwatchedDirs = appendUniqueString(unwatchedDirs, dir)
+		cleanDir := filepath.Clean(dir)
+		if !slices.Contains(persistentDirAgents[cleanDir], agent) {
+			persistentDirAgents[cleanDir] = append(persistentDirAgents[cleanDir], agent)
+		}
+	}
 	addRoot := func(agent parser.AgentType, dir, path string, recursive, exists bool) {
 		path = filepath.Clean(path)
 		scope := watchScope{agent: agent, syncDir: dir}
@@ -2388,21 +2526,21 @@ func collectWatchRoots(cfg config.Config) (
 			scopes:    []watchScope{scope},
 		})
 	}
-	for _, def := range parser.Registry {
+	for _, factory := range cfg.LocalProviderFactories() {
+		def := factory.Definition()
 		for _, d := range cfg.ResolveDirs(def.Type) {
 			addAgentRoot := func(dir, root string, recursive, exists bool) {
 				addRoot(def.Type, dir, root, recursive, exists)
 			}
-			_, hasProvider := parser.ProviderFactoryByType(def.Type)
-			if providerWatched, polling := collectProviderWatchRoots(def, d, addAgentRoot); providerWatched {
+			if providerWatched, polling := collectProviderWatchRoots(factory, d, addAgentRoot); providerWatched {
 				if polling.persistent {
-					persistentPollingDirs[d] = struct{}{}
-					unwatchedDirs = appendUniqueString(unwatchedDirs, d)
+					addPersistent(def.Type, d)
 				}
 				for _, symRoot := range polling.symlinkRoots {
-					symlinkGatedDirs[symRoot] = appendUniqueString(
-						symlinkGatedDirs[symRoot], d,
-					)
+					scope := watchScope{agent: def.Type, syncDir: d}
+					if !slices.Contains(symlinkGatedDirs[symRoot], scope) {
+						symlinkGatedDirs[symRoot] = append(symlinkGatedDirs[symRoot], scope)
+					}
 				}
 				for _, missing := range polling.missingRoots {
 					idx, ok := rootIndexes[filepath.Clean(missing)]
@@ -2417,16 +2555,12 @@ func collectWatchRoots(cfg config.Config) (
 				continue
 			}
 			if !def.FileBased {
-				if hasProvider {
-					persistentPollingDirs[d] = struct{}{}
-					unwatchedDirs = appendUniqueString(unwatchedDirs, d)
-				}
+				addPersistent(def.Type, d)
 				continue
 			}
 			fallbackUnwatched := collectLegacyWatchRoots(def, d, addAgentRoot)
 			for _, pollingDir := range fallbackUnwatched {
-				persistentPollingDirs[pollingDir] = struct{}{}
-				unwatchedDirs = appendUniqueString(unwatchedDirs, pollingDir)
+				addPersistent(def.Type, pollingDir)
 			}
 		}
 	}
@@ -2440,7 +2574,7 @@ func collectWatchRoots(cfg config.Config) (
 			}
 		}
 	}
-	return roots, unwatchedDirs, symlinkGatedDirs
+	return roots, unwatchedDirs, symlinkGatedDirs, persistentDirAgents
 }
 
 type providerPollingReasons struct {
@@ -2454,14 +2588,11 @@ type providerPollingReasons struct {
 }
 
 func collectProviderWatchRoots(
-	def parser.AgentDef,
+	factory parser.ProviderFactory,
 	dir string,
 	addRoot func(dir, root string, recursive, exists bool),
 ) (bool, providerPollingReasons) {
-	factory, ok := parser.ProviderFactoryByType(def.Type)
-	if !ok {
-		return false, providerPollingReasons{}
-	}
+	def := factory.Definition()
 	provider := factory.NewProvider(parser.ProviderConfig{
 		Roots: []string{dir},
 	})
@@ -2745,10 +2876,21 @@ func runArchiveAudit(
 	result, err := runWorkerWritePass(
 		ctx, ctx, cfg, engine, database, lock, "audit", nil,
 	)
-	if (result.Synced > 0 || result.Tombstoned > 0) && emitter != nil {
+	if workerResultHasSessionChanges(result) && emitter != nil {
 		emitter.Emit("sessions")
 	}
 	return err
+}
+
+// workerResultHasSessionChanges reports whether a worker pass changed rows
+// clients must refetch. Cwd-only reconciliations ride the serialized
+// SyncStats payload rather than the summary counters, so the audit emit
+// must consult it or a cwd-only pass would leave the UI stale.
+func workerResultHasSessionChanges(result workerResult) bool {
+	if result.Synced > 0 || result.Tombstoned > 0 {
+		return true
+	}
+	return result.Stats != nil && result.Stats.CwdUpdated > 0
 }
 
 // scheduledSyncEngine is the reconciliation surface the scheduled pass needs.
@@ -2774,7 +2916,7 @@ type scheduledReconcileTarget struct {
 // present scope would read the missing one as an authoritative empty discovery
 // and tombstone every session beneath it.
 func scheduledReconcileTargets(cfg config.Config) []scheduledReconcileTarget {
-	roots, _, _ := collectWatchRoots(cfg)
+	roots, _, _, _ := collectWatchRoots(cfg)
 	deferred := make(map[parser.AgentType]map[string]struct{})
 	for _, root := range roots {
 		if root.exists {
@@ -2818,11 +2960,27 @@ func scheduledReconcileTargets(cfg config.Config) []scheduledReconcileTarget {
 func runScheduledSyncPass(
 	ctx context.Context, engine scheduledSyncEngine, targets []scheduledReconcileTarget,
 ) {
+	started := time.Now()
+	log.Printf("scheduled reconciliation started: targets=%d", len(targets))
+	var firstErr error
+	failed := 0
 	for _, target := range targets {
 		if err := engine.ReconcileProviderRoots(ctx, target.Agent, target.Roots); err != nil {
-			log.Printf("scheduled reconciliation for %s: %v", target.Agent, err)
+			if firstErr == nil {
+				firstErr = err
+			}
+			failed++
+			log.Printf(
+				"scheduled reconciliation for %s failed: error_type=%T",
+				target.Agent, err,
+			)
 		}
 	}
+	log.Printf(
+		"scheduled reconciliation finished: targets=%d failed=%d duration=%s outcome=%s",
+		len(targets), failed, time.Since(started).Round(time.Millisecond),
+		syncLifecycleOutcome(ctx, firstErr),
+	)
 }
 
 func startRemoteHostSync(

@@ -16,6 +16,7 @@ type manifestSession struct {
 	Agent                string  `json:"agent"`
 	AgentLabel           string  `json:"agent_label,omitempty"`
 	Entrypoint           string  `json:"entrypoint,omitempty"`
+	SessionKind          string  `json:"session_kind,omitempty"`
 	FirstMessage         *string `json:"first_message"`
 	DisplayName          *string `json:"display_name,omitempty"`
 	StartedAt            *string `json:"started_at"`
@@ -58,8 +59,8 @@ type manifestSession struct {
 	SourceSessionID      string `json:"source_session_id,omitempty"`
 	SourceVersion        string `json:"source_version,omitempty"`
 	TranscriptFidelity   string `json:"transcript_fidelity,omitempty"`
-	ParserMalformedLines int    `json:"parser_malformed_lines,omitempty"`
-	IsTruncated          bool   `json:"is_truncated,omitempty"`
+	ParserMalformedLines int    `json:"parser_malformed_lines,omitzero"`
+	IsTruncated          bool   `json:"is_truncated,omitzero"`
 
 	DeletedAt          *string `json:"deleted_at,omitempty"`
 	TerminationStatus  *string `json:"termination_status,omitempty"`
@@ -95,6 +96,7 @@ func manifestSessionFromDB(s db.Session) manifestSession {
 		Agent:                s.Agent,
 		AgentLabel:           s.AgentLabel,
 		Entrypoint:           s.Entrypoint,
+		SessionKind:          s.SessionKind,
 		FirstMessage:         s.FirstMessage,
 		DisplayName:          s.DisplayName,
 		StartedAt:            s.StartedAt,
@@ -155,6 +157,7 @@ func (m manifestSession) dbSession() db.Session {
 		Agent:                m.Agent,
 		AgentLabel:           m.AgentLabel,
 		Entrypoint:           m.Entrypoint,
+		SessionKind:          m.SessionKind,
 		FirstMessage:         m.FirstMessage,
 		DisplayName:          m.DisplayName,
 		StartedAt:            m.StartedAt,

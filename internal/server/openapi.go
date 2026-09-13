@@ -17,14 +17,15 @@ func OpenAPISpec(version VersionInfo, opts ...Option) *huma.OpenAPI {
 		cfg: config.Config{
 			WriteTimeout: 30 * time.Second,
 		},
-		mux:     http.NewServeMux(),
-		version: version,
+		mux:               http.NewServeMux(),
+		version:           version,
+		rawSyncSchemaOnly: true,
 	}
 	for _, opt := range opts {
 		opt(s)
 	}
 
-	configureHumaErrors()
+	configureHuma()
 	s.api = humago.New(s.mux, s.humaConfig())
 	s.registerTypedAPIRoutes()
 	return s.api.OpenAPI()

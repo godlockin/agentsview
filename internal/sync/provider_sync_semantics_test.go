@@ -30,8 +30,22 @@ func (f semanticTestFactory) Capabilities() parser.Capabilities {
 	return f.provider.Capabilities()
 }
 
-func (f semanticTestFactory) NewProvider(parser.ProviderConfig) parser.Provider {
-	return f.provider
+type semanticTestScopedProvider struct {
+	*semanticTestProvider
+	scopes parser.ProviderBase
+}
+
+func (p semanticTestScopedProvider) ResolveReconciliationScopes(
+	ctx context.Context, req parser.ReconciliationScopeRequest,
+) (parser.ReconciliationScopePlan, error) {
+	return p.scopes.ResolveReconciliationScopes(ctx, req)
+}
+
+func (f semanticTestFactory) NewProvider(cfg parser.ProviderConfig) parser.Provider {
+	return semanticTestScopedProvider{
+		semanticTestProvider: f.provider,
+		scopes:               perCallScopeProviderBase(f.provider.ProviderBase, cfg),
+	}
 }
 
 type semanticTestProvider struct {
@@ -142,21 +156,19 @@ func newContainerSemanticProvider(
 		FingerprintKey: container,
 	}
 	provider := &semanticTestProvider{
-		ProviderBase: parser.ProviderBase{
-			Def: parser.AgentDef{
-				Type:      parser.AgentOmnigent,
-				IDPrefix:  "omnigent:",
-				FileBased: true,
+		Def: parser.AgentDef{
+			Type:      parser.AgentOmnigent,
+			IDPrefix:  "omnigent:",
+			FileBased: true,
+		},
+		Caps: parser.Capabilities{
+			Source: parser.SourceCapabilities{
+				DiscoverSources:    parser.CapabilitySupported,
+				StreamingDiscovery: parser.CapabilitySupported,
+				MultiSessionSource: parser.CapabilitySupported,
 			},
-			Caps: parser.Capabilities{
-				Source: parser.SourceCapabilities{
-					DiscoverSources:    parser.CapabilitySupported,
-					StreamingDiscovery: parser.CapabilitySupported,
-					MultiSessionSource: parser.CapabilitySupported,
-				},
-				Sync: parser.ProviderSyncSemantics{
-					FingerprintHashInCacheKey: true,
-				},
+			Sync: parser.ProviderSyncSemantics{
+				FingerprintHashInCacheKey: true,
 			},
 		},
 		sources:      []parser.SourceRef{source},
@@ -250,7 +262,7 @@ func TestOmnigentWholeContainerCachePromotesAfterSuccessfulWrite(
 		require.NoError(t, err)
 		assert.NotNil(t, stored)
 	}
-	wantKey := container + "?source_hash=container-hash&data_version=" +
+	wantKey := container + "?agent=omnigent?source_hash=container-hash&data_version=" +
 		strconv.Itoa(db.CurrentDataVersion())
 	assert.Equal(t, map[string]int64{wantKey: fingerprint.MTimeNS},
 		engine.SnapshotSkipCache())
@@ -332,7 +344,7 @@ func TestOmnigentContainerSkipCacheEntryFreshWithoutStoredRow(t *testing.T) {
 		FingerprintHashRequiredForFreshness: true,
 	}
 
-	containerFresh := engine.providerSkipCacheEntryFreshInDB(
+	containerFresh, containerHashVerified := engine.providerSkipCacheEntryFreshInDB(
 		parser.DiscoveredFile{Path: container, Agent: parser.AgentOmnigent},
 		parser.SourceRef{
 			Provider: parser.AgentOmnigent, Key: container,
@@ -341,7 +353,7 @@ func TestOmnigentContainerSkipCacheEntryFreshWithoutStoredRow(t *testing.T) {
 		parser.SourceFingerprint{Key: container, Hash: "container-hash"},
 		providerSemantics,
 	)
-	memberFresh := engine.providerSkipCacheEntryFreshInDB(
+	memberFresh, _ := engine.providerSkipCacheEntryFreshInDB(
 		parser.DiscoveredFile{Path: memberPath, Agent: parser.AgentOmnigent},
 		parser.SourceRef{
 			Provider: parser.AgentOmnigent, Key: memberPath,
@@ -353,6 +365,9 @@ func TestOmnigentContainerSkipCacheEntryFreshWithoutStoredRow(t *testing.T) {
 
 	assert.True(t, containerFresh,
 		"a whole-container entry needs no stored physical-path row")
+	assert.False(t, containerHashVerified,
+		"container identity freshness never compares a stored row hash, "+
+			"so it must not authorize a stat-digest stamp")
 	assert.False(t, memberFresh,
 		"a virtual member entry must still validate against its stored row")
 }
@@ -371,16 +386,14 @@ func TestSyncSemanticsDeclaredRowlessCacheFreshnessSkipsParse(t *testing.T) {
 		Key: path, Size: 10, MTimeNS: 2468, Hash: "rowless-hash",
 	}
 	provider := &semanticTestProvider{
-		ProviderBase: parser.ProviderBase{
-			Def: parser.AgentDef{
-				Type: semanticTestAgent, IDPrefix: "semantic:", FileBased: true,
-			},
-			Caps: parser.Capabilities{
-				Sync: parser.ProviderSyncSemantics{
-					FingerprintHashInCacheKey:           true,
-					FingerprintHashRequiredForFreshness: true,
-					SkipCacheFreshWithoutStoredRow:      true,
-				},
+		Def: parser.AgentDef{
+			Type: semanticTestAgent, IDPrefix: "semantic:", FileBased: true,
+		},
+		Caps: parser.Capabilities{
+			Sync: parser.ProviderSyncSemantics{
+				FingerprintHashInCacheKey:           true,
+				FingerprintHashRequiredForFreshness: true,
+				SkipCacheFreshWithoutStoredRow:      true,
 			},
 		},
 		fingerprints: map[string]parser.SourceFingerprint{
@@ -426,16 +439,20 @@ func TestOmnigentCompleteResultOwnershipTombstonesAndRevivesMissingMember(
 		},
 		{
 			ID: "omnigent:missing", Agent: string(parser.AgentOmnigent),
-			Machine: "devbox", FilePath: &missingPath,
+			Machine: "", FilePath: &missingPath,
 		},
 	} {
 		require.NoError(t, database.UpsertSession(seed))
 	}
 	require.NoError(t, database.BaselineActiveSessionSourcePaths(
-		t.Context(), "devbox", []db.SessionSourcePath{
-			{Agent: string(parser.AgentOmnigent), FilePath: keptPath},
-			{Agent: string(parser.AgentOmnigent), FilePath: missingPath},
-		},
+		t.Context(), "devbox", []db.SessionSourcePath{{
+			Agent: string(parser.AgentOmnigent), FilePath: keptPath,
+		}},
+	))
+	require.NoError(t, database.BaselineActiveSessionSourcePaths(
+		t.Context(), "", []db.SessionSourcePath{{
+			Agent: string(parser.AgentOmnigent), FilePath: missingPath,
+		}},
 	))
 	provider, source := newContainerSemanticProvider(
 		container, fingerprint, parser.ParseOutcome{
@@ -459,12 +476,11 @@ func TestOmnigentCompleteResultOwnershipTombstonesAndRevivesMissingMember(
 
 	active, err := database.GetSession(t.Context(), "omnigent:missing")
 	require.NoError(t, err)
-	assert.Nil(t, active)
+	assert.NotNil(t, active)
 	archived, err := database.GetSessionFull(t.Context(), "omnigent:missing")
 	require.NoError(t, err)
-	require.NotNil(t, archived)
-	require.NotNil(t, archived.DeletionCause)
-	assert.Equal(t, "source_missing", *archived.DeletionCause)
+	assert.Empty(t, archived.Machine)
+	assertSourceMissingState(t, archived)
 
 	// The revived member re-appears through a real container change: the
 	// database fingerprint moves, so the promoted container cache entry no
@@ -488,7 +504,8 @@ func TestOmnigentCompleteResultOwnershipTombstonesAndRevivesMissingMember(
 
 	revived, err := database.GetSession(t.Context(), "omnigent:missing")
 	require.NoError(t, err)
-	assert.NotNil(t, revived)
+	require.NotNil(t, revived)
+	assert.Empty(t, revived.Machine)
 }
 
 func TestCompleteResultOwnershipReadFailureAbortsWithoutCaching(
@@ -559,10 +576,16 @@ func TestSyncSemanticsUnchangedResultPolicies(t *testing.T) {
 		file, []parser.ParseResult{result},
 		parser.UnchangedResultMTimeAndHash,
 	)
+	engine.forceFullParse = true
+	forced := engine.dropUnchangedSharedSQLiteResults(
+		file, []parser.ParseResult{result}, parser.UnchangedResultMTime,
+	)
 
 	assert.Empty(t, mtimeOnly)
 	require.Len(t, mtimeAndHash, 1)
 	assert.Equal(t, "semantic:member", mtimeAndHash[0].Session.ID)
+	require.Len(t, forced, 1)
+	assert.Equal(t, "semantic:member", forced[0].Session.ID)
 }
 
 func TestOmnigentDependentSourceExpansionPreservesEngineIDPrefixing(
@@ -585,9 +608,7 @@ func TestOmnigentDependentSourceExpansionPreservesEngineIDPrefixing(
 		FingerprintKey: childPath,
 	}
 	provider := &semanticTestProvider{
-		ProviderBase: parser.ProviderBase{
-			Def: parser.AgentDef{Type: parser.AgentOmnigent, FileBased: true},
-		},
+		Def: parser.AgentDef{Type: parser.AgentOmnigent, FileBased: true},
 		reconciled: map[string]parser.SourceRef{
 			childPath: childSource,
 		},
@@ -596,13 +617,13 @@ func TestOmnigentDependentSourceExpansionPreservesEngineIDPrefixing(
 	require.NoError(t, database.UpsertSession(db.Session{
 		ID:       parentID,
 		Agent:    string(parser.AgentOmnigent),
-		Machine:  "local",
+		Machine:  "",
 		FilePath: &rootPath,
 	}))
 	require.NoError(t, database.UpsertSession(db.Session{
 		ID:              "remote~omnigent:child",
 		Agent:           string(parser.AgentOmnigent),
-		Machine:         "local",
+		Machine:         "",
 		ParentSessionID: &parentID,
 		FilePath:        &childPath,
 	}))
@@ -618,6 +639,13 @@ func TestOmnigentDependentSourceExpansionPreservesEngineIDPrefixing(
 
 	require.NoError(t, err)
 	assert.ElementsMatch(t, []parser.SourceRef{rootSource, childSource}, expanded)
+
+	canceled, cancel := context.WithCancel(t.Context())
+	cancel()
+	_, err = engine.expandOmnigentInheritedMetadataSources(
+		canceled, provider, []parser.SourceRef{rootSource},
+	)
+	require.ErrorContains(t, err, "list omnigent parent session machines")
 }
 
 // TestBaselineFailureDoesNotPromoteSkipCache pins the omnigent-only cache
@@ -657,13 +685,11 @@ func testNonStreamedBaselineFailureRejectsCache(t *testing.T) {
 	t.Cleanup(engine.Close)
 	results := make(chan syncJob, 1)
 	results <- syncJob{
-		agent: parser.AgentOmnigent,
-		path:  path,
-		processResult: processResult{
-			cacheSkip: true,
-			cacheKey:  path + "?complete",
-			mtime:     1234,
-		},
+		agent:     parser.AgentOmnigent,
+		path:      path,
+		cacheSkip: true,
+		cacheKey:  path + "?complete",
+		mtime:     1234,
 	}
 	close(results)
 	require.NoError(t, database.CloseWriter())
@@ -759,13 +785,11 @@ func TestBaselineFailureKeepsRowlessCacheForOtherProviders(t *testing.T) {
 	t.Cleanup(engine.Close)
 	results := make(chan syncJob, 1)
 	results <- syncJob{
-		agent: semanticTestAgent,
-		path:  path,
-		processResult: processResult{
-			cacheSkip: true,
-			cacheKey:  path + "?complete",
-			mtime:     1234,
-		},
+		agent:     semanticTestAgent,
+		path:      path,
+		cacheSkip: true,
+		cacheKey:  path + "?complete",
+		mtime:     1234,
 	}
 	close(results)
 	require.NoError(t, database.CloseWriter())

@@ -3,7 +3,7 @@ package main
 import (
 	"context"
 	"database/sql"
-	"encoding/json"
+	"encoding/json/v2"
 	"errors"
 	"fmt"
 	"net/http"
@@ -21,7 +21,6 @@ import (
 	"github.com/stretchr/testify/require"
 	"go.kenn.io/agentsview/internal/config"
 	"go.kenn.io/agentsview/internal/db"
-	"go.kenn.io/agentsview/internal/db/driver"
 	"go.kenn.io/kit/daemon"
 )
 
@@ -1089,6 +1088,120 @@ func TestWaitForBackgroundServeReadyAttachedObservesProgressWithoutTimeout(
 	}
 }
 
+func TestWaitForBackgroundServeReadyRenewsTimeoutOnStartupProgress(t *testing.T) {
+	setStartProbeTickForTest(t, 300*time.Millisecond)
+	dir := runtimeTestDir(t)
+	require.NoError(t, os.MkdirAll(dir, 0o700))
+	updatedAt := time.Now()
+	writeState := func(detail string, update time.Time) {
+		data, err := json.Marshal(startupState{
+			PID:       321,
+			StartedAt: updatedAt,
+			Phase:     "initial sync",
+			Detail:    detail,
+			UpdatedAt: update,
+		})
+		require.NoError(t, err)
+		require.NoError(t, os.WriteFile(startupStatePath(dir), data, 0o600))
+	}
+	writeState("1/2 sessions", updatedAt)
+	MarkDaemonStarting(dir)
+	t.Cleanup(func() { UnmarkDaemonStarting(dir) })
+
+	initialObserved := make(chan struct{}, 1)
+	resultCh := make(chan *DaemonRuntime, 1)
+	errCh := make(chan error, 1)
+	go func() {
+		rt, waitErr := waitForBackgroundServeReadyWithPolicy(
+			context.Background(), dir, "", make(chan error), 500*time.Millisecond,
+			backgroundServeReadyWaitPolicy{
+				Observe: func(st *startupState, _ time.Duration) {
+					if st == nil {
+						return
+					}
+					select {
+					case initialObserved <- struct{}{}:
+					default:
+					}
+				},
+			},
+		)
+		resultCh <- rt
+		errCh <- waitErr
+	}()
+
+	select {
+	case <-initialObserved:
+	case <-time.After(time.Second):
+		t.Fatal("readiness wait did not observe initial startup state")
+	}
+	select {
+	case <-initialObserved:
+	case <-time.After(time.Second):
+		t.Fatal("readiness wait did not reach its final poll before timeout")
+	}
+	writeState("2/2 sessions", updatedAt.Add(time.Second))
+	time.Sleep(250 * time.Millisecond)
+	host, port := testPingServer(t)
+	_, err := WriteDaemonRuntime(dir, host, port, version, false)
+	require.NoError(t, err)
+	t.Cleanup(func() { RemoveDaemonRuntime(dir) })
+
+	select {
+	case err := <-errCh:
+		require.NoError(t, err)
+		rt := <-resultCh
+		require.NotNil(t, rt)
+		assert.Equal(t, port, rt.Port)
+	case <-time.After(time.Second):
+		t.Fatal("readiness wait did not return authoritative runtime")
+	}
+}
+
+func TestWaitForBackgroundServeReadyTimesOutWithoutNewStartupProgress(t *testing.T) {
+	setStartProbeTickForTest(t, 5*time.Millisecond)
+	dir := runtimeTestDir(t)
+	require.NoError(t, os.MkdirAll(dir, 0o700))
+	data, err := json.Marshal(startupState{
+		PID:       321,
+		StartedAt: time.Now(),
+		Phase:     "initial sync",
+		Detail:    "1/2 sessions",
+		UpdatedAt: time.Now(),
+	})
+	require.NoError(t, err)
+	require.NoError(t, os.WriteFile(startupStatePath(dir), data, 0o600))
+	MarkDaemonStarting(dir)
+	t.Cleanup(func() { UnmarkDaemonStarting(dir) })
+
+	startedAt := time.Now()
+	rt, err := waitForBackgroundServeReady(
+		context.Background(), dir, "", make(chan error), 40*time.Millisecond,
+	)
+	require.NoError(t, err)
+	assert.Nil(t, rt)
+	assert.Less(t, time.Since(startedAt), 200*time.Millisecond)
+}
+
+func TestWaitForBackgroundServeReadyReprobesRuntimeAtTimeout(t *testing.T) {
+	setStartProbeTickForTest(t, time.Second)
+	dir := runtimeTestDir(t)
+	host, port := testPingServer(t)
+	rt, err := waitForBackgroundServeReadyWithPolicy(
+		context.Background(), dir, "", make(chan error), 20*time.Millisecond,
+		backgroundServeReadyWaitPolicy{
+			Observe: func(*startupState, time.Duration) {
+				_, writeErr := WriteDaemonRuntime(dir, host, port, version, false)
+				require.NoError(t, writeErr)
+			},
+		},
+	)
+	t.Cleanup(func() { RemoveDaemonRuntime(dir) })
+	require.NoError(t, err)
+	require.NotNil(t, rt)
+	assert.Equal(t, port, rt.Port)
+}
+
 func TestWaitForBackgroundServeReadyAttachedChildExitAndCancellation(t *testing.T) {
 	setStartProbeTickForTest(t, 10*time.Millisecond)
 
@@ -1533,9 +1646,26 @@ func TestEnsureBackgroundServeReplacesIncompatibleDaemonAfterStartupWait(
 
 	unlockStart := holdExternalDaemonStartLock(t, dir)
 	oldHost, oldPort := testPingServer(t)
+	waitStarted := make(chan struct{})
+	oldWaitForDaemonStartup := waitForDaemonStartupForEnsure
+	waitForDaemonStartupForEnsure = func(
+		ctx context.Context,
+		dataDir string,
+		timeout time.Duration,
+		authToken ...string,
+	) bool {
+		close(waitStarted)
+		return oldWaitForDaemonStartup(
+			ctx, dataDir, timeout, authToken...,
+		)
+	}
+	t.Cleanup(func() {
+		waitForDaemonStartupForEnsure = oldWaitForDaemonStartup
+	})
+
 	errCh := make(chan error, 1)
 	go func() {
-		time.Sleep(2 * startProbeTick())
+		<-waitStarted
 		_, err := writeRuntimeRecordForTest(dir, daemonRuntimeRecord(
 			oldHost, oldPort,
 			withRuntimeVersion("1.0.0"),
@@ -2464,7 +2594,7 @@ func writeTooNewSQLiteDB(t *testing.T, dir string) string {
 	require.NoError(t, database.Close())
 
 	futureVersion := db.CurrentDataVersion() + 10
-	conn, err := sql.Open(driver.DriverName, dbPath)
+	conn, err := sql.Open("sqlite3", dbPath)
 	require.NoError(t, err)
 	_, err = conn.Exec(fmt.Sprintf("PRAGMA user_version = %d", futureVersion))
 	require.NoError(t, err)

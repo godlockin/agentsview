@@ -26,33 +26,33 @@ import (
 func (s *Server) registerSessionRoutes() {
 	group := newRouteGroup(s.api, "/api/v1", "Sessions")
 
-	get(s, group, "/sessions", "List sessions", s.humaListSessions)
-	get(s, group, "/sessions/sidebar-index", "List sidebar sessions", s.humaSidebarSessionIndex)
-	get(s, group, "/session-ids/resolve", "Resolve session IDs", s.humaResolveSessionIDs)
-	get(s, group, "/sessions/{id}", "Get session", s.humaGetSession)
-	get(s, group, "/sessions/{id}/messages", "List session messages", s.humaGetMessages)
-	get(s, group, "/sessions/{id}/tool-calls", "List session tool calls", s.humaToolCalls)
-	get(s, group, "/sessions/{id}/children", "List child sessions", s.humaGetChildSessions)
-	get(s, group, "/sessions/{id}/activity", "Get session activity", s.humaGetSessionActivity)
-	get(s, group, "/sessions/{id}/timing", "Get session timing", s.humaSessionTiming)
-	get(s, group, "/sessions/{id}/usage", "Get session usage", s.humaSessionUsage)
-	stream(s, group, http.MethodGet, "/sessions/{id}/watch", "Watch session events", s.humaWatchSession)
-	stream(s, group, http.MethodGet, "/events", "Watch server events", s.humaEvents)
-	raw(s, group, http.MethodGet, "/sessions/{id}/export", "Export session as HTML", s.humaExportSession)
-	raw(s, group, http.MethodGet, "/sessions/{id}/md", "Export session as Markdown", s.humaMarkdownSession)
-	post(s, group, "/sessions/{id}/publish", "Publish session", s.humaPublishSession)
-	post(s, group, "/sessions/{id}/resume", "Resume session", s.humaResumeSession)
-	get(s, group, "/sessions/{id}/directory", "Get session directory", s.humaGetSessionDir)
-	get(s, group, "/sessions/{id}/search", "Search within a session", s.humaSearchSession)
-	post(s, group, "/sessions/{id}/open", "Open session directory", s.humaOpenSession)
-	post(s, group, "/sessions/upload", "Upload a session export", s.humaUploadSession)
-	patch(s, group, "/sessions/{id}/rename", "Rename session", s.humaRenameSession)
-	post(s, group, "/sessions/batch-delete", "Batch delete sessions", s.humaBatchDeleteSessions)
-	deleteRoute(s, group, "/sessions/{id}", "Delete session", s.humaDeleteSession)
-	post(s, group, "/sessions/{id}/restore", "Restore session", s.humaRestoreSession)
-	deleteRoute(s, group, "/sessions/{id}/permanent", "Permanently delete session", s.humaPermanentDeleteSession)
-	get(s, group, "/trash", "List trash", s.humaListTrash)
-	deleteRoute(s, group, "/trash", "Empty trash", s.humaEmptyTrash)
+	s.get(group, "/sessions", "List sessions", s.humaListSessions)
+	s.get(group, "/sessions/sidebar-index", "List sidebar sessions", s.humaSidebarSessionIndex)
+	s.get(group, "/session-ids/resolve", "Resolve session IDs", s.humaResolveSessionIDs)
+	s.get(group, "/sessions/{id}", "Get session", s.humaGetSession)
+	s.get(group, "/sessions/{id}/messages", "List session messages", s.humaGetMessages)
+	s.get(group, "/sessions/{id}/tool-calls", "List session tool calls", s.humaToolCalls)
+	s.get(group, "/sessions/{id}/children", "List child sessions", s.humaGetChildSessions)
+	s.get(group, "/sessions/{id}/activity", "Get session activity", s.humaGetSessionActivity)
+	s.get(group, "/sessions/{id}/timing", "Get session timing", s.humaSessionTiming)
+	s.get(group, "/sessions/{id}/usage", "Get session usage", s.humaSessionUsage)
+	s.stream(group, http.MethodGet, "/sessions/{id}/watch", "Watch session events", s.humaWatchSession)
+	s.stream(group, http.MethodGet, "/events", "Watch server events", s.humaEvents)
+	s.raw(group, http.MethodGet, "/sessions/{id}/export", "Export session as HTML", s.humaExportSession)
+	s.raw(group, http.MethodGet, "/sessions/{id}/md", "Export session as Markdown", s.humaMarkdownSession)
+	s.post(group, "/sessions/{id}/publish", "Publish session", s.humaPublishSession)
+	s.post(group, "/sessions/{id}/resume", "Resume session", s.humaResumeSession)
+	s.get(group, "/sessions/{id}/directory", "Get session directory", s.humaGetSessionDir)
+	s.get(group, "/sessions/{id}/search", "Search within a session", s.humaSearchSession)
+	s.post(group, "/sessions/{id}/open", "Open session directory", s.humaOpenSession)
+	s.post(group, "/sessions/upload", "Upload a session export", s.humaUploadSession)
+	s.patch(group, "/sessions/{id}/rename", "Rename session", s.humaRenameSession)
+	s.post(group, "/sessions/batch-delete", "Batch delete sessions", s.humaBatchDeleteSessions)
+	s.deleteRoute(group, "/sessions/{id}", "Delete session", s.humaDeleteSession)
+	s.post(group, "/sessions/{id}/restore", "Restore session", s.humaRestoreSession)
+	s.deleteRoute(group, "/sessions/{id}/permanent", "Permanently delete session", s.humaPermanentDeleteSession)
+	s.get(group, "/trash", "List trash", s.humaListTrash)
+	s.deleteRoute(group, "/trash", "Empty trash", s.humaEmptyTrash)
 }
 
 type messageDirection string
@@ -76,6 +76,7 @@ type sessionFilterInput struct {
 	IncludeOneShot   bool              `query:"include_one_shot" doc:"Include one-shot sessions"`
 	IncludeAutomated bool              `query:"include_automated" doc:"Include automated sessions"`
 	IncludeChildren  bool              `query:"include_children" doc:"Include child sessions"`
+	IncludeSource    bool              `query:"include_source" doc:"Include source file paths"`
 	Outcome          string            `query:"outcome" doc:"Filter by detected outcome"`
 	HealthGrade      string            `query:"health_grade" doc:"Filter by health grade"`
 	Cursor           string            `query:"cursor" doc:"Opaque pagination cursor"`
@@ -142,6 +143,7 @@ func (in *sessionFilterInput) listFilter() (service.ListFilter, error) {
 		IncludeOneShot:   in.IncludeOneShot,
 		IncludeAutomated: in.IncludeAutomated,
 		IncludeChildren:  in.IncludeChildren,
+		IncludeSource:    in.IncludeSource,
 		Outcome:          in.Outcome,
 		HealthGrade:      in.HealthGrade,
 		Cursor:           in.Cursor,
@@ -225,6 +227,10 @@ func (s *Server) humaSidebarSessionIndex(
 	filter, err := in.dbFilter(true)
 	if err != nil {
 		return nil, err
+	}
+	filter.Machine, err = db.ResolveMachineFilter(ctx, s.db, filter.Machine)
+	if err != nil {
+		return nil, serverError(err)
 	}
 	index, err := s.db.GetSidebarSessionIndex(ctx, filter)
 	if err != nil {
@@ -370,19 +376,23 @@ func (s *Server) humaSessionTiming(
 }
 
 type sessionUsageResponse struct {
-	SessionID           string                          `json:"session_id"`
-	Agent               string                          `json:"agent"`
-	Project             string                          `json:"project"`
-	TotalOutputTokens   int                             `json:"total_output_tokens"`
-	PeakContextTokens   int                             `json:"peak_context_tokens"`
-	HasTokenData        bool                            `json:"has_token_data"`
-	Cost                money.Money                     `json:"cost"`
-	HasCost             bool                            `json:"has_cost"`
+	SessionID         string      `json:"session_id"`
+	Agent             string      `json:"agent"`
+	Project           string      `json:"project"`
+	TotalOutputTokens int         `json:"total_output_tokens"`
+	PeakContextTokens int         `json:"peak_context_tokens"`
+	HasTokenData      bool        `json:"has_token_data"`
+	Cost              money.Money `json:"cost"`
+	HasCost           bool        `json:"has_cost"`
+	// CostUSD is a deprecated compatibility alias for
+	// Cost.Microdollars/1e6; see db.SessionUsage.CostUSD.
+	CostUSD             *float64                        `json:"cost_usd,omitempty"`
 	CostSource          export.CostSource               `json:"cost_source,omitempty"`
-	AICredits           float64                         `json:"ai_credits,omitempty"`
+	AICredits           float64                         `json:"ai_credits,omitzero"`
 	Models              []string                        `json:"models"`
 	UnpricedModels      []string                        `json:"unpriced_models"`
 	BreakdownCount      int                             `json:"breakdown_count"`
+	SubagentCount       int                             `json:"subagent_count,omitzero"`
 	Breakdown           []sessionUsageBreakdownResponse `json:"breakdown"`
 	ServerRunning       bool                            `json:"server_running"`
 	RollupCost          *money.Money                    `json:"rollup_cost,omitempty"`
@@ -395,6 +405,7 @@ type sessionUsageInput struct {
 	ID        string `path:"id" required:"true" doc:"Session ID"`
 	Breakdown bool   `query:"breakdown" doc:"Include per-step breakdown rows"`
 	Rollup    bool   `query:"rollup" doc:"Include explicit subagent descendant costs"`
+	Subagents bool   `query:"subagents" doc:"Fold subagent descendant usage into the totals, models, and breakdown"`
 }
 
 type sessionUsageBreakdownResponse struct {
@@ -404,10 +415,12 @@ type sessionUsageBreakdownResponse struct {
 	Label                    string      `json:"label"`
 	Timestamp                string      `json:"timestamp"`
 	Model                    string      `json:"model"`
+	SubagentSessionID        string      `json:"subagent_session_id,omitempty"`
 	InputTokens              int         `json:"input_tokens"`
 	OutputTokens             int         `json:"output_tokens"`
 	CacheCreationInputTokens int         `json:"cache_creation_input_tokens"`
 	CacheReadInputTokens     int         `json:"cache_read_input_tokens"`
+	WebSearchRequests        int         `json:"web_search_requests,omitzero"`
 	Cost                     money.Money `json:"cost"`
 	HasCost                  bool        `json:"has_cost"`
 }
@@ -444,10 +457,12 @@ func newSessionUsageHumaResponse(usage *db.SessionUsage) sessionUsageResponse {
 			Label:                    entry.Label,
 			Timestamp:                entry.Timestamp,
 			Model:                    entry.Model,
+			SubagentSessionID:        entry.SubagentSessionID,
 			InputTokens:              entry.InputTokens,
 			OutputTokens:             entry.OutputTokens,
 			CacheCreationInputTokens: entry.CacheCreationInputTokens,
 			CacheReadInputTokens:     entry.CacheReadInputTokens,
+			WebSearchRequests:        entry.WebSearchRequests,
 			Cost:                     entry.Cost,
 			HasCost:                  entry.HasCost,
 		})
@@ -461,11 +476,13 @@ func newSessionUsageHumaResponse(usage *db.SessionUsage) sessionUsageResponse {
 		HasTokenData:      usage.HasTokenData,
 		Cost:              usage.Cost,
 		HasCost:           usage.HasCost,
+		CostUSD:           usage.CostUSD,
 		CostSource:        usage.CostSource,
 		AICredits:         usage.AICredits,
 		Models:            usage.Models,
 		UnpricedModels:    unpricedModels,
 		BreakdownCount:    usage.BreakdownCount,
+		SubagentCount:     usage.SubagentCount,
 		Breakdown:         breakdown,
 		ServerRunning:     true,
 	}
@@ -495,7 +512,18 @@ func (s *Server) humaSessionUsage(
 		body.RollupSubagentCount = &rollup.SubagentCount
 		return &jsonOutput[sessionUsageResponse]{Body: body}, nil
 	}
-	usage, err := s.db.GetSessionUsage(ctx, in.ID, in.Breakdown)
+	// `subagents` is additive: it changes the totals, models and breakdown
+	// in place rather than adding parallel rollup_* fields, so a caller
+	// (the CLI) gets one combined document. `rollup` above keeps its own
+	// shape because the SPA reads those fields.
+	var usage *db.SessionUsage
+	var err error
+	if in.Subagents {
+		usage, err = service.SessionUsageWithSubagents(
+			ctx, s.db, in.ID, in.Breakdown)
+	} else {
+		usage, err = s.db.GetSessionUsage(ctx, in.ID, in.Breakdown)
+	}
 	if err != nil {
 		if handled := handleHumaContextError(err); handled != nil {
 			return nil, handled
@@ -748,7 +776,7 @@ func (s *Server) humaDeleteSession(
 
 type batchDeleteInput struct {
 	Body struct {
-		SessionIDs []string `json:"session_ids" required:"true" nullable:"false" doc:"Session IDs to soft-delete"`
+		SessionIDs []string `json:"session_ids" required:"true" doc:"Session IDs to soft-delete"`
 	}
 }
 
@@ -840,9 +868,10 @@ func (s *Server) humaEmptyTrash(
 }
 
 type uploadSessionInput struct {
-	Project string `query:"project" required:"true" doc:"Project for imported session"`
-	Machine string `query:"machine" default:"remote" doc:"Machine name for imported session"`
-	RawBody huma.MultipartFormFiles[uploadSessionForm]
+	Project      string `query:"project" required:"true" doc:"Project for imported session"`
+	Machine      string `query:"machine" default:"remote" doc:"Machine name for imported session"`
+	AllowShorter bool   `query:"allow_shorter" doc:"Permit replacing an existing session with fewer messages"`
+	RawBody      huma.MultipartFormFiles[uploadSessionForm]
 }
 
 type uploadSessionForm struct {
@@ -1067,12 +1096,17 @@ func (s *Server) humaUploadSession(
 	if len(results) == 0 {
 		return nil, apiError(http.StatusBadRequest, "no sessions parsed from upload")
 	}
+	stem := strings.TrimSuffix(safeName, ".jsonl")
+	if results[0].Session.ID != stem && parser.IsValidSessionID(results[0].Session.ID) {
+		upload.finalPath = filepath.Join(filepath.Dir(upload.finalPath), results[0].Session.ID+".jsonl")
+	}
 	for i := range results {
 		results[i].Session.File.Path = upload.finalPath
 	}
 	writes := make([]db.SessionBatchWrite, len(results))
 	for i, pr := range results {
 		writes[i] = sessionBatchWriteFromParsed(pr.Session, pr.Messages)
+		writes[i].RejectMessageCountDecrease = !in.AllowShorter
 	}
 	var commitErr error
 	var uploadCommit committedUpload
@@ -1094,6 +1128,13 @@ func (s *Server) humaUploadSession(
 		}
 		if handled := handleHumaReadOnly(err); handled != nil {
 			return nil, handled
+		}
+		if shorter, ok := errors.AsType[*db.SessionWouldShortenError](err); ok {
+			return nil, apiError(http.StatusConflict, fmt.Sprintf(
+				"session upload rejected: session %s has %d messages, upload has %d; retry with allow_shorter=true",
+				shorter.SessionID, shorter.ExistingMessages,
+				shorter.IncomingMessages,
+			))
 		}
 		if errors.Is(err, db.ErrSessionExcluded) ||
 			errors.Is(err, db.ErrSessionTrashed) {

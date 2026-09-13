@@ -27,6 +27,7 @@ CREATE TABLE sessions (
 	last_activity_at INTEGER,
 	workspace_json TEXT,
 	metadata_json TEXT,
+	main_chain_id INTEGER,
 	hidden INTEGER NOT NULL DEFAULT 0
 );
 `
@@ -44,15 +45,16 @@ CREATE TABLE message_nodes (
 `
 
 type devinSessionRow struct {
-	ID                 string
-	Title              string
-	WorkingDirectory   string
-	Model              string
-	CreatedAtMillis    *int64
-	LastActivityMillis *int64
-	WorkspaceJSON      string
-	MetadataJSON       string
-	Hidden             bool
+	ID               string
+	Title            string
+	WorkingDirectory string
+	Model            string
+	CreatedAt        *int64
+	LastActivityAt   *int64
+	WorkspaceJSON    string
+	MetadataJSON     string
+	MainChainID      *int64
+	Hidden           bool
 }
 
 type devinTestFixture struct {
@@ -63,12 +65,12 @@ type devinTestFixture struct {
 }
 
 type devinSyntheticMessageNodeRow struct {
-	SessionID       string
-	NodeID          int64
-	ParentNodeID    *int64
-	ChatMessage     string
-	CreatedAtMillis int64
-	MetadataJSON    string
+	SessionID    string
+	NodeID       int64
+	ParentNodeID *int64
+	ChatMessage  string
+	CreatedAt    int64
+	MetadataJSON string
 }
 
 func newDevinTestFixture(t *testing.T, rows ...devinSessionRow) *devinTestFixture {
@@ -120,27 +122,29 @@ func insertDevinSessionRow(t *testing.T, dbPath string, row devinSessionRow) {
 			last_activity_at,
 			workspace_json,
 			metadata_json,
+			main_chain_id,
 			hidden
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	`,
 		row.ID,
 		row.Title,
 		row.WorkingDirectory,
 		row.Model,
-		devinNullableMillis(row.CreatedAtMillis),
-		devinNullableMillis(row.LastActivityMillis),
+		devinNullableTimestamp(row.CreatedAt),
+		devinNullableTimestamp(row.LastActivityAt),
 		devinNullableString(row.WorkspaceJSON),
 		devinNullableString(row.MetadataJSON),
+		devinNullableInt64(row.MainChainID),
 		row.Hidden,
 	)
 	require.NoError(t, err)
 }
 
-func devinNullableMillis(ms *int64) any {
-	if ms == nil {
+func devinNullableTimestamp(sec *int64) any {
+	if sec == nil {
 		return nil
 	}
-	return *ms
+	return *sec
 }
 
 func devinNullableString(value string) any {
@@ -204,7 +208,7 @@ func insertDevinMessageNodeRow(t *testing.T, dbPath string, row devinSyntheticMe
 		row.NodeID,
 		devinNullableInt64(row.ParentNodeID),
 		row.ChatMessage,
-		row.CreatedAtMillis,
+		row.CreatedAt,
 		devinNullableString(row.MetadataJSON),
 	)
 	require.NoError(t, err)

@@ -31,11 +31,9 @@ func (f devinProviderFactory) Capabilities() Capabilities {
 func (f devinProviderFactory) NewProvider(cfg ProviderConfig) Provider {
 	cfg = cfg.Clone()
 	return &devinProvider{
-		ProviderBase: ProviderBase{
-			Def:    cloneAgentDef(f.def),
-			Caps:   devinProviderCapabilities(),
-			Config: cfg,
-		},
+		Def:     cloneAgentDef(f.def),
+		Caps:    devinProviderCapabilities(),
+		Config:  cfg,
 		sources: newDevinSourceSet(cfg.Roots),
 	}
 }
@@ -114,8 +112,7 @@ func (p *devinProvider) Parse(
 			SkipReason:        SkipNoSession,
 		}, nil
 	}
-	var transcriptErr *devinTranscriptError
-	if errors.As(err, &transcriptErr) {
+	if transcriptErr, ok := errors.AsType[*devinTranscriptError](err); ok {
 		return ParseOutcome{}, transcriptErr
 	}
 	if err != nil {
@@ -444,6 +441,14 @@ func devinFingerprintHash(
 		return "", err
 	}
 	if transcriptInfo == nil {
+		if _, err := fmt.Fprintf(
+			h,
+			"main_chain_valid\x00%t\x00main_chain\x00%d\x00",
+			meta.MainChainID.Valid,
+			meta.MainChainID.Int64,
+		); err != nil {
+			return "", err
+		}
 		if err := devinAppendMessageNodesFingerprint(h, dbPath, meta.RawSessionID); err != nil {
 			return "", err
 		}
@@ -473,13 +478,13 @@ func devinAppendMessageNodesFingerprint(h io.Writer, dbPath, rawSessionID string
 	if err != nil {
 		return err
 	}
-	var maxCreatedAtMS int64
+	var maxCreatedAt int64
 	for _, node := range nodes {
-		if node.CreatedAtMS > maxCreatedAtMS {
-			maxCreatedAtMS = node.CreatedAtMS
+		if node.CreatedAt > maxCreatedAt {
+			maxCreatedAt = node.CreatedAt
 		}
 	}
-	if _, err := fmt.Fprintf(h, "message_nodes\x00count\x00%d\x00max_created\x00%d\x00", len(nodes), maxCreatedAtMS); err != nil {
+	if _, err := fmt.Fprintf(h, "message_nodes\x00count\x00%d\x00max_created\x00%d\x00", len(nodes), maxCreatedAt); err != nil {
 		return err
 	}
 	for _, node := range nodes {
@@ -490,7 +495,7 @@ func devinAppendMessageNodesFingerprint(h io.Writer, dbPath, rawSessionID string
 			node.NodeID,
 			node.ParentNodeID.Valid,
 			node.ParentNodeID.Int64,
-			node.CreatedAtMS,
+			node.CreatedAt,
 			len(node.ChatMessage),
 		); err != nil {
 			return err
@@ -548,7 +553,10 @@ func (s devinSourceSet) dbPathForEvent(root, path string) (string, bool) {
 	if !ok || strings.Contains(rel, string(filepath.Separator)) {
 		return "", false
 	}
-	if rel == devinDBFilename || rel == devinDBFilename+"-wal" || rel == devinDBFilename+"-shm" {
+	// A bare "-shm" event is ignored: the provider's own read connections
+	// rewrite that index, and every committed write lands in the main file
+	// or the WAL.
+	if rel == devinDBFilename || rel == devinDBFilename+"-wal" {
 		return filepath.Join(cliRoot, devinDBFilename), true
 	}
 	return "", false

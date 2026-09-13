@@ -3,7 +3,6 @@ package sync
 import (
 	"context"
 	"fmt"
-	"io"
 	"log"
 	"os"
 	"path/filepath"
@@ -42,19 +41,23 @@ import (
 const (
 	defaultBenchSyncSessions = 40
 	defaultBenchSyncMessages = 30
-	benchLargeSessionLines   = 1000
+	// The usage-bearing fixture is larger so the partial usage-index
+	// B-trees see enough rows for per-row maintenance costs to show.
+	defaultBenchSyncUsageSessions = 60
+	defaultBenchSyncUsageMessages = 100
+	benchLargeSessionLines        = 1000
 )
 
-// silenceBenchLogs discards the engine's global log output for the
-// duration of the benchmark. Log lines interleave with `go test
-// -bench` result lines on stdout, which corrupts them so benchfmt
-// cannot parse the benchmark — benchgate fails on such corruption,
-// and before it did, the corrupted benchmarks silently vanished
-// from the gate on both sides.
-func silenceBenchLogs(b *testing.B) {
+// routeBenchLogs sends the engine's global log output through the
+// benchmark's own output for its duration. go test prints a benchmark's
+// name before the timed loop and its numbers after, so a log line
+// written straight to stderr in between splits the result line and the
+// bench gate rejects the capture. Output written through b.Output is
+// printed after the result line instead.
+func routeBenchLogs(b *testing.B) {
 	b.Helper()
 	prev := log.Writer()
-	log.SetOutput(io.Discard)
+	log.SetOutput(b.Output())
 	b.Cleanup(func() { log.SetOutput(prev) })
 }
 
@@ -105,6 +108,50 @@ func writeBenchClaudeArchive(
 	}
 }
 
+// writeBenchClaudeUsageArchive is the usage-bearing variant: every
+// assistant line carries model, unique message/request identity, and
+// token usage, the shape billed turns take in real Claude transcripts.
+// Those rows land in the partial usage/activity archive indexes, so
+// ingest benchmarks over this fixture exercise their per-row
+// maintenance cost.
+func writeBenchClaudeUsageArchive(
+	b *testing.B, dir string, sessions, perSession int,
+) {
+	b.Helper()
+	proj := filepath.Join(dir, "bench-project")
+	if err := os.MkdirAll(proj, 0o755); err != nil {
+		b.Fatalf("MkdirAll: %v", err)
+	}
+	for s := range sessions {
+		builder := testjsonl.NewSessionBuilder()
+		for m := 0; m < perSession; m += 2 {
+			ts := fmt.Sprintf(
+				"2026-06-20T10:%02d:%02dZ", (m/2/60)%60, (m/2)%60,
+			)
+			builder.AddClaudeUser(ts, fmt.Sprintf(
+				"user message %d in session %d", m, s,
+			))
+			builder.AddClaudeAssistantUsage(ts, fmt.Sprintf(
+				"assistant reply %d in session %d", m, s,
+			), testjsonl.ClaudeAssistantUsage{
+				MessageID:    fmt.Sprintf("msg_bench_%04d_%04d", s, m),
+				RequestID:    fmt.Sprintf("req_bench_%04d_%04d", s, m),
+				Model:        "claude-sonnet-4-20250514",
+				InputTokens:  1000 + m,
+				OutputTokens: 500 + m,
+			})
+		}
+		path := filepath.Join(
+			proj, fmt.Sprintf("bench-%04d.jsonl", s),
+		)
+		if err := os.WriteFile(
+			path, []byte(builder.String()), 0o644,
+		); err != nil {
+			b.Fatalf("WriteFile %s: %v", path, err)
+		}
+	}
+}
+
 // openBenchEngine opens a fresh SQLite DB and an engine watching dir
 // as a Claude root. Cleanup closes the engine before the DB so any
 // pending debounced signal recompute drains first.
@@ -135,7 +182,7 @@ func openBenchEngine(b *testing.B, dir string) (*Engine, *db.DB) {
 // benchmark exists to protect — a warm no-op pass must not reparse
 // or rewrite anything.
 func BenchmarkSyncAllWarmNoop(b *testing.B) {
-	silenceBenchLogs(b)
+	routeBenchLogs(b)
 	sessions := benchIntFromEnv(
 		"AGENTSVIEW_BENCH_SYNC_SESSIONS", defaultBenchSyncSessions,
 	)
@@ -185,9 +232,25 @@ func BenchmarkSyncAllWarmNoop(b *testing.B) {
 // staying flat as the session grows is exactly the invariant this
 // benchmark protects.
 func BenchmarkSyncPathsIncrementalAppend(b *testing.B) {
-	silenceBenchLogs(b)
+	benchSyncPathsIncrementalAppend(b, false)
+}
+
+// BenchmarkSyncPathsIncrementalAppendUsage appends usage-bearing
+// assistant lines to a usage-bearing session, the shape live Claude
+// streaming takes: each absorbed line maintains the partial usage
+// indexes and notifies the usage cache.
+func BenchmarkSyncPathsIncrementalAppendUsage(b *testing.B) {
+	benchSyncPathsIncrementalAppend(b, true)
+}
+
+func benchSyncPathsIncrementalAppend(b *testing.B, withUsage bool) {
+	routeBenchLogs(b)
 	dir := b.TempDir()
-	writeBenchClaudeArchive(b, dir, 1, benchLargeSessionLines)
+	writeArchive := writeBenchClaudeArchive
+	if withUsage {
+		writeArchive = writeBenchClaudeUsageArchive
+	}
+	writeArchive(b, dir, 1, benchLargeSessionLines)
 	engine, database := openBenchEngine(b, dir)
 	ctx := context.Background()
 
@@ -235,6 +298,20 @@ func BenchmarkSyncPathsIncrementalAppend(b *testing.B) {
 	// loop that helper cost would be gated as if it were sync work.
 	lines := make([]string, b.N)
 	for i := range lines {
+		if withUsage {
+			lines[i] = testjsonl.NewSessionBuilder().AddClaudeAssistantUsage(
+				"2026-06-20T11:00:00Z",
+				fmt.Sprintf("streamed line %d", i),
+				testjsonl.ClaudeAssistantUsage{
+					MessageID:    fmt.Sprintf("msg_bench_append_%06d", i),
+					RequestID:    fmt.Sprintf("req_bench_append_%06d", i),
+					Model:        "claude-sonnet-4-20250514",
+					InputTokens:  1000 + i,
+					OutputTokens: 500 + i,
+				},
+			).String()
+			continue
+		}
 		lines[i] = testjsonl.NewSessionBuilder().AddClaudeUser(
 			"2026-06-20T11:00:00Z",
 			fmt.Sprintf("streamed line %d", i),
@@ -267,21 +344,31 @@ func BenchmarkSyncPathsIncrementalAppend(b *testing.B) {
 // benchColdArchive is the shared cold-ingest loop: each iteration
 // syncs the same archive into a fresh database via syncOnce, then
 // verify checks the iteration's outcome with the timer stopped.
+// withUsage selects the usage-bearing fixture and its larger default
+// size.
 func benchColdArchive(
-	b *testing.B,
+	b *testing.B, withUsage bool,
 	syncOnce func(*Engine) SyncStats,
 	verify func(*Engine, SyncStats, int),
 ) {
 	b.Helper()
-	silenceBenchLogs(b)
+	routeBenchLogs(b)
+	defaultSessions, defaultMessages := defaultBenchSyncSessions,
+		defaultBenchSyncMessages
+	writeArchive := writeBenchClaudeArchive
+	if withUsage {
+		defaultSessions, defaultMessages = defaultBenchSyncUsageSessions,
+			defaultBenchSyncUsageMessages
+		writeArchive = writeBenchClaudeUsageArchive
+	}
 	sessions := benchIntFromEnv(
-		"AGENTSVIEW_BENCH_SYNC_SESSIONS", defaultBenchSyncSessions,
+		"AGENTSVIEW_BENCH_SYNC_SESSIONS", defaultSessions,
 	)
 	perSession := benchIntFromEnv(
-		"AGENTSVIEW_BENCH_SYNC_MESSAGES", defaultBenchSyncMessages,
+		"AGENTSVIEW_BENCH_SYNC_MESSAGES", defaultMessages,
 	)
 	dir := b.TempDir()
-	writeBenchClaudeArchive(b, dir, sessions, perSession)
+	writeArchive(b, dir, sessions, perSession)
 	dbDir := b.TempDir()
 
 	b.ReportAllocs()
@@ -329,8 +416,19 @@ func benchColdArchive(
 // through the public SyncAll path: parse plus the default
 // per-session writes a user's first sync performs.
 func BenchmarkSyncAllColdArchive(b *testing.B) {
+	benchSyncAllColdArchive(b, false)
+}
+
+// BenchmarkSyncAllColdArchiveUsage is the same ingest over the
+// usage-bearing fixture, so archive usage-index maintenance and
+// token-field extraction are part of the gated cost.
+func BenchmarkSyncAllColdArchiveUsage(b *testing.B) {
+	benchSyncAllColdArchive(b, true)
+}
+
+func benchSyncAllColdArchive(b *testing.B, withUsage bool) {
 	ctx := context.Background()
-	benchColdArchive(b,
+	benchColdArchive(b, withUsage,
 		func(engine *Engine) SyncStats {
 			return engine.SyncAll(ctx, nil)
 		},
@@ -353,8 +451,18 @@ func BenchmarkSyncAllColdArchive(b *testing.B) {
 // self-asserts that every session really went through the batch
 // pipeline so the benchmark cannot silently measure the wrong path.
 func BenchmarkResyncBulkIngest(b *testing.B) {
+	benchResyncBulkIngest(b, false)
+}
+
+// BenchmarkResyncBulkIngestUsage runs the bulk-write pipeline over the
+// usage-bearing fixture so per-row usage-index maintenance is gated.
+func BenchmarkResyncBulkIngestUsage(b *testing.B) {
+	benchResyncBulkIngest(b, true)
+}
+
+func benchResyncBulkIngest(b *testing.B, withUsage bool) {
 	ctx := context.Background()
-	benchColdArchive(b,
+	benchColdArchive(b, withUsage,
 		func(engine *Engine) SyncStats {
 			engine.syncMu.Lock()
 			defer engine.syncMu.Unlock()
@@ -383,8 +491,19 @@ func BenchmarkResyncBulkIngest(b *testing.B) {
 // BenchmarkResyncBulkContributorIngest measures the same cold archive shape
 // when it enters the atomic rebuild through a contributor engine.
 func BenchmarkResyncBulkContributorIngest(b *testing.B) {
+	benchResyncBulkContributorIngest(b, false)
+}
+
+// BenchmarkResyncBulkContributorIngestUsage is the contributor rebuild
+// over the usage-bearing fixture, covering the full ResyncAll path
+// including the usage-index drop and rebuild.
+func BenchmarkResyncBulkContributorIngestUsage(b *testing.B) {
+	benchResyncBulkContributorIngest(b, true)
+}
+
+func benchResyncBulkContributorIngest(b *testing.B, withUsage bool) {
 	ctx := context.Background()
-	benchColdArchive(b,
+	benchColdArchive(b, withUsage,
 		func(engine *Engine) SyncStats {
 			dir := engine.agentDirs[parser.AgentClaude][0]
 			engine.agentDirs = nil

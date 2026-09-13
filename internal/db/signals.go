@@ -2,7 +2,6 @@ package db
 
 import (
 	"context"
-	"database/sql"
 	"fmt"
 	"log"
 )
@@ -12,6 +11,10 @@ const signalsBackfillMarker = "session_quality_signals_v1"
 // SessionSignalUpdate holds computed signal values to persist
 // on the sessions table.
 type SessionSignalUpdate struct {
+	// FullState is optional state computed from the complete message snapshot
+	// being published. The same transaction binds it to the stored revision.
+	// Incremental and asynchronous writers use their own snapshot guards.
+	FullState              *SessionSignalState
 	ToolFailureSignalCount int
 	ToolRetryCount         int
 	EditChurnCount         int
@@ -33,6 +36,57 @@ type SessionSignalUpdate struct {
 	QualitySignals         QualitySignals
 }
 
+// usageOnlySignalUpdate is the canonical derived-signal state for an archive
+// that deliberately omits the transcript content those signals require. The
+// current version marks the empty result as intentional so startup backfill
+// does not revisit the row on every process launch.
+func usageOnlySignalUpdate() SessionSignalUpdate {
+	return SessionSignalUpdate{
+		QualitySignals: QualitySignals{
+			Version: CurrentQualitySignalVersion,
+		},
+	}
+}
+
+func settleUsageOnlySignalsTx(
+	tx transactionQueries, sessionID string,
+) error {
+	if err := updateSessionSignalsTx(
+		tx, sessionID, usageOnlySignalUpdate(),
+	); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(`DELETE FROM session_signal_state WHERE session_id = ?`, sessionID); err != nil {
+		return fmt.Errorf("clearing usage-only signal state: %w", err)
+	}
+	return replaceSecretFindingsTx(tx, sessionID, nil, 0, "")
+}
+
+// SettleUsageOnlySignals atomically clears transcript-derived signal state and
+// records the current signal version. It also heals compact archives created
+// before usage-only writes persisted that terminal state.
+func (db *DB) SettleUsageOnlySignals(sessionID string) error {
+	if !db.usageOnlyStorage() {
+		return fmt.Errorf(
+			"settling usage-only signals for %s on a full-content database",
+			sessionID,
+		)
+	}
+
+	db.mu.Lock()
+	defer db.mu.Unlock()
+
+	tx, err := db.getWriter().Begin()
+	if err != nil {
+		return fmt.Errorf("beginning usage-only signal tx: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	if err := settleUsageOnlySignalsTx(tx, sessionID); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
 // UpdateSessionSignals persists computed signal values on the
 // sessions table. Bumps local_modified_at so the session is
 // re-selected by the next pg push -- a recomputed signal column
@@ -50,7 +104,12 @@ func (db *DB) UpdateSessionSignals(
 		return fmt.Errorf("beginning tx: %w", err)
 	}
 	defer func() { _ = tx.Rollback() }()
-	if err := updateSessionSignalsTx(tx, sessionID, u); err != nil {
+	if db.usageOnlyStorage() {
+		err = settleUsageOnlySignalsTx(tx, sessionID)
+	} else {
+		err = updateSessionSignalsTx(tx, sessionID, u)
+	}
+	if err != nil {
 		return err
 	}
 	return tx.Commit()
@@ -64,7 +123,7 @@ func (db *DB) UpdateSessionSignals(
 // on SessionSignalUpdate are carried here only so callers can forward them to
 // replaceSecretFindingsTx alongside the findings.
 func updateSessionSignalsTx(
-	tx *sql.Tx, sessionID string, u SessionSignalUpdate,
+	tx transactionQueries, sessionID string, u SessionSignalUpdate,
 ) error {
 	_, err := tx.Exec(`
 		UPDATE sessions SET
@@ -125,6 +184,25 @@ func updateSessionSignalsTx(
 			"updating session signals for %s: %w",
 			sessionID, err,
 		)
+	}
+	if u.FullState != nil {
+		state := u.FullState
+		// Copy the revision inside SQLite, avoiding a post-commit read and
+		// a second transaction for the same session's derived state.
+		if _, err := tx.Exec(`
+			INSERT INTO session_signal_state
+				(session_id, state, transcript_revision, signal_version, updated_at)
+			SELECT id, ?, transcript_revision, ?, strftime('%Y-%m-%dT%H:%M:%fZ','now')
+			FROM sessions WHERE id = ?
+			ON CONFLICT(session_id) DO UPDATE SET
+				state = excluded.state,
+				transcript_revision = excluded.transcript_revision,
+				signal_version = excluded.signal_version,
+				updated_at = excluded.updated_at`,
+			state.State, state.SignalVersion, sessionID,
+		); err != nil {
+			return fmt.Errorf("writing full signal state for %s: %w", sessionID, err)
+		}
 	}
 	return nil
 }

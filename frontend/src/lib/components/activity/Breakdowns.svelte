@@ -1,10 +1,15 @@
 <script lang="ts">
   import { m } from "../../i18n/index.js";
+  import { router } from "../../stores/router.svelte.js";
   import type { Report } from "../../api/types.js";
   import type { ActivityKeyMinutes } from "../../api/generated/index";
   import { formatMoney, moneyFromMicrodollars } from "../../money.js";
 
-  let { report }: { report: Report } = $props();
+  interface Props {
+    report: Report;
+  }
+
+  let { report }: Props = $props();
 
   type Metric = "minutes" | "cost";
   let metric = $state<Metric>("minutes");
@@ -12,19 +17,22 @@
   // by_* fields are typed `any[] | null` by the codegen; cast each
   // to the generated element model for field-level type safety.
   function asKeyMinutes(arr: any[] | null): ActivityKeyMinutes[] {
-    return (arr ?? []) as ActivityKeyMinutes[];
+    return arr ?? [];
   }
 
   function rowValue(row: ActivityKeyMinutes): number {
     return metric === "cost" ? row.cost.microdollars : row.agent_minutes;
   }
 
-  // Per-row automation split for the active metric. Interactive + automated
-  // sum to rowValue, so the two bar segments stack to the full bar width.
+  // Each session belongs to one class, so the three segments sum to the row.
   function interactiveValue(row: ActivityKeyMinutes): number {
     return metric === "cost"
       ? row.interactive_cost.microdollars
       : row.interactive_agent_minutes;
+  }
+
+  function subagentValue(row: ActivityKeyMinutes): number {
+    return metric === "cost" ? row.subagent_cost.microdollars : row.subagent_agent_minutes;
   }
 
   function automatedValue(row: ActivityKeyMinutes): number {
@@ -59,6 +67,21 @@
 
   function rowIdentity(row: ActivityKeyMinutes, projectRows: boolean): string {
 	return projectRows ? (row.project_key || row.key) : row.key;
+  }
+
+  function projectKeyOf(row: ActivityKeyMinutes): string {
+    return row.project_key || row.key;
+  }
+
+  function projectHref(row: ActivityKeyMinutes): string {
+    return router.buildHref("data", { project_key: projectKeyOf(row) });
+  }
+
+  function openInData(event: MouseEvent, row: ActivityKeyMinutes) {
+    if (event.metaKey || event.ctrlKey || event.shiftKey || event.altKey || event.button !== 0)
+      return;
+    event.preventDefault();
+    router.navigate("data", { project_key: projectKeyOf(row) });
   }
 
   function maxValue(rows: ActivityKeyMinutes[]): number {
@@ -102,7 +125,7 @@
     const rect = (e.currentTarget as HTMLElement).getBoundingClientRect();
     const pct = total > 0 ? Math.round((rowValue(row) / total) * 100) : 0;
     const unit = metric === "cost" ? "" : m.activity_min_unit();
-    const split = m.activity_int_auto_split({ int: fmtSeg(interactiveValue(row)), auto: fmtSeg(automatedValue(row)) });
+    const split = m.activity_class_split({ int: fmtSeg(interactiveValue(row)), sub: fmtSeg(subagentValue(row)), auto: fmtSeg(automatedValue(row)) });
     tooltip = {
       x: rect.left + rect.width / 2,
       y: rect.top - 4,
@@ -122,6 +145,9 @@
       <div class="legend" aria-hidden="true">
         <span class="legend-item">
           <span class="swatch interactive"></span>{m.activity_interactive()}
+        </span>
+        <span class="legend-item">
+          <span class="swatch subagent"></span>{m.activity_subagents()}
         </span>
         <span class="legend-item">
           <span class="swatch automated"></span>{m.activity_automated()}
@@ -165,13 +191,28 @@
                 onmouseenter={(e) => showTip(e, row, total)}
                 onmouseleave={hideTip}
               >
-                <span class="bar-label" title={row.key}>
-                  {truncate(row.key, 22)}
-                </span>
+                {#if panel.projectRows}
+                  <a
+                    class="bar-label"
+                    href={projectHref(row)}
+                    title={m.activity_view_in_data({ project: row.key })}
+                    onclick={(event) => openInData(event, row)}
+                  >
+                    {truncate(row.key, 22)}
+                  </a>
+                {:else}
+                  <span class="bar-label" title={row.key}>
+                    {truncate(row.key, 22)}
+                  </span>
+                {/if}
                 <div class="bar-track">
                   <div
                     class="bar-seg interactive"
                     style="width: {barWidth(interactiveValue(row), max)}%"
+                  ></div>
+                  <div
+                    class="bar-seg subagent"
+                    style="width: {barWidth(subagentValue(row), max)}%"
                   ></div>
                   <div
                     class="bar-seg automated"
@@ -193,7 +234,7 @@
 
   {#if tooltip}
     <div class="tooltip" style="left: {tooltip.x}px; top: {tooltip.y}px;">
-      {tooltip.text}
+      <span>{tooltip.text}</span>
     </div>
   {/if}
 </div>
@@ -208,6 +249,8 @@
     display: flex;
     align-items: center;
     justify-content: space-between;
+    flex-wrap: wrap;
+    gap: 8px;
     margin-bottom: 12px;
   }
 
@@ -220,12 +263,15 @@
   .panel-actions {
     display: flex;
     align-items: center;
+    flex-wrap: wrap;
+    min-width: 0;
     gap: 12px;
   }
 
   .legend {
     display: flex;
     align-items: center;
+    flex-wrap: wrap;
     gap: var(--space-5);
   }
 
@@ -245,6 +291,11 @@
 
   .swatch.interactive {
     background: var(--accent-blue);
+  }
+
+  .swatch.subagent,
+  .bar-seg.subagent {
+    background: var(--accent-violet);
   }
 
   .swatch.automated {
@@ -311,6 +362,7 @@
     display: flex;
     align-items: center;
     gap: 8px;
+    position: relative;
   }
 
   .bar-label {
@@ -321,6 +373,15 @@
     white-space: nowrap;
     overflow: hidden;
     text-overflow: ellipsis;
+  }
+
+  a.bar-label {
+    color: var(--text-secondary);
+    text-decoration: none;
+  }
+
+  a.bar-label:hover {
+    text-decoration: underline;
   }
 
   .bar-track {

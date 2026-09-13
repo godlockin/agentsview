@@ -2,7 +2,7 @@ package server
 
 import (
 	"context"
-	"encoding/json"
+	"encoding/json/v2"
 	"errors"
 	"html/template"
 	"net/http"
@@ -586,9 +586,10 @@ func TestGenerateExportHTML_PreservesNonGoalSystemPrefixedRows(t *testing.T) {
 func TestFocusedExportOrdinals(t *testing.T) {
 	t.Parallel()
 	tests := []struct {
-		name string
-		msgs []db.Message
-		want []int
+		name  string
+		agent string
+		msgs  []db.Message
+		want  []int
 	}{
 		{
 			name: "keeps final assistant before next user",
@@ -720,12 +721,44 @@ func TestFocusedExportOrdinals(t *testing.T) {
 			},
 			want: []int{0, 1, 2, 3},
 		},
+		{
+			name:  "keeps a Codex answer that further tool work follows",
+			agent: "codex",
+			msgs: []db.Message{
+				exportUserMsg(0),
+				exportAssistantMsg(1, "answer"),
+				exportToolMsg(2, "[Bash]\nkeep going"),
+				exportUserMsg(3),
+			},
+			want: []int{0, 1, 3},
+		},
+		{
+			name:  "keeps a TraeX answer that further tool work follows",
+			agent: "traex",
+			msgs: []db.Message{
+				exportUserMsg(0),
+				exportAssistantMsg(1, "answer"),
+				exportToolMsg(2, "[Bash]\nkeep going"),
+				exportUserMsg(3),
+			},
+			want: []int{0, 1, 3},
+		},
+		{
+			name:  "keeps dropping Codex turns that never answered",
+			agent: "codex",
+			msgs: []db.Message{
+				exportUserMsg(0),
+				exportToolMsg(1, "[Bash]\nmake test"),
+				exportUserMsg(2),
+			},
+			want: []int{0, 2},
+		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
-			visible := focusedExportOrdinals(tt.msgs)
+			visible := focusedExportOrdinals(tt.msgs, tt.agent)
 			got := make([]int, 0, len(tt.msgs))
 			for _, msg := range tt.msgs {
 				if visible[msg.Ordinal] {
@@ -1332,7 +1365,7 @@ func TestCreateGistVisibility(t *testing.T) {
 			ts := httptest.NewServer(http.HandlerFunc(
 				func(w http.ResponseWriter, r *http.Request) {
 					assert.NoError(t,
-						json.NewDecoder(r.Body).Decode(&payload))
+						json.UnmarshalRead(r.Body, &payload))
 					w.WriteHeader(http.StatusCreated)
 					w.Write([]byte(`{"id":"abc123",` +
 						`"html_url":"https://gist.github.com/abc123",` +

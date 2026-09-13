@@ -30,13 +30,13 @@ const cannedInsight = {
   created_at: "2026-05-26T12:00:00Z",
 };
 
-test.describe("Insights quality rollout", () => {
-  test.describe.configure({ timeout: COLD_WEBKIT_TEST_TIMEOUT_MS });
+test.describe("Generated insights", () => {
+  if (process.env.CI !== "true") {
+    test.describe.configure({ timeout: COLD_WEBKIT_TEST_TIMEOUT_MS });
+  }
 
   test.beforeEach(async ({ page }) => {
-    await page.route("**/api/v1/projects*", (route) =>
-      route.fulfill({ json: { projects: [] } }),
-    );
+    await page.route("**/api/v1/projects*", (route) => route.fulfill({ json: { projects: [] } }));
     await page.route("**/api/v1/agents*", (route) =>
       route.fulfill({
         json: {
@@ -80,16 +80,12 @@ test.describe("Insights quality rollout", () => {
     );
   });
 
-  test("renders saved deterministic quality recommendation metadata", async ({
-    page,
-  }) => {
+  test("renders saved generated report metadata", async ({ page }) => {
     await page.addInitScript(() => {
       Object.defineProperty(navigator, "clipboard", {
         value: {
           writeText: async (text: string) => {
-            (
-              window as unknown as { __copiedInsightLink?: string }
-            ).__copiedInsightLink = text;
+            (window as unknown as { __copiedInsightLink?: string }).__copiedInsightLink = text;
           },
         },
         configurable: true,
@@ -104,43 +100,33 @@ test.describe("Insights quality rollout", () => {
       route.fulfill({ json: { insights: [cannedInsight] } }),
     );
 
-    await page.goto("/insights");
+    await page.goto("/recall?tab=generated");
 
     const archive = page.getByRole("region", {
-      name: "Generated Insights Archive",
+      name: "Generated insights",
     });
     const savedInsight = archive.getByRole("button", {
       name: /Prompt Maturity global/,
     });
-    await expect(
-      page.getByRole("heading", { name: "Quality Patterns" }),
-    ).toBeVisible();
     await archive.getByTitle("Select generator").click();
-    await expect(
-      archive.getByRole("option", { name: "Codex", exact: true }),
-    ).toBeVisible();
-    await expect(
-      archive.getByRole("option", { name: "Copilot", exact: true }),
-    ).toBeVisible();
-    await expect(
-      archive.getByRole("option", { name: /Codex \(/ }),
-    ).toHaveCount(0);
-    await expect(
-      archive.getByRole("option", { name: /Hermes/ }),
-    ).toHaveCount(0);
+    await expect(archive.getByRole("option", { name: "Codex", exact: true })).toBeVisible();
+    await expect(archive.getByRole("option", { name: "Copilot", exact: true })).toBeVisible();
+    await expect(archive.getByRole("option", { name: /Codex \(/ })).toHaveCount(0);
+    await expect(archive.getByRole("option", { name: /Hermes/ })).toHaveCount(0);
     await page.keyboard.press("Escape");
     await expect(savedInsight).toBeVisible();
     await savedInsight.click({ force: true });
-    await expect(page).toHaveURL(/\/insights\?.*insight=42/);
+    await expect(page).toHaveURL(/\/recall\?.*insight=42/);
     const selectedInsightUrl = new URL(page.url());
-    expect(selectedInsightUrl.pathname).toBe("/insights");
+    expect(selectedInsightUrl.pathname).toBe("/recall");
+    expect(selectedInsightUrl.searchParams.get("tab")).toBe("generated");
     expect(selectedInsightUrl.searchParams.get("insight")).toBe("42");
     expect(selectedInsightUrl.searchParams.get("window_days")).toBeNull();
     expect(selectedInsightUrl.searchParams.get("date_from")).toBeNull();
     expect(selectedInsightUrl.searchParams.get("date_to")).toBeNull();
 
     await expect(
-      page.locator(".generated-detail .badge", {
+      page.locator(".generated-detail .generated-badge", {
         hasText: "Prompt Maturity",
       }),
     ).toBeVisible();
@@ -148,24 +134,16 @@ test.describe("Insights quality rollout", () => {
     await expect(page.getByText("template v1")).toBeVisible();
     await expect(page.getByText("aggregate abcdef123456")).toBeVisible();
     await expect(
-      page
-        .locator(".generated-detail")
-        .getByRole("heading", { name: "Prompt Maturity" }),
+      page.locator(".generated-detail").getByRole("heading", { name: "Prompt Maturity" }),
     ).toBeVisible();
     await expect(
-      page.getByText(
-        "Deterministic score distribution: 10 scored sessions, average 92.",
-      ),
+      page.getByText("Deterministic score distribution: 10 scored sessions, average 92."),
     ).toBeVisible();
     await expect(
       page.getByText("Deterministic health scores and signal rows were not modified."),
     ).toBeVisible();
-    await expect(
-      page.getByRole("button", { name: "Delete generated insight" }),
-    ).toBeVisible();
-    await expect(
-      page.getByRole("button", { name: "Delete", exact: true }),
-    ).toHaveCount(0);
+    await expect(page.getByRole("button", { name: "Delete generated insight" })).toBeVisible();
+    await expect(page.getByRole("button", { name: "Delete", exact: true })).toHaveCount(0);
 
     const copyLink = page.getByRole("button", {
       name: "Copy generated insight link",
@@ -178,23 +156,20 @@ test.describe("Insights quality rollout", () => {
       }),
     ).toBeVisible();
     const copied = await page.evaluate(
-      () =>
-        (window as unknown as { __copiedInsightLink?: string })
-          .__copiedInsightLink,
+      () => (window as unknown as { __copiedInsightLink?: string }).__copiedInsightLink,
     );
     const copiedUrl = new URL(copied!);
     expect(copiedUrl.origin).toBe(selectedInsightUrl.origin);
-    expect(copiedUrl.pathname).toBe("/insights");
+    expect(copiedUrl.pathname).toBe("/recall");
+    expect(copiedUrl.searchParams.get("tab")).toBe("generated");
     expect(copiedUrl.searchParams.get("insight")).toBe("42");
     expect(copiedUrl.searchParams.get("window_days")).toBeNull();
     expect(copiedUrl.searchParams.get("date_from")).toBeNull();
     expect(copiedUrl.searchParams.get("date_to")).toBeNull();
 
-    await page.goto("/insights?insight=42");
+    await page.goto("/recall?tab=generated&insight=42");
     await expect(
-      page
-        .locator(".generated-detail")
-        .getByRole("heading", { name: "Prompt Maturity" }),
+      page.locator(".generated-detail").getByRole("heading", { name: "Prompt Maturity" }),
     ).toBeVisible();
   });
 
@@ -204,9 +179,7 @@ test.describe("Insights quality rollout", () => {
         json: { version: "test", commit: "test", read_only: true },
       }),
     );
-    await page.route("**/api/v1/insights", (route) =>
-      route.fulfill({ json: { insights: [] } }),
-    );
+    await page.route("**/api/v1/insights", (route) => route.fulfill({ json: { insights: [] } }));
     await page.route("**/api/v1/insights/generate", (route) =>
       route.fulfill({
         status: 500,
@@ -214,20 +187,16 @@ test.describe("Insights quality rollout", () => {
       }),
     );
 
-    await page.goto("/insights");
+    await page.goto("/recall?tab=generated");
 
-    await expect(
-      page.getByRole("heading", { name: "Generated Insights Archive" }),
-    ).toBeVisible();
-    await expect(
-      page.getByText("No generated insights saved."),
-    ).toBeVisible();
+    await expect(page.getByRole("heading", { name: "Generated insights" })).toBeVisible();
+    await expect(page.getByText("No generated insights saved.")).toBeVisible();
     const generate = page
-      .getByRole("region", { name: "Generated Insights Archive" })
+      .getByRole("region", { name: "Generated insights" })
       .getByRole("button", { name: "Generate" });
     await expect(generate).toHaveAttribute(
       "title",
-      "Generation is disabled in read-only mode",
+      "Insight generation is unavailable for this archive",
     );
     await expect(generate).toBeDisabled();
   });
@@ -239,9 +208,7 @@ test.describe("Insights quality rollout", () => {
         json: { version: "test", commit: "test", read_only: false },
       }),
     );
-    await page.route("**/api/v1/insights", (route) =>
-      route.fulfill({ json: { insights: [] } }),
-    );
+    await page.route("**/api/v1/insights", (route) => route.fulfill({ json: { insights: [] } }));
     await page.route("**/api/v1/insights/generate", (route) => {
       generateCalls += 1;
       if (generateCalls === 1) {
@@ -271,10 +238,10 @@ test.describe("Insights quality rollout", () => {
       });
     });
 
-    await page.goto("/insights");
+    await page.goto("/recall?tab=generated");
 
     const archive = page.getByRole("region", {
-      name: "Generated Insights Archive",
+      name: "Generated insights",
     });
     await archive.getByTitle("Select template").click();
     const templateFilter = archive.getByRole("combobox", {
@@ -284,18 +251,12 @@ test.describe("Insights quality rollout", () => {
     await templateFilter.press("Enter");
     await archive.getByRole("button", { name: "Generate" }).click();
 
-    await expect(
-      archive.getByText("generated insight failed validation"),
-    ).toBeVisible();
-    await expect(
-      archive.getByRole("button", { name: "Dismiss failed generation" }),
-    ).toBeVisible();
+    await expect(archive.getByText("generated insight failed validation")).toBeVisible();
+    await expect(archive.getByRole("button", { name: "Dismiss failed generation" })).toBeVisible();
 
     await archive.getByRole("button", { name: "Retry" }).click();
 
-    await expect(
-      archive.getByRole("button", { name: /Model and Cost global/ }),
-    ).toBeVisible();
+    await expect(archive.getByRole("button", { name: /Model and Cost global/ })).toBeVisible();
     expect(generateCalls).toBe(2);
   });
 });

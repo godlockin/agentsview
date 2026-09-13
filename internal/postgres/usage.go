@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/tidwall/gjson"
+	"go.kenn.io/agentsview/internal/activity"
 	"go.kenn.io/agentsview/internal/db"
 	"go.kenn.io/agentsview/internal/export"
 	"go.kenn.io/agentsview/internal/money"
@@ -61,7 +62,11 @@ func paddedUTCBound(ts string, hours int) string {
 	if err != nil {
 		return ts
 	}
-	return t.Add(time.Duration(hours) * time.Hour).Format(time.RFC3339)
+	padded := t.Add(time.Duration(hours) * time.Hour)
+	if padded.Year() < 1 {
+		padded = time.Date(1, time.January, 1, 0, 0, 0, 0, time.UTC)
+	}
+	return padded.Format(time.RFC3339)
 }
 
 func appendPGUsageBranchFilterClauses(
@@ -225,7 +230,9 @@ SELECT
 	m.ordinal AS message_ordinal,
 	'message' AS usage_source,
 	COALESCE(m.timestamp, s.started_at) AS ts,
+	m.timestamp AS pricing_ts,
 	m.model,
+	m.provider_id,
 	m.token_usage,
 	0 AS input_tokens,
 	0 AS output_tokens,
@@ -258,7 +265,9 @@ SELECT
 	ue.message_ordinal,
 	ue.source AS usage_source,
 	COALESCE(ue.occurred_at, s.started_at) AS ts,
+	ue.occurred_at AS pricing_ts,
 	ue.model,
+	ue.provider_id,
 	'' AS token_usage,
 	ue.input_tokens,
 	ue.output_tokens,
@@ -303,7 +312,9 @@ SELECT
 	m.ordinal AS message_ordinal,
 	'message' AS usage_source,
 	COALESCE(m.timestamp, s.started_at) AS ts,
+	m.timestamp AS pricing_ts,
 	m.model,
+	m.provider_id,
 	m.token_usage,
 	0 AS input_tokens,
 	0 AS output_tokens,
@@ -330,7 +341,9 @@ SELECT
 	ue.message_ordinal,
 	ue.source AS usage_source,
 	COALESCE(ue.occurred_at, s.started_at) AS ts,
+	ue.occurred_at AS pricing_ts,
 	ue.model,
+	ue.provider_id,
 	'' AS token_usage,
 	ue.input_tokens,
 	ue.output_tokens,
@@ -359,7 +372,9 @@ SELECT
 	m.ordinal AS message_ordinal,
 	'message' AS usage_source,
 	COALESCE(m.timestamp, s.started_at) AS ts,
+	m.timestamp AS pricing_ts,
 	m.model,
+	m.provider_id,
 	m.token_usage,
 	0 AS input_tokens,
 	0 AS output_tokens,
@@ -385,7 +400,9 @@ SELECT
 	ue.message_ordinal,
 	ue.source AS usage_source,
 	COALESCE(ue.occurred_at, s.started_at) AS ts,
+	ue.occurred_at AS pricing_ts,
 	ue.model,
+	ue.provider_id,
 	'' AS token_usage,
 	ue.input_tokens,
 	ue.output_tokens,
@@ -431,6 +448,7 @@ message_timestamp_rows AS MATERIALIZED (
 		m.ordinal,
 		m.timestamp,
 		m.model,
+		m.provider_id,
 		m.token_usage,
 		m.claude_message_id,
 		m.claude_request_id,
@@ -446,6 +464,7 @@ usage_event_timestamp_rows AS MATERIALIZED (
 		ue.source,
 		ue.occurred_at,
 		ue.model,
+		ue.provider_id,
 		ue.input_tokens,
 		ue.output_tokens,
 		ue.cache_creation_input_tokens,
@@ -493,7 +512,9 @@ type pgUsageScanRow struct {
 	messageOrdinal           sql.NullInt64
 	usageSource              string
 	ts                       sql.NullTime
+	pricingTS                sql.NullTime
 	model                    string
+	providerID               string
 	tokenJSON                string
 	inputTokens              int
 	outputTokens             int
@@ -522,8 +543,11 @@ type pgDailyUsageScanRow struct {
 	messageOrdinal           sql.NullInt64
 	usageSource              string
 	ts                       sql.NullTime
+	pricingTS                sql.NullTime
 	model                    string
+	providerID               string
 	tokenJSON                string
+	webSearchRequests        sql.NullInt64
 	inputTokens              int
 	outputTokens             int
 	cacheCreationInputTokens int
@@ -554,7 +578,9 @@ SELECT
 	u.message_ordinal,
 	u.usage_source,
 	u.ts,
+	u.pricing_ts,
 	u.model,
+	u.provider_id,
 	u.token_usage,
 	u.input_tokens,
 	u.output_tokens,
@@ -594,21 +620,61 @@ func pgDailyUsageRowSelectFromRows(rowsSQL string) string {
 func pgDailyUsageRowSelectFromRowsWithMachine(
 	rowsSQL string, includeMachine bool,
 ) string {
+	return pgDailyUsageRowSelectFromRowsWithSession(
+		rowsSQL, includeMachine, "u.session_id", false)
+}
+
+func pgDailyUsageRowSelectFromSnapshotRowsWithMachine(
+	rowsSQL string, includeMachine bool,
+) string {
+	return pgDailyUsageRowSelectFromRowsWithSession(
+		rowsSQL, includeMachine, "u.snapshot_attribution_session_id", true)
+}
+
+func pgDailyUsageRowSelectFromRowsWithSession(
+	rowsSQL string, includeMachine bool, sessionColumn string,
+	reloadSessionMetadata bool,
+) string {
+	projectColumn := "u.project"
+	agentColumn := "u.agent"
+	machineColumnExpr := "u.machine"
+	webSearchColumn := `CASE
+		WHEN u.usage_source = 'message' THEN GREATEST(COALESCE(
+			CAST(agentsview_json_integer(
+				u.token_usage,
+				ARRAY['server_tool_use', 'web_search_requests'],
+				'web_search_requests') AS BIGINT),
+			0), 0)
+		ELSE 0
+	END`
+	metadataJoin := ""
+	if reloadSessionMetadata {
+		metadataJoin = `
+LEFT JOIN sessions attributed
+	ON attributed.id = u.snapshot_attribution_session_id`
+		projectColumn = "CASE WHEN attributed.id IS NULL THEN u.project ELSE attributed.project END"
+		agentColumn = "CASE WHEN attributed.id IS NULL THEN u.agent ELSE attributed.agent END"
+		machineColumnExpr = "CASE WHEN attributed.id IS NULL THEN u.machine ELSE attributed.machine END"
+		webSearchColumn = "u.snapshot_web_search_requests"
+	}
 	machineColumn := ""
 	if includeMachine {
-		machineColumn = ",\n\tu.machine"
+		machineColumn = ",\n\t" + machineColumnExpr
 	}
 	return `
 SELECT
-	u.session_id,
+	` + sessionColumn + `,
 	u.message_ordinal,
 	u.usage_source,
 	u.ts,
+	u.pricing_ts,
 	u.model,
+	u.provider_id,
 	u.token_usage,
+	` + webSearchColumn + ` AS web_search_requests,
 	u.input_tokens,
-		u.output_tokens,
-		u.cache_creation_input_tokens,
+	u.output_tokens,
+	u.cache_creation_input_tokens,
 	u.cache_read_input_tokens,
 	u.reasoning_tokens,
 	u.cost_microdollars,
@@ -617,9 +683,9 @@ SELECT
 	u.claude_request_id,
 	u.source_uuid,
 	u.usage_dedup_key,
-	u.project,
-	u.agent` + machineColumn + `
-FROM (` + rowsSQL + `) u
+	` + projectColumn + ` AS project,
+	` + agentColumn + ` AS agent` + machineColumn + `
+FROM (` + rowsSQL + `) u` + metadataJoin + `
 WHERE 1=1`
 }
 
@@ -750,7 +816,9 @@ SELECT
 	NULL::INT AS message_ordinal,
 	'cursor' AS usage_source,
 	cu.occurred_at AS ts,
+	cu.occurred_at AS pricing_ts,
 	cu.model,
+	'' AS provider_id,
 	'' AS token_usage,
 	cu.input_tokens,
 	cu.output_tokens,
@@ -817,18 +885,124 @@ func pgCursorUsageRowsSQLForBounds(
 
 func pgDailyUsageRowQuery(pb *paramBuilder, f db.UsageFilter, hasCursorTable bool) string {
 	bounds := pgUsageBoundsForFilter(pb, f)
-	rowsSQL := pgDailyUsageRowsSQLForBounds(pb, f, bounds)
+	rowsSQL := pgDailyUsageRowsSQLForBounds(
+		pb, pgUsageSnapshotInputFilter(f), bounds)
 	if hasCursorTable {
 		cursorRowsSQL, ok := pgCursorUsageRowsSQLForBounds(pb, f, bounds)
 		if ok {
 			rowsSQL += "\n\nUNION ALL\n\n" + cursorRowsSQL
 		}
 	}
-	return pgDailyUsageRowSelectFromRowsWithMachine(rowsSQL, f.Breakdowns)
+	rowsSQL = pgSnapshotRankedDailyUsageRowsSQL(pb, rowsSQL, f)
+	return pgDailyUsageRowSelectFromSnapshotRowsWithMachine(
+		rowsSQL, f.Breakdowns)
 }
 
 func pgTopSessionsUsageRowQuery(pb *paramBuilder, f db.UsageFilter) string {
-	return pgUsageRowQuery(pb, f)
+	bounds := pgUsageBoundsForFilter(pb, f)
+	rowsSQL := pgDailyUsageRowsSQLForBounds(
+		pb, pgUsageSnapshotInputFilter(f), bounds)
+	rowsSQL = pgSnapshotRankedDailyUsageRowsSQL(pb, rowsSQL, f)
+	return pgDailyUsageRowSelectFromSnapshotRowsWithMachine(rowsSQL, false)
+}
+
+func pgUsageSnapshotInputFilter(f db.UsageFilter) db.UsageFilter {
+	return db.UsageFilter{From: f.From, To: f.To, Timezone: f.Timezone}
+}
+
+func pgExactUsageUTCWindow(f db.UsageFilter) (from, to time.Time) {
+	loc := usageLocation(f)
+	if f.From != "" {
+		from, _ = time.ParseInLocation("2006-01-02", f.From, loc)
+	}
+	if f.To != "" {
+		to, _ = time.ParseInLocation("2006-01-02", f.To, loc)
+		if !to.IsZero() {
+			to = to.AddDate(0, 0, 1)
+		}
+	}
+	return from.UTC(), to.UTC()
+}
+
+// pgSnapshotRankedDailyUsageRowsSQL keeps the greatest output snapshot and the
+// maximum billed web-search count for each Claude request before rows cross
+// into Go. Rows without complete Claude request identity bypass the window.
+func pgSnapshotRankedDailyUsageRowsSQL(
+	pb *paramBuilder, rowsSQL string, f db.UsageFilter,
+) string {
+	from, to := pgExactUsageUTCWindow(f)
+	where := "TRUE"
+	if !from.IsZero() {
+		where += "\n\t\t\tAND u.ts >= " + pb.add(from) + "::timestamptz"
+	}
+	if !to.IsZero() {
+		where += "\n\t\t\tAND u.ts < " + pb.add(to) + "::timestamptz"
+	}
+	filterWhere := appendPGUsageSourceFilterClauses(
+		"TRUE", pb, f, "survivor.model")
+	filterWhere = appendPGUsageSessionFilterClauses(filterWhere, pb, f)
+	outputTokens := fmt.Sprintf(`CASE
+				WHEN u.usage_source = 'message' THEN LEAST(GREATEST(COALESCE(
+					CAST(agentsview_json_integer(
+						u.token_usage, ARRAY['output_tokens'], 'output_tokens') AS NUMERIC),
+					0), 0), %[1]d)
+				WHEN u.usage_source = 'session'
+					THEN GREATEST(u.output_tokens, 0)
+				ELSE LEAST(GREATEST(u.output_tokens, 0), %[1]d)
+			END`, db.MaxPlausibleTokens)
+	webSearchRequests := `CASE
+				WHEN u.usage_source = 'message' THEN GREATEST(COALESCE(
+					CAST(agentsview_json_integer(
+						u.token_usage,
+						ARRAY['server_tool_use', 'web_search_requests'],
+						'web_search_requests') AS BIGINT),
+					0), 0)
+				ELSE 0
+			END`
+	return fmt.Sprintf(`
+		WITH usage_snapshot_window AS (
+			SELECT u.*, %[1]s AS snapshot_output_tokens,
+				%[5]s AS snapshot_row_web_search_requests
+			FROM (%[2]s) u
+			WHERE %[3]s
+		),
+		usage_snapshot_ranked AS (
+			SELECT usage_snapshot_window.*,
+				FIRST_VALUE(session_id) OVER (
+					PARTITION BY claude_message_id, claude_request_id
+					ORDER BY ts ASC NULLS LAST, session_id ASC,
+						COALESCE(message_ordinal, -1) ASC
+				) AS snapshot_attribution_session_id,
+				ROW_NUMBER() OVER (
+					PARTITION BY claude_message_id, claude_request_id
+					ORDER BY snapshot_output_tokens DESC, ts DESC NULLS LAST,
+						session_id DESC, COALESCE(message_ordinal, -1) DESC
+				) AS snapshot_rank,
+				MAX(snapshot_row_web_search_requests) OVER (
+					PARTITION BY claude_message_id, claude_request_id
+				) AS snapshot_web_search_requests
+			FROM usage_snapshot_window
+			WHERE claude_message_id != '' AND claude_request_id != ''
+		),
+		usage_snapshot_survivors AS (
+			SELECT *
+			FROM usage_snapshot_ranked
+			WHERE snapshot_rank = 1
+			UNION ALL
+			SELECT usage_snapshot_window.*,
+				session_id AS snapshot_attribution_session_id,
+				1 AS snapshot_rank,
+				snapshot_row_web_search_requests AS snapshot_web_search_requests
+			FROM usage_snapshot_window
+			WHERE claude_message_id = '' OR claude_request_id = ''
+		)
+		SELECT survivor.*
+		FROM usage_snapshot_survivors survivor
+		LEFT JOIN sessions s
+			ON s.id = survivor.snapshot_attribution_session_id
+		WHERE survivor.snapshot_attribution_session_id = ''
+			OR (%[4]s)`,
+		outputTokens, rowsSQL, where, filterWhere, webSearchRequests)
 }
 
 func scanPGUsageRow(rows *sql.Rows) (pgUsageScanRow, error) {
@@ -838,7 +1012,9 @@ func scanPGUsageRow(rows *sql.Rows) (pgUsageScanRow, error) {
 		&r.messageOrdinal,
 		&r.usageSource,
 		&r.ts,
+		&r.pricingTS,
 		&r.model,
+		&r.providerID,
 		&r.tokenJSON,
 		&r.inputTokens,
 		&r.outputTokens,
@@ -877,8 +1053,11 @@ func scanPGDailyUsageRowWithMachine(
 		&r.messageOrdinal,
 		&r.usageSource,
 		&r.ts,
+		&r.pricingTS,
 		&r.model,
+		&r.providerID,
 		&r.tokenJSON,
+		&r.webSearchRequests,
 		&r.inputTokens,
 		&r.outputTokens,
 		&r.cacheCreationInputTokens,
@@ -902,6 +1081,29 @@ func scanPGDailyUsageRowWithMachine(
 
 func pgTokenJSONCount(usage gjson.Result, key string) int {
 	return db.ClampPlausibleTokens(usage.Get(key).Int())
+}
+
+// pgUsageRowWebSearchRequests returns how many billed Anthropic
+// server-side web searches a usage row reports. It mirrors
+// db.usageRowWebSearchRequests: only per-message rows carry a usage blob,
+// and a negative or absent counter reads as none.
+func pgUsageRowWebSearchRequests(usageSource, tokenJSON string) int {
+	if usageSource != "message" {
+		return 0
+	}
+	requests := gjson.Get(
+		tokenJSON, "server_tool_use.web_search_requests").Int()
+	if requests <= 0 {
+		return 0
+	}
+	return int(requests)
+}
+
+func pgDailyUsageRowWebSearchRequests(r pgDailyUsageScanRow) int {
+	if r.webSearchRequests.Valid {
+		return max(int(r.webSearchRequests.Int64), 0)
+	}
+	return pgUsageRowWebSearchRequests(r.usageSource, r.tokenJSON)
 }
 
 func pgClampedUsageRowTokens(
@@ -937,8 +1139,8 @@ func pgFloorNegativeTokens(v int) int {
 	return v
 }
 
-// pgUsageLookupModel mirrors internal/db usage pricing: date-ambiguous Kimi
-// aliases resolve according to the usage row timestamp.
+// pgUsageLookupModel mirrors internal/db usage pricing: runtime aliases
+// resolve to their fixed or timestamp-selected canonical model.
 func pgUsageLookupModel(model string, ts sql.NullTime) string {
 	var timestamp time.Time
 	if ts.Valid {
@@ -950,6 +1152,13 @@ func pgUsageLookupModel(model string, ts sql.NullTime) string {
 	return model
 }
 
+func pgUsagePricingTimestamp(ts sql.NullTime) time.Time {
+	if !ts.Valid {
+		return time.Time{}
+	}
+	return ts.Time
+}
+
 func pgDailyUsageAmounts(
 	r pgDailyUsageScanRow, pricing *export.PricingResolver,
 ) (
@@ -957,7 +1166,102 @@ func pgDailyUsageAmounts(
 	cost, savings money.Money,
 	err error,
 ) {
-	reasoningTok := r.reasoningTokens
+	inputTok, outputTok, cacheCrTok, cacheRdTok, reasoningTok :=
+		pgDailyUsageRowTokens(r)
+	cacheCr1hTok := pgUsageRowCacheCreation1hTokens(
+		r.usageSource, r.tokenJSON, cacheCrTok)
+
+	pricedModel, lookup := pricing.ResolveAt(
+		r.model, pgUsageLookupModel(r.model, r.pricingTS),
+		pgUsagePricingTimestamp(r.pricingTS),
+	)
+	rates := lookup.Rates
+	requestScoped := pgUsageRowIsRequestScoped(r.usageSource, r.messageOrdinal)
+	if r.cost.Valid && r.costSource != db.CopilotReportedCostSource {
+		cost = money.Money{Microdollars: r.cost.Int64}
+		pricing.RecordResolvedReported(r.model, pricedModel, lookup)
+	} else {
+		_, lookup, err = pricing.ResolveBilledAt(
+			r.providerID, r.model, pgUsageLookupModel(r.model, r.pricingTS),
+			pgUsagePricingTimestamp(r.pricingTS))
+		if err != nil {
+			return 0, 0, 0, 0, money.Money{}, money.Money{}, err
+		}
+		rates = lookup.Rates
+		cost, err = rates.CostForTokensScoped(
+			requestScoped,
+			inputTok, outputTok, reasoningTok, cacheCrTok, cacheCr1hTok,
+			cacheRdTok)
+		if err != nil {
+			return 0, 0, 0, 0, money.Money{}, money.Money{},
+				fmt.Errorf("pricing pg usage row for model %q: %w", r.model, err)
+		}
+		// Anthropic bills server-side web search per request on top of
+		// tokens; see db.sessionRowCost for why a reported cost skips it.
+		cost, err = export.AddWebSearchFee(
+			cost, pgDailyUsageRowWebSearchRequests(r))
+		if err != nil {
+			return 0, 0, 0, 0, money.Money{}, money.Money{},
+				fmt.Errorf("pricing pg usage row for model %q: %w", r.model, err)
+		}
+		pgRecordComputedUsagePricing(
+			pricing, r.model, pricedModel, lookup, requestScoped,
+			inputTok, cacheCrTok, cacheRdTok,
+		)
+	}
+	selectedRates := rates
+	if requestScoped {
+		selectedRates = rates.RatesForTokens(inputTok, cacheCrTok, cacheRdTok)
+	}
+	savingsRates := selectedRates
+	if r.cost.Valid && r.costSource != db.CopilotReportedCostSource &&
+		(cacheCrTok != 0 || cacheRdTok != 0) {
+		_, savingsLookup, err := pricing.ResolveBilledAt(
+			r.providerID, r.model, pgUsageLookupModel(r.model, r.pricingTS),
+			pgUsagePricingTimestamp(r.pricingTS))
+		if err != nil {
+			return 0, 0, 0, 0, money.Money{}, money.Money{},
+				fmt.Errorf("pricing pg reported usage cache savings for model %q: %w", r.model, err)
+		}
+		savingsRates = savingsLookup.Rates
+		if requestScoped {
+			savingsRates = savingsRates.RatesForTokens(inputTok, cacheCrTok, cacheRdTok)
+		}
+	}
+	readRate, err := money.Sub(
+		savingsRates.InputPerMTok, savingsRates.CacheReadPerMTok)
+	if err != nil {
+		return 0, 0, 0, 0, money.Money{}, money.Money{},
+			fmt.Errorf("deriving pg cache read rate for model %q: %w", r.model, err)
+	}
+	creationRate, err := money.Sub(
+		savingsRates.InputPerMTok, savingsRates.CacheWritePerMTok)
+	if err != nil {
+		return 0, 0, 0, 0, money.Money{}, money.Money{},
+			fmt.Errorf("deriving pg cache creation rate for model %q: %w", r.model, err)
+	}
+	creation1hRate, err := money.Sub(
+		savingsRates.InputPerMTok, savingsRates.EffectiveCacheWrite1hPerMTok())
+	if err != nil {
+		return 0, 0, 0, 0, money.Money{}, money.Money{},
+			fmt.Errorf("deriving pg 1h cache creation rate for model %q: %w", r.model, err)
+	}
+	savings, err = money.SignedCostPerMillion([]money.RatedTokens{
+		{Tokens: int64(cacheRdTok), Rate: readRate},
+		{Tokens: int64(cacheCrTok - cacheCr1hTok), Rate: creationRate},
+		{Tokens: int64(cacheCr1hTok), Rate: creation1hRate},
+	})
+	if err != nil {
+		return 0, 0, 0, 0, money.Money{}, money.Money{},
+			fmt.Errorf("pricing pg cache savings for model %q: %w", r.model, err)
+	}
+	return inputTok, outputTok, cacheCrTok, cacheRdTok, cost, savings, nil
+}
+
+func pgDailyUsageRowTokens(
+	r pgDailyUsageScanRow,
+) (inputTok, outputTok, cacheCrTok, cacheRdTok, reasoningTok int) {
+	reasoningTok = r.reasoningTokens
 	if r.usageSource == "message" {
 		usage := gjson.Parse(r.tokenJSON)
 		inputTok = pgTokenJSONCount(usage, "input_tokens")
@@ -973,41 +1277,46 @@ func pgDailyUsageAmounts(
 				r.inputTokens, r.outputTokens,
 				r.cacheCreationInputTokens, r.cacheReadInputTokens)
 	}
-
-	pricedModel, lookup := pricing.Resolve(
-		r.model, pgUsageLookupModel(r.model, r.ts))
-	rates := lookup.Rates
-	if r.cost.Valid && r.costSource != db.CopilotReportedCostSource {
-		cost = money.Money{Microdollars: r.cost.Int64}
-		pricing.RecordResolvedReported(r.model, pricedModel, lookup)
-	} else {
-		cost, err = rates.CostForTokens(
-			inputTok, outputTok, reasoningTok, cacheCrTok, cacheRdTok)
-		if err != nil {
-			return 0, 0, 0, 0, money.Money{}, money.Money{},
-				fmt.Errorf("pricing pg usage row for model %q: %w", r.model, err)
-		}
-		pricing.RecordResolvedComputed(r.model, pricedModel, lookup)
-	}
-	readRate, err := money.Sub(rates.InputPerMTok, rates.CacheReadPerMTok)
-	if err != nil {
-		return 0, 0, 0, 0, money.Money{}, money.Money{},
-			fmt.Errorf("deriving pg cache read rate for model %q: %w", r.model, err)
-	}
-	creationRate, err := money.Sub(rates.InputPerMTok, rates.CacheWritePerMTok)
-	if err != nil {
-		return 0, 0, 0, 0, money.Money{}, money.Money{},
-			fmt.Errorf("deriving pg cache creation rate for model %q: %w", r.model, err)
-	}
-	savings, err = money.SignedCostPerMillion([]money.RatedTokens{
-		{Tokens: int64(cacheRdTok), Rate: readRate},
-		{Tokens: int64(cacheCrTok), Rate: creationRate},
-	})
-	if err != nil {
-		return 0, 0, 0, 0, money.Money{}, money.Money{},
-			fmt.Errorf("pricing pg cache savings for model %q: %w", r.model, err)
-	}
 	return
+}
+
+// pgUsageRowCacheCreation1hTokens returns the clamped 1h-TTL subset of a
+// message row's cache-write tokens from the nested cache_creation
+// breakdown. Usage events never carry the breakdown. It mirrors
+// db.clampedCacheCreation1hTokens: the flat counter stays authoritative,
+// so the subset never exceeds it.
+func pgUsageRowCacheCreation1hTokens(
+	usageSource, tokenJSON string, cacheCrTok int,
+) int {
+	if usageSource != "message" {
+		return 0
+	}
+	cr1h := pgTokenJSONCount(
+		gjson.Parse(tokenJSON),
+		"cache_creation.ephemeral_1h_input_tokens")
+	return min(cr1h, cacheCrTok)
+}
+
+func pgUsageRowIsRequestScoped(
+	usageSource string, messageOrdinal sql.NullInt64,
+) bool {
+	return db.UsageSourceIsRequestScoped(usageSource) || messageOrdinal.Valid
+}
+
+func pgRecordComputedUsagePricing(
+	pricing *export.PricingResolver,
+	reportedModel, pricedModel string,
+	lookup export.PricingLookup,
+	requestScoped bool,
+	inputTokens, cacheWriteTokens, cacheReadTokens int,
+) {
+	if requestScoped {
+		pricing.RecordResolvedComputedRequest(
+			reportedModel, pricedModel, lookup,
+			inputTokens, cacheWriteTokens, cacheReadTokens)
+		return
+	}
+	pricing.RecordResolvedComputedAggregate(reportedModel, pricedModel, lookup)
 }
 
 type pgUsageDedupToken struct {
@@ -1042,6 +1351,13 @@ func pgUsageDedupTokenForRow(
 func pgSessionRowCost(
 	r pgUsageScanRow, pricing *export.PricingResolver,
 ) (cost money.Money, priced, contributes bool, err error) {
+	return pgSessionRowCostWithWebSearchRequests(
+		r, pgUsageRowWebSearchRequests(r.usageSource, r.tokenJSON), pricing)
+}
+
+func pgSessionRowCostWithWebSearchRequests(
+	r pgUsageScanRow, webSearches int, pricing *export.PricingResolver,
+) (cost money.Money, priced, contributes bool, err error) {
 	var inTok, outTok, crTok, rdTok int
 	reasoningTok := r.reasoningTokens
 	if r.usageSource == "message" {
@@ -1057,28 +1373,51 @@ func pgSessionRowCost(
 			r.inputTokens, r.outputTokens,
 			r.cacheCreationInputTokens, r.cacheReadInputTokens)
 	}
-
-	pricedModel, lookup := pricing.Resolve(
-		r.model, pgUsageLookupModel(r.model, r.ts))
+	cr1hTok := pgUsageRowCacheCreation1hTokens(
+		r.usageSource, r.tokenJSON, crTok)
+	pricedModel, lookup := pricing.ResolveAt(
+		r.model, pgUsageLookupModel(r.model, r.pricingTS),
+		pgUsagePricingTimestamp(r.pricingTS),
+	)
 	if r.cost.Valid {
 		pricing.RecordResolvedReported(r.model, pricedModel, lookup)
 		return money.Money{Microdollars: r.cost.Int64}, true, true, nil
 	}
-	if inTok == 0 && outTok == 0 && reasoningTok == 0 &&
-		crTok == 0 && rdTok == 0 {
+	if !activity.UsageDataContributes(
+		false, inTok, outTok, reasoningTok, crTok, rdTok, webSearches,
+	) {
 		return money.Money{}, true, false, nil
 	}
 	if !lookup.OK {
 		pricing.RecordResolvedComputed(r.model, pricedModel, lookup)
-		return money.Money{}, false, true, nil
+		fee, feeErr := export.WebSearchFee(webSearches)
+		if feeErr != nil {
+			return money.Money{}, false, false, feeErr
+		}
+		return fee, false, true, nil
 	}
-	cost, err = lookup.Rates.CostForTokens(
-		inTok, outTok, reasoningTok, crTok, rdTok)
+	pricedModel, lookup, err = pricing.ResolveBilledAt(
+		r.providerID, r.model, pgUsageLookupModel(r.model, r.pricingTS),
+		pgUsagePricingTimestamp(r.pricingTS))
+	if err != nil {
+		return money.Money{}, false, false, err
+	}
+	requestScoped := pgUsageRowIsRequestScoped(r.usageSource, r.messageOrdinal)
+	cost, err = lookup.Rates.CostForTokensScoped(
+		requestScoped,
+		inTok, outTok, reasoningTok, crTok, cr1hTok, rdTok)
 	if err != nil {
 		return money.Money{}, false, false,
 			fmt.Errorf("pricing pg session usage for model %q: %w", r.model, err)
 	}
-	pricing.RecordResolvedComputed(r.model, pricedModel, lookup)
+	cost, err = export.AddWebSearchFee(cost, webSearches)
+	if err != nil {
+		return money.Money{}, false, false,
+			fmt.Errorf("pricing pg session usage for model %q: %w", r.model, err)
+	}
+	pgRecordComputedUsagePricing(
+		pricing, r.model, pricedModel, lookup,
+		requestScoped, inTok, crTok, rdTok)
 	return cost, true, true, nil
 }
 
@@ -1087,6 +1426,18 @@ func pgSessionUsageBreakdownEntry(
 	ordinal int,
 	cost money.Money,
 	priced bool,
+) db.SessionUsageBreakdownEntry {
+	return pgSessionUsageBreakdownEntryWithWebSearchRequests(
+		r, ordinal, cost, priced,
+		pgUsageRowWebSearchRequests(r.usageSource, r.tokenJSON))
+}
+
+func pgSessionUsageBreakdownEntryWithWebSearchRequests(
+	r pgUsageScanRow,
+	ordinal int,
+	cost money.Money,
+	priced bool,
+	webSearches int,
 ) db.SessionUsageBreakdownEntry {
 	var inTok, outTok, crTok, rdTok int
 	if r.usageSource == "message" {
@@ -1111,6 +1462,7 @@ func pgSessionUsageBreakdownEntry(
 		OutputTokens:             outTok,
 		CacheCreationInputTokens: crTok,
 		CacheReadInputTokens:     rdTok,
+		WebSearchRequests:        webSearches,
 		Cost:                     cost,
 		HasCost:                  priced,
 	}
@@ -1122,16 +1474,8 @@ func pgSessionUsageBreakdownEntry(
 }
 
 func pgSessionUsageBreakdownLabel(r pgUsageScanRow) string {
-	if r.messageOrdinal.Valid {
-		if r.usageSource == "message" {
-			return fmt.Sprintf("Prompt %d", r.messageOrdinal.Int64+1)
-		}
-		return fmt.Sprintf("Step %d", r.messageOrdinal.Int64+1)
-	}
-	if r.usageSource != "" {
-		return r.usageSource
-	}
-	return "usage"
+	return db.SessionUsageBreakdownLabel(
+		pgNullInt64Pointer(r.messageOrdinal), r.usageSource)
 }
 
 func usageDate(ts sql.NullTime, loc *time.Location) string {
@@ -1243,13 +1587,49 @@ func (s *Store) GetSessionUsage(
 	breakdown := make([]db.SessionUsageBreakdownEntry, 0)
 	breakdownCount := 0
 
-	seen := make(map[pgUsageDedupToken]struct{})
-
+	var usageRows []pgUsageScanRow
 	for rows.Next() {
 		r, scanErr := scanPGUsageRow(rows)
 		if scanErr != nil {
 			return nil,
 				fmt.Errorf("scanning pg session usage row: %w", scanErr)
+		}
+		usageRows = append(usageRows, r)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterating pg session usage rows: %w", err)
+	}
+	snapshotRows := make([]activity.UsageRow, len(usageRows))
+	for i, r := range usageRows {
+		var outputTokens int
+		if r.usageSource == "message" {
+			outputTokens = pgTokenJSONCount(
+				gjson.Parse(r.tokenJSON), "output_tokens")
+		} else {
+			_, outputTokens, _, _ = pgUsageEventRowTokens(
+				r.usageSource,
+				r.inputTokens, r.outputTokens,
+				r.cacheCreationInputTokens, r.cacheReadInputTokens)
+		}
+		snapshotRows[i] = activity.UsageRow{
+			SessionID:      r.sessionID,
+			Timestamp:      startedAtString(r.ts),
+			MessageOrdinal: pgUsageRowMessageOrdinal(r.messageOrdinal),
+			OutputTokens:   outputTokens,
+			WebSearchRequests: pgUsageRowWebSearchRequests(
+				r.usageSource, r.tokenJSON),
+			ClaudeMessageID: r.claudeMessageID,
+			ClaudeRequestID: r.claudeRequestID,
+		}
+	}
+	snapshotMask, _, snapshotWebSearchRequests :=
+		activity.ClaudeSnapshotSurvivorSelection(snapshotRows)
+	deduplicatedOutputTokens := 0
+	seen := make(map[pgUsageDedupToken]struct{})
+	for i, r := range usageRows {
+		if !snapshotMask[i] {
+			deduplicatedOutputTokens += snapshotRows[i].OutputTokens
+			continue
 		}
 		if key, ok := pgUsageDedupTokenForRow(
 			r.usageSource, r.agent, r.claudeMessageID,
@@ -1268,7 +1648,9 @@ func (s *Store) GetSessionUsage(
 			authoritativeCost = &v
 			costRow.cost = sql.NullInt64{}
 		}
-		c, priced, contributes, priceErr := pgSessionRowCost(costRow, rateResolver)
+		c, priced, contributes, priceErr :=
+			pgSessionRowCostWithWebSearchRequests(
+				costRow, snapshotWebSearchRequests[i], rateResolver)
 		if priceErr != nil {
 			return nil, priceErr
 		}
@@ -1295,12 +1677,11 @@ func (s *Store) GetSessionUsage(
 		}
 		breakdownCount++
 		if includeBreakdown {
-			breakdown = append(breakdown, pgSessionUsageBreakdownEntry(
-				r, breakdownCount, c, priced))
+			breakdown = append(breakdown,
+				pgSessionUsageBreakdownEntryWithWebSearchRequests(
+					r, breakdownCount, c, priced,
+					snapshotWebSearchRequests[i]))
 		}
-	}
-	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("iterating pg session usage rows: %w", err)
 	}
 	if authoritativeCost != nil && len(breakdown) > 0 {
 		weights := make([]money.Money, len(breakdown))
@@ -1318,7 +1699,7 @@ func (s *Store) GetSessionUsage(
 		SessionID:         sess.ID,
 		Agent:             sess.Agent,
 		Project:           sess.Project,
-		TotalOutputTokens: sess.TotalOutputTokens,
+		TotalOutputTokens: max(sess.TotalOutputTokens-deduplicatedOutputTokens, 0),
 		PeakContextTokens: sess.PeakContextTokens,
 		HasTokenData: sess.HasTotalOutputTokens ||
 			sess.HasPeakContextTokens,
@@ -1337,6 +1718,7 @@ func (s *Store) GetSessionUsage(
 		}
 		out.AICredits = db.AICreditsFromCost(sess.Agent, out.Cost)
 	}
+	out.CostUSD = db.CostUSDFromCost(out.HasCost, out.Cost)
 	if len(unpricedSet) > 0 {
 		out.UnpricedModels = sortedStringSetKeys(unpricedSet)
 	}
@@ -1378,11 +1760,12 @@ func (s *Store) GetDailyUsage(
 	defer rows.Close()
 
 	type accumKey struct {
-		date    string
-		project string
-		agent   string
-		machine string
-		model   string
+		date       string
+		project    string
+		agent      string
+		machine    string
+		model      string
+		providerID string
 	}
 	type bucket struct {
 		inputTok  int
@@ -1420,7 +1803,6 @@ func (s *Store) GetDailyUsage(
 		if f.To != "" && date > f.To {
 			continue
 		}
-
 		if key, ok := pgUsageDedupTokenForRow(
 			r.usageSource, r.agent, r.claudeMessageID,
 			r.claudeRequestID, r.sourceUUID, r.usageDedupKey,
@@ -1457,6 +1839,7 @@ func (s *Store) GetDailyUsage(
 		key := accumKey{
 			date: date, project: r.project,
 			agent: r.agent, machine: r.machine, model: r.model,
+			providerID: r.providerID,
 		}
 		b, ok := accum[key]
 		if !ok {
@@ -1489,7 +1872,6 @@ func (s *Store) GetDailyUsage(
 		return db.DailyUsageResult{},
 			fmt.Errorf("iterating daily usage rows: %w", err)
 	}
-
 	sessionIDs := make([]string, 0, len(sessionCosts))
 	for sessionID := range sessionCosts {
 		sessionIDs = append(sessionIDs, sessionID)
@@ -1515,6 +1897,9 @@ func (s *Store) GetDailyUsage(
 				}
 				if a.machine != b.machine {
 					return a.machine < b.machine
+				}
+				if a.providerID != b.providerID {
+					return a.providerID < b.providerID
 				}
 				return a.model < b.model
 			})
@@ -1993,7 +2378,6 @@ func (s *Store) GetTopSessionsByCost(
 		if f.To != "" && date > f.To {
 			continue
 		}
-
 		if key, ok := pgUsageDedupTokenForRow(
 			r.usageSource, r.agent, r.claudeMessageID,
 			r.claudeRequestID, r.sourceUUID, r.usageDedupKey,
@@ -2035,7 +2419,6 @@ func (s *Store) GetTopSessionsByCost(
 		return nil,
 			fmt.Errorf("iterating top sessions rows: %w", err)
 	}
-
 	result := make([]db.TopSessionEntry, 0, len(order))
 	for _, id := range order {
 		sa := accum[id]
@@ -2087,7 +2470,7 @@ func (s *Store) GetUsageSessionCounts(
 	ctx context.Context, f db.UsageFilter,
 ) (db.UsageSessionCounts, error) {
 	pb := &paramBuilder{}
-	query := pgUsageRowQuery(pb, f)
+	query := pgTopSessionsUsageRowQuery(pb, f)
 	query += ` ORDER BY u.ts ASC, u.session_id ASC,
 		COALESCE(u.message_ordinal, -1) ASC`
 

@@ -5,6 +5,7 @@ export const SESSION_ANALYTICS_WINDOW_PARAM = "window_days";
 /** True when URL params contain session filter keys (deep-link). */
 export const SESSION_FILTER_KEYS: ReadonlySet<string> = new Set([
   "project",
+  "starred",
   "machine",
   "agent",
   "termination",
@@ -25,23 +26,15 @@ export function hasFilterParams(params: Record<string, string>): boolean {
   return Object.keys(params).some((k) => SESSION_FILTER_KEYS.has(k));
 }
 
-function hasFixedSessionDateParams(
-  params: Record<string, string>,
-): boolean {
+function hasFixedSessionDateParams(params: Record<string, string>): boolean {
   return !!params["date"] || !!params["date_from"] || !!params["date_to"];
 }
 
-export function hasSessionDateIntent(
-  params: Record<string, string>,
-): boolean {
-  return hasFixedSessionDateParams(params) ||
-    !!params[SESSION_ANALYTICS_WINDOW_PARAM];
+export function hasSessionDateIntent(params: Record<string, string>): boolean {
+  return hasFixedSessionDateParams(params) || !!params[SESSION_ANALYTICS_WINDOW_PARAM];
 }
 
-export function hasSessionRouteDateIntent(
-  route: string,
-  params: Record<string, string>,
-): boolean {
+export function hasSessionRouteDateIntent(route: string, params: Record<string, string>): boolean {
   return route === "sessions" && hasSessionDateIntent(params);
 }
 
@@ -49,14 +42,11 @@ export function sessionDateIntentCleared(
   currentParams: Record<string, string>,
   nextParams: Record<string, string>,
 ): boolean {
-  return hasSessionDateIntent(currentParams) &&
-    !hasSessionDateIntent(nextParams);
+  return hasSessionDateIntent(currentParams) && !hasSessionDateIntent(nextParams);
 }
 
 /** Parses a window_days param; null unless a canonical positive integer. */
-export function parseWindowDaysParam(
-  raw: string | undefined,
-): number | null {
+export function parseWindowDaysParam(raw: string | undefined): number | null {
   if (!raw) return null;
   const n = Number.parseInt(raw, 10);
   if (!Number.isInteger(n) || n <= 0 || String(n) !== raw) return null;
@@ -120,9 +110,7 @@ export function sessionRouteParamsForFilters(
   return next;
 }
 
-export function currentSessionRouteParams(
-  currentParams: Record<string, string>,
-): Record<string, string> {
+function currentSessionRouteParams(currentParams: Record<string, string>): Record<string, string> {
   const next: Record<string, string> = {};
   for (const key of SESSION_FILTER_KEYS) {
     const value = currentParams[key];
@@ -142,10 +130,7 @@ export function sessionRouteParamsForDetailExit(
   return sessionRouteParamsForFilters(filterParams, currentParams);
 }
 
-export function filterParamsEqual(
-  a: Record<string, string>,
-  b: Record<string, string>,
-): boolean {
+export function filterParamsEqual(a: Record<string, string>, b: Record<string, string>): boolean {
   for (const k of SESSION_FILTER_KEYS) {
     if ((a[k] ?? "") !== (b[k] ?? "")) return false;
   }

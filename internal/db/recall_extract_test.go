@@ -100,9 +100,13 @@ func TestExtractGenerationRetireActiveRequiresForce(t *testing.T) {
 		ctx, "fp-a", []string{"rules-v1"}, time.Now()))
 
 	err = d.RetireExtractGeneration(ctx, "fp-a", false)
-	require.Error(t, err, "retiring the active generation needs force")
+	require.ErrorIs(t, err, ErrExtractGenerationActive)
 
 	require.NoError(t, d.RetireExtractGeneration(ctx, "fp-a", true))
+	require.ErrorIs(t,
+		d.RetireExtractGeneration(ctx, "fp-missing", false),
+		ErrExtractGenerationNotFound,
+	)
 	generations, err := d.ExtractGenerations(ctx)
 	require.NoError(t, err)
 	assert.Equal(t, ExtractGenerationRetired, generations[0].State)
@@ -1729,6 +1733,13 @@ func TestExtractCandidatesRespectsProgressState(t *testing.T) {
 	seedExtractCandidate(t, d, "sess-done", 3*time.Hour, nil)
 	seedExtractCandidate(t, d, "sess-failed-fresh", 2*time.Hour, nil)
 	seedExtractCandidate(t, d, "sess-failed-stale", 1*time.Hour, nil)
+	// Done revisits intentionally include writes at the extraction timestamp.
+	// Make this unchanged fixture strictly older instead of relying on the
+	// seeding and extraction calls landing in different milliseconds.
+	_, err := d.getWriter().Exec(
+		"UPDATE sessions SET local_modified_at = '2000-01-01T00:00:00.000Z' " +
+			"WHERE id = 'sess-done'")
+	require.NoError(t, err)
 
 	for _, fp := range []string{"fp-a", "fp-b"} {
 		_, err := d.EnsureExtractGeneration(ctx, ExtractGeneration{
@@ -1736,7 +1747,7 @@ func TestExtractCandidatesRespectsProgressState(t *testing.T) {
 		})
 		require.NoError(t, err)
 	}
-	_, err := d.UpsertExtractProgress(ctx, ExtractProgressUpsert{
+	_, err = d.UpsertExtractProgress(ctx, ExtractProgressUpsert{
 		SessionID: "sess-pending", Fingerprint: "fp-a",
 		ContentDigest: "dg", UnitsTotal: 2, StampedAt: time.Now(),
 	})
@@ -3162,4 +3173,110 @@ func TestRefreshExtractedSessionCoverageRestoresProvenance(t *testing.T) {
 	assert.NotEqual(t, "stale", evidence.ContentDigest)
 	assert.Equal(t, "sess-1-uuid-0", evidence.MessageStartSourceUUID)
 	assert.Equal(t, "sess-1-uuid-1", evidence.MessageEndSourceUUID)
+}
+
+func TestExtractCandidatesAllowCandidateFindingsPolicy(t *testing.T) {
+	d := testDB(t)
+	ctx := context.Background()
+	d.SetExtractCandidateFindingsAllowed(true)
+
+	seedExtractCandidate(t, d, "sess-clean", 2*time.Hour, nil)
+	seedExtractCandidate(t, d, "sess-candidate", 2*time.Hour, nil)
+	seedExtractCandidate(t, d, "sess-definite", 2*time.Hour, nil)
+	require.NoError(t, d.ReplaceSessionSecretFindings(
+		"sess-candidate",
+		[]SecretFinding{{
+			SessionID:    "sess-candidate",
+			RuleName:     "high-entropy-assignment",
+			Confidence:   "candidate",
+			LocationKind: "message",
+		}},
+		0, "rules-v1",
+	))
+	require.NoError(t, d.ReplaceSessionSecretFindings(
+		"sess-definite",
+		[]SecretFinding{{
+			SessionID:    "sess-definite",
+			RuleName:     "aws-access-key-id",
+			Confidence:   "definite",
+			LocationKind: "message",
+		}},
+		1, "rules-v1",
+	))
+
+	ids, err := d.ExtractCandidates(ctx, ExtractCandidateQuery{
+		Fingerprint:  "fp-a",
+		QuietCutoff:  time.Now().Add(-30 * time.Minute),
+		ScanVersions: []string{"rules-v1"},
+	})
+	require.NoError(t, err)
+	assert.ElementsMatch(t, []string{"sess-clean", "sess-candidate"}, ids,
+		"with candidate findings allowed only definite findings exclude a session")
+
+	// Switching the policy back restores the strict boundary on the same rows.
+	d.SetExtractCandidateFindingsAllowed(false)
+	ids, err = d.ExtractCandidates(ctx, ExtractCandidateQuery{
+		Fingerprint:  "fp-a",
+		QuietCutoff:  time.Now().Add(-30 * time.Minute),
+		ScanVersions: []string{"rules-v1"},
+	})
+	require.NoError(t, err)
+	assert.Equal(t, []string{"sess-clean"}, ids)
+}
+
+func TestReconcileIneligibleKeepsCandidateOnlySessionsWhenAllowed(t *testing.T) {
+	d := testDB(t)
+	ctx := context.Background()
+	d.SetExtractCandidateFindingsAllowed(true)
+	fp := "fp-a"
+	_, err := d.EnsureExtractGeneration(ctx, ExtractGeneration{
+		Fingerprint: fp, Model: "m", Segmenter: "turns-v1",
+	})
+	require.NoError(t, err)
+	entry := func(id, sessionID, fp string) RecallEntry {
+		return RecallEntry{
+			ID: id, Type: "fact", Scope: "project", Status: "accepted",
+			ReviewState: "unreviewed_auto", Title: "t", Body: "b",
+			SourceSessionID: sessionID, SourceRunID: fp,
+			Evidence: []RecallEvidence{{
+				SessionID: sessionID, MessageEndOrdinal: 1,
+			}},
+		}
+	}
+	for _, id := range []string{"sess-candidate", "sess-definite"} {
+		seedExtractCandidate(t, d, id, 2*time.Hour, nil)
+		_, err = d.UpsertExtractProgress(ctx, ExtractProgressUpsert{
+			SessionID: id, Fingerprint: fp,
+			ContentDigest: "dg", UnitsTotal: 2, StampedAt: time.Now(),
+		})
+		require.NoError(t, err)
+		_, err = d.InsertExtractedRecallEntries(ctx, []RecallEntry{
+			entry("e-"+id, id, fp),
+		})
+		require.NoError(t, err)
+	}
+	require.NoError(t, d.ReplaceSessionSecretFindings(
+		"sess-candidate", []SecretFinding{{
+			SessionID: "sess-candidate", RuleName: "high-entropy-assignment",
+			Confidence: "candidate", LocationKind: "message",
+			RedactedMatch: "…AHm", RulesVersion: "rules-v1",
+		}}, 0, "rules-v1"))
+	require.NoError(t, d.ReplaceSessionSecretFindings(
+		"sess-definite", []SecretFinding{{
+			SessionID: "sess-definite", RuleName: "aws-access-key-id",
+			Confidence: "definite", LocationKind: "message",
+			RedactedMatch: "AKIA…", RulesVersion: "rules-v1",
+		}}, 1, "rules-v1"))
+
+	rowsRemoved, entriesDeleted, err := d.ReconcileIneligibleExtractSessions(
+		ctx, time.Time{})
+	require.NoError(t, err)
+	assert.Equal(t, 1, rowsRemoved, "only the definite-finding session is retracted")
+	assert.Equal(t, 1, entriesDeleted)
+	kept, err := d.GetRecallEntry(ctx, "e-sess-candidate")
+	require.NoError(t, err)
+	assert.NotNil(t, kept, "candidate-only session keeps its entries")
+	gone, err := d.GetRecallEntry(ctx, "e-sess-definite")
+	require.NoError(t, err)
+	assert.Nil(t, gone)
 }

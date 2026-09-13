@@ -8,6 +8,7 @@ import (
 	"github.com/BurntSushi/toml"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"go.kenn.io/agentsview/internal/parser"
 )
 
 func readConfigFile(t *testing.T, dir string) Config {
@@ -33,6 +34,53 @@ func TestSaveSettingsPersistsChartPalette(t *testing.T) {
 	assert.Equal(t, ChartPaletteMatplotlib, fileCfg.ChartPalette)
 }
 
+func TestSaveSettingsPersistsZoomLevelAndPreservesUnrelatedTables(t *testing.T) {
+	dir := setupTestEnv(t)
+	require.NoError(t, os.WriteFile(filepath.Join(dir, configFileName), []byte(
+		"github_token = \"keep\"\n[proxy]\nmode = \"caddy\"\n"), 0o600))
+	cfg, err := Default()
+	require.NoError(t, err)
+	cfg.DataDir = dir
+
+	require.NoError(t, cfg.SaveSettings(map[string]any{
+		"zoom_level": ZoomLevel120,
+	}))
+	require.NotNil(t, cfg.ZoomLevel)
+	assert.Equal(t, ZoomLevel120, *cfg.ZoomLevel)
+
+	fileCfg := readConfigFile(t, dir)
+	require.NotNil(t, fileCfg.ZoomLevel)
+	assert.Equal(t, ZoomLevel120, *fileCfg.ZoomLevel)
+	assert.Equal(t, "keep", fileCfg.GithubToken)
+	assert.Equal(t, "caddy", fileCfg.Proxy.Mode)
+}
+
+func TestSaveSettingsRejectsInvalidZoomWithoutChangingSelectionOrDisk(t *testing.T) {
+	dir := setupTestEnv(t)
+	cfg, err := Default()
+	require.NoError(t, err)
+	cfg.DataDir = dir
+	require.NoError(t, cfg.SaveSettings(map[string]any{
+		"zoom_level": ZoomLevel120,
+	}))
+	before, err := os.ReadFile(filepath.Join(dir, configFileName))
+	require.NoError(t, err)
+
+	err = cfg.SaveSettings(map[string]any{
+		"zoom_level": ZoomLevel(101),
+	})
+	require.EqualError(t, err,
+		"zoom_level must be one of 67, 75, 80, 90, 100, 110, 120, 125, 130, 150, 175, 200 (got 101)")
+	require.NotNil(t, cfg.ZoomLevel)
+	assert.Equal(t, ZoomLevel120, *cfg.ZoomLevel)
+	after, err := os.ReadFile(filepath.Join(dir, configFileName))
+	require.NoError(t, err)
+	assert.Equal(t, before, after)
+
+	err = cfg.SaveSettings(map[string]any{"zoom_level": 120})
+	assert.EqualError(t, err, "zoom_level must use the typed configuration value")
+}
+
 func TestSaveSettingsRejectsInvalidChartPaletteWithoutChangingSelection(t *testing.T) {
 	dir := setupTestEnv(t)
 	cfg, err := Default()
@@ -50,6 +98,28 @@ func TestSaveSettingsRejectsInvalidChartPaletteWithoutChangingSelection(t *testi
 	assert.Equal(t, ChartPaletteMatplotlib, cfg.ChartPalette)
 	fileCfg := readConfigFile(t, dir)
 	assert.Equal(t, ChartPaletteMatplotlib, fileCfg.ChartPalette)
+}
+
+func TestSaveSettingsPersistsDisabledAgents(t *testing.T) {
+	dir := setupTestEnv(t)
+	cfg, err := Default()
+	require.NoError(t, err)
+	cfg.DataDir = dir
+
+	require.NoError(t, cfg.SaveSettings(map[string]any{
+		"disabled_agents": []parser.AgentType{
+			parser.AgentGemini,
+			parser.AgentClaude,
+			parser.AgentGemini,
+		},
+	}))
+
+	assert.Equal(t,
+		[]parser.AgentType{parser.AgentClaude, parser.AgentGemini},
+		cfg.DisabledAgents,
+	)
+	fileCfg := readConfigFile(t, dir)
+	assert.Equal(t, cfg.DisabledAgents, fileCfg.DisabledAgents)
 }
 
 func TestCursorSecret_GeneratedAndPersisted(t *testing.T) {

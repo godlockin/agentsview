@@ -2,6 +2,7 @@ name: CI
 
 on:
   workflow_call:
+  workflow_dispatch:
   push:
     branches: [main]
   # Run on every pull request regardless of base branch so stacked PRs that
@@ -17,16 +18,22 @@ permissions:
 
 jobs:
   lint:
-    runs-on: ${{ github.repository == 'kenn-io/agentsview' && (github.event_name == 'push' && github.ref == 'refs/heads/main' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.base.repo.full_name == github.repository)) && 'kenn-linux-x64-public' || 'ubuntu-latest' }}
+    runs-on: namespace-profile-linux-4cpu
+    timeout-minutes: 10
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
           persist-credentials: false
 
-      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16  # v6.5.0
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e  # v7.0.0
         with:
           go-version-file: go.mod
-          cache: ${{ github.repository == 'kenn-io/agentsview' && (github.event_name == 'push' && github.ref == 'refs/heads/main' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.base.repo.full_name == github.repository)) && 'false' || 'true' }}
+          cache: false
+
+      - name: Configure Namespace Go cache
+        uses: namespacelabs/nscloud-cache-action@c5f8dab7560444c4bf8dbc64f1b203431873c547  # v1
+        with:
+          cache: go
 
       - name: Install lint tools
         run: |
@@ -37,15 +44,40 @@ jobs:
         run: make lint-ci
 
   frontend:
-    runs-on: ${{ github.repository == 'kenn-io/agentsview' && (github.event_name == 'push' && github.ref == 'refs/heads/main' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.base.repo.full_name == github.repository)) && 'kenn-linux-x64-public' || 'ubuntu-latest' }}
+    runs-on: namespace-profile-linux-8cpu
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
           persist-credentials: false
 
-      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e  # v6.4.0
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020  # v7.0.0
         with:
           node-version: "24"
+          package-manager-cache: false
+
+      - name: Configure Namespace npm cache
+        uses: namespacelabs/nscloud-cache-action@c5f8dab7560444c4bf8dbc64f1b203431873c547  # v1
+        with:
+          cache: npm
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e  # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: false
+
+      - name: Configure Namespace Go cache
+        uses: namespacelabs/nscloud-cache-action@c5f8dab7560444c4bf8dbc64f1b203431873c547  # v1
+        with:
+          cache: go
+
+      - name: Prepare SQLite header
+        if: runner.os == 'Linux'
+        run: |
+          make sqlite-vec-header
+          echo "CGO_CFLAGS=-O2 -g -I$GITHUB_WORKSPACE/.sqlite-include" >> "$GITHUB_ENV"
+
+      - name: Generate pricing snapshot
+        run: go run ./internal/pricing/cmd/litellm-snapshot
 
       - name: Install frontend dependencies
         run: npm ci
@@ -67,15 +99,21 @@ jobs:
         working-directory: frontend
 
   frontend-node-25:
-    runs-on: ${{ github.repository == 'kenn-io/agentsview' && (github.event_name == 'push' && github.ref == 'refs/heads/main' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.base.repo.full_name == github.repository)) && 'kenn-linux-x64-public' || 'ubuntu-latest' }}
+    runs-on: namespace-profile-linux-8cpu
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
           persist-credentials: false
 
-      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e  # v6.4.0
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020  # v7.0.0
         with:
           node-version: "25"
+          package-manager-cache: false
+
+      - name: Configure Namespace npm cache
+        uses: namespacelabs/nscloud-cache-action@c5f8dab7560444c4bf8dbc64f1b203431873c547  # v1
+        with:
+          cache: npm
 
       - name: Install frontend dependencies
         run: npm ci
@@ -86,18 +124,19 @@ jobs:
         working-directory: frontend
 
   docs:
-    runs-on: ${{ github.repository == 'kenn-io/agentsview' && (github.event_name == 'push' && github.ref == 'refs/heads/main' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.base.repo.full_name == github.repository)) && 'kenn-linux-x64-public' || 'ubuntu-latest' }}
+    name: Docs and scripts
+    runs-on: namespace-profile-linux-4cpu
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
           persist-credentials: false
 
-      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1  # v6.3.0
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
         with:
           python-version: "3.14"
 
       - name: Set up uv
-        uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39  # v8.2.0
+        uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d  # v10.0.1
 
       - name: Install docs check tools
         run: |
@@ -107,38 +146,48 @@ jobs:
       - name: Run docs check
         run: make docs-check
 
-  scripts:
-    runs-on: ${{ github.repository == 'kenn-io/agentsview' && (github.event_name == 'push' && github.ref == 'refs/heads/main' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.base.repo.full_name == github.repository)) && 'kenn-linux-x64-public' || 'ubuntu-latest' }}
-    steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
-        with:
-          persist-credentials: false
-
       - name: Run shell script tests
         run: |
           bash scripts/install_test.sh
           bash scripts/retry_test.sh
-          bash scripts/check_desktop_release_health_test.sh
-          bash scripts/check_desktop_release_health_from_event_test.sh
+          bash scripts/e2e-server_test.sh
           bash desktop/scripts/test-repair-appimage-diricon.sh
 
   test:
     name: Go Test (${{ matrix.os }})
-    runs-on: ${{ contains(fromJSON('["ubuntu-latest","ubuntu-24.04","ubuntu-22.04"]'), matrix.os) && github.repository == 'kenn-io/agentsview' && (github.event_name == 'push' && github.ref == 'refs/heads/main' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.base.repo.full_name == github.repository)) && 'kenn-linux-x64-public' || matrix.os }}
+    runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-latest]
+        include:
+          - os: ubuntu-latest
+            runner: namespace-profile-linux-8cpu
+          - os: windows-latest
+            runner: namespace-profile-windows-4cpu
+          - os: macos-latest
+            runner: macos-latest
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
           fetch-depth: 0
           persist-credentials: false
 
-      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16  # v6.5.0
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e  # v7.0.0
         with:
           go-version-file: go.mod
-          cache: ${{ contains(fromJSON('["ubuntu-latest","ubuntu-24.04","ubuntu-22.04"]'), matrix.os) && github.repository == 'kenn-io/agentsview' && (github.event_name == 'push' && github.ref == 'refs/heads/main' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.base.repo.full_name == github.repository)) && 'false' || 'true' }}
+          cache: ${{ runner.os == 'macOS' }}
+
+      - name: Configure Namespace Go cache
+        if: runner.os != 'macOS'
+        uses: namespacelabs/nscloud-cache-action@c5f8dab7560444c4bf8dbc64f1b203431873c547  # v1
+        with:
+          cache: go
+
+      - name: Prepare SQLite header
+        if: runner.os == 'Linux'
+        run: |
+          make sqlite-vec-header
+          echo "CGO_CFLAGS=-O2 -g -I$GITHUB_WORKSPACE/.sqlite-include" >> "$GITHUB_ENV"
 
       - name: Setup MinGW (Windows)
         if: runner.os == 'Windows'
@@ -163,8 +212,37 @@ jobs:
       - name: Restore pricing snapshot
         run: go run ./internal/pricing/cmd/litellm-snapshot -restore
 
-      - name: Run Go tests
-        run: go test -tags "fts5" ./... -v -count=1 -timeout=20m
+      - name: Run Go tests (Linux)
+        if: runner.os == 'Linux'
+        run: go test -tags "fts5" -coverprofile=coverage.out ./... -v -count=1 -timeout=20m
+        env:
+          CGO_ENABLED: "1"
+
+      - name: Run Go tests (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          # SQLite-heavy packages run in their own jobs below so they do not
+          # compete for this runner's package workers and timeout budget.
+          $packages = @(go list ./...)
+          if ($LASTEXITCODE -ne 0) {
+            exit $LASTEXITCODE
+          }
+          $isolatedPackages = @(
+            'go.kenn.io/agentsview/internal/capture'
+            'go.kenn.io/agentsview/internal/db'
+            'go.kenn.io/agentsview/internal/duckdb'
+            'go.kenn.io/agentsview/internal/parser'
+            'go.kenn.io/agentsview/internal/sync'
+          )
+          $packages = $packages | Where-Object { $_ -notin $isolatedPackages }
+          go test -tags "fts5" $packages -count=1 -timeout=20m
+        env:
+          CGO_ENABLED: "1"
+
+      - name: Run raw capture tests (macOS)
+        if: runner.os == 'macOS'
+        run: go test -tags "fts5" ./internal/rawcapture -count=1 -timeout=10m
         env:
           CGO_ENABLED: "1"
 
@@ -172,21 +250,293 @@ jobs:
         if: runner.os == 'Linux'
         run: make test-evalingest
 
-      - name: Run Go tests (race detector)
+      - name: Upload coverage
+        if: runner.os == 'Linux'
+        id: codecov
+        uses: codecov/codecov-action@fb8b3582c8e4def4969c97caa2f19720cb33a72f  # v7.0.0
+        with:
+          files: coverage.out
+        continue-on-error: true
+
+      - name: Warn on coverage upload failure
+        if: runner.os == 'Linux' && steps.codecov.outcome == 'failure'
+        run: echo "::warning::Codecov upload failed"
+
+  # Share setup for the shorter SQLite suites; keep Sync on its own runner.
+  test-sqlite-packages-windows:
+    name: Go Test (windows-latest, ${{ matrix.name }})
+    runs-on: namespace-profile-windows-4cpu
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Capture, Database, Parser
+            package: ./internal/capture ./internal/db ./internal/parser
+          - name: Sync
+            package: ./internal/sync
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e  # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: false
+
+      - name: Configure Namespace Go cache
+        uses: namespacelabs/nscloud-cache-action@c5f8dab7560444c4bf8dbc64f1b203431873c547  # v1
+        with:
+          cache: go
+
+      - name: Setup MinGW
+        id: setup_mingw
+        continue-on-error: true
+        uses: msys2/setup-msys2@66cd2cce69caa17b53920067426061ca1de3a884  # v2
+        with:
+          msystem: MINGW64
+          update: false
+          install: mingw-w64-x86_64-gcc
+          path-type: inherit
+
+      - name: Setup MinGW (retry on transient failure)
+        if: steps.setup_mingw.outcome == 'failure'
+        uses: msys2/setup-msys2@66cd2cce69caa17b53920067426061ca1de3a884  # v2
+        with:
+          msystem: MINGW64
+          update: false
+          install: mingw-w64-x86_64-gcc
+          path-type: inherit
+
+      - name: Restore pricing snapshot
+        run: go run ./internal/pricing/cmd/litellm-snapshot -restore
+
+      # The Windows system tree and the runner's data volume have parent
+      # permissions that capture deliberately rejects. Use a private directory
+      # directly on the system drive for this job's fixtures.
+      - name: Prepare capture test temporary directory
+        if: contains(matrix.package, './internal/capture')
+        shell: pwsh
+        run: |
+          $testTemp = Join-Path $env:SystemDrive ("agentsview-ci-" + [guid]::NewGuid().ToString("N"))
+          New-Item -ItemType Directory -Path $testTemp | Out-Null
+          icacls $testTemp /inheritance:r /grant:r '*S-1-5-18:(OI)(CI)F' '*S-1-5-32-544:(OI)(CI)F'
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          "SystemTemp=$testTemp" >> $env:GITHUB_ENV
+          "AGENTSVIEW_CI_TEMP=$testTemp" >> $env:GITHUB_ENV
+
+      - name: Run ${{ matrix.name }} tests
+        shell: pwsh
+        run: |
+          go test -json -tags "fts5" ${{ matrix.package }} -count=1 -timeout=20m 2>&1 |
+            Tee-Object -FilePath go-test-events.jsonl
+          exit $LASTEXITCODE
+        env:
+          CGO_ENABLED: "1"
+
+      - name: Remove capture test temporary directory
+        if: always() && contains(matrix.package, './internal/capture') && env.AGENTSVIEW_CI_TEMP != ''
+        shell: pwsh
+        run: Remove-Item -LiteralPath $env:AGENTSVIEW_CI_TEMP -Recurse -Force
+
+      - name: Summarize ${{ matrix.name }} test timing
+        if: always()
+        shell: pwsh
+        run: |
+          $eventsPath = "go-test-events.jsonl"
+          if (-not (Test-Path $eventsPath)) {
+            Write-Warning "Go test event log was not created"
+            exit 0
+          }
+
+          $events = @(
+            Get-Content $eventsPath | ForEach-Object {
+              try {
+                $_ | ConvertFrom-Json -ErrorAction Stop
+              } catch {
+                # Keep the raw artifact authoritative if a killed process left
+                # one incomplete line at the end of the stream.
+              }
+            }
+          )
+          if ($events.Count -eq 0) {
+            Write-Warning "Go test event log contains no complete JSON events"
+            exit 0
+          }
+
+          $terminal = @{}
+          $completed = @(
+            $events | Where-Object {
+              $_.Test -and $_.Action -in @("pass", "fail", "skip")
+            }
+          )
+          foreach ($event in $completed) {
+            $terminal[$event.Test] = $event.Action
+          }
+
+          $seenActive = @{}
+          $active = @(
+            $events |
+              Where-Object { $_.Test -and $_.Action -eq "run" } |
+              Sort-Object Time -Descending |
+              Where-Object {
+                if ($terminal.ContainsKey($_.Test) -or $seenActive.ContainsKey($_.Test)) {
+                  return $false
+                }
+                $seenActive[$_.Test] = $true
+                return $true
+              }
+          )
+
+          $summary = [System.Collections.Generic.List[string]]::new()
+          $summary.Add("## ${{ matrix.name }} Go test diagnostics")
+          $summary.Add("")
+          $summary.Add("### Tests active when the process ended")
+          $summary.Add("")
+          if ($active.Count -eq 0) {
+            $summary.Add("None.")
+          } else {
+            foreach ($event in $active | Select-Object -First 25) {
+              $summary.Add("- ``$($event.Test.Replace('|', '\|'))`` (started $($event.Time))")
+            }
+          }
+
+          $summary.Add("")
+          $summary.Add("### Slowest completed tests")
+          $summary.Add("")
+          $summary.Add("| Test | Result | Seconds |")
+          $summary.Add("| --- | --- | ---: |")
+          foreach ($event in $completed |
+            Sort-Object { [double]$_.Elapsed } -Descending |
+            Select-Object -First 25) {
+            $name = $event.Test.Replace('|', '\|')
+            $elapsed = "{0:N3}" -f [double]$event.Elapsed
+            $summary.Add("| ``$name`` | $($event.Action) | $elapsed |")
+          }
+
+          $summary.Add("")
+          $summary.Add("### Last completed tests")
+          $summary.Add("")
+          $summary.Add("| Completed | Test | Result | Seconds |")
+          $summary.Add("| --- | --- | --- | ---: |")
+          foreach ($event in $completed |
+            Sort-Object Time -Descending |
+            Select-Object -First 25) {
+            $name = $event.Test.Replace('|', '\|')
+            $elapsed = "{0:N3}" -f [double]$event.Elapsed
+            $summary.Add("| $($event.Time) | ``$name`` | $($event.Action) | $elapsed |")
+          }
+
+          $summary | Write-Output
+          $summary | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
+
+      - name: Upload ${{ matrix.name }} test events
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        with:
+          name: go-test-events-windows-${{ matrix.name }}-attempt-${{ github.run_attempt }}
+          path: go-test-events.jsonl
+          if-no-files-found: warn
+          retention-days: 7
+
+  # Keep the derived-mirror suite concurrent with the main Windows package set.
+  test-duckdb-windows:
+    name: Go Test (windows-latest, DuckDB)
+    runs-on: namespace-profile-windows-4cpu
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e  # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: false
+
+      - name: Configure Namespace Go cache
+        uses: namespacelabs/nscloud-cache-action@c5f8dab7560444c4bf8dbc64f1b203431873c547  # v1
+        with:
+          cache: go
+
+      - name: Setup MinGW
+        id: setup_mingw
+        continue-on-error: true
+        uses: msys2/setup-msys2@66cd2cce69caa17b53920067426061ca1de3a884  # v2
+        with:
+          msystem: MINGW64
+          update: false
+          install: mingw-w64-x86_64-gcc
+          path-type: inherit
+
+      - name: Setup MinGW (retry on transient failure)
+        if: steps.setup_mingw.outcome == 'failure'
+        uses: msys2/setup-msys2@66cd2cce69caa17b53920067426061ca1de3a884  # v2
+        with:
+          msystem: MINGW64
+          update: false
+          install: mingw-w64-x86_64-gcc
+          path-type: inherit
+
+      - name: Restore pricing snapshot
+        run: go run ./internal/pricing/cmd/litellm-snapshot -restore
+
+      - name: Run DuckDB tests
+        run: go test -tags "fts5" ./internal/duckdb -count=1 -timeout=20m
+        env:
+          CGO_ENABLED: "1"
+
+  test-race:
+    name: Go Test (race detector)
+    runs-on: namespace-profile-linux-8cpu
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e  # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: false
+
+      - name: Configure Namespace Go cache
+        uses: namespacelabs/nscloud-cache-action@c5f8dab7560444c4bf8dbc64f1b203431873c547  # v1
+        with:
+          cache: go
+
+      - name: Prepare SQLite header
         if: runner.os == 'Linux'
         run: |
-          go test -tags "fts5" ./internal/duckdb -count=1
-          go test -tags "fts5" -race $(go list ./... | grep -v '/internal/duckdb$') -count=1 -timeout=20m
+          make sqlite-vec-header
+          echo "CGO_CFLAGS=-O2 -g -I$GITHUB_WORKSPACE/.sqlite-include" >> "$GITHUB_ENV"
+
+      - name: Restore pricing snapshot
+        run: go run ./internal/pricing/cmd/litellm-snapshot -restore
+
+      # internal/duckdb is excluded from -race (CGo-heavy, race-insensitive,
+      # and 7+ minutes on its own); it is still covered without -race by the
+      # main test job's ./... run. Limit package fan-out because the race
+      # detector makes highly parallel runs slow enough to exhaust deadlines.
+      - name: Run Go tests (race detector)
+        run: go list ./... | grep -v '/internal/duckdb$' | xargs go test -p 4 -tags "fts5" -race -count=1 -timeout=20m
         env:
           CGO_ENABLED: "1"
 
   desktop-windows-unit:
     name: Desktop Unit Tests (Windows)
-    runs-on: windows-latest
+    runs-on: namespace-profile-windows-4cpu
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
           persist-credentials: false
+
+      - name: Configure Namespace Rust cache
+        uses: namespacelabs/nscloud-cache-action@c5f8dab7560444c4bf8dbc64f1b203431873c547  # v1
+        with:
+          cache: rust
+          path: desktop/src-tauri/target
 
       - name: Prepare placeholder sidecar resource
         shell: pwsh
@@ -212,43 +562,11 @@ jobs:
             Start-Sleep -Seconds (10 * $attempt)
           }
 
-      - name: Run Windows desktop update tests
-        run: cargo test --locked --manifest-path desktop/src-tauri/Cargo.toml --lib install_downloaded_update
-
-  coverage:
-    runs-on: ${{ github.repository == 'kenn-io/agentsview' && (github.event_name == 'push' && github.ref == 'refs/heads/main' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.base.repo.full_name == github.repository)) && 'kenn-linux-x64-public' || 'ubuntu-latest' }}
-    steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
-        with:
-          fetch-depth: 0
-          persist-credentials: false
-
-      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16  # v6.5.0
-        with:
-          go-version-file: go.mod
-          cache: ${{ github.repository == 'kenn-io/agentsview' && (github.event_name == 'push' && github.ref == 'refs/heads/main' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.base.repo.full_name == github.repository)) && 'false' || 'true' }}
-
-      - name: Restore pricing snapshot
-        run: go run ./internal/pricing/cmd/litellm-snapshot -restore
-
-      - name: Test with coverage
-        run: go test -tags "fts5" -coverprofile=coverage.out ./...
-        env:
-          CGO_ENABLED: "1"
-
-      - name: Upload coverage
-        id: codecov
-        uses: codecov/codecov-action@fb8b3582c8e4def4969c97caa2f19720cb33a72f  # v7.0.0
-        with:
-          files: coverage.out
-        continue-on-error: true
-
-      - name: Warn on coverage upload failure
-        if: steps.codecov.outcome == 'failure'
-        run: echo "::warning::Codecov upload failed"
+      - name: Run Windows desktop unit tests
+        run: cargo test --locked --manifest-path desktop/src-tauri/Cargo.toml --lib
 
   integration:
-    runs-on: ${{ github.repository == 'kenn-io/agentsview' && (github.event_name == 'push' && github.ref == 'refs/heads/main' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.base.repo.full_name == github.repository)) && 'kenn-linux-x64-public' || 'ubuntu-latest' }}
+    runs-on: namespace-profile-linux-4cpu
     services:
       postgres:
         image: pgvector/pgvector:pg18
@@ -258,21 +576,29 @@ jobs:
           POSTGRES_DB: agentsview_test
         ports:
           - 5433:5432
+        # PG18 keeps its data under /var/lib/postgresql/18/docker. The suite
+        # repeatedly rebuilds schemas; keep this disposable cluster in memory.
         options: >-
+          --tmpfs /var/lib/postgresql:rw,size=4g
           --health-cmd "pg_isready -U agentsview_test -d agentsview_test"
           --health-interval 2s
           --health-timeout 5s
           --health-retries 10
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
           fetch-depth: 0
           persist-credentials: false
 
-      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16  # v6.5.0
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e  # v7.0.0
         with:
           go-version-file: go.mod
-          cache: ${{ github.repository == 'kenn-io/agentsview' && (github.event_name == 'push' && github.ref == 'refs/heads/main' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.base.repo.full_name == github.repository)) && 'false' || 'true' }}
+          cache: false
+
+      - name: Configure Namespace Go cache
+        uses: namespacelabs/nscloud-cache-action@c5f8dab7560444c4bf8dbc64f1b203431873c547  # v1
+        with:
+          cache: go
 
       - name: Restore pricing snapshot
         run: go run ./internal/pricing/cmd/litellm-snapshot -restore
@@ -315,21 +641,38 @@ jobs:
           TEST_SSH_KEY: ${{ github.workspace }}/testdata/ssh/test_key
 
   e2e:
-    runs-on: ${{ github.repository == 'kenn-io/agentsview' && (github.event_name == 'push' && github.ref == 'refs/heads/main' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.base.repo.full_name == github.repository)) && 'kenn-linux-x64-public' || 'ubuntu-latest' }}
+    runs-on: namespace-profile-linux-8cpu
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
           fetch-depth: 0
           persist-credentials: false
 
-      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16  # v6.5.0
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e  # v7.0.0
         with:
           go-version-file: go.mod
-          cache: ${{ github.repository == 'kenn-io/agentsview' && (github.event_name == 'push' && github.ref == 'refs/heads/main' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.base.repo.full_name == github.repository)) && 'false' || 'true' }}
+          cache: false
 
-      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e  # v6.4.0
+      - name: Configure Namespace Go cache
+        uses: namespacelabs/nscloud-cache-action@c5f8dab7560444c4bf8dbc64f1b203431873c547  # v1
+        with:
+          cache: go
+
+      - name: Prepare SQLite header
+        if: runner.os == 'Linux'
+        run: |
+          make sqlite-vec-header
+          echo "CGO_CFLAGS=-O2 -g -I$GITHUB_WORKSPACE/.sqlite-include" >> "$GITHUB_ENV"
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020  # v7.0.0
         with:
           node-version: "24"
+          package-manager-cache: false
+
+      - name: Configure Namespace npm cache
+        uses: namespacelabs/nscloud-cache-action@c5f8dab7560444c4bf8dbc64f1b203431873c547  # v1
+        with:
+          cache: npm
 
       - name: Install frontend dependencies
         run: npm ci
@@ -356,13 +699,24 @@ jobs:
         env:
           CGO_ENABLED: "1"
 
-      - name: Install Playwright browsers
+      - name: Configure Namespace Playwright cache
+        uses: namespacelabs/nscloud-cache-action@c5f8dab7560444c4bf8dbc64f1b203431873c547  # v1
+        with:
+          cache: playwright
+
+      - name: Install Playwright browsers and system dependencies
         run: npx playwright install --with-deps chromium webkit
         working-directory: frontend
 
       - name: Run E2E tests
         run: npx playwright test --reporter=list
         working-directory: frontend
+        env:
+          E2E_PREBUILT_FIXTURE: /tmp/testfixture
+          E2E_PREBUILT_SERVER: /tmp/agentsview
+
+      - name: Run DuckDB E2E tests
+        run: make e2e-duckdb
         env:
           E2E_PREBUILT_FIXTURE: /tmp/testfixture
           E2E_PREBUILT_SERVER: /tmp/agentsview

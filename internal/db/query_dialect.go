@@ -404,15 +404,6 @@ func (b *QueryBuilder) Limit(limit int) string {
 	return "LIMIT " + b.Add(limit)
 }
 
-// NullsLast returns an ORDER BY expression with dialect-appropriate NULL
-// placement when the backend supports it.
-func (d QueryDialect) NullsLast(expr string) string {
-	if d.nullsLast {
-		return expr + " NULLS LAST"
-	}
-	return expr
-}
-
 // EscapeLikePattern escapes SQL LIKE wildcard characters so a bind parameter
 // is treated as literal user text.
 func EscapeLikePattern(s string) string {
@@ -464,10 +455,6 @@ func (d QueryDialect) CanonicalChildRelationshipsSQL() string {
 		quoted = append(quoted, "'"+rel+"'")
 	}
 	return strings.Join(quoted, ", ")
-}
-
-func SidebarChildRelationshipPredicate(dialect QueryDialect, sessionAlias string) string {
-	return sessionAlias + ".relationship_type IN (" + dialect.SidebarChildRelationshipsSQL() + ")"
 }
 
 func CanonicalChildRelationshipPredicate(dialect QueryDialect, sessionAlias string) string {
@@ -603,18 +590,7 @@ func sessionFilterPredicates(
 				f.Date, f.Timezone, true,
 			)))+")")
 	}
-	if f.DateFrom != "" {
-		preds = append(preds, b.dialect.dateEndExpr(q)+" >= "+
-			b.dialect.dateParam(b.Add(sessionDateBoundary(
-				f.DateFrom, f.Timezone, false,
-			))))
-	}
-	if f.DateTo != "" {
-		preds = append(preds, b.dialect.dateStartExpr(q)+" < "+
-			b.dialect.dateParam(b.Add(sessionDateBoundary(
-				f.DateTo, f.Timezone, true,
-			))))
-	}
+	preds = append(preds, b.SessionDateRangePredicates(f.DateFrom, f.DateTo, f.Timezone, q)...)
 	if f.ActiveSince != "" {
 		preds = append(preds, b.dialect.dateEndExpr(q)+" >= "+
 			b.dialect.dateParam(b.Add(f.ActiveSince)))
@@ -893,4 +869,23 @@ func (b *QueryBuilder) terminationParam(t time.Time) string {
 	default:
 		return b.dialect.activityParam(b.Add(t))
 	}
+}
+
+// SessionDateRangePredicates matches sessions whose activity overlaps the inclusive
+// calendar-date range. Empty bounds add no restriction, as in session listing.
+func (b *QueryBuilder) SessionDateRangePredicates(dateFrom, dateTo, timezone string, q func(string) string) []string {
+	var preds []string
+	if dateFrom != "" {
+		preds = append(preds, b.dialect.dateEndExpr(q)+" >= "+
+			b.dialect.dateParam(b.Add(sessionDateBoundary(
+				dateFrom, timezone, false,
+			))))
+	}
+	if dateTo != "" {
+		preds = append(preds, b.dialect.dateStartExpr(q)+" < "+
+			b.dialect.dateParam(b.Add(sessionDateBoundary(
+				dateTo, timezone, true,
+			))))
+	}
+	return preds
 }

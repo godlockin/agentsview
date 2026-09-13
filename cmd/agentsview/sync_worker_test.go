@@ -5,7 +5,7 @@ import (
 	"bytes"
 	"context"
 	"database/sql"
-	"encoding/json"
+	"encoding/json/v2"
 	"errors"
 	"fmt"
 	"os"
@@ -40,9 +40,9 @@ func testConfigWithClaudeFixture(t *testing.T) config.Config {
 		))
 	}
 	return config.Config{
-		DataDir:          dataDir,
-		DBPath:           filepath.Join(dataDir, "sessions.db"),
-		LocalMachineName: "local",
+		DataDir:        dataDir,
+		DBPath:         filepath.Join(dataDir, "sessions.db"),
+		InstallationID: "0123456789abcdef0123456789abcdef",
 		AgentDirs: map[parser.AgentType][]string{
 			parser.AgentClaude: {claudeDir},
 		},
@@ -99,16 +99,96 @@ func TestSyncWorkerStartupModeSyncsAndEmitsTerminalResult(t *testing.T) {
 		"public SyncStats fields must survive the NDJSON protocol")
 }
 
-func TestSyncWorkerReportsAbortAsFailure(t *testing.T) {
+func TestSyncWorkerAuditModeForwardsReconciliationProgress(t *testing.T) {
 	cfg := testConfigWithClaudeFixture(t)
-	ctx, cancel := context.WithCancel(context.Background())
-	cancel() // aborted before work starts
 	var out bytes.Buffer
-	err := runSyncWorkerContext(ctx, cfg, "startup", &out)
-	require.Error(t, err, "aborted work must not exit zero")
+	require.NoError(t, runSyncWorker(cfg, "audit", &out))
+
+	sawActiveProgress := false
+	sc := bufio.NewScanner(&out)
+	for sc.Scan() {
+		var line workerLine
+		require.NoError(t, json.Unmarshal(sc.Bytes(), &line),
+			"every stdout line must be a workerLine JSON object")
+		if line.Progress != nil &&
+			line.Progress.Phase == sync.PhaseSyncing &&
+			line.Progress.SessionsDone > 0 {
+			sawActiveProgress = true
+		}
+	}
+	require.NoError(t, sc.Err())
+	assert.True(t, sawActiveProgress,
+		"audit worker must forward active reconciliation progress")
+}
+
+func TestSyncWorkerStartupUsesConfiguredSourceMachine(t *testing.T) {
+	cfg := testConfigWithClaudeFixture(t)
+	claudeRoot := cfg.AgentDirs[parser.AgentClaude][0]
+	cfg.SourceMachines = map[parser.AgentType]map[string]string{
+		parser.AgentClaude: {claudeRoot: "archivebox"},
+	}
+
+	var out bytes.Buffer
+	require.NoError(t, runSyncWorker(cfg, "startup", &out))
+	assert.Equal(t, "ok", decodeSingleResult(t, &out).Status)
+
+	database, err := db.OpenReadOnly(cfg.DBPath)
+	require.NoError(t, err)
+	defer database.Close()
+	page, err := database.ListSessions(context.Background(), db.SessionFilter{})
+	require.NoError(t, err)
+	require.Len(t, page.Sessions, 3)
+	for _, sess := range page.Sessions {
+		assert.Equal(t, "archivebox", sess.Machine)
+	}
+}
+
+func TestSyncWorkerReportsAbortAsFailure(t *testing.T) {
+	for _, mode := range []string{"startup", "resync-build"} {
+		t.Run(mode, func(t *testing.T) {
+			cfg := testConfigWithClaudeFixture(t)
+			database, err := openDB(cfg)
+			require.NoError(t, err)
+			require.NoError(t, database.Close())
+			ctx, cancel := context.WithCancel(t.Context())
+			cancel() // aborted before work starts
+			var out bytes.Buffer
+			err = runSyncWorkerContext(ctx, cfg, mode, &out)
+			require.Error(t, err, "aborted work must not exit zero")
+			result := decodeSingleResult(t, &out)
+			assert.Equal(t, "aborted", result.Status)
+			assert.False(t, result.DiscoveryComplete)
+		})
+	}
+}
+
+func TestSyncWorkerResyncBuildReportsMissingArchive(t *testing.T) {
+	dir := t.TempDir()
+	cfg := config.Config{
+		DataDir: dir, DBPath: filepath.Join(dir, "missing.db"),
+		InstallationID: "0123456789abcdef0123456789abcdef",
+	}
+	var out bytes.Buffer
+	require.Error(t, runSyncWorkerContext(t.Context(), cfg, "resync-build", &out))
 	result := decodeSingleResult(t, &out)
-	assert.Equal(t, "aborted", result.Status)
+	assert.Equal(t, "failed", result.Status)
 	assert.False(t, result.DiscoveryComplete)
+}
+
+func TestWorkerResultPreservesTombstonesAcrossProtocol(t *testing.T) {
+	result := workerResultFromStats(context.Background(), sync.SyncStats{
+		Tombstoned: 2,
+		Aborted:    true,
+	})
+	var wire bytes.Buffer
+	require.NoError(t, json.MarshalWrite(&wire, workerLine{Result: &result}))
+
+	decoded, err := readWorkerResult(&wire, nil)
+	require.NoError(t, err)
+	assert.Equal(t, 2, decoded.Tombstoned,
+		"the terminal summary must carry committed tombstones")
+	assert.Equal(t, 2, statsFromWorkerResult(decoded).Tombstoned,
+		"the daemon-side stats must retain tombstones after JSON decoding")
 }
 
 func TestSyncWorkerFailsWhenWriteLockHeld(t *testing.T) {
@@ -147,6 +227,59 @@ func TestSyncWorkerResyncBuildModeBuildsReplacement(t *testing.T) {
 	assert.Equal(t, 3, result.Synced)
 	assert.FileExists(t, cfg.DBPath+"-resync",
 		"worker must leave the built replacement for the daemon to swap")
+}
+
+func TestSyncWorkerResyncBuildUsesConfiguredImagePolicy(t *testing.T) {
+	cfg := testConfigWithClaudeFixture(t)
+	claudeRoot := cfg.AgentDirs[parser.AgentClaude][0]
+	imageSession := filepath.Join(claudeRoot, "-home-proj0", "session0.jsonl")
+	imageContent := `[ {"type":"text","text":"before"},{"type":"input_image","image_url":"data:image/png;base64,AAEC"},{"type":"text","text":"after"} ]`
+	require.NoError(t, os.WriteFile(imageSession, []byte(
+		testjsonl.NewSessionBuilder().
+			AddClaudeUser("2026-01-01T00:00:00Z", "hello").
+			AddRaw(`{"type":"assistant","timestamp":"2026-01-01T00:00:01Z","message":{"content":[{"type":"tool_use","id":"call-image","name":"Read","input":{}}]}}`).
+			AddRaw(fmt.Sprintf(`{"type":"user","timestamp":"2026-01-01T00:00:02Z","message":{"content":[{"type":"tool_result","tool_use_id":"call-image","content":%s}]}}`, imageContent)).
+			String(),
+	), 0o644))
+
+	seedCfg := cfg
+	seedCfg.ToolResultImages = config.ToolResultImagesKeep
+	database, err := db.Open(cfg.DBPath)
+	require.NoError(t, err)
+	engine := sync.NewEngine(database, workerEngineConfig(seedCfg))
+	require.Equal(t, 3, engine.SyncAll(context.Background(), nil).Synced)
+	engine.Close()
+	require.NoError(t, database.Close())
+
+	cfg.ToolResultImages = config.ToolResultImagesDrop
+	var out bytes.Buffer
+	require.NoError(t, runSyncWorker(cfg, "resync-build", &out))
+	require.Equal(t, "ok", decodeSingleResult(t, &out).Status)
+
+	replacement, err := db.Open(cfg.DBPath + "-resync")
+	require.NoError(t, err)
+	defer func() { require.NoError(t, replacement.Close()) }()
+	page, err := replacement.ListSessions(context.Background(), db.SessionFilter{})
+	require.NoError(t, err)
+	var foundImageCall bool
+	for _, session := range page.Sessions {
+		messages, err := replacement.GetAllMessages(context.Background(), session.ID)
+		require.NoError(t, err)
+		for _, message := range messages {
+			for _, call := range message.ToolCalls {
+				if call.ToolUseID != "call-image" {
+					continue
+				}
+				foundImageCall = true
+				assert.NotContains(t, call.ResultContent, "input_image")
+				assert.NotContains(t, call.ResultContent, "data:image")
+				for _, event := range call.ResultEvents {
+					assert.NotContains(t, event.Content, "input_image")
+				}
+			}
+		}
+	}
+	assert.True(t, foundImageCall, "fixture must reach the normalized tool-result tables")
 }
 
 // TestSyncWorkerResyncBuildAppliesClassifierConfig pins the classifier wiring
@@ -327,6 +460,12 @@ func TestResyncBuildResultFromStatsToleratesMinorityParseFailures(t *testing.T) 
 			ctx:        context.Background(),
 			stats:      sync.SyncStats{Aborted: true},
 			wantStatus: "aborted",
+		},
+		{
+			name:       "deferred processing",
+			ctx:        context.Background(),
+			stats:      sync.SyncStats{Deferred: 1},
+			wantStatus: "failed",
 		},
 		{
 			name:       "build error",

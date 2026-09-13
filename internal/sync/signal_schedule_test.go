@@ -2,12 +2,15 @@ package sync
 
 import (
 	"context"
+	"os"
 	"sync"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"go.kenn.io/agentsview/internal/testjsonl"
 )
 
 type harnessTimer struct {
@@ -269,60 +272,62 @@ func TestSignalSchedulerStopFlushesAndRunsInlineAfter(t *testing.T) {
 // running on the timer goroutine must finish before stop returns,
 // or the owner could close the DB underneath it.
 func TestSignalSchedulerStopWaitsForInflightTimerRun(t *testing.T) {
-	started := make(chan struct{})
-	release := make(chan struct{})
-	var startedOnce sync.Once
-	var mu sync.Mutex
-	clock := time.Unix(1_700_000_000, 0)
-	sched := newSignalScheduler(10*time.Second, 2*time.Second,
-		func(string) {},
-		func(flush func()) {
-			startedOnce.Do(func() { close(started) })
-			<-release
-			flush()
-		},
-	)
-	sched.now = func() time.Time {
+	synctest.Test(t, func(t *testing.T) {
+		started := make(chan struct{})
+		release := make(chan struct{})
+		var startedOnce sync.Once
+		var mu sync.Mutex
+		clock := time.Unix(1_700_000_000, 0)
+		sched := newSignalScheduler(10*time.Second, 2*time.Second,
+			func(string) {},
+			func(flush func()) {
+				startedOnce.Do(func() { close(started) })
+				<-release
+				flush()
+			},
+		)
+		sched.now = func() time.Time {
+			mu.Lock()
+			defer mu.Unlock()
+			return clock
+		}
+		var timerCB func()
+		sched.afterFunc = func(_ time.Duration, f func()) func() bool {
+			timerCB = f
+			return func() bool { return false }
+		}
+
+		sched.markDirty("s1") // leading edge, inline
+		sched.markDirty("s1") // defers and arms the timer
+		require.NotNil(t, timerCB, "deferral should arm the flush timer")
+
+		// The timer fires after the quiet delay and the deferred run
+		// blocks, simulating a recompute in the middle of DB work.
 		mu.Lock()
-		defer mu.Unlock()
-		return clock
-	}
-	var timerCB func()
-	sched.afterFunc = func(_ time.Duration, f func()) func() bool {
-		timerCB = f
-		return func() bool { return false }
-	}
+		clock = clock.Add(3 * time.Second)
+		mu.Unlock()
+		go timerCB()
+		<-started
 
-	sched.markDirty("s1") // leading edge, inline
-	sched.markDirty("s1") // defers and arms the timer
-	require.NotNil(t, timerCB, "deferral should arm the flush timer")
-
-	// The timer fires after the quiet delay and the deferred run
-	// blocks, simulating a recompute in the middle of DB work.
-	mu.Lock()
-	clock = clock.Add(3 * time.Second)
-	mu.Unlock()
-	go timerCB()
-	<-started
-
-	stopDone := make(chan struct{})
-	go func() {
-		sched.stop()
-		close(stopDone)
-	}()
-	stopped := func() bool {
+		stopDone := make(chan struct{})
+		go func() {
+			sched.stop()
+			close(stopDone)
+		}()
+		synctest.Wait()
 		select {
 		case <-stopDone:
-			return true
+			require.FailNow(t, "stop must wait for the in-flight timer recompute")
 		default:
-			return false
 		}
-	}
-	assert.Never(t, stopped, 100*time.Millisecond, 10*time.Millisecond,
-		"stop must wait for the in-flight timer recompute")
-	close(release)
-	require.Eventually(t, stopped, 2*time.Second, 5*time.Millisecond,
-		"stop must return once the in-flight recompute finishes")
+		close(release)
+		synctest.Wait()
+		select {
+		case <-stopDone:
+		default:
+			require.FailNow(t, "stop must return once the in-flight recompute finishes")
+		}
+	})
 }
 
 // TestSignalSchedulerFlushAllInlineUsesInlinePath covers the flush
@@ -528,6 +533,30 @@ func TestWriteIncrementalDebouncesSignalRecompute(t *testing.T) {
 		"third secret must flush, proving the deferral was real")
 }
 
+func TestClaudeAssistantAppendDebouncesSignalRecompute(t *testing.T) {
+	fx := newEngineFixture(t)
+	path := fx.writeClaudeSession(t, "proj", "assistant-debounce.jsonl", "hello")
+	fx.engine.SyncAll(context.Background(), nil)
+	sid := fx.sessionIDFor(t, path)
+
+	// Open the debounce window with a user append, then stream an assistant
+	// reply. Its findings must be included when the deferred work is flushed.
+	fx.appendClaudeMessage(t, path, "continue")
+	fx.engine.SyncPaths([]string{path})
+	line := testjsonl.NewSessionBuilder().AddClaudeAssistant(
+		"2026-06-20T11:00:00Z", "key AKIA7QHWN2DKR4FYPLJM leaked",
+	).String()
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0o600)
+	require.NoError(t, err)
+	_, err = f.WriteString(line)
+	require.NoError(t, err)
+	require.NoError(t, f.Close())
+	fx.engine.SyncPaths([]string{path})
+	assert.Zero(t, secretLeakCount(t, fx, sid), "assistant appends must debounce")
+	fx.engine.FlushSignals()
+	assert.Equal(t, 1, secretLeakCount(t, fx, sid))
+}
+
 // TestSyncThenRunFlushesSignalsBeforeWork mirrors the PG/DuckDB push
 // endpoints: work scans SQLite rows while syncMu is held, so any
 // deferred signal recompute must be flushed before work runs or the
@@ -585,24 +614,26 @@ func TestRunExclusiveFlushedFlushesSignalsBeforeWork(t *testing.T) {
 }
 
 func TestSignalSchedulerRealTimerFlushes(t *testing.T) {
-	var mu sync.Mutex
-	var runs int
-	run := func(string) {
-		mu.Lock()
-		runs++
-		mu.Unlock()
-	}
-	sched := newSignalScheduler(
-		50*time.Millisecond, 10*time.Millisecond, run,
-		func(flush func()) { flush() },
-	)
+	synctest.Test(t, func(t *testing.T) {
+		var mu sync.Mutex
+		var runs int
+		run := func(string) {
+			mu.Lock()
+			runs++
+			mu.Unlock()
+		}
+		sched := newSignalScheduler(
+			50*time.Millisecond, 10*time.Millisecond, run,
+			func(flush func()) { flush() },
+		)
 
-	sched.markDirty("s1")
-	sched.markDirty("s1")
-	require.Eventually(t, func() bool {
+		sched.markDirty("s1")
+		sched.markDirty("s1")
+		synctest.Sleep(10 * time.Millisecond)
+		synctest.Wait()
 		mu.Lock()
 		defer mu.Unlock()
-		return runs == 2
-	}, 2*time.Second, 5*time.Millisecond,
-		"deferred recompute should flush via the real timer")
+		assert.Equal(t, 2, runs,
+			"deferred recompute should flush via the real timer")
+	})
 }

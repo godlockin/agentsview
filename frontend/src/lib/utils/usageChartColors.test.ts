@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vite-plus/test";
-import type { UsageSummaryResponse } from "../api/types/usage.js";
+import type { UsageSummaryResponse } from "../api/generated/index";
 import { testMoney } from "../test/money.js";
 import { usageChartColorMaps } from "./usageChartColors.js";
 
@@ -27,30 +27,37 @@ function tenModelSummary(): UsageSummaryResponse {
   return {
     from: "2026-07-01",
     to: "2026-07-01",
+    projects: {},
     totals: {
       inputTokens: 100,
       outputTokens: 50,
       cacheCreationTokens: 0,
       cacheReadTokens: 0,
       totalCost: testMoney(55),
+      cacheSavings: testMoney(0),
     },
-    daily: [{
-      date: "2026-07-01",
-      inputTokens: 100,
-      outputTokens: 50,
-      cacheCreationTokens: 0,
-      cacheReadTokens: 0,
-      totalCost: testMoney(55),
-      modelsUsed: models,
-      modelBreakdowns: models.map((modelName, index) => ({
-        modelName,
-        inputTokens: 10,
-        outputTokens: 5,
+    daily: [
+      {
+        date: "2026-07-01",
+        inputTokens: 100,
+        outputTokens: 50,
         cacheCreationTokens: 0,
         cacheReadTokens: 0,
-        cost: testMoney(index + 1),
-      })),
-    }],
+        totalCost: testMoney(55),
+        modelsUsed: models,
+        modelBreakdowns: models.map((modelName, index) => ({
+          modelName,
+          inputTokens: 10,
+          outputTokens: 5,
+          cacheCreationTokens: 0,
+          cacheReadTokens: 0,
+          cost: testMoney(index + 1),
+        })),
+        projectBreakdowns: [],
+        agentBreakdowns: [],
+        machineBreakdowns: [],
+      },
+    ],
     projectTotals: [],
     modelTotals,
     agentTotals: [],
@@ -67,11 +74,12 @@ function tenModelSummary(): UsageSummaryResponse {
 }
 
 describe("usageChartColorMaps", () => {
-  it("chooses the Matplotlib family from the full model universe", () => {
+  it("assigns Matplotlib colors by aggregate cost descending", () => {
     const colors = usageChartColorMaps(tenModelSummary(), "matplotlib").model;
 
     expect(colors.size).toBe(10);
-    expect(colors.get("model-alpha")).toBe("#1f77b4");
-    expect(colors.get("model-zulu")).toBe("#c5b0d5");
+    expect(colors.get("model-zulu")).toBe("#1f77b4");
+    expect(colors.get("model-india")).toBe("#aec7e8");
+    expect(colors.get("model-alpha")).toBe("#c5b0d5");
   });
 });

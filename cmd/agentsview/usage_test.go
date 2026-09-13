@@ -5,17 +5,21 @@ import (
 	"context"
 	"database/sql"
 	"encoding/base64"
-	"encoding/json"
+	"encoding/json/jsontext"
+	"encoding/json/v2"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
 	"os"
 	"path/filepath"
+	"runtime"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"github.com/thlib/go-timezone-local/tzlocal"
 	"go.kenn.io/agentsview/internal/config"
 	"go.kenn.io/agentsview/internal/cursorusage"
 	"go.kenn.io/agentsview/internal/db"
@@ -25,6 +29,7 @@ import (
 	"go.kenn.io/agentsview/internal/parser"
 	"go.kenn.io/agentsview/internal/parsertest"
 	"go.kenn.io/agentsview/internal/pricingrefresh"
+	"go.kenn.io/agentsview/internal/timeutil"
 )
 
 var goldenFixtureNow = time.Date(2026, 7, 3, 12, 0, 0, 0, time.UTC)
@@ -64,6 +69,76 @@ func TestFmtCost(t *testing.T) {
 	}
 }
 
+func TestPrintUsageStatuslineJSON(t *testing.T) {
+	tests := []struct {
+		name  string
+		agent string
+		cost  string
+		want  usageStatuslineReport
+	}{
+		{
+			name: "no agent filter omits the agent field",
+			cost: "9.61",
+			want: usageStatuslineReport{
+				Date: "2026-08-04",
+				Cost: money.Money{Microdollars: 9_610_000},
+			},
+		},
+		{
+			name:  "agent filter is reported",
+			agent: "claude",
+			cost:  "6.42",
+			want: usageStatuslineReport{
+				Date:  "2026-08-04",
+				Cost:  money.Money{Microdollars: 6_420_000},
+				Agent: "claude",
+			},
+		},
+		{
+			name: "an empty day still reports a zero cost",
+			cost: "0",
+			want: usageStatuslineReport{
+				Date: "2026-08-04",
+				Cost: money.Money{},
+			},
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			result := db.DailyUsageResult{
+				Totals: db.UsageTotals{
+					TotalCost: money.MustParseDollars(tc.cost),
+				},
+			}
+			out := captureStdout(t, func() {
+				printUsageStatuslineJSON(result, tc.agent, "2026-08-04")
+			})
+
+			var got usageStatuslineReport
+			require.NoError(t, json.Unmarshal([]byte(out), &got))
+			assert.Equal(t, tc.want, got)
+		})
+	}
+}
+
+// The documented budget check reads .cost.microdollars, so the cost has to
+// stay an exact integer: a formatted or rounded value would make a threshold
+// comparison silently wrong.
+func TestPrintUsageStatuslineJSONKeepsExactMicrodollars(t *testing.T) {
+	result := db.DailyUsageResult{
+		Totals: db.UsageTotals{
+			TotalCost: money.Money{Microdollars: 25_000_001},
+		},
+	}
+
+	out := captureStdout(t, func() {
+		printUsageStatuslineJSON(result, "", "2026-08-04")
+	})
+
+	assert.Contains(t, out, `"microdollars": 25000001`)
+	assert.NotContains(t, out, "25.000001")
+}
+
 func TestUsageDailyGolden(t *testing.T) {
 	setupExportGoldenDataDir(t)
 
@@ -86,7 +161,7 @@ func TestUsageDailyGolden(t *testing.T) {
 	require.NoError(t, json.Unmarshal([]byte(stdout), &report))
 	assert.Equal(t, export.UsageDailySchemaVersion, report.SchemaVersion)
 
-	assertGoldenBytes(t, "usage_daily_v4.json", []byte(stdout))
+	assertCatalogGolden(t, "usage_daily_v6.json", []byte(stdout))
 }
 
 func TestUsageDailyBreakdownGolden(t *testing.T) {
@@ -116,7 +191,7 @@ func TestUsageDailyBreakdownGolden(t *testing.T) {
 		assert.Equal(t, "golden-host", daily.MachineBreakdowns[0].MachineName)
 	}
 
-	assertGoldenBytes(t, "usage_daily_breakdown_v4.json", []byte(stdout))
+	assertCatalogGolden(t, "usage_daily_breakdown_v6.json", []byte(stdout))
 }
 
 func setupExportGoldenDataDir(t *testing.T) string {
@@ -131,7 +206,7 @@ func setupExportGoldenDataDir(t *testing.T) string {
 	database := dbtest.OpenTestDBAt(t, dbPath)
 	seedExportGoldenArchive(t, database)
 	require.NoError(t, database.Close(), "close golden database")
-	setGoldenPricingUpdatedAt(t, dbPath)
+	setGoldenExportTimestamps(t, dbPath)
 	return dataDir
 }
 
@@ -182,7 +257,7 @@ func seedExportGoldenArchive(t *testing.T, database *db.DB) {
 		startedAt: "2026-07-03T10:00:00Z",
 		endedAt:   "2026-07-03T10:30:00Z",
 		model:     goldenComputedModel,
-		tokenJSON: json.RawMessage(`{"input_tokens":1200,"output_tokens":240,` +
+		tokenJSON: jsontext.Value(`{"input_tokens":1200,"output_tokens":240,` +
 			`"cache_creation_input_tokens":80,"cache_read_input_tokens":400}`),
 		outputTokens: 240,
 		cwd:          "/fixtures/remote-project/worktrees/feature/app",
@@ -193,7 +268,7 @@ func seedExportGoldenArchive(t *testing.T, database *db.DB) {
 		startedAt:    "2026-07-02T09:00:00Z",
 		endedAt:      "2026-07-02T09:20:00Z",
 		model:        goldenComputedModel,
-		tokenJSON:    json.RawMessage(`{"input_tokens":800,"output_tokens":160}`),
+		tokenJSON:    jsontext.Value(`{"input_tokens":800,"output_tokens":160}`),
 		outputTokens: 160,
 		cwd:          "/fixtures/remote-project/worktrees/feature/cli",
 		gitBranch:    "feature/golden",
@@ -257,7 +332,7 @@ type goldenExportSessionSpec struct {
 	startedAt    string
 	endedAt      string
 	model        string
-	tokenJSON    json.RawMessage
+	tokenJSON    jsontext.Value
 	outputTokens int
 	costUSD      *money.Money
 	cwd          string
@@ -338,16 +413,19 @@ func seedGoldenExportSession(
 	}
 }
 
-func setGoldenPricingUpdatedAt(t *testing.T, dbPath string) {
+func setGoldenExportTimestamps(t *testing.T, dbPath string) {
 	t.Helper()
 	conn, err := sql.Open("sqlite3", dbPath)
 	require.NoError(t, err, "open golden db for pricing timestamp")
 	defer func() {
 		require.NoError(t, conn.Close(), "close pricing timestamp db")
 	}()
-	_, err = conn.Exec(`UPDATE model_pricing SET updated_at = ?`,
-		goldenPricingUpdatedAt)
-	require.NoError(t, err, "set deterministic pricing updated_at")
+	_, err = conn.Exec(`
+		UPDATE model_pricing SET updated_at = ?;
+		UPDATE genai_pricing SET updated_at = ?;
+		UPDATE sessions SET local_modified_at = ?`,
+		goldenPricingUpdatedAt, goldenPricingUpdatedAt, "2026-07-03T12:00:00.123Z")
+	require.NoError(t, err, "set deterministic export timestamps")
 }
 
 func assertGoldenBytes(t *testing.T, name string, got []byte) {
@@ -363,10 +441,57 @@ func assertGoldenBytes(t *testing.T, name string, got []byte) {
 	}
 	want, err := os.ReadFile(path)
 	require.NoError(t, err, "read golden (run with -update to generate)")
+	if strings.HasSuffix(name, ".json") {
+		assert.JSONEq(t, string(want), string(got), "golden mismatch for %s", name)
+		return
+	}
+	if strings.HasSuffix(name, ".ndjson") {
+		wantLines := strings.Split(strings.TrimSpace(string(want)), "\n")
+		gotLines := strings.Split(strings.TrimSpace(string(got)), "\n")
+		require.Len(t, gotLines, len(wantLines), "line count for %s", name)
+		for i := range wantLines {
+			assert.JSONEq(t, wantLines[i], gotLines[i],
+				"golden mismatch for %s line %d", name, i+1)
+		}
+		return
+	}
 	if !bytes.Equal(want, got) {
 		assert.Equal(t, string(want), string(got),
 			"golden mismatch for %s", name)
 	}
+}
+
+func assertCatalogGolden(t *testing.T, name string, got []byte) {
+	t.Helper()
+	var metadata struct {
+		Pricing struct {
+			EffectiveRowCount int `json:"effective_row_count"`
+		} `json:"pricing"`
+	}
+	require.NoError(t, json.Unmarshal(got, &metadata), "decode %s", name)
+	require.Greater(t, metadata.Pricing.EffectiveRowCount, 1000,
+		"pricing catalog row count for %s", name)
+
+	path := filepath.Join("..", "..", "testdata", "golden", name)
+	if *updateGolden {
+		require.NoError(t, os.WriteFile(path, got, 0o644),
+			"write golden %s", name)
+		t.Logf("rewrote %s (%d bytes)", path, len(got))
+		return
+	}
+	want, err := os.ReadFile(path)
+	require.NoError(t, err, "read golden (run with -update to generate)")
+
+	var gotReport, wantReport map[string]any
+	require.NoError(t, json.Unmarshal(got, &gotReport), "decode actual %s", name)
+	require.NoError(t, json.Unmarshal(want, &wantReport), "decode golden %s", name)
+	for _, report := range []map[string]any{gotReport, wantReport} {
+		pricing, ok := report["pricing"].(map[string]any)
+		require.True(t, ok, "pricing object for %s", name)
+		delete(pricing, "effective_row_count")
+		delete(pricing, "digest")
+	}
+	assert.Equal(t, wantReport, gotReport, "golden mismatch for %s", name)
 }
 
 func TestDefaultUsageDateRange(t *testing.T) {
@@ -464,6 +589,127 @@ func TestFetchHTTPDailyUsage(t *testing.T) {
 	assert.Equal(t, 10, got.Totals.InputTokens)
 	assert.Equal(t, 20, got.Daily[0].OutputTokens)
 	assert.Equal(t, 1, got.SessionCounts.Total)
+}
+
+func TestLocalTimezoneWindowsNameProducesServerAcceptedUsageQuery(t *testing.T) {
+	if runtime.GOOS != "windows" {
+		t.Skip("requires the Windows local timezone resolver")
+	}
+	previousTZ, hadTZ := os.LookupEnv("TZ")
+	require.NoError(t, os.Unsetenv("TZ"))
+	t.Cleanup(func() {
+		if hadTZ {
+			_ = os.Setenv("TZ", previousTZ)
+		} else {
+			_ = os.Unsetenv("TZ")
+		}
+	})
+	oldLocal := time.Local
+	time.Local = time.FixedZone("Eastern Standard Time", -5*60*60)
+	t.Cleanup(func() { time.Local = oldLocal })
+	expected, err := tzlocal.LocalTZ()
+	require.NoError(t, err)
+	require.NotEmpty(t, expected)
+
+	var gotTimezones []string
+	ts := httptest.NewServer(http.HandlerFunc(func(
+		w http.ResponseWriter, r *http.Request,
+	) {
+		tz := r.URL.Query().Get("timezone")
+		gotTimezones = append(gotTimezones, tz)
+		if tz == "Eastern Standard Time" {
+			w.WriteHeader(http.StatusBadRequest)
+			writeJSONResponse(w, `{"error":"invalid timezone: Eastern Standard Time"}`)
+			return
+		}
+		if tz != expected {
+			w.WriteHeader(http.StatusBadRequest)
+			writeJSONResponse(w, `{"error":"invalid timezone: `+tz+`"}`)
+			return
+		}
+		writeJSONResponse(w, sampleDailyUsageJSON)
+	}))
+	t.Cleanup(ts.Close)
+
+	base, err := fetchHTTPDailyUsage(context.Background(), transport{URL: ts.URL}, "",
+		dailyUsageQuery{Filter: db.UsageFilter{
+			Timezone: time.Now().Location().String(),
+		}, NoDefaultRange: true})
+	assert.Equal(t, db.DailyUsageResult{}, base)
+	require.EqualError(t, err,
+		`usage summary: HTTP 400: {"error":"invalid timezone: Eastern Standard Time"}`)
+	t.Logf("base: timezone=%q error=%v", gotTimezones[0], err)
+
+	head, err := fetchHTTPDailyUsage(context.Background(), transport{URL: ts.URL}, "",
+		dailyUsageQuery{Filter: db.UsageFilter{
+			Timezone: localTimezone(),
+		}, NoDefaultRange: true})
+	require.NoError(t, err)
+	require.Len(t, head.Daily, 1)
+	assert.Equal(t, expected, gotTimezones[1])
+	t.Logf("head: timezone=%q status=200 daily=%d", gotTimezones[1], len(head.Daily))
+}
+
+func TestUsageDateForTimezoneFallsBackToUTC(t *testing.T) {
+	now := time.Date(2026, 7, 3, 22, 30, 0, 0, time.FixedZone("local", -5*60*60))
+	assert.Equal(t, "2026-07-03", usageDateForTimezone(now, "America/New_York"))
+	assert.Equal(t, "2026-07-04", usageDateForTimezone(now, "UTC"))
+	assert.Equal(t, "2026-07-04", usageDateForTimezone(now, "not/a-zone"))
+}
+
+func TestRunUsageDailyDefaultsToMappedLocalTimezone(t *testing.T) {
+	t.Setenv("TZ", "America/New_York")
+	oldLocal := time.Local
+	time.Local = time.FixedZone("Eastern Standard Time", -5*60*60)
+	t.Cleanup(func() { time.Local = oldLocal })
+	dataDir := newAgentDataDir(t)
+	var gotTimezone string
+	ts := sessionUsageRuntimeServer(t, func(w http.ResponseWriter, r *http.Request) {
+		gotTimezone = r.URL.Query().Get("timezone")
+		writeJSONResponse(w, sampleDailyUsageJSON)
+	})
+	registerSyncRouteTestRuntime(t, dataDir, ts.URL)
+
+	captureStdout(t, func() {
+		runUsageDaily(UsageDailyConfig{JSON: true, Offline: false})
+	})
+	assert.Equal(t, "America/New_York", gotTimezone)
+}
+
+func TestRunUsageStatuslineDefaultsToMappedLocalTimezone(t *testing.T) {
+	t.Setenv("TZ", "America/New_York")
+	oldLocal := time.Local
+	time.Local = time.FixedZone("Eastern Standard Time", -5*60*60)
+	t.Cleanup(func() { time.Local = oldLocal })
+	dataDir := newAgentDataDir(t)
+	var gotTimezone string
+	ts := sessionUsageRuntimeServer(t, func(w http.ResponseWriter, r *http.Request) {
+		gotTimezone = r.URL.Query().Get("timezone")
+		writeJSONResponse(w, sampleDailyUsageJSON)
+	})
+	registerSyncRouteTestRuntime(t, dataDir, ts.URL)
+
+	captureStdout(t, func() {
+		runUsageStatusline(UsageStatuslineConfig{JSON: true})
+	})
+	assert.Equal(t, "America/New_York", gotTimezone)
+}
+
+func TestCursorUsageWindowUsesMappedLocalTimezone(t *testing.T) {
+	t.Setenv("TZ", "America/New_York")
+	oldLocal := time.Local
+	time.Local = time.FixedZone("Eastern Standard Time", -5*60*60)
+	t.Cleanup(func() { time.Local = oldLocal })
+
+	loc := timeutil.LocalLocation()
+	assert.Equal(t, "America/New_York", loc.String())
+	start, end, err := resolveCursorUsageWindow(UsageCursorConfig{
+		Since: "2026-03-08", Until: "2026-03-08",
+	}, loc)
+	require.NoError(t, err)
+	assert.Equal(t, time.Date(2026, 3, 8, 5, 0, 0, 0, time.UTC), start)
+	assert.Equal(t,
+		time.Date(2026, 3, 9, 3, 59, 59, 999000000, time.UTC), end)
 }
 
 func TestFetchHTTPDailyUsageMissingProjectsDefaultsEmptyMap(t *testing.T) {
@@ -853,6 +1099,38 @@ func TestRunUsageDailyOfflineUsesReadOnlyDBWhenWriteLockHeld(t *testing.T) {
 		"offline read-only usage must preserve custom pricing")
 }
 
+func TestApplyFallbackPricingPreservesReadOnlyLongContextBands(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "sessions.db")
+	writable := dbtest.OpenTestDBAt(t, dbPath)
+	startedAt := "2026-07-03T12:00:00Z"
+	require.NoError(t, writable.UpsertSession(db.Session{
+		ID: "long-context", Project: "pricing", Machine: "local", Agent: "codex",
+		StartedAt: &startedAt,
+	}))
+	ordinal := 1
+	require.NoError(t, writable.ReplaceSessionUsageEvents("long-context", []db.UsageEvent{{
+		MessageOrdinal: &ordinal,
+		Source:         "codex",
+		Model:          "gpt-5.5",
+		InputTokens:    272_001,
+		OccurredAt:     startedAt,
+		DedupKey:       "request-1",
+	}}))
+	require.NoError(t, writable.Close())
+
+	readonly, err := db.OpenReadOnly(dbPath)
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, readonly.Close()) })
+	applyFallbackPricing(readonly, nil)
+
+	got, err := readonly.GetDailyUsage(context.Background(), db.UsageFilter{
+		From: "2026-07-03", To: "2026-07-03", Timezone: "UTC",
+	})
+	require.NoError(t, err)
+
+	assert.Equal(t, money.Money{Microdollars: 2_720_010}, got.Totals.TotalCost)
+}
+
 func TestArchiveQueryBackendNoSyncStartsNoSyncDaemonForDailyUsage(t *testing.T) {
 	newAgentDataDir(t)
 	var started bool
@@ -939,7 +1217,7 @@ func TestLocalArchiveQueryDailyUsageAppliesDefaultRange(t *testing.T) {
 			Role:       "assistant",
 			Timestamp:  recent,
 			Model:      "test-model",
-			TokenUsage: json.RawMessage(`{"input_tokens":10,"output_tokens":1}`),
+			TokenUsage: jsontext.Value(`{"input_tokens":10,"output_tokens":1}`),
 		},
 		{
 			SessionID:  "old",
@@ -947,7 +1225,7 @@ func TestLocalArchiveQueryDailyUsageAppliesDefaultRange(t *testing.T) {
 			Role:       "assistant",
 			Timestamp:  old,
 			Model:      "test-model",
-			TokenUsage: json.RawMessage(`{"input_tokens":20,"output_tokens":2}`),
+			TokenUsage: jsontext.Value(`{"input_tokens":20,"output_tokens":2}`),
 		},
 		{
 			SessionID:  "future",
@@ -955,7 +1233,7 @@ func TestLocalArchiveQueryDailyUsageAppliesDefaultRange(t *testing.T) {
 			Role:       "assistant",
 			Timestamp:  future,
 			Model:      "test-model",
-			TokenUsage: json.RawMessage(`{"input_tokens":40,"output_tokens":4}`),
+			TokenUsage: jsontext.Value(`{"input_tokens":40,"output_tokens":4}`),
 		},
 	}))
 
@@ -1058,7 +1336,7 @@ func seedUsageDailyExportMetadataFixture(
 		{
 			SessionID: "usage-meta-fallback-cost", Ordinal: 0,
 			Role: "assistant", Timestamp: started, Model: fallbackModel,
-			TokenUsage: json.RawMessage(`{"input_tokens":200,"output_tokens":100}`),
+			TokenUsage: jsontext.Value(`{"input_tokens":200,"output_tokens":100}`),
 		},
 	}))
 	cost := money.MustParseDollars("0.25")
@@ -1109,7 +1387,7 @@ func TestFormatDailyUsageJSON(t *testing.T) {
 	out, err := json.Marshal(result)
 	require.NoError(t, err, "json.Marshal failed")
 
-	var decoded map[string]json.RawMessage
+	var decoded map[string]jsontext.Value
 	require.NoError(t, json.Unmarshal(out, &decoded),
 		"json.Unmarshal failed")
 
@@ -1117,7 +1395,7 @@ func TestFormatDailyUsageJSON(t *testing.T) {
 	assert.Contains(t, decoded, "totals", "missing 'totals' key in JSON output")
 
 	// Verify daily array has expected entry
-	var daily []map[string]json.RawMessage
+	var daily []map[string]jsontext.Value
 	require.NoError(t, json.Unmarshal(decoded["daily"], &daily),
 		"parsing daily array")
 	require.Len(t, daily, 1, "daily length")
@@ -1135,7 +1413,7 @@ func TestFormatDailyUsageJSON(t *testing.T) {
 	}
 
 	// Verify totals fields
-	var totals map[string]json.RawMessage
+	var totals map[string]jsontext.Value
 	require.NoError(t, json.Unmarshal(decoded["totals"], &totals),
 		"parsing totals")
 	totalFields := []string{
@@ -1172,7 +1450,7 @@ func TestNewUsageCursorCommandUsesConfigFallbacksAndSharedPagination(t *testing.
 		assert.Empty(t, pass)
 
 		var req map[string]any
-		require.NoError(t, json.NewDecoder(r.Body).Decode(&req), "decode request")
+		require.NoError(t, json.UnmarshalRead(r.Body, &req), "decode request")
 		requests = append(requests, req)
 
 		page, _ := req["page"].(float64)
@@ -1381,7 +1659,7 @@ func TestNewUsageCursorCommandExplicitMemberFilterDoesNotReuseConfigSibling(t *t
 
 			var request map[string]any
 			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				require.NoError(t, json.NewDecoder(r.Body).Decode(&request),
+				require.NoError(t, json.UnmarshalRead(r.Body, &request),
 					"decode request")
 				_, _ = w.Write([]byte(`{
 					"totalUsageEventsCount": 0,
@@ -1415,44 +1693,10 @@ func TestNewUsageCursorCommandExplicitMemberFilterDoesNotReuseConfigSibling(t *t
 	}
 }
 
-// TestPeriodicPricingRefresh_ZeroIntervalReturnsImmediately guards
-// against a bad config value (interval <= 0) turning into a hot
-// spin loop.
-func TestPeriodicPricingRefresh_ZeroIntervalReturnsImmediately(t *testing.T) {
-	done := make(chan struct{})
-	go func() {
-		periodicPricingRefresh(context.Background(), nil, nil, 0)
-		close(done)
-	}()
-	select {
-	case <-done:
-	case <-time.After(time.Second):
-		t.Fatal("periodicPricingRefresh did not return on interval<=0")
-	}
-}
-
-// TestPeriodicPricingRefresh_StopsOnContextCancel ensures the
-// goroutine unwinds cleanly when the server is shutting down.
-func TestPeriodicPricingRefresh_StopsOnContextCancel(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
-	done := make(chan struct{})
-	go func() {
-		// Long interval so the ticker never fires during the test.
-		periodicPricingRefresh(ctx, nil, nil, time.Hour)
-		close(done)
-	}()
-	cancel()
-	select {
-	case <-done:
-	case <-time.After(time.Second):
-		t.Fatal("periodicPricingRefresh did not stop after cancel")
-	}
-}
-
 // sampleDailyUsageJSON is a full usage summary body with a single day and
 // non-zero totals, shared by the HTTP and daemon usage tests.
 const sampleDailyUsageJSON = `{
-	"schema_version": 4,
+	"schema_version": 6,
 	"from": "2026-06-01",
 	"to": "2026-06-02",
 	"pricing": {

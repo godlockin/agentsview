@@ -2,7 +2,7 @@ package mcp
 
 import (
 	"context"
-	"encoding/json"
+	"encoding/json/v2"
 	"strings"
 	"testing"
 	"time"
@@ -33,6 +33,10 @@ func (f *fakeMCPRecallVectorSearcher) ValidateRecallSnapshot(
 	context.Context, db.RecallVectorSnapshot,
 ) error {
 	return nil
+}
+
+func (f *fakeMCPRecallVectorSearcher) MaxRecallSearchCandidates() int {
+	return 0
 }
 
 func newTestToolset(t *testing.T) (*toolset, *db.DB) {
@@ -75,6 +79,72 @@ func TestSearchSessions_ReturnsHitsWithOrdinal(t *testing.T) {
 	assert.Equal(t, "s1", out.Results[0].SessionID)
 	assert.Equal(t, "proj-a", out.Results[0].Project)
 	assert.Zero(t, out.ExcludedActive)
+}
+
+func TestSearchSessions_ChineseSegmentation(t *testing.T) {
+	ts, d := newTestToolset(t)
+	if !d.HasCJKFTS() {
+		t.Skip("simple FTS5 runtime is not installed for this test process")
+	}
+	seedFTSSession(t, d, "chinese", "proj",
+		"这是全文的搜索实现说明。", "2024-06-15T10:00:00Z")
+
+	out := mustSearch(t, ts, searchSessionsIn{Query: "全文搜索"})
+	require.Len(t, out.Results, 1)
+	assert.Equal(t, "chinese", out.Results[0].SessionID)
+	assert.Contains(t, out.Results[0].Snippet, "<mark>全文</mark>")
+	assert.Contains(t, out.Results[0].Snippet, "<mark>搜索</mark>")
+
+	phrase := mustSearch(t, ts, searchSessionsIn{Query: `"全文搜索"`})
+	assert.Empty(t, phrase.Results, "explicit phrases must retain word adjacency")
+}
+
+func TestSearchSessions_JapaneseAndKoreanTerms(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		query string
+		match string
+		miss  string
+	}{
+		{"japanese", "かな", "かなを探します。", "なかを探します。"},
+		{"korean", "검색", "검색합니다.", "색상 검토입니다."},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ts, d := newTestToolset(t)
+			if !d.HasCJKFTS() {
+				t.Skip("simple FTS5 runtime is not installed for this test process")
+			}
+			seedFTSSession(t, d, "match", "proj", tc.match, "2024-06-15T10:00:00Z")
+			seedFTSSession(t, d, "miss", "proj", tc.miss, "2024-06-15T10:00:00Z")
+
+			out := mustSearch(t, ts, searchSessionsIn{Query: tc.query})
+			require.Len(t, out.Results, 1)
+			assert.Equal(t, "match", out.Results[0].SessionID)
+			assert.Contains(t, out.Results[0].Snippet, "<mark>"+tc.query+"</mark>")
+		})
+	}
+}
+
+func TestSearchSessions_QuerySyntax(t *testing.T) {
+	ts, d := newTestToolset(t)
+	seedFTSSession(t, d, "terms", "proj",
+		`fix the bug with status:500 and say"hi`, "2024-06-15T10:00:00Z")
+	for _, tc := range []struct {
+		query string
+		hits  int
+	}{
+		{"fix bug", 1},
+		{"status:500", 1},
+		{`say"hi`, 1},
+		{`"say""hi"`, 1},
+		{`"fix bug"`, 0},
+		{`"fix" OR "missing"`, 1},
+	} {
+		t.Run(tc.query, func(t *testing.T) {
+			out := mustSearch(t, ts, searchSessionsIn{Query: tc.query})
+			assert.Len(t, out.Results, tc.hits)
+		})
+	}
 }
 
 func TestSearchSessions_ExcludesRecentlyActive(t *testing.T) {
@@ -1289,4 +1359,86 @@ func TestGetMessages_AroundClampsOversizedWindow(t *testing.T) {
 	assert.Less(t, len(out.Messages), total,
 		"the oversized request must actually be capped below what an "+
 			"unclamped window would have returned")
+}
+
+func TestSearchSessions_DateRange(t *testing.T) {
+	ts, d := newTestToolset(t)
+	require.True(t, d.HasFTS(), "run with -tags fts5")
+	fixtures := []struct{ id, start, end string }{
+		{"early", "2024-06-01T10:00:00Z", "2024-06-01T11:00:00Z"},
+		{"boundary", "2024-06-02T23:59:59Z", "2024-06-02T23:59:59Z"},
+		{"late", "2024-06-03T00:00:00Z", "2024-06-03T01:00:00Z"},
+		{"spanning", "2024-06-01T23:00:00Z", "2024-06-03T01:00:00Z"},
+	}
+	for _, f := range fixtures {
+		dbtest.SeedSession(t, d, f.id, "project-a", func(s *db.Session) {
+			s.StartedAt = new(f.start)
+			s.EndedAt = new(f.end)
+			s.SessionName = new("datefilter name")
+		})
+		require.NoError(t, d.InsertMessages([]db.Message{dbtest.UserMsg(f.id, 0, "datefilter message")}))
+	}
+	srv := newServer(ServeOptions{Service: ts.svc, Now: ts.now})
+	st, ct := newInMemoryPair(t, srv)
+	defer func() { require.NoError(t, ct.Close()); require.NoError(t, st.Wait()) }()
+	for _, tc := range []struct {
+		name, from, to string
+		want           []string
+	}{
+		{"omitted", "", "", []string{"early", "boundary", "late", "spanning"}},
+		{"lower only", "2024-06-02", "", []string{"boundary", "late", "spanning"}},
+		{"upper only", "", "2024-06-02", []string{"early", "boundary", "spanning"}},
+		{"same day", "2024-06-02", "2024-06-02", []string{"boundary", "spanning"}},
+		{"no matches", "2024-06-04", "2024-06-04", []string{}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			for _, query := range []string{"message", "name"} {
+				args := map[string]any{"query": query, "project": "project-a", "limit": 1}
+				if tc.from != "" {
+					args["date_from"] = tc.from
+				}
+				if tc.to != "" {
+					args["date_to"] = tc.to
+				}
+				var ids []string
+				for range len(fixtures) + 1 {
+					res, err := ct.CallTool(context.Background(), callParams(ToolSearchSessions, args))
+					require.NoError(t, err)
+					require.False(t, res.IsError, "%+v", res.Content)
+					raw, err := json.Marshal(res.StructuredContent)
+					require.NoError(t, err)
+					var out searchSessionsOut
+					require.NoError(t, json.Unmarshal(raw, &out))
+					for _, hit := range out.Results {
+						ids = append(ids, hit.SessionID)
+					}
+					if out.NextCursor == nil {
+						break
+					}
+					args["cursor"] = *out.NextCursor
+				}
+				assert.ElementsMatch(t, tc.want, ids, "query %s", query)
+			}
+		})
+	}
+}
+
+func TestSearchSessions_RejectsInvalidDateRange(t *testing.T) {
+	ts, _ := newTestToolset(t)
+	for _, tc := range []struct {
+		name, from, to, message string
+	}{
+		{"reversed", "2024-06-03", "2024-06-01", "date_from must not be after date_to"},
+		{"malformed from", "not-a-date", "", "invalid date format: use YYYY-MM-DD"},
+		{"malformed to", "", "2024-02-30", "invalid date format: use YYYY-MM-DD"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, _, err := ts.searchSessions(context.Background(), nil, searchSessionsIn{
+				Query: "hello", DateFrom: tc.from, DateTo: tc.to,
+			})
+			var inputErr *db.SearchInputError
+			require.ErrorAs(t, err, &inputErr)
+			assert.Contains(t, inputErr.Error(), tc.message)
+		})
+	}
 }

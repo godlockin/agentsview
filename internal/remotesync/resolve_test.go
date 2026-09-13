@@ -3,6 +3,7 @@ package remotesync_test
 import (
 	"archive/tar"
 	"bytes"
+	"fmt"
 	"io"
 	"os"
 	"os/exec"
@@ -18,6 +19,79 @@ import (
 	"go.kenn.io/agentsview/internal/remotesync"
 	"go.kenn.io/agentsview/internal/ssh"
 )
+
+func resolveTargetsForTest(t *testing.T, cfg config.Config) remotesync.TargetSet {
+	t.Helper()
+	targets, err := remotesync.ResolveTargets(cfg)
+	require.NoError(t, err)
+	return targets
+}
+
+func TestResolveTargetsExcludesNonLocalStructuredSessionSources(t *testing.T) {
+	const localMachine = "0123456789abcdef0123456789abcdef"
+	const foreignMachine = "remote-host"
+	home, err := filepath.EvalSymlinks(t.TempDir())
+	require.NoError(t, err)
+	dataDir := filepath.Join(home, "data")
+	localRoot := filepath.Join(home, "local-copilot")
+	localStructuredRoot := filepath.Join(home, "local-structured-copilot")
+	foreignRoot := filepath.Join(localRoot, "foreign-copilot")
+	for _, dir := range []string{dataDir, localRoot, localStructuredRoot, foreignRoot} {
+		require.NoError(t, os.MkdirAll(dir, 0o755))
+	}
+	localSession := filepath.Join(localRoot, "local.jsonl")
+	foreignSession := filepath.Join(foreignRoot, "foreign.jsonl")
+	require.NoError(t, os.WriteFile(localSession, []byte("local\n"), 0o600))
+	require.NoError(t, os.WriteFile(foreignSession, []byte("foreign\n"), 0o600))
+	t.Setenv("HOME", home)
+	t.Setenv("USERPROFILE", home)
+	t.Setenv("AGENTSVIEW_DATA_DIR", dataDir)
+	for _, def := range parser.Registry {
+		if def.DefaultRootEnvVar != "" {
+			t.Setenv(def.DefaultRootEnvVar, "")
+		}
+		if def.EnvVar != "" {
+			t.Setenv(def.EnvVar, "")
+		}
+	}
+	require.NoError(t, os.WriteFile(
+		filepath.Join(dataDir, "config.toml"),
+		fmt.Appendf(nil, `
+copilot_dirs = [%q]
+
+[[session_sources]]
+agent = "copilot"
+dir = %q
+
+[[session_sources]]
+agent = "copilot"
+dir = %q
+machine = %q
+`, localRoot, localStructuredRoot, foreignRoot, foreignMachine),
+		0o600,
+	))
+
+	require.NoError(t, os.WriteFile(filepath.Join(dataDir, "telemetry-install-id"), []byte(localMachine), 0o600))
+	cfg, err := config.LoadMinimal()
+	require.NoError(t, err)
+	require.Equal(t, localMachine, cfg.InstallationID)
+	targets := resolveTargetsForTest(t, cfg)
+
+	assert.ElementsMatch(t, []string{localRoot, localStructuredRoot},
+		targets.Dirs[parser.AgentCopilot])
+	assert.NotContains(t, targets.Dirs[parser.AgentCopilot], foreignRoot,
+		"a source attributed to another machine must not be re-exported as local")
+	assert.Contains(t, targets.ForbiddenRoots, foreignRoot)
+	manifest, err := remotesync.BuildManifest(targets)
+	require.NoError(t, err)
+	var manifestPaths []string
+	for _, file := range manifest.Files {
+		manifestPaths = append(manifestPaths, file.Path)
+	}
+	assert.Contains(t, manifestPaths, localSession)
+	assert.NotContains(t, manifestPaths, foreignSession,
+		"an allowed ancestor must not re-export its nested foreign source")
+}
 
 func TestResolveTargetsFiltersAndIncludesSpecialFiles(t *testing.T) {
 	root := t.TempDir()
@@ -51,7 +125,7 @@ func TestResolveTargetsFiltersAndIncludesSpecialFiles(t *testing.T) {
 	codexIndex := filepath.Join(root, ".codex", parser.CodexSessionIndexFilename)
 	require.NoError(t, os.WriteFile(codexIndex, []byte("{}\n"), 0o644))
 
-	targets := remotesync.ResolveTargets(config.Config{
+	targets := resolveTargetsForTest(t, config.Config{
 		AgentDirs: map[parser.AgentType][]string{
 			parser.AgentClaude: {claudeDir, missingDir},
 			parser.AgentCodex:  {codexDir},
@@ -80,7 +154,7 @@ func TestResolveTargetsFiltersAndIncludesSpecialFiles(t *testing.T) {
 	}, targets.Files[parser.AgentWindsurf])
 	assert.NotContains(t, targets.Files[parser.AgentWindsurf], windsurfStateSHM)
 	assert.NotContains(t, targets.Files[parser.AgentWindsurf], windsurfSecret)
-	assert.Contains(t, targets.ExtraFiles, codexIndex)
+	assert.Contains(t, targets.ProviderExtraFiles[parser.AgentCodex], codexIndex)
 }
 
 func TestResolveTargetsExcludesRemoteSyncExcludedAgentState(t *testing.T) {
@@ -98,7 +172,7 @@ func TestResolveTargetsExcludesRemoteSyncExcludedAgentState(t *testing.T) {
 		filepath.Join(root, "credentials.json"), []byte("secret"), 0o600,
 	))
 
-	targets := remotesync.ResolveTargets(config.Config{
+	targets := resolveTargetsForTest(t, config.Config{
 		AgentDirs: map[parser.AgentType][]string{
 			parser.AgentTrae: {root},
 		},
@@ -117,7 +191,7 @@ func TestResolveTargetsExcludesTraeProfile(t *testing.T) {
 	require.NoError(t, os.MkdirAll(traeRoot, 0o755))
 	require.NoError(t, os.MkdirAll(claudeRoot, 0o755))
 
-	targets := remotesync.ResolveTargets(config.Config{AgentDirs: map[parser.AgentType][]string{
+	targets := resolveTargetsForTest(t, config.Config{AgentDirs: map[parser.AgentType][]string{
 		parser.AgentTrae:   {traeRoot},
 		parser.AgentClaude: {claudeRoot},
 	}})
@@ -139,7 +213,7 @@ func TestResolveTargetsOmitsAllowedTargetsInsideForbiddenRoots(t *testing.T) {
 	require.NoError(t, os.MkdirAll(nestedClaude, 0o755))
 	require.NoError(t, os.MkdirAll(outsideClaude, 0o755))
 
-	targets := remotesync.ResolveTargets(config.Config{
+	targets := resolveTargetsForTest(t, config.Config{
 		AgentDirs: map[parser.AgentType][]string{
 			parser.AgentTrae:   {traeRoot},
 			parser.AgentClaude: {nestedClaude, outsideClaude},
@@ -175,7 +249,7 @@ func TestResolveTargetsDropsFileScopedAgentWhenSessionFilesForbidden(
 		[]byte(`{"id":"task-1","ts":1,"task":"t"}`), 0o644,
 	))
 
-	targets := remotesync.ResolveTargets(config.Config{
+	targets := resolveTargetsForTest(t, config.Config{
 		AgentDirs: map[parser.AgentType][]string{
 			parser.AgentTrae:    {tasksDir},
 			parser.AgentRooCode: {rooRoot},
@@ -199,7 +273,7 @@ func TestResolveTargetsPoolsideNarrowsToTrajectories(t *testing.T) {
 	require.NoError(t, os.MkdirAll(trajectoriesDir, 0o755))
 	require.NoError(t, os.WriteFile(settingsFile, []byte(`{"api_key":"sk-secret"}`), 0o644))
 
-	targets := remotesync.ResolveTargets(config.Config{AgentDirs: map[parser.AgentType][]string{
+	targets := resolveTargetsForTest(t, config.Config{AgentDirs: map[parser.AgentType][]string{
 		parser.AgentPoolside: {root},
 	}})
 
@@ -217,7 +291,7 @@ func TestResolveTargetsPoolsideNarrowsToTrajectories(t *testing.T) {
 func TestResolveTargetsPoolsideSkipsMissingTrajectories(t *testing.T) {
 	root := t.TempDir()
 
-	targets := remotesync.ResolveTargets(config.Config{AgentDirs: map[parser.AgentType][]string{
+	targets := resolveTargetsForTest(t, config.Config{AgentDirs: map[parser.AgentType][]string{
 		parser.AgentPoolside: {root},
 	}})
 
@@ -232,7 +306,7 @@ func TestResolveTargetsPoolsideTrajectoriesRoot(t *testing.T) {
 	trajectoriesDir := filepath.Join(t.TempDir(), "trajectories")
 	require.NoError(t, os.MkdirAll(trajectoriesDir, 0o755))
 
-	targets := remotesync.ResolveTargets(config.Config{AgentDirs: map[parser.AgentType][]string{
+	targets := resolveTargetsForTest(t, config.Config{AgentDirs: map[parser.AgentType][]string{
 		parser.AgentPoolside: {trajectoriesDir},
 	}})
 
@@ -257,7 +331,7 @@ func TestResolveTargetsExpandsHermesProfilesWithDatabaseFiles(t *testing.T) {
 		require.NoError(t, os.WriteFile(path, []byte("sqlite"), 0o644))
 	}
 
-	targets := remotesync.ResolveTargets(config.Config{
+	targets := resolveTargetsForTest(t, config.Config{
 		AgentDirs: map[parser.AgentType][]string{
 			parser.AgentHermes: {profilesRoot},
 		},
@@ -275,7 +349,7 @@ func TestResolveTargetsExpandsHermesProfilesWithDatabaseFiles(t *testing.T) {
 		filepath.Join(databaseOnly, "state.db-wal"),
 		filepath.Join(databaseOnly, "state.db-shm"),
 		filepath.Join(databaseOnly, "state.db-journal"),
-	}, targets.ExtraFiles)
+	}, targets.ProviderExtraFiles[parser.AgentHermes])
 }
 
 func TestResolveTargetsIncludesFlatCustomHermesRoot(t *testing.T) {
@@ -285,7 +359,7 @@ func TestResolveTargetsIncludesFlatCustomHermesRoot(t *testing.T) {
 		filepath.Join(root, "child.jsonl"), []byte("{}\n"), 0o644,
 	))
 
-	targets := remotesync.ResolveTargets(config.Config{
+	targets := resolveTargetsForTest(t, config.Config{
 		AgentDirs: map[parser.AgentType][]string{
 			parser.AgentHermes: {root},
 		},
@@ -308,7 +382,7 @@ func TestResolveTargetsSkipsSessionlessHermesProfileCredentials(t *testing.T) {
 		filepath.Join(profileRoot, "debug.jsonl"), []byte("not a session\n"), 0o600,
 	))
 
-	targets := remotesync.ResolveTargets(config.Config{
+	targets := resolveTargetsForTest(t, config.Config{
 		AgentDirs: map[parser.AgentType][]string{
 			parser.AgentHermes: {profileRoot},
 		},
@@ -328,7 +402,7 @@ func TestResolveTargetsSkipsAiderHomeRoot(t *testing.T) {
 	require.NoError(t, os.MkdirAll(filepath.Dir(aiderHistory), 0o755))
 	require.NoError(t, os.WriteFile(aiderHistory, []byte("# aider\n"), 0o644))
 
-	targets := remotesync.ResolveTargets(config.Config{
+	targets := resolveTargetsForTest(t, config.Config{
 		AgentDirs: map[parser.AgentType][]string{
 			parser.AgentAider: {home + string(filepath.Separator)},
 		},
@@ -482,7 +556,7 @@ func TestResolveTargetsMatchesSSHResolverForRepresentativeHome(t *testing.T) {
 	require.NoError(t, err, "ssh resolver output: %s", out)
 	sshDirs, sshFiles, sshExtra, _ := ssh.ParseResolvedTargetsWithFilesForTest(string(out))
 
-	goTargets := remotesync.ResolveTargets(config.Config{
+	goTargets := resolveTargetsForTest(t, config.Config{
 		AgentDirs: map[parser.AgentType][]string{
 			parser.AgentClaude:   {claudeDir},
 			parser.AgentCodex:    {codexDir},
@@ -509,7 +583,7 @@ func TestResolveTargetsMatchesSSHResolverForRepresentativeHome(t *testing.T) {
 	}, goTargets.Files[parser.AgentWindsurf])
 	assert.ElementsMatch(t, sshFiles[parser.AgentWindsurf], goTargets.Files[parser.AgentWindsurf])
 	assert.NotContains(t, sshDirs[parser.AgentWindsurf], windsurfWorkspaceRoot)
-	assert.ElementsMatch(t, sshExtra, goTargets.ExtraFiles)
+	assert.ElementsMatch(t, sshExtra, goTargets.AllExtraFiles())
 	// Poolside: both resolvers must narrow to the trajectories/
 	// subdirectory, not the application-data root.
 	assert.ElementsMatch(t, []string{poolsideTrajectories}, sshDirs[parser.AgentPoolside])
@@ -688,7 +762,7 @@ func TestRooCodeRemoteSyncExportsOnlySessionFiles(t *testing.T) {
 	require.NoError(t, os.WriteFile(checkpointBlob, []byte("checkpoint"), 0o644))
 	require.NoError(t, os.WriteFile(cacheBlob, []byte("cache"), 0o644))
 
-	targets := remotesync.ResolveTargets(config.Config{
+	targets := resolveTargetsForTest(t, config.Config{
 		AgentDirs: map[parser.AgentType][]string{
 			parser.AgentRooCode: {rooRoot},
 		},
@@ -801,13 +875,13 @@ func TestRooCodeRemoteSyncToleratesVanishedSessionFile(t *testing.T) {
 			parser.AgentRooCode: {rooRoot},
 		},
 	}
-	staleClientTargets := remotesync.ResolveTargets(cfg)
+	staleClientTargets := resolveTargetsForTest(t, cfg)
 	require.Contains(t, staleClientTargets.Files[parser.AgentRooCode],
 		task1Messages)
 
 	// The whole task vanishes on the remote before the next request.
 	require.NoError(t, os.RemoveAll(task1))
-	freshServerTargets := remotesync.ResolveTargets(cfg)
+	freshServerTargets := resolveTargetsForTest(t, cfg)
 	assert.NotContains(t, freshServerTargets.Files[parser.AgentRooCode],
 		task1Messages)
 
@@ -883,7 +957,7 @@ func TestRooCodeRemoteSyncSkipsRootWithoutSessions(t *testing.T) {
 		filepath.Join(settingsDir, "mcp_settings.json"),
 		[]byte(`{"mcpServers":{}}`), 0o644))
 
-	targets := remotesync.ResolveTargets(config.Config{
+	targets := resolveTargetsForTest(t, config.Config{
 		AgentDirs: map[parser.AgentType][]string{
 			parser.AgentRooCode: {rooRoot},
 		},
@@ -893,4 +967,55 @@ func TestRooCodeRemoteSyncSkipsRootWithoutSessions(t *testing.T) {
 	// root must not fall back to a recursive directory target.
 	assert.NotContains(t, targets.Dirs, parser.AgentRooCode)
 	assert.NotContains(t, targets.Files, parser.AgentRooCode)
+}
+
+func TestCursorRemoteTargetsExcludeChatsRoot(t *testing.T) {
+	home, err := filepath.EvalSymlinks(t.TempDir())
+	require.NoError(t, err)
+	projects := filepath.Join(home, ".cursor", "projects")
+	chats := filepath.Join(home, ".cursor", "chats")
+	require.NoError(t, os.MkdirAll(projects, 0o755))
+	require.NoError(t, os.MkdirAll(chats, 0o755))
+	require.NoError(t, os.MkdirAll(filepath.Join(chats, "workspace", "session"), 0o755))
+	require.NoError(t, os.WriteFile(
+		filepath.Join(chats, "workspace", "session", "store.db"),
+		[]byte("store"),
+		0o644,
+	))
+
+	root, meta, err := parser.ResolveProviderRoot(parser.AgentCursor, projects)
+	require.NoError(t, err)
+	require.NotEmpty(t, meta)
+	assert.True(t, samePathForTest(t, meta, chats))
+
+	targets := resolveTargetsForTest(t, config.Config{
+		AgentDirs: map[parser.AgentType][]string{
+			parser.AgentCursor: {root},
+		},
+		ProviderMetadata: map[parser.AgentType]map[string][]string{
+			parser.AgentCursor: {root: {meta}},
+		},
+	})
+	require.Contains(t, targets.Dirs, parser.AgentCursor)
+	assert.Contains(t, targets.Dirs[parser.AgentCursor], root)
+	for _, dir := range targets.Dirs[parser.AgentCursor] {
+		assert.False(t, samePathForTest(t, dir, meta), "chats metadata must not be a transfer dir: %s", dir)
+		assert.NotEqual(t, "chats", filepath.Base(dir))
+	}
+	for _, files := range targets.Files {
+		for _, file := range files {
+			assert.NotContains(t, file, string(filepath.Separator)+"chats"+string(filepath.Separator))
+			assert.NotContains(t, filepath.Base(file), "store.db")
+		}
+	}
+}
+
+func samePathForTest(t *testing.T, a, b string) bool {
+	t.Helper()
+	aAbs, err := filepath.Abs(a)
+	require.NoError(t, err)
+	bAbs, err := filepath.Abs(b)
+	require.NoError(t, err)
+	return filepath.Clean(aAbs) == filepath.Clean(bAbs) ||
+		strings.EqualFold(filepath.Clean(aAbs), filepath.Clean(bAbs))
 }

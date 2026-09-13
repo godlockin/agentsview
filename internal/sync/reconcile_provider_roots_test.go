@@ -79,8 +79,8 @@ func TestReconcileProviderRootsDoesNotExpandAcrossProviders(t *testing.T) {
 	}
 	base := t.TempDir()
 	aiderRoot := filepath.Join(base, "aider")
-	// claudeDir is a descendant of aiderRoot: the overlap that
-	// logicalRootsForWatchRoots would otherwise expand across providers.
+	// claudeDir is a descendant of aiderRoot: the overlap an unscoped root
+	// expansion would otherwise widen across providers.
 	claudeDir := filepath.Join(aiderRoot, "claude")
 	require.NoError(t, os.MkdirAll(claudeDir, 0o755))
 
@@ -122,9 +122,7 @@ func TestReconcileProviderRootsDoesNotExpandAcrossProviders(t *testing.T) {
 	// Deletion within scope is preserved.
 	deleted, err := database.GetSessionFull(t.Context(), aiderIDs[2])
 	require.NoError(t, err)
-	require.NotNil(t, deleted)
-	require.NotNil(t, deleted.DeletionCause)
-	assert.Equal(t, "source_missing", *deleted.DeletionCause)
+	assertSourceMissingState(t, deleted)
 
 	// Surviving Aider sources stay active.
 	for i, id := range aiderIDs {

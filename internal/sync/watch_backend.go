@@ -49,6 +49,7 @@ func (w *Watcher) RegisterRoots(
 				}
 			}
 			w.SetRootAgents(root.Path, agents)
+			w.setRootScopes(root.Path, root.Scopes)
 		}
 		return backend.RegisterRoots(roots, recursiveBudget)
 	}
@@ -62,6 +63,7 @@ func (w *Watcher) RegisterRoots(
 			}
 		}
 		w.SetRootAgents(root.Path, agents)
+		w.setRootScopes(root.Path, root.Scopes)
 		if !root.Exists {
 			continue
 		}
@@ -76,7 +78,7 @@ func (w *Watcher) RegisterRoots(
 			continue
 		}
 		results[i] = w.backend.AddRecursive(root.Path, remaining)
-		remaining -= results[i].Watched
+		remaining -= results[i].Allocated
 	}
 	return results
 }

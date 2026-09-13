@@ -10,9 +10,30 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-
-	"go.kenn.io/agentsview/internal/db/driver"
 )
+
+func TestCopySyncStateQueuesBothRecordedLocalArtifactIdentities(t *testing.T) {
+	ctx := t.Context()
+	source := testDB(t)
+	require.NoError(t, source.SetSyncState("artifact_origin_id", "origin-a"))
+	require.NoError(t, source.SetSyncState("artifact_local_machine_name", "previous-machine"))
+	require.NoError(t, source.SetSyncState("artifact_local_installation_id", "installation-a"))
+
+	replacement := testDB(t)
+	for _, machine := range []string{"local", "previous-machine", "installation-a", "other-machine"} {
+		require.NoError(t, replacement.UpsertSession(Session{
+			ID: machine, Machine: machine, Agent: "claude", Project: "project-a",
+		}))
+	}
+	require.NoError(t, replacement.CopySyncStateFrom(source.Path()))
+	queued, err := replacement.PendingArtifactExports(ctx, 10)
+	require.NoError(t, err)
+	ids := make([]string, 0, len(queued))
+	for _, item := range queued {
+		ids = append(ids, item.SessionID)
+	}
+	assert.ElementsMatch(t, []string{"local", "previous-machine", "installation-a"}, ids)
+}
 
 func TestCopySyncStatePreservesArtifactImportAuthority(t *testing.T) {
 	ctx := t.Context()
@@ -431,7 +452,7 @@ func stageCheckpointForCopyTest(
 
 func TestExecWithoutCancelDropsTempTableWithCanceledContext(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "test.db")
-	pool, err := sql.Open(driver.DriverName, path)
+	pool, err := sql.Open("sqlite3", path)
 	require.NoError(t, err, "open sqlite")
 	defer pool.Close()
 
@@ -458,6 +479,46 @@ func TestExecWithoutCancelDropsTempTableWithCanceledContext(t *testing.T) {
 			id TEXT PRIMARY KEY
 		)`)
 	require.NoError(t, err, "recreate temp table after cleanup")
+}
+
+func TestCopyOrphanedDataPreservesSessionKindAndPromptSource(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	srcPath := filepath.Join(dir, "old.db")
+	srcDB := testDBAtPath(t, srcPath, "src")
+	insertSession(t, srcDB, "kind-orphan", "proj", func(s *Session) {
+		s.SessionKind = "bg"
+		s.MessageCount = 2
+	})
+	insertMessages(t, srcDB,
+		Message{
+			SessionID: "kind-orphan", Ordinal: 0, Role: "user",
+			Content: "first", PromptSource: "typed",
+		},
+		Message{
+			SessionID: "kind-orphan", Ordinal: 1, Role: "user",
+			Content: "second", PromptSource: "queued",
+		},
+	)
+	require.NoError(t, srcDB.Close(), "close source")
+
+	dstPath := filepath.Join(dir, "new.db")
+	dstDB := testDBAtPath(t, dstPath, "dst")
+	defer dstDB.Close()
+
+	count, err := dstDB.CopyOrphanedDataFrom(srcPath)
+	require.NoError(t, err, "CopyOrphanedDataFrom")
+	require.Equal(t, 1, count, "expected one orphan")
+
+	session, err := dstDB.GetSession(ctx, "kind-orphan")
+	require.NoError(t, err, "get copied session")
+	assert.Equal(t, "bg", session.SessionKind)
+
+	msgs, err := dstDB.GetMessages(ctx, "kind-orphan", 0, 10, true)
+	require.NoError(t, err, "get copied messages")
+	require.Len(t, msgs, 2)
+	assert.Equal(t, "typed", msgs[0].PromptSource)
+	assert.Equal(t, "queued", msgs[1].PromptSource)
 }
 
 func TestCopyOrphanedDataSanitizesCopiedContent(t *testing.T) {
@@ -646,7 +707,8 @@ func TestCopySkipsSanitizeForSanitizedSource(t *testing.T) {
 			name:  "trashed",
 			trash: true,
 			copy: func(dst *DB, srcPath string) (int, error) {
-				return dst.CopyTrashedDataFrom(srcPath)
+				ids, err := dst.CopyTrashedDataFrom(srcPath)
+				return len(ids), err
 			},
 		},
 	}

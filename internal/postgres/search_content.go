@@ -96,12 +96,30 @@ func pgSessionFilter(f db.ContentSearchFilter) db.SessionFilter {
 	}
 }
 
+// appendExcludeSessionIDsPG adds `NOT (col = ANY($n))` using a Postgres text
+// array bind. Empty IDs are a no-op so callers can thread ContentSearchFilter
+// through without a nil check.
+func appendExcludeSessionIDsPG(
+	where string, args []any, col string, ids []string,
+) (string, []any) {
+	ids = db.NormalizeExcludeSessionIDs(ids)
+	if len(ids) == 0 {
+		return where, args
+	}
+	out := make([]any, 0, len(args)+1)
+	out = append(out, args...)
+	out = append(out, ids)
+	return where + fmt.Sprintf(" AND NOT (%s = ANY($%d))", col, len(out)), out
+}
+
 // searchContentSubstringPG runs ILIKE-based UNION ALL across the selected
 // sources, scoped to qualifying sessions via a WITH scoped CTE.
 func (s *Store) searchContentSubstringPG(
 	ctx context.Context, f db.ContentSearchFilter,
 ) (db.ContentSearchPage, error) {
 	scopeWhere, scopeArgs := buildPGSessionFilter(pgSessionFilter(f))
+	scopeWhere, scopeArgs = appendExcludeSessionIDsPG(
+		scopeWhere, scopeArgs, "id", f.ExcludeSessionIDs)
 	escapedPat := escapeLike(f.Pattern)
 
 	pb := &paramBuilder{
@@ -400,6 +418,8 @@ func (s *Store) pgRegexCandidateRows(
 	ctx context.Context, f db.ContentSearchFilter, lit string,
 ) (*sql.Rows, error) {
 	scopeWhere, scopeArgs := buildPGSessionFilter(pgSessionFilter(f))
+	scopeWhere, scopeArgs = appendExcludeSessionIDsPG(
+		scopeWhere, scopeArgs, "id", f.ExcludeSessionIDs)
 
 	pb := &paramBuilder{
 		n:    len(scopeArgs),
@@ -565,15 +585,15 @@ func pgBuildSnippet(f db.ContentSearchFilter, body string, start, end int) strin
 
 // pgSubstringSnippet builds a substring-match snippet: it locates the
 // case-insensitive pattern (the ILIKE already matched, so it is present; fall
-// back to the start) and windows it. It uses db.CaseInsensitiveIndex so the
-// offset indexes body directly even when lowercasing would change byte length.
+// back to the start) and windows it. It uses db.CaseInsensitiveSpan so both
+// offsets index body directly even when lowercasing would change byte length.
 func pgSubstringSnippet(f db.ContentSearchFilter, body string) string {
 	if f.Mode == "fts" {
 		start, end := db.FTSSnippetRange(f.Pattern, body)
 		return pgBuildSnippet(f, body, start, end)
 	}
-	off := max(db.CaseInsensitiveIndex(body, f.Pattern), 0)
-	return pgBuildSnippet(f, body, off, min(off+len(f.Pattern), len(body)))
+	start, end, _ := db.CaseInsensitiveSpan(body, f.Pattern)
+	return pgBuildSnippet(f, body, start, end)
 }
 
 // literalPrefixPG returns the required literal prefix from a regex pattern,

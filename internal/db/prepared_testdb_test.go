@@ -4,15 +4,13 @@ import (
 	"crypto/rand"
 	"database/sql"
 	"fmt"
-
-	"go.kenn.io/agentsview/internal/db/driver"
 )
 
 // OpenPreparedTestDB opens a private test database file that has already been
 // initialized with the current schema and data version. It is intentionally
 // test-only so production code cannot bypass the normal open/migration path.
 func OpenPreparedTestDB(path string) (*DB, error) {
-	writer, err := sql.Open(driver.DriverName, makeDSN(path, false))
+	writer, err := sql.Open(sqliteArchiveDriverName, makeDSN(path, false))
 	if err != nil {
 		return nil, fmt.Errorf("opening prepared test writer: %w", err)
 	}
@@ -21,15 +19,20 @@ func OpenPreparedTestDB(path string) (*DB, error) {
 		writer.Close()
 		return nil, fmt.Errorf("configuring prepared test wal: %w", err)
 	}
+	if err := installCJKFTSTriggers(writer); err != nil {
+		writer.Close()
+		return nil, fmt.Errorf("configuring prepared test CJK FTS: %w", err)
+	}
 
-	reader, err := sql.Open(driver.DriverName, makeDSN(path, true))
+	reader, err := sql.Open(sqliteArchiveDriverName, makeDSN(path, true))
 	if err != nil {
 		writer.Close()
 		return nil, fmt.Errorf("opening prepared test reader: %w", err)
 	}
 	reader.SetMaxOpenConns(4)
 
-	db := &DB{path: path}
+	db := &DB{path: path, usageCache: newUsageCacheManager(path)}
+	db.usageCache.attachArchive(db)
 	db.writer.Store(writer)
 	db.reader.Store(reader)
 

@@ -14,7 +14,6 @@ import (
 	"github.com/stretchr/testify/require"
 	"go.kenn.io/agentsview/internal/config"
 	"go.kenn.io/agentsview/internal/db"
-	"go.kenn.io/agentsview/internal/db/driver"
 	"go.kenn.io/agentsview/internal/dbtest"
 	"go.kenn.io/agentsview/internal/parser"
 )
@@ -86,7 +85,7 @@ func TestDoctorSyncStaleDatabaseReportsLikelyAbortedResync(t *testing.T) {
 	}), "insert session")
 	require.NoError(t, database.Close(), "close db")
 
-	conn, err := sql.Open(driver.DriverName, dbPath)
+	conn, err := sql.Open("sqlite3", dbPath)
 	require.NoError(t, err, "raw sqlite open")
 	_, err = conn.Exec("PRAGMA user_version = 0")
 	require.NoError(t, err, "downgrade user_version")
@@ -175,7 +174,7 @@ func TestDoctorSyncNewerDatabaseReportsRefusedStartup(t *testing.T) {
 	require.NoError(t, database.Close(), "close db")
 
 	futureVersion := db.CurrentDataVersion() + 10
-	conn, err := sql.Open(driver.DriverName, dbPath)
+	conn, err := sql.Open("sqlite3", dbPath)
 	require.NoError(t, err, "raw sqlite open")
 	_, err = conn.Exec(fmt.Sprintf("PRAGMA user_version = %d", futureVersion))
 	require.NoError(t, err, "set future user_version")
@@ -204,10 +203,8 @@ func TestDoctorSyncNewerDatabaseReportsRefusedStartup(t *testing.T) {
 func TestWriteDoctorSummaryMode(t *testing.T) {
 	var buf bytes.Buffer
 	writeDoctorSummaryMode(&buf, doctorSyncReport{
-		doctorDBInspection: doctorDBInspection{
-			AntigravityCLITotal:   12,
-			AntigravityCLISummary: 5,
-		},
+		AntigravityCLITotal:   12,
+		AntigravityCLISummary: 5,
 	})
 	out := buf.String()
 	assert.Contains(t, out, "antigravity-cli")
@@ -219,9 +216,7 @@ func TestWriteDoctorSummaryMode(t *testing.T) {
 func TestWriteDoctorSummaryModeSilentWhenNone(t *testing.T) {
 	var buf bytes.Buffer
 	writeDoctorSummaryMode(&buf, doctorSyncReport{
-		doctorDBInspection: doctorDBInspection{
-			AntigravityCLITotal: 12, AntigravityCLISummary: 0,
-		},
+		AntigravityCLITotal: 12, AntigravityCLISummary: 0,
 	})
 	assert.NotContains(t, buf.String(), "summary mode")
 }
@@ -229,11 +224,9 @@ func TestWriteDoctorSummaryModeSilentWhenNone(t *testing.T) {
 func TestWriteDoctorSummaryModeSilentOnErr(t *testing.T) {
 	var buf bytes.Buffer
 	writeDoctorSummaryMode(&buf, doctorSyncReport{
-		doctorDBInspection: doctorDBInspection{
-			AntigravityCLITotal:   12,
-			AntigravityCLISummary: 5,
-			AntigravityCountsErr:  errors.New("query failed"),
-		},
+		AntigravityCLITotal:   12,
+		AntigravityCLISummary: 5,
+		AntigravityCountsErr:  errors.New("query failed"),
 	})
 	assert.Empty(t, buf.String())
 }
@@ -241,9 +234,7 @@ func TestWriteDoctorSummaryModeSilentOnErr(t *testing.T) {
 func TestWriteDoctorUnknownSchema(t *testing.T) {
 	var buf bytes.Buffer
 	writeDoctorUnknownSchema(&buf, doctorSyncReport{
-		doctorDBInspection: doctorDBInspection{
-			AntigravityUnknownSchema: 3,
-		},
+		AntigravityUnknownSchema: 3,
 	})
 	out := buf.String()
 	assert.Contains(t, out, "3 session(s) on unrecognized Antigravity schema")
@@ -253,9 +244,7 @@ func TestWriteDoctorUnknownSchema(t *testing.T) {
 func TestWriteDoctorUnknownSchemaSilentWhenNone(t *testing.T) {
 	var buf bytes.Buffer
 	writeDoctorUnknownSchema(&buf, doctorSyncReport{
-		doctorDBInspection: doctorDBInspection{
-			AntigravityUnknownSchema: 0,
-		},
+		AntigravityUnknownSchema: 0,
 	})
 	assert.Empty(t, buf.String())
 }
@@ -263,10 +252,8 @@ func TestWriteDoctorUnknownSchemaSilentWhenNone(t *testing.T) {
 func TestWriteDoctorUnknownSchemaSilentOnErr(t *testing.T) {
 	var buf bytes.Buffer
 	writeDoctorUnknownSchema(&buf, doctorSyncReport{
-		doctorDBInspection: doctorDBInspection{
-			AntigravityUnknownSchema: 3,
-			AntigravityCountsErr:     errors.New("query failed"),
-		},
+		AntigravityUnknownSchema: 3,
+		AntigravityCountsErr:     errors.New("query failed"),
 	})
 	assert.Empty(t, buf.String())
 }
@@ -353,10 +340,8 @@ func TestDoctorSyncReportStatErrorDoesNotRenderAsMissingDatabase(t *testing.T) {
 			DataDir: "/data",
 			DBPath:  "/data/sessions.db",
 		},
-		doctorDBInspection: doctorDBInspection{
-			DBExists: false,
-			DBError:  errors.New("stat /data/sessions.db: permission denied"),
-		},
+		DBExists: false,
+		DBError:  errors.New("stat /data/sessions.db: permission denied"),
 	}
 
 	var out bytes.Buffer

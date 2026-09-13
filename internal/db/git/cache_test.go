@@ -11,8 +11,6 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-
-	"go.kenn.io/agentsview/internal/db/driver"
 )
 
 // cacheSchema matches the `git_cache` DDL in internal/db/schema.sql. We keep
@@ -83,7 +81,7 @@ func newCacheDBWithoutSchema(t *testing.T) *sql.DB {
 func openCacheDB(t *testing.T, withSchema bool) *sql.DB {
 	t.Helper()
 	path := filepath.Join(t.TempDir(), "cache.db")
-	db, err := sql.Open(driver.DriverName, path)
+	db, err := sql.Open("sqlite3", path)
 	require.NoError(t, err, "sql.Open")
 	t.Cleanup(func() { _ = db.Close() })
 	if withSchema {

@@ -1,177 +1,165 @@
 package pricing
 
 import (
+	"context"
+	"errors"
 	"testing"
-
-	"go.kenn.io/agentsview/internal/money"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"go.kenn.io/agentsview/internal/money"
 )
 
-// TestParseOpenRouterPricing_TextGenerationOnly verifies the
-// parser keeps text->text entries, drops other modalities,
-// converts per-token strings to per-million-token floats, and
-// maps cache fields correctly.
-func TestParseOpenRouterPricing_TextGenerationOnly(t *testing.T) {
-	body := []byte(`{
-		"data": [
-			{
-				"id": "MiniMax/MiniMax-M3",
-				"architecture": {"modality": "text->text"},
-				"pricing": {
-					"prompt": "0.000005",
-					"completion": "0.000025",
-					"input_cache_read": "0.0000005",
-					"input_cache_write": "0.00000625"
-				}
-			},
-			{
-				"id": "openai/ignored-image",
-				"architecture": {"modality": "text->image"},
-				"pricing": {"prompt": "0.01", "completion": "0.01"}
-			},
-			{
-				"id": "no-pricing",
-				"architecture": {"modality": "text->text"},
-				"pricing": {"prompt": "", "completion": ""}
-			}
-		]
-	}`)
-
-	prices, err := ParseOpenRouterPricing(body)
-	require.NoError(t, err)
-	require.Len(t, prices, 2,
-		"one prefixed entry plus its unique bare-suffix alias")
-
-	// Prefixed row keeps the OpenRouter id verbatim.
-	got := prices[0]
-	assert.Equal(t, "MiniMax/MiniMax-M3", got.ModelPattern)
-	assert.Equal(t, int64(5_000_000), got.InputPerMTok.Microdollars, "input")
-	assert.Equal(t, int64(25_000_000), got.OutputPerMTok.Microdollars, "output")
-	assert.Equal(t, int64(500_000), got.CacheReadPerMTok.Microdollars, "cache_read")
-	assert.Equal(t, int64(6_250_000), got.CacheCreationPerMTok.Microdollars, "cache_creation")
-
-	// Bare alias so sessions that record just "MiniMax-M3" resolve.
-	alias := prices[1]
-	assert.Equal(t, "MiniMax-M3", alias.ModelPattern)
-	assert.Equal(t, int64(5_000_000), alias.InputPerMTok.Microdollars, "alias input")
-	assert.Equal(t, int64(25_000_000), alias.OutputPerMTok.Microdollars, "alias output")
+func rate(dollars string) money.Money {
+	return money.MustParseDollars(dollars)
 }
 
-// TestParseOpenRouterPricing_MultimodalInputProducingText verifies
-// that OpenRouter entries whose input is multimodal but whose
-// output is text (`text+image->text`, `text+image+video->text`)
-// are kept. These models still bill prompt/completion in tokens
-// and are what user-visible names like `MiniMax-M3` / `kimi-k2.5`
-// actually resolve to on OpenRouter.
-func TestParseOpenRouterPricing_MultimodalInputProducingText(t *testing.T) {
-	body := []byte(`{
-		"data": [
-			{
-				"id": "minimax/minimax-m3",
-				"architecture": {"modality": "text+image+video->text"},
-				"pricing": {"prompt": "0.0000003", "completion": "0.0000012"}
-			},
-			{
-				"id": "moonshotai/kimi-k2.5",
-				"architecture": {"modality": "text+image->text"},
-				"pricing": {"prompt": "0.000000375", "completion": "0.000002025"}
-			},
-			{
-				"id": "openai/image-model",
-				"architecture": {"modality": "text->image"},
-				"pricing": {"prompt": "0.01", "completion": "0.01"}
-			}
-		]
-	}`)
+func noGenAIPricing(context.Context) (*GenAIPrices, error) {
+	return nil, errors.New("GenAI Prices unavailable")
+}
 
-	prices, err := ParseOpenRouterPricing(body)
-	require.NoError(t, err)
-	// Two prefixed rows plus their two unique bare aliases.
-	require.Len(t, prices, 4)
-
-	patterns := map[string]bool{}
-	for _, p := range prices {
-		patterns[p.ModelPattern] = true
+func TestFetchCatalogDegradesWhenOpenRouterFails(t *testing.T) {
+	litellm := []ModelPricing{
+		{ModelPattern: "acme/model", InputPerMTok: rate("1")},
 	}
-	assert.True(t, patterns["minimax/minimax-m3"],
-		"prefixed minimax-m3 kept")
-	assert.True(t, patterns["minimax-m3"],
-		"bare minimax-m3 alias emitted")
-	assert.True(t, patterns["moonshotai/kimi-k2.5"],
-		"prefixed kimi-k2.5 kept")
-	assert.True(t, patterns["kimi-k2.5"],
-		"bare kimi-k2.5 alias emitted")
-	assert.False(t, patterns["openai/image-model"],
-		"text->image entry dropped")
-}
-
-// that when two OpenRouter entries share the same bare suffix
-// (e.g. two providers publishing "kimi-k2.5"), the unqualified
-// alias is NOT emitted for either, so the canonical resolver does
-// not see fabricated ambiguity from within OpenRouter itself.
-func TestParseOpenRouterPricing_AmbiguousBareSuffixSuppressed(t *testing.T) {
-	body := []byte(`{
-		"data": [
-			{
-				"id": "moonshotai/kimi-k2.5",
-				"architecture": {"modality": "text->text"},
-				"pricing": {"prompt": "0.0000006", "completion": "0.0000025"}
-			},
-			{
-				"id": "baseten/moonshotai/kimi-k2.5",
-				"architecture": {"modality": "text->text"},
-				"pricing": {"prompt": "0.0000006", "completion": "0.0000025"}
-			}
-		]
-	}`)
-
-	prices, err := ParseOpenRouterPricing(body)
-	require.NoError(t, err)
-	require.Len(t, prices, 2, "two prefixed rows, no bare alias")
-	for _, p := range prices {
-		assert.NotEqual(t, "kimi-k2.5", p.ModelPattern,
-			"bare alias must be suppressed when suffix is shared")
+	fetchLiteLLM := func(context.Context) ([]ModelPricing, error) {
+		return litellm, nil
 	}
+	openrouterErr := errors.New("openrouter down")
+	fetchOpenRouter := func(context.Context) ([]ModelPricing, error) {
+		return nil, openrouterErr
+	}
+
+	catalog, err := fetchCatalog(
+		context.Background(), noGenAIPricing, fetchLiteLLM, fetchOpenRouter,
+	)
+
+	assert.ErrorIs(t, err, openrouterErr)
+	assert.Equal(t, Catalog{LiteLLM: litellm}, catalog,
+		"LiteLLM rows survive an OpenRouter outage")
 }
 
-// TestMergePricing_FirstNonZeroWins verifies that when two
-// sources both price the same model_pattern, the first source
-// in the iteration order wins for every field, and the second
-// source only fills in fields the first left at zero. This
-// gives LiteLLM priority over OpenRouter for shared models
-// while still letting OpenRouter contribute new rows.
-func TestMergePricing_FirstNonZeroWins(t *testing.T) {
-	sources := map[string][]ModelPricing{
-		"a": {
-			{ModelPattern: "shared", InputPerMTok: money.Money{Microdollars: 3}, OutputPerMTok: money.Money{Microdollars: 15}},
-			{ModelPattern: "only-a", InputPerMTok: money.Money{Microdollars: 1}, OutputPerMTok: money.Money{Microdollars: 2}},
+func TestFetchCatalogFailsWhenLiteLLMFails(t *testing.T) {
+	litellmErr := errors.New("litellm down")
+	fetchLiteLLM := func(context.Context) ([]ModelPricing, error) {
+		return nil, litellmErr
+	}
+	fetchOpenRouter := func(context.Context) ([]ModelPricing, error) {
+		t.Fatal("openrouter must not be fetched after a litellm failure")
+		return nil, nil
+	}
+
+	catalog, err := fetchCatalog(
+		context.Background(), noGenAIPricing, fetchLiteLLM, fetchOpenRouter,
+	)
+
+	assert.ErrorIs(t, err, litellmErr)
+	assert.Equal(t, Catalog{}, catalog)
+}
+
+func TestCatalogReconcile(t *testing.T) {
+	litellm := []ModelPricing{
+		{ModelPattern: "minimax/MiniMax-M3", InputPerMTok: rate("2")},
+		{ModelPattern: "openrouter/openai/gpt-x", InputPerMTok: rate("1")},
+		{ModelPattern: "free-model"},
+	}
+	openrouter := []ModelPricing{
+		// Same model, different spelling: LiteLLM's rate wins.
+		{ModelPattern: "minimax/minimax-m3", InputPerMTok: rate("9")},
+		// Same canonical name under another provider prefix.
+		{ModelPattern: "openai/gpt-x", InputPerMTok: rate("4")},
+		// Free in LiteLLM, paid in OpenRouter: no field backfill.
+		{ModelPattern: "free-model", InputPerMTok: rate("5")},
+		// A stale row from an earlier LiteLLM catalog still shadows.
+		{ModelPattern: "acme/stale", InputPerMTok: rate("6")},
+		{ModelPattern: "acme/only-openrouter", InputPerMTok: rate("7")},
+	}
+	stored := []string{
+		"minimax/MiniMax-M3", "acme/Stale", "acme/previous",
+		// A row from another source that shadows a delisted
+		// OpenRouter row stored under a different spelling.
+		"acme/Old-Spelling", "acme/old-spelling",
+	}
+
+	prices, owned, retired := Catalog{
+		LiteLLM: litellm, OpenRouter: openrouter,
+	}.Reconcile(stored, []string{"acme/previous", "acme/old-spelling"})
+
+	assert.Equal(t, append(litellm, openrouter[4]), prices)
+	assert.Equal(t, []string{"acme/only-openrouter", "acme/previous"}, owned,
+		"a delisted OpenRouter row stays tracked until something covers it")
+	assert.Equal(t, []string{"acme/old-spelling"}, retired)
+
+	byPattern := make(map[string]ModelPricing, len(prices))
+	for _, p := range prices {
+		byPattern[p.ModelPattern] = p
+	}
+	price, ok := Resolve(byPattern, "MiniMax-M3")
+	require.True(t, ok, "bare lookup resolves without a tie")
+	assert.Equal(t, rate("2"), price.InputPerMTok)
+	price, ok = Resolve(byPattern, "only-openrouter")
+	require.True(t, ok, "OpenRouter-only model resolves by bare name")
+	assert.Equal(t, rate("7"), price.InputPerMTok)
+}
+
+func TestCatalogReconcileRetiresShadowedPrevious(t *testing.T) {
+	c := Catalog{
+		LiteLLM: []ModelPricing{
+			{ModelPattern: "minimax/MiniMax-M3"},
+			{ModelPattern: "acme/now-in-litellm"},
 		},
-		"b": {
-			{ModelPattern: "shared", InputPerMTok: money.Money{Microdollars: 99}, OutputPerMTok: money.Money{Microdollars: 99},
-				CacheCreationPerMTok: money.Money{Microdollars: 4}},
-			{ModelPattern: "only-b", InputPerMTok: money.Money{Microdollars: 7}, OutputPerMTok: money.Money{Microdollars: 8}},
+		OpenRouter: []ModelPricing{
+			{ModelPattern: "minimax/minimax-m3"},
+			{ModelPattern: "acme/still-listed"},
 		},
 	}
-	merged := MergePricing(sources)
+	previous := []string{
+		"acme/still-listed",
+		// LiteLLM now spells this model differently: retire it.
+		"minimax/minimax-m3",
+		// LiteLLM adopted the exact spelling: LiteLLM owns it now.
+		"acme/now-in-litellm",
+		// OpenRouter dropped it and nothing replaces it: keep pricing.
+		"acme/delisted",
+	}
 
-	require.Len(t, merged, 3, "expected 3 distinct patterns")
-	assert.Equal(t, int64(3), merged["shared"].InputPerMTok.Microdollars, "a wins input")
-	assert.Equal(t, int64(15), merged["shared"].OutputPerMTok.Microdollars, "a wins output")
-	assert.Equal(t, int64(4), merged["shared"].CacheCreationPerMTok.Microdollars,
-		"b fills the zero field")
-	assert.Equal(t, int64(1), merged["only-a"].InputPerMTok.Microdollars)
-	assert.Equal(t, int64(7), merged["only-b"].InputPerMTok.Microdollars)
+	prices, owned, retired := c.Reconcile(
+		append([]string{"minimax/MiniMax-M3"}, previous...), previous,
+	)
+
+	assert.Equal(t, []ModelPricing{
+		{ModelPattern: "minimax/MiniMax-M3"},
+		{ModelPattern: "acme/now-in-litellm"},
+		{ModelPattern: "acme/still-listed"},
+	}, prices)
+	assert.Equal(t, []string{"acme/delisted", "acme/still-listed"}, owned)
+	assert.Equal(t, []string{"minimax/minimax-m3"}, retired)
 }
 
-// TestDefaultPricingSources_OrderIsStable makes sure the
-// declared priority (LiteLLM first, OpenRouter second) is
-// preserved so upstream rate precedence stays deterministic
-// after MergePricing.
-func TestDefaultPricingSources_OrderIsStable(t *testing.T) {
-	srcs := DefaultPricingSources()
-	require.Len(t, srcs, 2, "two default sources")
-	assert.Equal(t, "litellm", srcs[0].Name)
-	assert.Equal(t, "openrouter", srcs[1].Name)
+func TestShadowedPatterns(t *testing.T) {
+	catalog := []string{"minimax/MiniMax-M3", "acme/listed", "Bare-Model"}
+
+	got := ShadowedPatterns(catalog, []string{
+		"minimax/minimax-m3", // spelled differently: shadowed
+		"acme/listed",        // listed exactly: not shadowed
+		"bare-model",         // bare spelling of a covered name: shadowed
+		"acme/delisted",      // nothing covers it: kept
+	})
+
+	assert.Equal(t, []string{"bare-model", "minimax/minimax-m3"}, got)
+	assert.Empty(t, ShadowedPatterns(nil, []string{"acme/model"}))
+}
+
+func TestOpenRouterModelsRoundTrip(t *testing.T) {
+	assert.Equal(t, "[]", EncodeOpenRouterModels(nil))
+	decoded, err := DecodeOpenRouterModels(EncodeOpenRouterModels(
+		[]string{"a", "b"},
+	))
+	require.NoError(t, err)
+	assert.Equal(t, []string{"a", "b"}, decoded)
+	decoded, err = DecodeOpenRouterModels("")
+	require.NoError(t, err)
+	assert.Nil(t, decoded)
+	_, err = DecodeOpenRouterModels("not json")
+	require.Error(t, err)
 }

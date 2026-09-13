@@ -79,6 +79,88 @@ func (db *DB) FileBackedSessionCountForSource(
 	return db.fileBackedSessionCount(ctx, machine, idPrefix, true)
 }
 
+// RebuildAgentExclusion names an agent whose sessions leave the protected
+// rebuild count. KeepJSONLRows spares the agent's Claude-layout .jsonl
+// transcript rows: ICodeMate shares one agent label across self-preserving
+// OpenCode containers and ordinary CLI transcripts, and the coordinator
+// decides per resync whether the transcript rows stay protected (provider
+// enabled) or leave with the rest (provider disabled, nothing discovered).
+type RebuildAgentExclusion struct {
+	Agent         string
+	KeepJSONLRows bool
+}
+
+// FileBackedSessionCountForRebuildOwner returns the protected root-session
+// count owned by the local rebuild phase. Current, empty, and legacy local
+// machine values cover archives created before source baselines; exact
+// baseline rows preserve ownership after a structured root is relabeled.
+// Contributor namespaces and agents whose source format can legitimately move
+// between storage backends are excluded by the coordinator.
+func (db *DB) FileBackedSessionCountForRebuildOwner(
+	ctx context.Context,
+	localMachine string,
+	excludedIDPrefixes []string,
+	excludedAgents []RebuildAgentExclusion,
+) (int, error) {
+	conditions := []string{`(
+		machine = ? OR machine = '' OR machine = 'local' OR EXISTS (
+			SELECT 1
+			FROM local_session_source_baselines AS b
+			WHERE b.session_id = sessions.id
+			  AND b.machine = sessions.machine
+			  AND b.agent = sessions.agent
+			  AND b.file_path = sessions.file_path
+		)
+	)`}
+	args := nonSourceBackedAgentArgs()
+	args = append(args, localMachine)
+	seenPrefixes := make(map[string]struct{}, len(excludedIDPrefixes))
+	for _, prefix := range excludedIDPrefixes {
+		if prefix == "" {
+			continue
+		}
+		if _, seen := seenPrefixes[prefix]; seen {
+			continue
+		}
+		seenPrefixes[prefix] = struct{}{}
+		conditions = append(conditions, `substr(id, 1, length(?)) <> ?`)
+		args = append(args, prefix, prefix)
+	}
+	seenAgents := make(map[string]struct{}, len(excludedAgents))
+	for _, exclusion := range excludedAgents {
+		if exclusion.Agent == "" {
+			continue
+		}
+		if _, seen := seenAgents[exclusion.Agent]; seen {
+			continue
+		}
+		seenAgents[exclusion.Agent] = struct{}{}
+		if exclusion.KeepJSONLRows {
+			conditions = append(conditions,
+				`(agent <> ? OR lower(file_path) LIKE '%.jsonl')`)
+			args = append(args, exclusion.Agent)
+			continue
+		}
+		conditions = append(conditions, `agent <> ?`)
+		args = append(args, exclusion.Agent)
+	}
+
+	var count int
+	err := db.getReader().QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM sessions
+		 WHERE agent NOT IN (`+nonSourceBackedAgentPlaceholders()+`)
+		 AND `+rootSessionFilter+`
+		 AND `+strings.Join(conditions, "\n AND "),
+		args...,
+	).Scan(&count)
+	if err != nil {
+		return 0, fmt.Errorf(
+			"counting local rebuild-owned file sessions: %w", err,
+		)
+	}
+	return count, nil
+}
+
 func (db *DB) fileBackedSessionCount(
 	ctx context.Context, machine, idPrefix string, scoped bool,
 ) (int, error) {
@@ -124,21 +206,12 @@ func (db *DB) GetStats(
 	if excludeAutomated {
 		filter += " AND is_automated = 0"
 	}
-	query := fmt.Sprintf(`
-		SELECT
-			(SELECT COUNT(*) FROM sessions
-			 WHERE %s),
-			(SELECT COALESCE(SUM(message_count), 0)
-			 FROM sessions WHERE %s),
-			(SELECT COUNT(DISTINCT project) FROM sessions
-			 WHERE %s),
-			(SELECT COUNT(DISTINCT machine) FROM sessions
-			 WHERE %s),
-			(SELECT MIN(COALESCE(
-				NULLIF(started_at, ''), created_at
-			 )) FROM sessions
-			 WHERE %s)`,
-		filter, filter, filter, filter, filter)
+	// Sidebar polling needs all totals for the same rows. Aggregate them
+	// together so each refresh visits the filtered sessions only once.
+	query := `SELECT COUNT(*), COALESCE(SUM(message_count), 0),
+		COUNT(DISTINCT project), COUNT(DISTINCT machine),
+		MIN(COALESCE(NULLIF(started_at, ''), created_at))
+		FROM sessions WHERE ` + filter
 
 	var s Stats
 	err := db.getReader().QueryRowContext(ctx, query).Scan(

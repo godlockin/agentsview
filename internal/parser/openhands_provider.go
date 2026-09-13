@@ -29,11 +29,9 @@ func (f openHandsProviderFactory) Capabilities() Capabilities {
 func (f openHandsProviderFactory) NewProvider(cfg ProviderConfig) Provider {
 	cfg = cfg.Clone()
 	return &openHandsProvider{
-		ProviderBase: ProviderBase{
-			Def:    cloneAgentDef(f.def),
-			Caps:   openHandsProviderCapabilities(),
-			Config: cfg,
-		},
+		Def:     cloneAgentDef(f.def),
+		Caps:    openHandsProviderCapabilities(),
+		Config:  cfg,
 		sources: newOpenHandsSourceSet(cfg.Roots),
 	}
 }
@@ -89,7 +87,7 @@ func (p *openHandsProvider) Parse(
 		return ParseOutcome{}, fmt.Errorf("openhands source path unavailable")
 	}
 	machine := firstNonEmptyJSONLString(req.Machine, p.Config.Machine)
-	sess, msgs, err := p.parseSession(path, machine)
+	sess, msgs, err := p.parseSession(ctx, path, machine)
 	if err != nil {
 		return ParseOutcome{}, err
 	}

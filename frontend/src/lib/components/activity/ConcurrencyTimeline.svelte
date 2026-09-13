@@ -1,46 +1,61 @@
 <script lang="ts">
-  import { formatDateTime, m } from "../../i18n/index.js";
+  import { Chart, Layer, Line, Rect, Spline, Text } from "layerchart";
+  import { scaleLinear } from "d3-scale";
+  import { formatDateTime, getLocale, m } from "../../i18n/index.js";
   import type { Report } from "../../api/types.js";
-  import { activeSessionsInSlot } from "./activeSessions.js";
-  import { Typeahead, type TypeaheadOption } from "@kenn-io/kit-ui";
-  import type {
-    ActivityBucket,
-    ActivityReportInterval,
-    ActivitySessionRow,
-  } from "../../api/generated/index";
+  import { Button, Typeahead, type TypeaheadOption } from "@kenn-io/kit-ui";
+  import type { ActivityBucket } from "../../api/generated/index";
   import { formatMoney, moneyFromMicrodollars } from "../../money.js";
 
   let {
     report,
-    selectedBucket = null,
-    onSelectBucket,
+    selectedRange = null,
+    onSelectRange,
   }: {
     report: Report;
-    selectedBucket?: number | null;
-    onSelectBucket?: (
-      sel: { idx: number; label: string; sessionIds: string[] } | null,
+    selectedRange?: { start: number; end: number } | null;
+    onSelectRange?: (
+      sel: { start: number; end: number; label: string } | null,
     ) => void;
   } = $props();
 
-  const CHART_H = 160;
+  const TOP_PAD = 8;
+  const PLOT_H = 160;
   const X_LABEL_H = 18;
   const STRIP_H = 14;
   const STRIP_GAP = 6;
   const Y_LABEL_W = 32;
-  const RIGHT_PAD = 8;
+  const RIGHT_PAD = 16;
   const OVERLAY_AXIS_W = 48;
-  // Reserved headroom so the tallest bar, its grid line, and
-  // the top y-axis label do not clip against the viewBox edge.
-  const TOP_PAD = 10;
   const TICK_TARGET = 4;
+  const PLOT_BOTTOM = TOP_PAD + PLOT_H;
 
-  // buckets/by_* are typed `any[] | null` by the codegen, so cast
-  // to the generated element model for field-level type safety.
-  const buckets = $derived(
-    (report.buckets ?? []) as ActivityBucket[],
-  );
+  const buckets = $derived(report.buckets ?? []);
 
-  let tooltip = $state<{ x: number; y: number; text: string } | null>(null);
+  let tooltip = $state<{ x: number; y: number; bucket: ActivityBucket } | null>(null);
+  let tooltipEl = $state<HTMLDivElement>();
+  let tooltipPos = $state<{ left: number; top: number } | null>(null);
+  let keyboardAnchorIndex = $state<number | null>(null);
+
+  const TIP_PAD = 8;
+
+  // Clamp the measured tooltip box inside the viewport so it stays fully
+  // visible when the hovered bucket sits near a chart or window edge. The
+  // tooltip renders hidden for one frame while this measures it.
+  $effect(() => {
+    if (!tooltip || !tooltipEl) {
+      tooltipPos = null;
+      return;
+    }
+    const w = tooltipEl.offsetWidth;
+    const h = tooltipEl.offsetHeight;
+    const left = Math.min(
+      Math.max(tooltip.x - w / 2, TIP_PAD),
+      Math.max(window.innerWidth - w - TIP_PAD, TIP_PAD),
+    );
+    const top = Math.max(tooltip.y - h, TIP_PAD);
+    tooltipPos = { left, top };
+  });
 
   // Format bucket boundaries in the report's own timezone. Bucket start/end are
   // UTC instants of local calendar boundaries, so rendering them in the report
@@ -97,27 +112,12 @@
     return fmtMinuteRange(startMs, endMs);
   }
 
-  // Only the peak count splits by automation; the bucket's agent-minutes and
-  // cost stay combined (the API does not break those down per bucket), so the
-  // split annotation sits on "peak" alone and shows only when an automated
-  // agent was running at the peak.
   function showSlotTip(e: MouseEvent, b: ActivityBucket) {
     const rect = (e.currentTarget as Element).getBoundingClientRect();
-    const peakSplit =
-      b.automated_at_peak > 0
-        ? ` (${m.activity_int_auto_short({ int: b.interactive_at_peak, auto: b.automated_at_peak })})`
-        : "";
     tooltip = {
       x: rect.left + rect.width / 2,
       y: rect.top - 4,
-      text:
-        `${fmtBucketRange(b)} · ${m.activity_peak_label({ count: b.max_agents })}${peakSplit} · ` +
-        `${m.activity_agent_min_value({ value: b.agent_minutes.toFixed(1) })} · ` +
-        `${m.activity_output_tokens_value({
-          count: b.output_tokens,
-          countLabel: b.output_tokens.toLocaleString(),
-        })} · ` +
-        formatMoney(b.cost),
+      bucket: b,
     };
   }
 
@@ -125,59 +125,130 @@
     tooltip = null;
   }
 
-  const intervals = $derived(
-    (report.intervals ?? []) as ActivityReportInterval[],
-  );
-  const bySession = $derived(
-    new Map(
-      ((report.by_session ?? []) as ActivitySessionRow[]).map(
-        (r) => [r.session_id, r],
-      ),
-    ),
-  );
-
-  // Half-open [startMs, endMs) for a slot, taken straight from the bucket's own
-  // bounds (variable-width across presets). A missing bucket yields NaN bounds;
-  // NaN comparisons are all false in activeSessionsInSlot, so the slot resolves
-  // to an empty membership rather than throwing. In practice idx always maps to
-  // a rendered bucket.
-  function slotBounds(idx: number): { startMs: number; endMs: number } {
-    const b = buckets[idx];
-    if (!b) return { startMs: NaN, endMs: NaN };
-    return { startMs: Date.parse(b.start), endMs: Date.parse(b.end) };
+  function fmtSelectionRange(start: number, end: number): string {
+    const first = buckets[start];
+    const last = buckets[end - 1];
+    if (!first || !last) return "";
+    if (end - start === 1) return fmtBucketRange(first);
+    const startMs = Date.parse(first.start);
+    const endMs = Date.parse(last.end);
+    if (Number.isNaN(startMs) || Number.isNaN(endMs)) return "";
+    if (report.bucket_unit === "minute") return fmtMinuteRange(startMs, endMs);
+    if (report.bucket_unit === "hour") return fmtHourRange(startMs, endMs);
+    return fmtWeekRange(startMs, endMs);
   }
 
-  // Clicking a bucket hands its active-session membership to the parent, which
-  // owns the page-local sessions-table filter. Clicking the already selected
-  // bucket clears the filter. The parent resets `selectedBucket` to null
-  // whenever the report reloads, so a stale slot never points at a wrong bucket.
-  function selectSlot(idx: number) {
-    if (!onSelectBucket) return;
-    if (selectedBucket === idx) {
-      onSelectBucket(null);
+  function sameRange(start: number, end: number): boolean {
+    return selectedRange?.start === start && selectedRange.end === end;
+  }
+
+  // Bucket membership is computed by the shared backend aggregator. The chart
+  // emits a half-open range; ActivityPage requests that page asynchronously.
+  function selectRange(startIndex: number, endIndex: number) {
+    if (!onSelectRange) return;
+    const start = Math.min(startIndex, endIndex);
+    const end = Math.max(startIndex, endIndex) + 1;
+    if (sameRange(start, end)) {
+      onSelectRange(null);
       return;
     }
-    const b = buckets[idx];
-    const { startMs, endMs } = slotBounds(idx);
-    const sessionIds = activeSessionsInSlot(
-      intervals,
-      startMs,
-      endMs,
-      bySession,
-    ).map((r) => r.session_id);
-    onSelectBucket({ idx, label: b ? fmtBucketRange(b) : "", sessionIds });
+    onSelectRange({ start, end, label: fmtSelectionRange(start, end) });
   }
 
   function onSlotKey(e: KeyboardEvent, idx: number) {
+    if (e.key === "Escape" && selectedRange) {
+      e.preventDefault();
+      onSelectRange?.(null);
+      keyboardAnchorIndex = null;
+      return;
+    }
     if (e.key === "Enter" || e.key === " ") {
       e.preventDefault();
-      selectSlot(idx);
+      keyboardAnchorIndex = idx;
+      selectRange(idx, idx);
+      return;
     }
+    if (e.key !== "ArrowLeft" && e.key !== "ArrowRight") return;
+    e.preventDefault();
+    const next = Math.max(
+      0,
+      Math.min(
+        liveBars.length - 1,
+        idx + (e.key === "ArrowRight" ? 1 : -1),
+      ),
+    );
+    if (e.shiftKey) {
+      const anchor = keyboardAnchorIndex ?? idx;
+      keyboardAnchorIndex = anchor;
+      selectRange(anchor, next);
+    } else {
+      keyboardAnchorIndex = next;
+    }
+    queueMicrotask(() => {
+      document.querySelector<SVGElement>(
+        `[data-concurrency-bucket-index="${next}"]`,
+      )?.focus();
+    });
   }
 
-  // Optional secondary series overlaid on the bars: none, output tokens, or
-  // cost. Each metric scales to its own max so the line reads as a shape over
-  // the concurrency bars, not an absolute count on the agent axis.
+  let dragStart = $state<number | null>(null);
+  let dragEnd = $state<number | null>(null);
+
+  const activeRange = $derived.by(() => {
+    if (dragStart !== null) {
+      const end = dragEnd ?? dragStart;
+      return {
+        start: Math.min(dragStart, end),
+        end: Math.max(dragStart, end) + 1,
+      };
+    }
+    return selectedRange;
+  });
+
+  function beginRangeDrag(event: PointerEvent, idx: number) {
+    if (event.button !== 0) return;
+    event.preventDefault();
+    dragStart = idx;
+    dragEnd = idx;
+  }
+
+  function extendRangeDrag(idx: number) {
+    if (dragStart === null) return;
+    dragEnd = idx;
+  }
+
+  function moveRangeDrag(event: PointerEvent) {
+    if (dragStart === null || !containerEl || liveBars.length === 0) return;
+    const x = event.clientX - containerEl.getBoundingClientRect().left;
+    const first = liveBars[0]!;
+    const last = liveBars.at(-1)!;
+    if (x <= first.cellX) {
+      dragEnd = 0;
+      return;
+    }
+    if (x >= last.cellX + last.cellW) {
+      dragEnd = liveBars.length - 1;
+      return;
+    }
+    const idx = liveBars.findIndex((bar) => x < bar.cellX + bar.cellW);
+    if (idx >= 0) dragEnd = idx;
+  }
+
+  function finishRangeDrag() {
+    if (dragStart === null) return;
+    const start = dragStart;
+    const end = dragEnd ?? dragStart;
+    dragStart = null;
+    dragEnd = null;
+    selectRange(start, end);
+  }
+
+  function cancelRangeDrag() {
+    dragStart = null;
+    dragEnd = null;
+  }
+
+  // Combined usage overlays the stacked plot with its own right axis.
   let overlayMetric = $state<"none" | "tokens" | "cost">("none");
   const overlayOptions: TypeaheadOption[] = $derived([
     { name: "none", label: m.activity_overlay_none(), displayLabel: m.activity_overlay_none() },
@@ -200,6 +271,38 @@
     if (Number.isInteger(v)) return String(v);
     return trimDecimal(v, 1);
   }
+
+  function fmtCompactValue(v: number): string {
+    return new Intl.NumberFormat(getLocale(), {
+      notation: "compact",
+      compactDisplay: "short",
+      maximumFractionDigits: 1,
+    }).format(v);
+  }
+
+  // Sub-day ranges read the clock alone; longer ranges need the date too.
+  function peakTimeLabel(ms: number): string {
+    if (report.bucket_unit === "minute" || report.bucket_unit === "hour") {
+      return timeLabel(ms);
+    }
+    return formatDateTime(ms, {
+      month: "short",
+      day: "numeric",
+      hour: "2-digit",
+      minute: "2-digit",
+      hourCycle: "h23",
+      timeZone: report.timezone,
+    });
+  }
+
+  // The combined peak is the tallest stacked bar: its segments sum to
+  // report.peak.agents at that instant.
+  const peakLabel = $derived.by(() => {
+    const count = report.peak.agents.toLocaleString(getLocale());
+    return report.peak.at
+      ? m.activity_peak_at({ count, time: peakTimeLabel(Date.parse(report.peak.at)) })
+      : m.activity_peak_label({ count });
+  });
 
   function fmtOverlayTick(v: number): string {
     if (overlayMetric === "cost") return formatMoney(moneyFromMicrodollars(v));
@@ -257,64 +360,85 @@
     return { step, max };
   }
 
-  const maxAgents = $derived.by(() => {
-    let m = 0;
-    for (const b of buckets) {
-      if (b.max_agents > m) m = b.max_agents;
-    }
-    return m;
-  });
+  // Segment order from the baseline up. Each segment is that class's count at
+  // the instant of the bucket's combined peak, so the stack sums to max_agents.
+  // The independent class maxima can occur at different instants and are only
+  // reported in the tooltip; stacking them would overstate overlap.
+  const classes = $derived([
+    {
+      kind: "interactive",
+      label: m.activity_interactive(),
+      peakLabel: m.activity_interactive_peak(),
+      atPeak: "interactive_at_peak" as const,
+      max: "max_interactive_agents" as const,
+    },
+    {
+      kind: "subagent",
+      label: m.activity_subagents(),
+      peakLabel: m.activity_subagent_peak(),
+      atPeak: "subagent_at_peak" as const,
+      max: "max_subagent_agents" as const,
+    },
+    {
+      kind: "automated",
+      label: m.activity_automated(),
+      peakLabel: m.activity_automated_peak(),
+      atPeak: "automated_at_peak" as const,
+      max: "max_automated_agents" as const,
+    },
+  ]);
 
-  const scale = $derived(niceScale(maxAgents));
+  // One shared y-axis from zero to the tallest stacked bar.
+  const yScale = $derived(
+    niceScale(Math.max(0, ...buckets.map((bucket) => bucket.max_agents))),
+  );
+  const yTicks = $derived(
+    Array.from({ length: Math.round(yScale.max / yScale.step) + 1 }, (_, i) => ({
+      y: PLOT_BOTTOM - ((i * yScale.step) / yScale.max) * PLOT_H,
+      label: (i * yScale.step).toLocaleString(getLocale()),
+    })),
+  );
 
-  function scaleY(val: number, max: number, h: number): number {
-    const plotH = h - TOP_PAD;
-    return h - (val / max) * plotH;
+  function segmentHeight(count: number): number {
+    return (count / yScale.max) * PLOT_H;
   }
 
-  // Each bucket owns a full contiguous cell [cellX, cellX+cellW); the visible
-  // bar is inset by a small gap. Strip cells and hit targets reuse the cell.
-  const bars = $derived.by(() => {
-    const out: Array<{
-      x: number;
-      y: number;
-      w: number;
-      h: number;
-      interactiveY: number;
-      interactiveH: number;
-      automatedY: number;
-      automatedH: number;
-      cellX: number;
-      cellW: number;
-      idx: number;
-    }> = [];
-    for (let i = 0; i < buckets.length; i++) {
-      const b = buckets[i]!;
-      const bStart = Date.parse(b.start);
-      const bEnd = Date.parse(b.end);
-      const cellX = xForMs(bStart);
-      const cellW = Math.max(((bEnd - bStart) / rangeSpanMs) * plotWidth, 1);
-      const barGap = Math.min(cellW * 0.2, 2);
-      const top = scaleY(b.max_agents, scale.max, CHART_H);
-      // Split the peak bar into a blue interactive base and an orange automated
-      // cap. interactive_at_peak + automated_at_peak == max_agents, so the two
-      // segments stack to the full bar; interactiveTop is the seam between them.
-      const interactiveTop = scaleY(b.interactive_at_peak, scale.max, CHART_H);
-      out.push({
-        x: cellX + barGap / 2,
-        y: top,
-        w: Math.max(cellW - barGap, 1),
-        h: Math.max(CHART_H - top, 0),
-        interactiveY: interactiveTop,
-        interactiveH: Math.max(CHART_H - interactiveTop, 0),
-        automatedY: top,
-        automatedH: Math.max(interactiveTop - top, 0),
-        cellX,
-        cellW,
-        idx: i,
-      });
-    }
-    return out;
+  // The stacked bar, the activity strip, and selection share bucket bounds.
+  // Segments are stacked from the baseline in class order; zero-count classes
+  // draw nothing.
+  const bars = $derived(buckets.map((bucket, idx) => {
+    const start = Date.parse(bucket.start);
+    const end = Date.parse(bucket.end);
+    const cellX = xForMs(start);
+    const cellW = Math.max(((end - start) / rangeSpanMs) * plotWidth, 1);
+    const gap = Math.min(cellW * 0.2, 2);
+    let top = PLOT_BOTTOM;
+    const segments = classes.flatMap((cls) => {
+      const count = bucket[cls.atPeak];
+      if (count <= 0) return [];
+      const height = segmentHeight(count);
+      top -= height;
+      return [{ kind: cls.kind, y: top, height }];
+    });
+    return {
+      x: cellX + gap / 2,
+      w: Math.max(cellW - gap, 1),
+      cellX,
+      cellW,
+      idx,
+      segments,
+    };
+  }));
+
+  const selectionBounds = $derived.by(() => {
+    if (!activeRange) return null;
+    const first = bars[activeRange.start];
+    const last = bars[activeRange.end - 1];
+    if (!first || !last) return null;
+    return {
+      x: first.cellX,
+      width: last.cellX + last.cellW - first.cellX,
+    };
   });
 
   const overlayDataMax = $derived.by(() => {
@@ -327,42 +451,23 @@
   });
   const overlayMax = $derived(overlayDataMax || 1);
 
-  const overlayPath = $derived.by(() => {
-    if (overlayMetric === "none" || buckets.length === 0) return "";
-    let d = "";
-    for (let i = 0; i < buckets.length; i++) {
-      const b = buckets[i]!;
-      const center = (Date.parse(b.start) + Date.parse(b.end)) / 2;
-      const x = xForMs(center);
-      const y = scaleY(bucketOverlayValue(b), overlayMax, CHART_H);
-      d += i === 0 ? `M${x},${y}` : `L${x},${y}`;
-    }
-    return d;
-  });
+  const overlayPoints = $derived(
+    overlayMetric === "none"
+      ? []
+      : buckets.map((bucket) => ({
+          time: (Date.parse(bucket.start) + Date.parse(bucket.end)) / 2,
+          value: bucketOverlayValue(bucket) / overlayMax,
+        })),
+  );
 
   const overlayTicks = $derived.by(() => {
     if (overlayMetric === "none") return [];
     const values =
       overlayDataMax <= 0 ? [0] : [0, overlayDataMax / 2, overlayDataMax];
     return values.map((val) => ({
-      y: scaleY(val, overlayMax, CHART_H),
+      y: PLOT_BOTTOM - (val / overlayMax) * PLOT_H,
       label: fmtOverlayTick(val),
     }));
-  });
-
-  const yTicks = $derived.by(() => {
-    const { step, max } = scale;
-    if (max <= 0 || step <= 0) return [];
-    const ticks: Array<{ y: number; label: string }> = [];
-    const count = Math.round(max / step);
-    for (let i = 0; i <= count; i++) {
-      const val = step * i;
-      ticks.push({
-        y: scaleY(val, max, CHART_H),
-        label: String(val),
-      });
-    }
-    return ticks;
   });
 
   // Local clock fields in the report timezone, used to pick tick boundaries.
@@ -440,29 +545,41 @@
     Math.max(((rangeEndMs - futureStartMs) / rangeSpanMs) * plotWidth, 0),
   );
 
-  const svgW = $derived(plotWidth + Y_LABEL_W + rightAxisW);
-  const svgH = $derived(CHART_H + STRIP_GAP + STRIP_H + X_LABEL_H);
-  const stripY = $derived(CHART_H + STRIP_GAP);
+  // Buckets that start at or after the effective end are entirely in the
+  // future. They get no hit target, so they cannot be hovered, focused,
+  // tooltipped, or selected. Buckets are chronological, so this is a prefix
+  // of bars and slot indexes stay aligned.
+  const liveBars = $derived(
+    bars.filter((bar) => Date.parse(buckets[bar.idx]!.start) < futureStartMs),
+  );
+
+  const svgH = PLOT_BOTTOM + STRIP_GAP + STRIP_H + X_LABEL_H;
+  const stripY = PLOT_BOTTOM + STRIP_GAP;
 
   function setOverlayMetric(value: string) {
     overlayMetric = value as "none" | "tokens" | "cost";
   }
 </script>
 
+<svelte:window
+  onpointerup={finishRangeDrag}
+  onpointercancel={cancelRangeDrag}
+/>
+
 <div class="timeline">
   <div class="timeline-header">
     <h3 class="timeline-title">{m.activity_concurrency()}</h3>
     <div class="panel-actions">
-      <div class="legend" aria-hidden="true">
-        <span class="legend-item">
-          <span class="swatch interactive"></span>{m.activity_interactive()}
-        </span>
-        <span class="legend-item">
-          <span class="swatch automated"></span>{m.activity_automated()}
-        </span>
-      </div>
+      {#if selectedRange}
+        <Button
+          size="sm"
+          surface="soft"
+          label={m.sidebar_clear_selection()}
+          onclick={() => onSelectRange?.(null)}
+        />
+      {/if}
       <div class="overlay-toggle">
-        <span>{m.activity_overlay()}</span>
+        <span>{m.activity_all_sessions_overlay()}</span>
         <Typeahead
           options={overlayOptions}
           value={overlayMetric}
@@ -476,159 +593,223 @@
     </div>
   </div>
 
-  <div class="timeline-body" bind:this={containerEl}>
-    <svg
-      width="100%"
-      height={svgH}
-      viewBox="0 0 {svgW} {svgH}"
-      preserveAspectRatio="xMidYMid meet"
-      class="timeline-svg"
-    >
-      {#if futureW > 0}
-        <rect
-          class="concurrency-future"
-          data-future
-          x={futureX}
-          y={TOP_PAD}
-          width={futureW}
-          height={CHART_H - TOP_PAD}
-        />
-      {/if}
-
-      {#each yTicks as tick}
-        <line
-          x1={Y_LABEL_W}
-          y1={tick.y}
-          x2={Y_LABEL_W + plotWidth}
-          y2={tick.y}
-          class="grid-line"
-        />
-        <text
-          x={Y_LABEL_W - 4}
-          y={tick.y + 3}
-          class="y-label"
-          text-anchor="end"
-        >
-          {tick.label}
-        </text>
+  <div class="chart-meta">
+    <div class="legend" aria-hidden="true">
+      {#each classes as cls (cls.kind)}
+        <span class="legend-item">
+          <span class={`swatch ${cls.kind}`}></span>{cls.label}
+        </span>
       {/each}
+    </div>
+    <span class="chart-peak">{peakLabel}</span>
+  </div>
 
-      {#each bars as bar (bar.idx)}
-        <rect
-          class="concurrency-seg interactive"
-          class:selected={selectedBucket === bar.idx}
-          x={bar.x}
-          y={bar.interactiveY}
-          width={bar.w}
-          height={bar.interactiveH}
-        />
-        <rect
-          class="concurrency-seg automated"
-          class:selected={selectedBucket === bar.idx}
-          x={bar.x}
-          y={bar.automatedY}
-          width={bar.w}
-          height={bar.automatedH}
-        />
-        {#if selectedBucket === bar.idx}
-          <rect
-            class="concurrency-outline"
-            x={bar.x}
-            y={bar.y}
-            width={bar.w}
-            height={bar.h}
+  <div
+    class="timeline-body"
+    role="group"
+    aria-label={m.activity_concurrency()}
+    bind:this={containerEl}
+    onpointermove={moveRangeDrag}
+  >
+    <Chart
+      data={overlayPoints}
+      x="time"
+      y="value"
+      xScale={scaleLinear()}
+      xDomain={[rangeStartMs, rangeEndMs]}
+      yDomain={[0, 1]}
+      xRange={[Y_LABEL_W, Y_LABEL_W + plotWidth]}
+      yRange={[PLOT_BOTTOM, TOP_PAD]}
+      padding={0}
+      height={svgH}
+    >
+      <Layer class="timeline-svg">
+        {#if futureW > 0}
+          <Rect
+            class="concurrency-future"
+            data-future
+            x={futureX}
+            y={TOP_PAD}
+            width={futureW}
+            height={PLOT_H}
           />
         {/if}
-      {/each}
 
-      {#if overlayMetric !== "none" && overlayPath}
-        <path class="overlay-line" d={overlayPath} />
-        <line
-          class="overlay-axis-line"
-          x1={Y_LABEL_W + plotWidth}
-          y1={TOP_PAD}
-          x2={Y_LABEL_W + plotWidth}
-          y2={CHART_H}
-        />
-        {#each overlayTicks as tick}
-          <line
-            class="overlay-axis-tick"
-            x1={Y_LABEL_W + plotWidth}
+        {#each yTicks as tick}
+          <Line
+            x1={Y_LABEL_W}
             y1={tick.y}
-            x2={Y_LABEL_W + plotWidth + 4}
+            x2={Y_LABEL_W + plotWidth}
             y2={tick.y}
+            class="grid-line"
           />
-          <text
-            x={Y_LABEL_W + plotWidth + 6}
+          <Text
+            value={tick.label}
+            x={Y_LABEL_W - 4}
             y={tick.y + 3}
-            class="overlay-y-label"
-            text-anchor="start"
-          >
-            {tick.label}
-          </text>
+            class="y-label"
+            textAnchor="end"
+          />
         {/each}
-      {/if}
+        {#each bars as bar (bar.idx)}
+          {@const selected = activeRange !== null && bar.idx >= activeRange.start && bar.idx < activeRange.end}
+          <g class="concurrency-bar" data-concurrency-bar={bar.idx}>
+            {#each bar.segments as seg (seg.kind)}
+              <Rect
+                class={`concurrency-seg ${seg.kind}${selected ? " selected" : ""}`}
+                x={bar.x}
+                y={seg.y}
+                width={bar.w}
+                height={seg.height}
+              />
+            {/each}
+          </g>
+        {/each}
 
-      {#each xTicks as tick}
-        <text
-          x={tick.x}
-          y={svgH - 4}
-          class="x-label"
-          text-anchor="middle"
-        >
-          {tick.label}
-        </text>
-      {/each}
+        {#if overlayMetric !== "none" && overlayPoints.length > 0}
+          <Spline
+            class="overlay-line"
+            data={overlayPoints}
+            x="time"
+            y="value"
+            fill="none"
+          />
+          <Line
+            class="overlay-axis-line"
+            x1={Y_LABEL_W + plotWidth}
+            y1={TOP_PAD}
+            x2={Y_LABEL_W + plotWidth}
+            y2={PLOT_BOTTOM}
+          />
+          {#each overlayTicks as tick}
+            <Line
+              class="overlay-axis-tick"
+              x1={Y_LABEL_W + plotWidth}
+              y1={tick.y}
+              x2={Y_LABEL_W + plotWidth + 4}
+              y2={tick.y}
+            />
+            <Text
+              value={tick.label}
+              x={Y_LABEL_W + plotWidth + 6}
+              y={tick.y + 3}
+              class="overlay-y-label"
+              textAnchor="start"
+            />
+          {/each}
+        {/if}
 
-      <!-- Active/idle strip: one full-width cell per elapsed bucket. -->
-      {#each bars as bar (bar.idx)}
-        {@const b = buckets[bar.idx]}
-        <rect
-          class="strip-cell"
-          class:active={b !== undefined && b.max_agents > 0}
-          x={bar.cellX}
-          y={stripY}
-          width={bar.cellW}
-          height={STRIP_H}
-        />
-      {/each}
-      {#if futureW > 0}
-        <rect
-          class="strip-future"
-          x={futureX}
-          y={stripY}
-          width={futureW}
-          height={STRIP_H}
-        />
-      {/if}
+        {#each xTicks as tick}
+          <Text
+            value={tick.label}
+            x={tick.x}
+            y={svgH - 4}
+            class="x-label"
+            textAnchor={tick.x <= Y_LABEL_W + 1
+              ? "start"
+              : tick.x >= Y_LABEL_W + plotWidth - 1
+                ? "end"
+                : "middle"}
+          />
+        {/each}
 
-      <!-- Transparent full-cell per-bucket hover/click target (one per bucket).
-           data-bucket-bar lives here, not on the visible bar, because the hover
-           handler that drives the tooltip is on this interactive rect. -->
-      {#each bars as bar (bar.idx)}
-        {@const b = buckets[bar.idx]}
-        <rect
-          class="slot-hit"
-          data-bucket-bar
-          x={bar.cellX}
-          y={TOP_PAD}
-          width={bar.cellW}
-          height={stripY + STRIP_H - TOP_PAD}
-          role="button"
-          tabindex="0"
-          aria-pressed={selectedBucket === bar.idx}
-          aria-label={m.activity_filter_active_in_slot()}
-          onmouseenter={(e) => b && showSlotTip(e, b)}
-          onmouseleave={hideTip}
-          onclick={() => selectSlot(bar.idx)}
-          onkeydown={(e) => onSlotKey(e, bar.idx)}
-        />
-      {/each}
-    </svg>
+        {#each bars as bar (bar.idx)}
+          {@const b = buckets[bar.idx]}
+          <Rect
+            class={`strip-cell${b !== undefined && b.max_agents > 0 ? " active" : ""}`}
+            x={bar.cellX}
+            y={stripY}
+            width={bar.cellW}
+            height={STRIP_H}
+          />
+        {/each}
+        {#if futureW > 0}
+          <Rect
+            class="strip-future"
+            x={futureX}
+            y={stripY}
+            width={futureW}
+            height={STRIP_H}
+          />
+        {/if}
+
+        {#if selectionBounds}
+          <Rect
+            class="range-selection"
+            x={selectionBounds.x}
+            y={TOP_PAD}
+            width={selectionBounds.width}
+            height={stripY + STRIP_H - TOP_PAD}
+          />
+        {/if}
+
+        {#each liveBars as bar (bar.idx)}
+          {@const b = buckets[bar.idx]}
+          <Rect
+            class="slot-hit"
+            data-bucket-bar
+            data-concurrency-bucket-index={bar.idx}
+            x={bar.cellX}
+            y={TOP_PAD}
+            width={bar.cellW}
+            height={stripY + STRIP_H - TOP_PAD}
+            role="button"
+            tabindex={0}
+            aria-pressed={activeRange !== null && bar.idx >= activeRange.start && bar.idx < activeRange.end}
+            aria-label={m.activity_filter_active_in_range()}
+            onmouseenter={(event) => b && showSlotTip(event, b)}
+            onmouseleave={hideTip}
+            onpointerdown={(event) => beginRangeDrag(event, bar.idx)}
+            onpointerenter={() => extendRangeDrag(bar.idx)}
+            onkeydown={(event) => onSlotKey(event, bar.idx)}
+          />
+        {/each}
+      </Layer>
+    </Chart>
 
     {#if tooltip}
-      <div class="tooltip" style="left: {tooltip.x}px; top: {tooltip.y}px;">
-        {tooltip.text}
+      <div
+        bind:this={tooltipEl}
+        class="tooltip"
+        style={tooltipPos
+          ? `left: ${tooltipPos.left}px; top: ${tooltipPos.top}px;`
+          : "visibility: hidden;"}
+      >
+        <div class="tooltip-date">{fmtBucketRange(tooltip.bucket)}</div>
+        <dl class="tooltip-metrics">
+          {#each classes as cls (cls.kind)}
+            <div>
+              <dt>{cls.label}</dt>
+              <dd>{tooltip.bucket[cls.atPeak].toLocaleString(getLocale())}</dd>
+            </div>
+          {/each}
+          <div>
+            <dt>{m.activity_combined_peak()}</dt>
+            <dd>{tooltip.bucket.max_agents.toLocaleString(getLocale())}</dd>
+          </div>
+          {#each classes as cls (cls.kind)}
+            <div>
+              <dt>{cls.peakLabel}</dt>
+              <dd>{tooltip.bucket[cls.max].toLocaleString(getLocale())}</dd>
+            </div>
+          {/each}
+          <div>
+            <dt>{m.activity_agent_min()}</dt>
+            <dd>{fmtCompactValue(tooltip.bucket.agent_minutes)}</dd>
+          </div>
+          <div>
+            <dt>{m.usage_input_tokens()}</dt>
+            <dd>{fmtCompactValue(tooltip.bucket.input_tokens ?? 0)}</dd>
+          </div>
+          <div>
+            <dt>{m.usage_output_tokens()}</dt>
+            <dd>{fmtCompactValue(tooltip.bucket.output_tokens)}</dd>
+          </div>
+          <div>
+            <dt>{m.activity_cost()}</dt>
+            <dd>{formatMoney(tooltip.bucket.cost)}</dd>
+          </div>
+        </dl>
       </div>
     {/if}
   </div>
@@ -644,6 +825,8 @@
     display: flex;
     align-items: center;
     justify-content: space-between;
+    flex-wrap: wrap;
+    gap: 8px;
     margin-bottom: 8px;
   }
 
@@ -659,9 +842,26 @@
     gap: 12px;
   }
 
+  .panel-actions :global(.kit-button.kit-button--sm) {
+    height: 22px;
+    min-height: 22px;
+    padding: 0 8px;
+    font-size: 10px;
+  }
+
+  .chart-meta {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    flex-wrap: wrap;
+    gap: 8px 12px;
+    margin-bottom: 4px;
+  }
+
   .legend {
     display: flex;
     align-items: center;
+    flex-wrap: wrap;
     gap: var(--space-5);
   }
 
@@ -683,12 +883,23 @@
     background: var(--accent-blue);
   }
 
+  .swatch.subagent {
+    background: var(--accent-violet);
+  }
+
   .swatch.automated {
     background: var(--accent-orange);
   }
 
+  .chart-peak {
+    font-size: 10px;
+    color: var(--text-muted);
+    font-family: var(--font-mono);
+  }
+
   .overlay-toggle {
     display: flex;
+    flex-shrink: 0;
     align-items: center;
     gap: 4px;
     font-size: 10px;
@@ -702,120 +913,165 @@
     --typeahead-control-font-size: 10px;
   }
 
+  .overlay-toggle :global(.kit-typeahead) {
+    flex: 0 0 96px;
+    width: 96px;
+  }
+
   .timeline-body {
     width: 100%;
   }
 
-  .timeline-svg {
+  .timeline :global(.timeline-svg) {
     display: block;
   }
 
-  .grid-line {
+  .timeline :global(.grid-line) {
     stroke: var(--border-muted);
     stroke-width: 1;
     stroke-dasharray: 2 2;
   }
 
-  .y-label {
+  .timeline :global(.y-label) {
     font-size: 9px;
     fill: var(--text-muted);
     font-family: var(--font-mono);
   }
 
-  .x-label {
+  .timeline :global(.x-label) {
     font-size: 9px;
     fill: var(--text-muted);
     font-family: var(--font-mono);
   }
 
-  .concurrency-seg {
+  .timeline :global(.concurrency-seg) {
     opacity: 0.75;
-  }
-
-  .concurrency-seg.interactive {
-    fill: var(--accent-blue);
-  }
-
-  .concurrency-seg.automated {
-    fill: var(--accent-orange);
-  }
-
-  .concurrency-seg.selected {
-    opacity: 1;
-  }
-
-  .concurrency-outline {
-    fill: none;
-    stroke: var(--text-primary);
+    /* Surface-colored seam so stacked segments read as separate parts. */
+    stroke: var(--bg-surface);
     stroke-width: 1;
   }
 
-  .concurrency-future {
+  .timeline :global(.concurrency-seg.interactive) {
+    fill: var(--accent-blue);
+  }
+
+  .timeline :global(.concurrency-seg.subagent) {
+    fill: var(--accent-violet);
+  }
+
+  .timeline :global(.concurrency-seg.automated) {
+    fill: var(--accent-orange);
+  }
+
+  .timeline :global(.concurrency-seg.selected) {
+    opacity: 1;
+  }
+
+  .timeline :global(.range-selection) {
+    fill: var(--accent-blue);
+    fill-opacity: 0.16;
+    stroke: var(--accent-blue);
+    stroke-opacity: 1;
+    stroke-width: 1.5;
+    pointer-events: none;
+  }
+
+  .timeline :global(.concurrency-future) {
     fill: var(--bg-inset);
     opacity: 0.5;
   }
 
-  .overlay-line {
+  .timeline :global(.overlay-line) {
     fill: none;
     stroke: var(--accent-amber);
     stroke-width: 1.5;
     opacity: 0.85;
   }
 
-  .overlay-axis-line,
-  .overlay-axis-tick {
+  .timeline :global(.overlay-axis-line),
+  .timeline :global(.overlay-axis-tick) {
     stroke: var(--accent-amber);
     stroke-width: 1;
     opacity: 0.55;
   }
 
-  .overlay-y-label {
+  .timeline :global(.overlay-y-label) {
     font-size: 9px;
     fill: var(--accent-amber);
     font-family: var(--font-mono);
   }
 
-  .strip-cell {
+  .timeline :global(.strip-cell) {
     fill: var(--bg-inset);
     stroke: var(--bg-surface);
     stroke-width: 0.5;
   }
 
-  .strip-cell.active {
+  .timeline :global(.strip-cell.active) {
     fill: var(--accent-blue);
     opacity: 0.55;
   }
 
-  .strip-future {
+  .timeline :global(.strip-future) {
     fill: var(--bg-inset);
     opacity: 0.5;
   }
 
-  .slot-hit {
+  .timeline :global(.slot-hit) {
     fill: transparent;
     cursor: pointer;
   }
 
-  .slot-hit:hover {
+  .timeline :global(.slot-hit:hover) {
     fill: var(--accent-blue);
     opacity: 0.08;
   }
 
-  .slot-hit:focus-visible {
+  .timeline :global(.slot-hit:focus-visible) {
     outline: 1px solid var(--accent-blue);
     outline-offset: -1px;
   }
 
   .tooltip {
     position: fixed;
-    transform: translateX(-50%) translateY(-100%);
-    padding: 4px 8px;
+    min-width: 168px;
+    padding: 8px 10px;
     background: var(--text-primary);
     color: var(--bg-primary);
-    font-size: 10px;
+    font-size: 11px;
     border-radius: var(--radius-sm);
     white-space: nowrap;
     pointer-events: none;
     z-index: var(--z-tooltip);
+  }
+
+  .tooltip-date {
+    padding-bottom: 6px;
+    border-bottom: 1px solid color-mix(in srgb, currentColor 18%, transparent);
+    font-weight: 600;
+  }
+
+  .tooltip-metrics {
+    display: grid;
+    gap: 4px;
+    margin: 6px 0 0;
+  }
+
+  .tooltip-metrics > div {
+    display: grid;
+    grid-template-columns: 1fr auto;
+    gap: 16px;
+    align-items: baseline;
+  }
+
+  .tooltip-metrics dt {
+    opacity: 0.7;
+  }
+
+  .tooltip-metrics dd {
+    margin: 0;
+    font-family: var(--font-mono);
+    font-weight: 600;
+    text-align: right;
   }
 </style>

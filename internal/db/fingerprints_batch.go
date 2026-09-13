@@ -119,10 +119,10 @@ func (db *DB) MessageTokenFingerprints(
 	err := forEachSessionIDBatch(sessionIDs, func(chunk []string) error {
 		ph, args := sessionIDArgs(chunk)
 		rows, err := db.getReader().Query(`
-			SELECT session_id, ordinal, model, token_usage, context_tokens,
+			SELECT session_id, ordinal, model, reasoning_effort, provider_id, token_usage, context_tokens,
 				output_tokens, has_context_tokens, has_output_tokens,
 				claude_message_id, claude_request_id,
-				source_type, source_subtype, source_uuid,
+				source_type, source_subtype, prompt_source, source_uuid,
 				source_parent_uuid, is_sidechain, is_compact_boundary
 			 FROM messages
 			 WHERE session_id IN (`+ph+`)
@@ -138,11 +138,11 @@ func (db *DB) MessageTokenFingerprints(
 			var sessionID string
 			var r tokenFingerprintRow
 			if err := rows.Scan(
-				&sessionID, &r.ordinal, &r.model, &r.tokenUsage,
+				&sessionID, &r.ordinal, &r.model, &r.reasoningEffort, &r.providerID, &r.tokenUsage,
 				&r.contextTokens, &r.outputTokens,
 				&r.hasContextTokens, &r.hasOutputTokens,
 				&r.claudeMessageID, &r.claudeRequestID,
-				&r.sourceType, &r.sourceSubtype, &r.sourceUUID,
+				&r.sourceType, &r.sourceSubtype, &r.promptSource, &r.sourceUUID,
 				&r.sourceParentUUID, &r.isSidechain, &r.isCompactBoundary,
 			); err != nil {
 				return err
@@ -599,6 +599,8 @@ func (db *DB) PinnedMessagesBySession(
 type tokenFingerprintRow struct {
 	ordinal           int
 	model             string
+	reasoningEffort   string
+	providerID        string
 	tokenUsage        string
 	contextTokens     int
 	outputTokens      int
@@ -608,6 +610,7 @@ type tokenFingerprintRow struct {
 	claudeRequestID   string
 	sourceType        string
 	sourceSubtype     string
+	promptSource      string
 	sourceUUID        string
 	sourceParentUUID  string
 	isSidechain       bool
@@ -620,24 +623,30 @@ type tokenFingerprintRow struct {
 // session on every push.
 func (r tokenFingerprintRow) appendTo(b *strings.Builder) {
 	model := SanitizeUTF8(r.model)
+	reasoningEffort := SanitizeUTF8(r.reasoningEffort)
+	providerID := SanitizeUTF8(r.providerID)
 	tokenUsage := SanitizeUTF8(r.tokenUsage)
 	claudeMsgID := SanitizeUTF8(r.claudeMessageID)
 	claudeReqID := SanitizeUTF8(r.claudeRequestID)
 	srcType := SanitizeUTF8(r.sourceType)
 	srcSubtype := SanitizeUTF8(r.sourceSubtype)
+	promptSource := SanitizeUTF8(r.promptSource)
 	srcUUID := SanitizeUTF8(r.sourceUUID)
 	srcParentUUID := SanitizeUTF8(r.sourceParentUUID)
 	fmt.Fprintf(b,
-		"%d|%d:%s|%d:%s|%d|%d|%t|%t|%s|%s|"+
-			"%d:%s|%d:%s|%d:%s|%d:%s|%t|%t;",
+		"%d|%d:%s|%d:%s|%d:%s|%d:%s|%d|%d|%t|%t|%s|%s|"+
+			"%d:%s|%d:%s|%d:%s|%d:%s|%d:%s|%t|%t;",
 		r.ordinal,
 		len(model), model,
+		len(reasoningEffort), reasoningEffort,
+		len(providerID), providerID,
 		len(tokenUsage), tokenUsage,
 		r.contextTokens, r.outputTokens,
 		r.hasContextTokens, r.hasOutputTokens,
 		claudeMsgID, claudeReqID,
 		len(srcType), srcType,
 		len(srcSubtype), srcSubtype,
+		len(promptSource), promptSource,
 		len(srcUUID), srcUUID,
 		len(srcParentUUID), srcParentUUID,
 		r.isSidechain, r.isCompactBoundary,

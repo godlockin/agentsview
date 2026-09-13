@@ -3,7 +3,8 @@ package parser
 import (
 	"context"
 	"database/sql"
-	"encoding/json"
+	"encoding/json/jsontext"
+	"encoding/json/v2"
 	"errors"
 	"fmt"
 	"os"
@@ -31,7 +32,7 @@ func ListWarpSessionMeta(
 ) ([]WarpSessionMeta, error) {
 	var metas []WarpSessionMeta
 	err := ForEachWarpSessionMeta(
-		context.Background(), dbPath,
+		context.Background(), dbPath, false,
 		func(meta WarpSessionMeta) error {
 			metas = append(metas, meta)
 			return nil
@@ -41,13 +42,13 @@ func ListWarpSessionMeta(
 }
 
 func ForEachWarpSessionMeta(
-	ctx context.Context, dbPath string, yield func(WarpSessionMeta) error,
+	ctx context.Context, dbPath string, stableSnapshot bool, yield func(WarpSessionMeta) error,
 ) error {
 	if _, err := os.Stat(dbPath); os.IsNotExist(err) {
 		return nil
 	}
 
-	db, err := openWarpDB(dbPath)
+	db, err := openWarpDB(dbPath, stableSnapshot)
 	if err != nil {
 		return err
 	}
@@ -88,9 +89,9 @@ func ForEachWarpSessionMeta(
 }
 
 func warpSessionMeta(
-	ctx context.Context, dbPath, sessionID string,
+	ctx context.Context, dbPath, sessionID string, stableSnapshot bool,
 ) (WarpSessionMeta, bool, error) {
-	db, err := openWarpDB(dbPath)
+	db, err := openWarpDB(dbPath, stableSnapshot)
 	if err != nil {
 		return WarpSessionMeta{}, false, err
 	}
@@ -115,7 +116,7 @@ func warpSessionMeta(
 // parseWarpSession parses a single conversation by ID from
 // the Warp database.
 func parseWarpSession(
-	dbPath, conversationID, machine string,
+	ctx context.Context, dbPath, conversationID, machine string, stableSnapshot bool,
 ) (*ParsedSession, []ParsedMessage, error) {
 	if _, err := os.Stat(dbPath); os.IsNotExist(err) {
 		return nil, nil, fmt.Errorf(
@@ -123,13 +124,13 @@ func parseWarpSession(
 		)
 	}
 
-	db, err := openWarpDB(dbPath)
+	db, err := openWarpDB(dbPath, stableSnapshot)
 	if err != nil {
 		return nil, nil, err
 	}
 	defer db.Close()
 
-	c, err := loadOneWarpConversation(db, conversationID)
+	c, err := loadOneWarpConversation(ctx, db, conversationID)
 	if err != nil {
 		return nil, nil, fmt.Errorf(
 			"loading warp conversation %s: %w",
@@ -137,12 +138,15 @@ func parseWarpSession(
 		)
 	}
 
-	return buildWarpSession(db, c, dbPath, machine)
+	return buildWarpSession(ctx, db, c, dbPath, machine)
 }
 
-func openWarpDB(dbPath string) (*sql.DB, error) {
-	dsn := "file:" + sqliteURIPath(dbPath) +
-		"?mode=ro&_busy_timeout=3000"
+func openWarpDB(dbPath string, stableSnapshot bool) (*sql.DB, error) {
+	immutable := "0"
+	if stableSnapshot {
+		immutable = "1"
+	}
+	dsn := "file:" + sqliteURIPath(dbPath) + "?mode=ro&immutable=" + immutable + "&_busy_timeout=3000"
 	db, err := sql.Open("sqlite3", dsn)
 	if err != nil {
 		return nil, fmt.Errorf(
@@ -160,9 +164,9 @@ type warpConversationRow struct {
 }
 
 func loadOneWarpConversation(
-	db *sql.DB, conversationID string,
+	ctx context.Context, db *sql.DB, conversationID string,
 ) (warpConversationRow, error) {
-	row := db.QueryRow(`
+	row := db.QueryRowContext(ctx, `
 		SELECT conversation_id,
 		       COALESCE(conversation_data, '{}'),
 		       last_modified_at
@@ -188,9 +192,9 @@ type warpExchangeRow struct {
 }
 
 func loadWarpExchanges(
-	db *sql.DB, conversationID string,
+	ctx context.Context, db *sql.DB, conversationID string,
 ) ([]warpExchangeRow, error) {
-	rows, err := db.Query(`
+	rows, err := db.QueryContext(ctx, `
 		SELECT exchange_id, start_ts,
 		       COALESCE(input, '[]'),
 		       COALESCE(model_id, ''),
@@ -220,11 +224,12 @@ func loadWarpExchanges(
 }
 
 func buildWarpSession(
+	ctx context.Context,
 	db *sql.DB,
 	c warpConversationRow,
 	dbPath, machine string,
 ) (*ParsedSession, []ParsedMessage, error) {
-	exchanges, err := loadWarpExchanges(db, c.id)
+	exchanges, err := loadWarpExchanges(ctx, db, c.id)
 	if err != nil {
 		return nil, nil, fmt.Errorf(
 			"loading exchanges for %s: %w", c.id, err,
@@ -294,7 +299,7 @@ func buildWarpSession(
 
 	// Extract project from working directory.
 	if cwd != "" {
-		project = ExtractProjectFromCwd(cwd)
+		project = ExtractProjectFromCwdWithBranchContext(ctx, cwd, "")
 	}
 	if project == "" {
 		project = "unknown"
@@ -358,6 +363,10 @@ type warpToolStats struct {
 	UseComputer        int
 }
 
+type warpToolCount struct {
+	Count int `json:"count"`
+}
+
 func parseWarpConversationMeta(data string) warpConversationMeta {
 	var meta warpConversationMeta
 	if data == "" || data == "{}" {
@@ -371,21 +380,19 @@ func parseWarpConversationMeta(data string) warpConversationMeta {
 				BYOKTokens int `json:"byok_tokens"`
 			} `json:"token_usage"`
 			ToolUsage struct {
-				RunCommand     struct{ Count int } `json:"run_command_stats"`
-				ReadFiles      struct{ Count int } `json:"read_files_stats"`
-				SearchCodebase struct{ Count int } `json:"search_codebase_stats"`
-				Grep           struct{ Count int } `json:"grep_stats"`
-				FileGlob       struct{ Count int } `json:"file_glob_stats"`
-				ApplyFileDiff  struct {
-					Count int `json:"count"`
-				} `json:"apply_file_diff_stats"`
-				WriteLongRunning  struct{ Count int } `json:"write_to_long_running_shell_command_stats"`
-				ReadMCPResource   struct{ Count int } `json:"read_mcp_resource_stats"`
-				CallMCPTool       struct{ Count int } `json:"call_mcp_tool_stats"`
-				SuggestPlan       struct{ Count int } `json:"suggest_plan_stats"`
-				SuggestCreatePlan struct{ Count int } `json:"suggest_create_plan_stats"`
-				ReadShellOutput   struct{ Count int } `json:"read_shell_command_output_stats"`
-				UseComputer       struct{ Count int } `json:"use_computer_stats"`
+				RunCommand        warpToolCount `json:"run_command_stats"`
+				ReadFiles         warpToolCount `json:"read_files_stats"`
+				SearchCodebase    warpToolCount `json:"search_codebase_stats"`
+				Grep              warpToolCount `json:"grep_stats"`
+				FileGlob          warpToolCount `json:"file_glob_stats"`
+				ApplyFileDiff     warpToolCount `json:"apply_file_diff_stats"`
+				WriteLongRunning  warpToolCount `json:"write_to_long_running_shell_command_stats"`
+				ReadMCPResource   warpToolCount `json:"read_mcp_resource_stats"`
+				CallMCPTool       warpToolCount `json:"call_mcp_tool_stats"`
+				SuggestPlan       warpToolCount `json:"suggest_plan_stats"`
+				SuggestCreatePlan warpToolCount `json:"suggest_create_plan_stats"`
+				ReadShellOutput   warpToolCount `json:"read_shell_command_output_stats"`
+				UseComputer       warpToolCount `json:"use_computer_stats"`
 			} `json:"tool_usage_metadata"`
 		} `json:"conversation_usage_metadata"`
 	}
@@ -481,7 +488,7 @@ func extractWarpQueryText(input string) string {
 		return ""
 	}
 
-	var items []json.RawMessage
+	var items []jsontext.Value
 	if err := json.Unmarshal([]byte(input), &items); err != nil {
 		return ""
 	}

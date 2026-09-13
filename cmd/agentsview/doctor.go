@@ -14,7 +14,6 @@ import (
 	"github.com/spf13/cobra"
 	"go.kenn.io/agentsview/internal/config"
 	"go.kenn.io/agentsview/internal/db"
-	"go.kenn.io/agentsview/internal/db/driver"
 	"go.kenn.io/agentsview/internal/parser"
 )
 
@@ -97,11 +96,11 @@ func runDoctorSync(w io.Writer, cfg config.Config) error {
 }
 
 func collectDoctorSyncReport(cfg config.Config) doctorSyncReport {
-	report := doctorSyncReport{Config: cfg}
+	report := doctorSyncReport{Config: cfg,
 
-	report.doctorDBInspection = inspectDoctorDB(cfg.DBPath)
-	report.TempFiles = listDoctorResyncTempFiles(cfg.DBPath)
-	report.AgentRoots = collectDoctorAgentRoots(cfg)
+		doctorDBInspection: inspectDoctorDB(cfg.DBPath),
+		TempFiles:          listDoctorResyncTempFiles(cfg.DBPath),
+		AgentRoots:         collectDoctorAgentRoots(cfg)}
 	report.TraeEncryptedRoots = collectDoctorTraeEncryptedRoots(report.AgentRoots)
 	report.DebugLines, report.DebugLogErr = readDoctorDebugLines(
 		filepath.Join(cfg.DataDir, "debug.log"),
@@ -127,7 +126,7 @@ func inspectDoctorDB(path string) doctorDBInspection {
 		return insp
 	}
 
-	conn, err := sql.Open(driver.DriverName, doctorReadOnlyDSN(path))
+	conn, err := sql.Open("sqlite3", doctorReadOnlyDSN(path))
 	if err != nil {
 		insp.DBError = err
 		return insp

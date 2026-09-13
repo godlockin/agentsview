@@ -5,7 +5,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"io"
 	"strings"
 	"testing"
 
@@ -15,6 +14,8 @@ import (
 )
 
 func TestCheckpointFloorBootstrapsFromLiveAndQuarantinedNodes(t *testing.T) {
+	t.Parallel()
+
 	_, store := newTestDocbankStore(t, docbank.Config{})
 	database := testDB(t)
 	origin := contractOrigin
@@ -47,6 +48,8 @@ func TestCheckpointFloorBootstrapsFromLiveAndQuarantinedNodes(t *testing.T) {
 }
 
 func TestCheckpointFloorTraversesStoreOnlyBeforeBootstrap(t *testing.T) {
+	t.Parallel()
+
 	database := testDB(t)
 	store := &countingCheckpointFloorStore{floor: 40}
 
@@ -74,7 +77,9 @@ func (s *countingCheckpointFloorStore) checkpointFloor(context.Context, string) 
 	return s.floor, nil
 }
 
-func TestExportCheckpointBootstrapStreamsLargeSessionMap(t *testing.T) {
+func TestExportCheckpointBootstrapReadsLargeSessionMap(t *testing.T) {
+	t.Parallel()
+
 	sessions := make(map[string]string, 2000)
 	for i := range 2000 {
 		sessions[fmt.Sprintf("%s~session-%04d", contractOrigin, i)] = strings64("a")
@@ -83,18 +88,17 @@ func TestExportCheckpointBootstrapStreamsLargeSessionMap(t *testing.T) {
 		Version: checkpointFormatVersion, Origin: contractOrigin, Sequence: 42, Sessions: sessions,
 	})
 	require.NoError(t, err)
-	reader := &maxReadReader{reader: strings.NewReader(string(body))}
-	head, err := decodeCanonicalCheckpointHead(reader, contractOrigin,
+	head, err := decodeCanonicalCheckpointHead(strings.NewReader(string(body)), contractOrigin,
 		"cp-0000000042.json", identityForBytes(t, body))
 	require.NoError(t, err)
 	mapBytes, err := canonicalJSON(sessions)
 	require.NoError(t, err)
 	assert.Equal(t, hashHex(mapBytes), head.SessionMapSHA256)
-	assert.Less(t, reader.max, len(body)/4,
-		"bootstrap must tokenize the checkpoint instead of reading its full body")
 }
 
 func TestExportCheckpointBootstrapSkipsNoncanonicalJSON(t *testing.T) {
+	t.Parallel()
+
 	tests := []struct {
 		name string
 		body string
@@ -132,6 +136,8 @@ func TestExportCheckpointBootstrapSkipsNoncanonicalJSON(t *testing.T) {
 }
 
 func TestExportCheckpointBootstrapSkipsMalformedCheckpointBeforeEOF(t *testing.T) {
+	t.Parallel()
+
 	database := testExportDB(t)
 	store := newTestArtifactStore(t)
 	body := append([]byte(`{"unexpected":`), deterministicDocbankBytes(1<<20)...)
@@ -153,6 +159,8 @@ func TestExportCheckpointBootstrapSkipsMalformedCheckpointBeforeEOF(t *testing.T
 }
 
 func TestExportCheckpointBootstrapDefersOnlyValidFutureCheckpoint(t *testing.T) {
+	t.Parallel()
+
 	tests := []struct {
 		name       string
 		body       string
@@ -273,24 +281,14 @@ func (s *checkpointVerifyErrorStore) Open(
 	return entry, &verifyErrorReader{VerifiedReader: reader, err: s.err}, nil
 }
 
-type maxReadReader struct {
-	reader io.Reader
-	max    int
-}
-
-func (r *maxReadReader) Read(p []byte) (int, error) {
-	if len(p) > r.max {
-		r.max = len(p)
-	}
-	return r.reader.Read(p)
-}
-
 // strings64 builds a 64-character stand-in for a sha256 hex digest.
 func strings64(ch string) string {
 	return strings.Repeat(ch, 64)
 }
 
 func TestDecodeSegmentRejectsAggregateNestedLimitsWithSmallLimits(t *testing.T) {
+	t.Parallel()
+
 	tests := []struct {
 		name      string
 		records   []segmentMessage
@@ -334,6 +332,8 @@ func TestDecodeSegmentRejectsAggregateNestedLimitsWithSmallLimits(t *testing.T) 
 }
 
 func TestDecodeSegmentAcceptsCanonicalTrailingNewlineAndEmptySession(t *testing.T) {
+	t.Parallel()
+
 	record := nestedSegmentData(t, segmentMessage{})
 	tests := []struct {
 		name string

@@ -13,18 +13,19 @@
     LinkIcon,
     SearchIcon,
     SquareTerminalIcon,
+    TriangleAlertIcon,
   } from "../../icons.js";
   import { onDestroy, onMount } from "svelte";
   import type { Session } from "../../api/types.js";
   import {
     OpenersService,
     SessionsService,
+    type Opener,
     type ResumeRequest,
     type ResumeResponse,
   } from "../../api/generated/index";
   import {
     callGenerated,
-    configureGeneratedClient,
     isAbortError,
   } from "../../api/runtime.js";
   import { copyToClipboard } from "../../utils/clipboard.js";
@@ -39,6 +40,8 @@
   import { normalizeMessagePreview } from "../../utils/messages.js";
   import { getGradeStyle, getGradeLabel } from "../../utils/grade.js";
   import SignalPanel from "../content/SignalPanel.svelte";
+  import SessionFilterControl from "../filters/SessionFilterControl.svelte";
+  import SidebarToggleButton from "./SidebarToggleButton.svelte";
   import { sessions } from "../../stores/sessions.svelte.js";
   import { router } from "../../stores/router.svelte.js";
   import { insights } from "../../stores/insights.svelte.js";
@@ -53,6 +56,7 @@
 
   import { inSessionSearch } from "../../stores/inSessionSearch.svelte.js";
   import { messages as messagesStore } from "../../stores/messages.svelte.js";
+  import { formatModelEffort } from "../../utils/model.js";
   import { ui } from "../../stores/ui.svelte.js";
   import { m } from "../../i18n/index.js";
 
@@ -72,23 +76,13 @@
   let showOpenMenu = $state(false);
   let openers: Opener[] = $state([]);
   let openFeedback = $state("");
+  let openFeedbackKind = $state<"success" | "error">("success");
   let feedbackTimer: ReturnType<typeof setTimeout> | undefined;
   let sessionDir = $state<string | null>(null);
   const openersRead = new LatestRead();
   const directoryRead = new LatestRead();
   const costRead = new LatestRead();
   const breakdownRead = new LatestRead();
-
-  interface Opener {
-    id: string;
-    name: string;
-    kind: "editor" | "terminal" | "files" | "action";
-    bin: string;
-  }
-
-  interface OpenersResponse {
-    openers: Opener[];
-  }
 
   interface SessionDirectoryResponse {
     path: string;
@@ -111,11 +105,10 @@
 
   onMount(() => {
     const signal = openersRead.begin();
-    configureGeneratedClient();
-    callGenerated(() => OpenersService.getApiV1Openers(), signal)
+    callGenerated((options) => OpenersService.getApiV1Openers(options), signal)
       .then((res) => {
         if (!openersRead.isCurrent(signal)) return;
-        openers = (res as unknown as OpenersResponse).openers;
+        openers = res.openers;
       })
       .catch((e) => {
         if (!isAbortError(e)) openers = [];
@@ -139,9 +132,8 @@
     const signal = directoryRead.begin();
     pendingSessionDirId = id;
     sessionDir = null;
-    configureGeneratedClient();
     callGenerated(
-      () => SessionsService.getApiV1SessionsIdDirectory({ id }),
+      (options) => SessionsService.getApiV1SessionsByIdDirectory({ id }, options),
       signal,
     )
       .then(({ path }) => {
@@ -250,9 +242,8 @@
     if (key === costFetchKey) return;
     const signal = costRead.begin();
     costSessionId = id;
-    configureGeneratedClient();
     callGenerated(
-      () => SessionsService.getApiV1SessionsIdUsage({ id, rollup: true }),
+      (options) => SessionsService.getApiV1SessionsByIdUsage({ id }, { rollup: true }, options),
       signal,
     )
       .then((res) => {
@@ -291,18 +282,16 @@
     if (key === breakdownFetchKey) return;
     const signal = breakdownRead.begin();
     usageBreakdownLoading = true;
-    configureGeneratedClient();
     callGenerated(
-      () => SessionsService.getApiV1SessionsIdUsage({ id, breakdown: true }),
+      (options) =>
+        SessionsService.getApiV1SessionsByIdUsage({ id }, { breakdown: true }, options),
       signal,
     )
       .then((res) => {
         if (!breakdownRead.isCurrent(signal)) return;
         breakdownFetchKey = key;
         usageBreakdownLoading = false;
-        sessionUsageBreakdown = Array.isArray(res.breakdown)
-          ? (res.breakdown as SessionUsageBreakdownEntry[])
-          : [];
+        sessionUsageBreakdown = Array.isArray(res.breakdown) ? res.breakdown : [];
       })
       .catch((e) => {
         if (isAbortError(e) || !breakdownRead.isCurrent(signal)) return;
@@ -359,11 +348,12 @@
       : null,
   );
 
-  let mainModel = $derived(
+  let mainModelInfo = $derived(
     messagesStore.sessionId === session?.id
-      ? messagesStore.mainModel
-      : "",
+      ? messagesStore.mainModelInfo
+      : { model: "", reasoningEffort: "" },
   );
+  let mainModel = $derived(formatModelEffort(mainModelInfo));
 
   let resumeModel = $derived(
     session ? messagesStore.resumeModelFor(session.id) : "",
@@ -441,7 +431,7 @@
   function handleAgentAnalysis() {
     if (!session) return;
     insights.generateForSession(session);
-    router.navigate("insights");
+    router.navigate("recall", { tab: "generated" });
   }
 
   function toggleMenu() {
@@ -488,8 +478,9 @@
     }
   }
 
-  function showFeedback(msg: string) {
+  function showFeedback(msg: string, kind: "success" | "error" = "success") {
     openFeedback = msg;
+    openFeedbackKind = kind;
     clearTimeout(feedbackTimer);
     feedbackTimer = setTimeout(() => { openFeedback = ""; }, 2000);
   }
@@ -498,14 +489,10 @@
     if (!session) return;
     showOpenMenu = false;
     try {
-      configureGeneratedClient();
-      const resp =
-        await SessionsService.postApiV1SessionsIdResume({
-          id: session.id,
-          requestBody: {
-            opener_id: opener.id,
-          } satisfies ResumeRequest,
-        }) as ResumeResponse;
+      const resp = await SessionsService.postApiV1SessionsByIdResume(
+        { id: session.id },
+        { opener_id: opener.id } satisfies ResumeRequest,
+      );
       if (resp.launched) {
         showFeedback(m.session_breadcrumb_resumed_in({
           target: resp.terminal ?? opener.name,
@@ -516,9 +503,12 @@
       if (resp.command) {
         const cmd = formatResumeResponseCommand(session.agent, resp);
         const ok = cmd ? await copyToClipboard(cmd) : false;
-        showFeedback(ok
-          ? m.session_breadcrumb_command_copied()
-          : m.session_breadcrumb_failed());
+        showFeedback(
+          ok
+            ? m.session_breadcrumb_command_copied()
+            : m.session_breadcrumb_failed(),
+          ok ? "success" : "error",
+        );
         return;
       }
     } catch {
@@ -529,11 +519,14 @@
     });
     if (cmd) {
       const ok = await copyToClipboard(cmd);
-      showFeedback(ok
-        ? m.session_breadcrumb_command_copied()
-        : m.session_breadcrumb_failed());
+      showFeedback(
+        ok
+          ? m.session_breadcrumb_command_copied()
+          : m.session_breadcrumb_failed(),
+        ok ? "success" : "error",
+      );
     } else {
-      showFeedback(m.session_breadcrumb_not_supported());
+      showFeedback(m.session_breadcrumb_not_supported(), "error");
     }
   }
 
@@ -541,18 +534,19 @@
     if (!session) return;
     showOpenMenu = false;
     try {
-      configureGeneratedClient();
-      const resp =
-        await SessionsService.postApiV1SessionsIdResume({
-          id: session.id,
-          requestBody: { command_only: true } satisfies ResumeRequest,
-        }) as ResumeResponse;
+      const resp = await SessionsService.postApiV1SessionsByIdResume(
+        { id: session.id },
+        { command_only: true } satisfies ResumeRequest,
+      );
       if (resp.command) {
         const cmd = formatResumeResponseCommand(session.agent, resp);
         const ok = cmd ? await copyToClipboard(cmd) : false;
-        showFeedback(ok
-          ? m.session_breadcrumb_command_copied()
-          : m.session_breadcrumb_failed());
+        showFeedback(
+          ok
+            ? m.session_breadcrumb_command_copied()
+            : m.session_breadcrumb_failed(),
+          ok ? "success" : "error",
+        );
         return;
       }
     } catch {
@@ -563,40 +557,45 @@
     });
     if (cmd) {
       const ok = await copyToClipboard(cmd);
-      showFeedback(ok
-        ? m.session_breadcrumb_command_copied()
-        : m.session_breadcrumb_failed());
+      showFeedback(
+        ok
+          ? m.session_breadcrumb_command_copied()
+          : m.session_breadcrumb_failed(),
+        ok ? "success" : "error",
+      );
     } else {
-      showFeedback(m.session_breadcrumb_not_supported());
+      showFeedback(m.session_breadcrumb_not_supported(), "error");
     }
   }
 
   async function handleCopyFilePath() {
     showOpenMenu = false;
     if (!sessionDir) {
-      showFeedback(m.session_breadcrumb_no_path_available());
+      showFeedback(m.session_breadcrumb_no_path_available(), "error");
       return;
     }
     const ok = await copyToClipboard(sessionDir);
-    showFeedback(ok
-      ? m.session_breadcrumb_path_copied()
-      : m.session_breadcrumb_failed());
+    showFeedback(
+      ok
+        ? m.session_breadcrumb_path_copied()
+        : m.session_breadcrumb_failed(),
+      ok ? "success" : "error",
+    );
   }
 
   async function handleOpenIn(opener: Opener) {
     if (!session) return;
     showOpenMenu = false;
     try {
-      configureGeneratedClient();
-      await SessionsService.postApiV1SessionsIdOpen({
-        id: session.id,
-        requestBody: { opener_id: opener.id },
-      });
+      await SessionsService.postApiV1SessionsByIdOpen(
+        { id: session.id },
+        { opener_id: opener.id },
+      );
       showFeedback(m.session_breadcrumb_opened_in({
         target: opener.name,
       }));
     } catch {
-      showFeedback(m.session_breadcrumb_failed_to_open());
+      showFeedback(m.session_breadcrumb_failed_to_open(), "error");
     }
   }
 
@@ -604,12 +603,7 @@
     if (!session) return;
     showOpenMenu = false;
     try {
-      configureGeneratedClient();
-      const resp =
-        await SessionsService.postApiV1SessionsIdResume({
-          id: session.id,
-          requestBody: {},
-        }) as ResumeResponse;
+      const resp = await SessionsService.postApiV1SessionsByIdResume({ id: session.id }, {});
       if (resp.launched) {
         showFeedback(
           m.session_breadcrumb_resumed_in({
@@ -621,9 +615,12 @@
       if (resp.command) {
         const cmd = formatResumeResponseCommand(session.agent, resp);
         const ok = cmd ? await copyToClipboard(cmd) : false;
-        showFeedback(ok
-          ? m.session_breadcrumb_command_copied()
-          : m.session_breadcrumb_failed());
+        showFeedback(
+          ok
+            ? m.session_breadcrumb_command_copied()
+            : m.session_breadcrumb_failed(),
+          ok ? "success" : "error",
+        );
         return;
       }
     } catch {
@@ -634,11 +631,14 @@
     });
     if (cmd) {
       const ok = await copyToClipboard(cmd);
-      showFeedback(ok
-        ? m.session_breadcrumb_command_copied()
-        : m.session_breadcrumb_failed());
+      showFeedback(
+        ok
+          ? m.session_breadcrumb_command_copied()
+          : m.session_breadcrumb_failed(),
+        ok ? "success" : "error",
+      );
     } else {
-      showFeedback(m.session_breadcrumb_not_supported());
+      showFeedback(m.session_breadcrumb_not_supported(), "error");
     }
   }
 
@@ -741,6 +741,19 @@
 
 
 <div class="session-breadcrumb">
+  {#if !ui.isMobileViewport && !ui.sidebarOpen}
+    <div
+      class="sidebar-controls"
+      data-sidebar-focus-region="content"
+    >
+      <SidebarToggleButton placement="content" />
+      <SessionFilterControl
+        showDisplay={false}
+        showStarred={false}
+        align="left"
+      />
+    </div>
+  {/if}
   <button
     class="breadcrumb-link"
     onclick={onBack}
@@ -827,7 +840,8 @@
         <span class="open-group">
           <button
             class="resume-btn"
-            class:has-feedback={openFeedback !== ""}
+            class:has-feedback-success={openFeedback !== "" && openFeedbackKind === "success"}
+            class:has-feedback-error={openFeedback !== "" && openFeedbackKind === "error"}
             onclick={(e) => { e.stopPropagation(); showOpenMenu = !showOpenMenu; }}
             title={canResume
               ? m.session_breadcrumb_resume_session_in_terminal()
@@ -837,7 +851,11 @@
               : m.session_breadcrumb_session_actions()}
           >
             {#if openFeedback}
-              <CheckIcon size="11" strokeWidth="2.4" aria-hidden="true" />
+              {#if openFeedbackKind === "error"}
+                <TriangleAlertIcon size="11" strokeWidth="2.2" aria-hidden="true" />
+              {:else}
+                <CheckIcon size="11" strokeWidth="2.4" aria-hidden="true" />
+              {/if}
               {openFeedback}
             {:else}
               {canResume
@@ -1030,8 +1048,12 @@
           {/if}
         </span>
       {/if}
-      {#if mainModel}
-        <span class="model-badge" title={mainModel}>{mainModel}</span>
+      {#if mainModelInfo.model}
+        <span
+          class="model-badge"
+          class:model-badge--with-effort={mainModelInfo.reasoningEffort}
+          title={mainModel}
+        ><span class="model-badge__model">{mainModelInfo.model}</span>{#if mainModelInfo.reasoningEffort}{" "}<span class="model-badge__effort">{mainModelInfo.reasoningEffort}</span>{/if}</span>
       {/if}
       <div class="actions-wrapper">
         <button
@@ -1124,6 +1146,12 @@
     color: var(--text-muted);
   }
 
+  .sidebar-controls {
+    position: relative;
+    display: flex;
+    align-items: center;
+  }
+
   .breadcrumb-link {
     color: var(--text-muted);
     font-size: 11px;
@@ -1170,7 +1198,8 @@
     align-items: center;
     gap: 6px;
     margin-left: auto;
-    flex-shrink: 0;
+    min-width: 0;
+    flex-shrink: 1;
   }
 
   .agent-badge {
@@ -1291,8 +1320,12 @@
     background: var(--bg-surface-hover);
   }
 
-  .resume-btn.has-feedback {
+  .resume-btn.has-feedback-success {
     color: var(--accent-green, #2ea043);
+  }
+
+  .resume-btn.has-feedback-error {
+    color: var(--accent-red, #e55);
   }
 
   .open-menu {
@@ -1497,13 +1530,33 @@
   }
 
   .model-badge {
+    display: inline-flex;
+    align-items: center;
+    min-width: 0;
+    max-width: min(280px, 28vw);
     font-size: 10px;
     color: var(--text-muted);
     padding: 1px 5px;
     border-radius: 4px;
     background: var(--bg-tertiary);
     white-space: nowrap;
+    overflow: hidden;
+    flex-shrink: 1;
+  }
+
+  .model-badge__model {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+
+  .model-badge--with-effort {
+    min-width: 39px;
+  }
+
+  .model-badge__effort {
     flex-shrink: 0;
+    margin-left: 4px;
   }
 
   .actions-wrapper {
@@ -1674,9 +1727,9 @@
     );
   }
 
-  @media (max-width: 760px) {
+  @media (max-width: 900px) {
     .breadcrumb-meta {
-      gap: 4px;
+      gap: 2px;
     }
 
     .session-time {
@@ -1718,6 +1771,29 @@
 
     .session-id {
       display: none;
+    }
+
+    .usage-breakdown {
+      display: none;
+    }
+  }
+
+  @media (max-width: 640px) {
+    .session-breadcrumb {
+      gap: 4px;
+      padding: 0 6px;
+    }
+
+    .breadcrumb-meta {
+      gap: 1px;
+    }
+
+    .breadcrumb-meta > .agent-badge {
+      display: none;
+    }
+
+    .actions-wrapper {
+      gap: 0;
     }
   }
 </style>

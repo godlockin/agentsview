@@ -3,7 +3,7 @@ package vector
 import (
 	"context"
 	"database/sql"
-	"encoding/json"
+	"encoding/json/v2"
 	"errors"
 	"fmt"
 
@@ -13,7 +13,10 @@ import (
 
 // snippetMaxRunes bounds the length of a Hit's Snippet; longer chunks are
 // truncated with a trailing ellipsis.
-const snippetMaxRunes = 200
+const (
+	snippetMaxRunes  = 200
+	MaxKNNCandidates = 4096 // sqlite-vec's vec0 KNN candidate ceiling.
+)
 
 // Hit is one unit-level semantic search result, anchored to a specific
 // message. For a run document Ordinal is the anchor: the member message
@@ -116,7 +119,7 @@ func (ix *Index) SearchPage(
 	}
 
 	vectors, err := kitvec.EncodeBatched(ctx, enc,
-		[]kitvec.Chunk{{Index: 0, Text: query}}, kitvec.BatchOptions{})
+		[]kitvec.Chunk{{Index: 0, Text: query}})
 	if err != nil {
 		return nil, false, &QueryEncodeError{Err: err}
 	}
@@ -133,6 +136,12 @@ func (ix *Index) SearchPage(
 
 	hydrated, err := ix.hydrateHits(ctx, hits)
 	return hydrated, exhausted, err
+}
+
+// MaxSearchCandidates reports the largest KNN candidate count accepted by
+// the sqlite-vec engine backing this index.
+func (ix *Index) MaxSearchCandidates() int {
+	return MaxKNNCandidates
 }
 
 // noActiveGenerationError distinguishes an empty index (ErrNoActiveGeneration)

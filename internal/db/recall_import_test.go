@@ -3,7 +3,7 @@ package db
 import (
 	"context"
 	"database/sql"
-	"encoding/json"
+	"encoding/json/v2"
 	"fmt"
 	"strings"
 	"testing"
@@ -11,8 +11,6 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-
-	"go.kenn.io/agentsview/internal/db/driver"
 )
 
 func TestImportAcceptedRecallEntriesJSONLImportsReviewedKeepers(t *testing.T) {
@@ -480,7 +478,7 @@ func TestImportAcceptedRecallEntriesJSONLNeverCommitsStaleEvidenceSnapshot(
 	messages[1].SourceUUID = "source-4"
 	insertMessages(t, d, messages...)
 
-	external, err := sql.Open(driver.DriverName, makeDSN(d.Path(), false))
+	external, err := sql.Open("sqlite3", makeDSN(d.Path(), false))
 	require.NoError(t, err)
 	defer external.Close()
 	_, err = external.Exec(`PRAGMA busy_timeout = 5000`)

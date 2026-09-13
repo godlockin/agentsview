@@ -1,49 +1,26 @@
 import { spawnSync } from "node:child_process";
-import {
-  mkdtempSync,
-  readFileSync,
-  rmSync,
-  writeFileSync,
-} from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import {
-  dirname,
-  join,
-  resolve,
-} from "node:path";
+import { dirname, join, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { generate } from "orval";
 
-const frontendDir = resolve(
-  dirname(fileURLToPath(import.meta.url)),
-  "..",
-);
+const frontendDir = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const repoRoot = resolve(frontendDir, "..");
+const generatedDir = join(frontendDir, "src/lib/api/generated");
 
-function suppressExpectedAbortLogging() {
-  const requestPath = join(
-    frontendDir,
-    "src/lib/api/generated/core/request.ts",
-  );
-  const source = readFileSync(requestPath, "utf8");
-  const generatedCatch = `    } catch (error) {
-      console.error(error);
+function generatedSources(dir, base = dir, sources = new Map()) {
+  if (!existsSync(dir)) return sources;
+  for (const entry of readdirSync(dir, { withFileTypes: true })) {
+    const path = join(dir, entry.name);
+    if (entry.isDirectory()) {
+      generatedSources(path, base, sources);
+      continue;
     }
-`;
-  const cancellationAwareCatch = `    } catch (error) {
-      if (!(error instanceof DOMException && error.name === 'AbortError')) {
-        console.error(error);
-      }
-    }
-`;
-  if (!source.includes(generatedCatch)) {
-    throw new Error(
-      "generated request body handler no longer matches the abort-log patch",
-    );
+    if (!entry.name.endsWith(".ts")) continue;
+    sources.set(relative(base, path), readFileSync(path, "utf8"));
   }
-  writeFileSync(
-    requestPath,
-    source.replace(generatedCatch, cancellationAwareCatch),
-  );
+  return sources;
 }
 
 function run(cmd, args, options = {}) {
@@ -59,36 +36,105 @@ function run(cmd, args, options = {}) {
   return result.stdout ?? "";
 }
 
+function operationName(operation, route) {
+  if (!operation.operationId) throw new Error("Every API operation must have an operationId");
+  let name = operation.operationId;
+  for (const match of route.matchAll(/\{([^}]+)\}/g)) {
+    const parameter = match[1]
+      .replace(/([a-z0-9])([A-Z])/g, "$1-$2")
+      .replaceAll("_", "-")
+      .toLowerCase();
+    for (const candidate of [parameter, parameter.replaceAll("-", "")]) {
+      const next = name.replace(`-${candidate}`, `-by-${parameter}`);
+      if (next !== name) {
+        name = next;
+        break;
+      }
+    }
+  }
+  return name.replace(/-([a-z0-9])/g, (_, character) => character.toUpperCase());
+}
+
+function writeIndex() {
+  const exports = ['export * from "./models/index.ts";'];
+  for (const entry of readdirSync(generatedDir, { withFileTypes: true })) {
+    if (!entry.isDirectory() || entry.name === "models") continue;
+    const serviceName = `${entry.name
+      .split("-")
+      .map((part) => part[0].toUpperCase() + part.slice(1))
+      .join("")}Service`;
+    exports.push(`export * as ${serviceName} from "./${entry.name}/${entry.name}.ts";`);
+  }
+  writeFileSync(join(generatedDir, "index.ts"), `${exports.sort().join("\n")}\n`);
+}
+
+const checkIfGoAvailable = process.argv.includes("--check-if-go-available");
+const verifyGenerated = process.argv.includes("--check") || checkIfGoAvailable;
+if (checkIfGoAvailable) {
+  const goVersion = spawnSync("go", ["version"], { stdio: "ignore" });
+  if (goVersion.error?.code === "ENOENT") {
+    console.warn("Skipping generated API client check because Go is not available.");
+    process.exit(0);
+  }
+}
+
+const previousGeneratedSources = verifyGenerated ? generatedSources(generatedDir) : null;
 const tempDir = mkdtempSync(join(tmpdir(), "agentsview-openapi-"));
 try {
+  const pricingSnapshot = join(repoRoot, "internal/pricing/snapshot/litellm_snapshot.json.gz");
+  if (!existsSync(pricingSnapshot)) {
+    run("go", ["run", "./internal/pricing/cmd/litellm-snapshot"], { cwd: repoRoot });
+  }
+  run("go", ["run", "./internal/pricing/cmd/litellm-snapshot", "-restore"], {
+    cwd: repoRoot,
+  });
   const specPath = join(tempDir, "openapi.json");
   const spec = run("go", ["run", "./cmd/agentsview", "openapi"], {
     cwd: repoRoot,
     capture: true,
   });
   writeFileSync(specPath, spec);
-  const openapiArgs = [
-    "openapi",
-    "-i",
-    specPath,
-    "-o",
-    "src/lib/api/generated",
-    "-c",
-    "fetch",
-    "--useOptions",
-    "--indent",
-    "2",
-  ];
-  if (process.platform === "win32") {
-    run(
-      process.env.ComSpec ?? "cmd.exe",
-      ["/d", "/s", "/c", "npx.cmd", ...openapiArgs],
-      { cwd: frontendDir },
-    );
-  } else {
-    run("npx", openapiArgs, { cwd: frontendDir });
-  }
-  suppressExpectedAbortLogging();
+
+  rmSync(generatedDir, { recursive: true, force: true });
+  await generate(
+    {
+      input: specPath,
+      output: {
+        client: "fetch",
+        mode: "tags-split",
+        target: generatedDir,
+        schemas: join(generatedDir, "models"),
+        clean: true,
+        urlEncodeParameters: true,
+        override: {
+          fetch: { includeHttpResponseReturnType: false },
+          header: () => ["Generated by Orval. Do not edit manually."],
+          mutator: {
+            path: join(frontendDir, "src/lib/api/runtime.ts"),
+            name: "orvalFetch",
+          },
+          operationName,
+          useNamedParameters: true,
+        },
+      },
+    },
+    frontendDir,
+  );
+  writeIndex();
+  run("vp", ["fmt", generatedDir], { cwd: frontendDir });
 } finally {
   rmSync(tempDir, { recursive: true, force: true });
+}
+
+if (previousGeneratedSources) {
+  const currentGeneratedSources = generatedSources(generatedDir);
+  const paths = new Set([...previousGeneratedSources.keys(), ...currentGeneratedSources.keys()]);
+  const changed = [...paths].filter(
+    (path) => previousGeneratedSources.get(path) !== currentGeneratedSources.get(path),
+  );
+  if (changed.length > 0) {
+    throw new Error(
+      `generated API client was stale and has been regenerated:\n${changed.join("\n")}`,
+    );
+  }
 }

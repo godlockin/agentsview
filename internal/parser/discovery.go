@@ -4,11 +4,12 @@ import (
 	"bufio"
 	"crypto/sha256"
 	"encoding/hex"
-	"encoding/json"
+	"encoding/json/v2"
 	"fmt"
 	"os"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"sort"
 	"strings"
 	"time"
@@ -54,14 +55,22 @@ type DiscoveredFile struct {
 	Path        string
 	Project     string    // pre-extracted project name
 	Agent       AgentType // which agent this file belongs to
-	Machine     string    // source machine (set for s3:// sources; empty = host machine)
+	Machine     string    // source machine override; empty = engine default
 	SourceSize  int64     // source object size for s3:// sources
 	SourceMtime int64     // source object mtime for s3:// sources, UnixNano
+	// TranscriptSize and TranscriptMtime retain the primary JSONL object's
+	// metadata when SourceSize and SourceMtime include persisted-result sidecars.
+	TranscriptSize  int64
+	TranscriptMtime int64
 	// SourceFingerprint is a durable object fingerprint for s3:// sources.
 	SourceFingerprint string
-	ForceParse        bool       // caller requires a full source reparse
-	ProviderSource    *SourceRef // provider-owned source identity, when known
-	ProviderProcess   bool       // true when this caller may parse via ProviderSource
+	ForceParse        bool // caller requires freshness bypass
+	// ForceFullParse also disables append-only processing so a materialized
+	// replacement cannot be mistaken for bytes appended to the stored source.
+	// A durable skip-cache entry may suppress it after a previous attempt.
+	ForceFullParse  bool
+	ProviderSource  *SourceRef // provider-owned source identity, when known
+	ProviderProcess bool       // true when this caller may parse via ProviderSource
 }
 
 // OpenCodeSourceMode identifies the usable OpenCode storage
@@ -81,6 +90,50 @@ type OpenCodeSource struct {
 	Root        string
 	SessionRoot string
 	DBPath      string
+	DBPaths     []string
+}
+
+func (f openCodeFormat) matchesDBName(name string) bool {
+	if name == f.dbName ||
+		runtime.GOOS == "windows" && strings.EqualFold(name, f.dbName) {
+		return true
+	}
+	if runtime.GOOS == "windows" {
+		name = strings.ToLower(name)
+	}
+	if f.agent != AgentOpenCode || !strings.HasPrefix(name, "opencode-") ||
+		!strings.HasSuffix(name, ".db") {
+		return false
+	}
+	channel := strings.TrimSuffix(strings.TrimPrefix(name, "opencode-"), ".db")
+	return channel != "" && strings.IndexFunc(channel, func(r rune) bool {
+		return !unicode.IsLetter(r) && !unicode.IsDigit(r) &&
+			r != '.' && r != '_' && r != '-'
+	}) == -1
+}
+
+func (f openCodeFormat) dbPaths(root string) []string {
+	entries, err := os.ReadDir(root)
+	if err != nil {
+		return nil
+	}
+	var canonical string
+	var channels []string
+	for _, entry := range entries {
+		if entry.IsDir() || !f.matchesDBName(entry.Name()) {
+			continue
+		}
+		path := filepath.Join(root, entry.Name())
+		if reconciliationScopeSamePath(entry.Name(), f.dbName) {
+			canonical = path
+		} else {
+			channels = append(channels, path)
+		}
+	}
+	if canonical != "" {
+		return append([]string{canonical}, channels...)
+	}
+	return channels
 }
 
 // openCodeFormat parameterizes the shared OpenCode storage format by
@@ -121,12 +174,18 @@ func resolveOpenCodeFormatSource(
 	}
 
 	sessionRoot := filepath.Join(root, "storage", f.sessionSubdir)
+	dbPaths := f.dbPaths(root)
+	dbPath := ""
+	if len(dbPaths) > 0 {
+		dbPath = dbPaths[0]
+	}
 	if info, err := os.Stat(sessionRoot); err == nil && info.IsDir() {
 		return OpenCodeSource{
 			Mode:        OpenCodeSourceStorage,
 			Root:        root,
 			SessionRoot: sessionRoot,
-			DBPath:      filepath.Join(root, f.dbName),
+			DBPath:      dbPath,
+			DBPaths:     dbPaths,
 		}
 	} else if err != nil && !os.IsNotExist(err) {
 		storageRoot := filepath.Join(root, "storage")
@@ -135,17 +194,18 @@ func resolveOpenCodeFormatSource(
 				Mode:        OpenCodeSourceStorage,
 				Root:        root,
 				SessionRoot: sessionRoot,
-				DBPath:      filepath.Join(root, f.dbName),
+				DBPath:      dbPath,
+				DBPaths:     dbPaths,
 			}
 		}
 	}
 
-	dbPath := filepath.Join(root, f.dbName)
-	if info, err := os.Stat(dbPath); err == nil && !info.IsDir() {
+	if dbPath != "" {
 		return OpenCodeSource{
-			Mode:   OpenCodeSourceSQLite,
-			Root:   root,
-			DBPath: dbPath,
+			Mode:    OpenCodeSourceSQLite,
+			Root:    root,
+			DBPath:  dbPath,
+			DBPaths: dbPaths,
 		}
 	}
 
@@ -219,13 +279,17 @@ func findOpenCodeFormatSourceFile(
 				}
 			}
 		}
-		if OpenCodeSQLiteSessionExists(src.DBPath, sessionID) {
-			return OpenCodeSQLiteVirtualPath(src.DBPath, sessionID)
+		for _, dbPath := range src.DBPaths {
+			if OpenCodeSQLiteSessionExists(dbPath, sessionID) {
+				return OpenCodeSQLiteVirtualPath(dbPath, sessionID)
+			}
 		}
 		return ""
 	case OpenCodeSourceSQLite:
-		if OpenCodeSQLiteSessionExists(src.DBPath, sessionID) {
-			return OpenCodeSQLiteVirtualPath(src.DBPath, sessionID)
+		for _, dbPath := range src.DBPaths {
+			if OpenCodeSQLiteSessionExists(dbPath, sessionID) {
+				return OpenCodeSQLiteVirtualPath(dbPath, sessionID)
+			}
 		}
 		return ""
 	default:
@@ -236,15 +300,15 @@ func findOpenCodeFormatSourceFile(
 func openCodeFormatStorageSessionIDs(
 	f openCodeFormat, root string,
 ) map[string]struct{} {
+	ids := make(map[string]struct{})
 	src := resolveOpenCodeFormatSource(f, root)
 	if src.Mode != OpenCodeSourceStorage {
-		return nil
+		return ids
 	}
 	entries, err := os.ReadDir(src.SessionRoot)
 	if err != nil {
-		return nil
+		return ids
 	}
-	ids := make(map[string]struct{})
 	for _, entry := range entries {
 		if !isDirOrSymlink(entry, src.SessionRoot) {
 			continue
@@ -279,8 +343,7 @@ func resolveOpenCodeFormatWatchRoots(
 	src := resolveOpenCodeFormatSource(f, root)
 	switch src.Mode {
 	case OpenCodeSourceStorage:
-		if info, err := os.Stat(src.DBPath); err == nil &&
-			!info.IsDir() {
+		if len(src.DBPaths) > 0 {
 			return []string{root}
 		}
 		return []string{filepath.Join(root, "storage")}
@@ -305,7 +368,9 @@ func parseOpenCodeFormatVirtualPath(
 	}
 	dbPath = sourcePath[:idx]
 	sessionID = sourcePath[idx+1:]
-	if filepath.Base(dbPath) != dbName {
+	name := filepath.Base(dbPath)
+	if name != dbName &&
+		(dbName != openCodeFmt.dbName || !openCodeFmt.matchesDBName(name)) {
 		return "", "", false
 	}
 	return dbPath, sessionID, true
@@ -336,11 +401,16 @@ func OpenCodeSQLiteVirtualPath(
 	return dbPath + "#" + sessionID
 }
 
+func ParseOpenCodeSQLiteVirtualPath(path string) (string, string, bool) {
+	return parseOpenCodeFormatVirtualPath(openCodeFmt.dbName, path)
+}
+
 func openCodeSessionProject(path string) string {
 	data, err := os.ReadFile(path)
 	if err == nil {
-		if cwd := gjson.GetBytes(data, "directory").Str; cwd != "" {
-			if project := ExtractProjectFromCwd(cwd); project != "" {
+		cwd := gjson.GetBytes(data, "directory").Str
+		if resolved, resolveErr := resolveOpenCodeStorageWorktree(path, cwd); resolveErr == nil {
+			if project := ExtractProjectFromCwd(resolved); project != "" {
 				return project
 			}
 		}
@@ -422,14 +492,58 @@ func ResolveCodexShallowWatchRoots(root string) []string {
 // expansion. The name carries no legacy entrypoint verb so the
 // provider can call it without shimming a Discover* free function.
 func ClaudeProjectSessionFiles(projectsDir string) []DiscoveredFile {
+	return projectJSONLSessionFiles(projectsDir, AgentClaude, claudeS3Scanner, nil)
+}
+
+// IcodemateCLIProjectSessionFiles enumerates a terminal CLI projects root in
+// the same Claude-layout terms as ClaudeProjectSessionFiles, labeling every
+// discovered transcript with AgentIcodemate and scanning s3:// roots against
+// the icodemate provider segment (.../raw/icodemate) so machine metadata and
+// source labeling match the owning agent instead of Claude's.
+func IcodemateCLIProjectSessionFiles(projectsDir string) []DiscoveredFile {
+	return projectJSONLSessionFiles(projectsDir, AgentIcodemate, icodemateCLIS3Scanner, nil)
+}
+
+// ProjectJSONLSessionCandidates finds only the requested Claude-layout filename
+// stems. Root transcripts need one exact probe per project and ID; subagents
+// still require traversal because workflow directories do not encode their ID.
+func ProjectJSONLSessionCandidates(
+	root string, agent AgentType, ids map[string]struct{},
+) []DiscoveredFile {
+	scanner := claudeS3Scanner
+	if agent == AgentIcodemate {
+		scanner = icodemateCLIS3Scanner
+	}
+	return projectJSONLSessionFiles(root, agent, scanner, ids)
+}
+
+// projectJSONLSessionFiles walks one Claude-layout projects root
+// (<root>/<project>/*.jsonl plus nested subagents trees) labeling each
+// DiscoveredFile with the owning agent, and routes s3:// roots through the
+// agent's own S3 scanner so the provider segment and agent metadata match.
+// Transient read errors on individual projects are skipped: a project
+// directory echoed by a concurrent watch may disappear mid-walk.
+func projectJSONLSessionFiles(
+	projectsDir string,
+	agent AgentType,
+	scanner func() S3SessionScanner,
+	wanted map[string]struct{},
+) []DiscoveredFile {
 	if strings.HasPrefix(projectsDir, "s3://") {
-		return discoverClaudeS3(projectsDir)
+		return s3PrefixScan(projectsDir, scanner())
 	}
 	entries, err := os.ReadDir(projectsDir)
 	if err != nil {
 		return nil
 	}
 
+	nested := wanted == nil
+	for id := range wanted {
+		if strings.HasPrefix(id, "agent-") {
+			nested = true
+			break
+		}
+	}
 	var files []DiscoveredFile
 	for _, entry := range entries {
 		if !isDirOrSymlink(entry, projectsDir) {
@@ -437,6 +551,16 @@ func ClaudeProjectSessionFiles(projectsDir string) []DiscoveredFile {
 		}
 
 		projDir := filepath.Join(projectsDir, entry.Name())
+		if wanted != nil && !nested {
+			for id := range wanted {
+				path := filepath.Join(projDir, id+".jsonl")
+				info, err := os.Lstat(path)
+				if err == nil && !info.IsDir() {
+					files = append(files, DiscoveredFile{Path: path, Project: entry.Name(), Agent: agent})
+				}
+			}
+			continue
+		}
 		sessionFiles, err := os.ReadDir(projDir)
 		if err != nil {
 			continue
@@ -451,13 +575,18 @@ func ClaudeProjectSessionFiles(projectsDir string) []DiscoveredFile {
 				continue
 			}
 			stem := strings.TrimSuffix(name, ".jsonl")
+			if wanted != nil {
+				if _, ok := wanted[stem]; !ok {
+					continue
+				}
+			}
 			if strings.HasPrefix(stem, "agent-") {
 				continue
 			}
 			files = append(files, DiscoveredFile{
 				Path:    filepath.Join(projDir, name),
 				Project: entry.Name(),
-				Agent:   AgentClaude,
+				Agent:   agent,
 			})
 		}
 
@@ -484,10 +613,15 @@ func ClaudeProjectSessionFiles(projectsDir string) []DiscoveredFile {
 						!strings.HasSuffix(name, ".jsonl") {
 						return nil
 					}
+					if wanted != nil {
+						if _, ok := wanted[strings.TrimSuffix(name, ".jsonl")]; !ok {
+							return nil
+						}
+					}
 					files = append(files, DiscoveredFile{
 						Path:    path,
 						Project: entry.Name(),
-						Agent:   AgentClaude,
+						Agent:   agent,
 					})
 					return nil
 				},
@@ -499,6 +633,68 @@ func ClaudeProjectSessionFiles(projectsDir string) []DiscoveredFile {
 		return files[i].Path < files[j].Path
 	})
 	return files
+}
+
+// ClaudeSubagentTranscriptPaths returns candidate subagent transcripts to
+// refresh before querying the Claude session stored at sessionPath, sorted by
+// path. Root sessions scan their own subagents tree. A subagent scans its
+// enclosing root's tree so newly written nested descendants can be linked;
+// relationship traversal later limits usage aggregation to the queried
+// session's descendants. An s3:// session lists the equivalent prefix and
+// returns object URIs. Returns nil for a non-Claude path, a path with no such
+// directory, or an empty path.
+func ClaudeSubagentTranscriptPaths(sessionPath string) []string {
+	if sessionPath == "" || !strings.HasSuffix(sessionPath, ".jsonl") {
+		return nil
+	}
+	if strings.HasPrefix(sessionPath, "s3://") {
+		return claudeS3SubagentTranscriptPaths(sessionPath)
+	}
+	stem := strings.TrimSuffix(filepath.Base(sessionPath), ".jsonl")
+	if stem == "" {
+		return nil
+	}
+	subagentsDir := filepath.Join(filepath.Dir(sessionPath), stem, "subagents")
+	if strings.HasPrefix(stem, "agent-") {
+		subagentsDir = claudeEnclosingSubagentsDir(sessionPath)
+		if subagentsDir == "" {
+			return nil
+		}
+	}
+	cleanSessionPath := filepath.Clean(sessionPath)
+	var paths []string
+	_ = filepath.WalkDir(
+		subagentsDir,
+		func(path string, entry os.DirEntry, err error) error {
+			if err != nil || entry.IsDir() {
+				return nil
+			}
+			name := entry.Name()
+			if !strings.HasPrefix(name, "agent-") ||
+				!strings.HasSuffix(name, ".jsonl") {
+				return nil
+			}
+			if filepath.Clean(path) == cleanSessionPath {
+				return nil
+			}
+			paths = append(paths, path)
+			return nil
+		},
+	)
+	sort.Strings(paths)
+	return paths
+}
+
+func claudeEnclosingSubagentsDir(sessionPath string) string {
+	for dir := filepath.Dir(sessionPath); ; dir = filepath.Dir(dir) {
+		if filepath.Base(dir) == "subagents" {
+			return dir
+		}
+		parent := filepath.Dir(dir)
+		if parent == dir {
+			return ""
+		}
+	}
 }
 
 // claudeFindSourceFile finds the original JSONL file for a Claude
@@ -710,6 +906,23 @@ func IsValidSessionID(id string) bool {
 	}
 	for _, c := range id {
 		if !isAlphanumOrDashUnderscore(c) {
+			return false
+		}
+	}
+	return true
+}
+
+// IsValidQoderSessionID reports whether id is a valid Qoder session
+// identifier. Qoder session IDs use the same alphanumeric/dash/underscore
+// charset as other agents, but the SharedClientCache layout (see
+// qoder_paths.go) appends dotted suffixes such as
+// "task-<uuid>.session.execution", so periods are also accepted here.
+func IsValidQoderSessionID(id string) bool {
+	if id == "" {
+		return false
+	}
+	for _, c := range id {
+		if !isAlphanum(c) && c != '-' && c != '_' && c != '.' {
 			return false
 		}
 	}

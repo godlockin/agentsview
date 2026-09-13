@@ -15,11 +15,11 @@ Recall is an experimental layer for durable, provenance-linked knowledge from
 past agent sessions. It stores compact facts, procedures, preferences, and
 warnings as entries that can be listed, queried, and packed into a task brief.
 
-This is different from [semantic search](/semantic-search/). Semantic search
-finds relevant passages in the transcript archive. Recall searches a separate
-set of distilled entries and keeps the transcript region supporting each entry
-as evidence. Recall queries support lexical, vector, and hybrid retrieval; the
-default remains lexical while this feature is experimental.
+This is different from [semantic search](/docs/semantic-search/). Semantic
+search finds relevant passages in the transcript archive. Recall searches a
+separate set of distilled entries and keeps the transcript region supporting
+each entry as evidence. Recall queries support lexical, vector, and hybrid
+retrieval; the default remains lexical while this feature is experimental.
 
 ## Current surface
 
@@ -33,16 +33,84 @@ The current implementation is local and SQLite-only. The CLI provides:
   `recall extract preview` for previewing deterministic session chunks; and
 - `recall import --dry-run` for validating reviewed JSONL candidates.
 
+The top-level **Recall** page has two tabs:
+
+- **Corpus** is a read-only browser for distilled entries. It shows extraction
+  coverage and generation state, and filters entries by text, project, entry
+  type, generation, and review state. Expand an entry to inspect its body,
+  trigger, uncertainty, provenance metadata, and evidence links back to the
+  source transcript.
+- **Generated insights** creates and stores longer reports over an explicit
+  session scope. Its form always shows the date range, project, session agent,
+  automated-session scope, report template, generator, and optional focus used
+  for the next report. Saved reports can be exported, published, linked, or
+  deleted from the archive.
+
+Open Recall from the header or navigate directly to `/recall`. Generated-report
+links use `/recall?tab=generated&insight=<id>`.
+
+![Recall corpus browser](/docs/assets/generated/screenshots/recall-corpus.png)
+
+![Generated insights](/docs/assets/generated/screenshots/recall-generated-insights.png)
+
+Generated insights use the configured OpenAI-compatible endpoint when
+`[insights]` has both an `endpoint` and `model`; when `[insights]` is absent,
+they use the selected agent CLI on your machine. Partial endpoint configuration
+is rejected during configuration validation. Endpoint mode sends one
+non-streaming `POST /chat/completions` request with the generated prompt as a
+user message. It accepts the first choice's `assistant` message with string
+`message.content` and optional response `model`. It does not support streaming,
+`/responses`, legacy completions, tool calls, or content-part arrays. An
+endpoint failure returns an error and does not retry through a CLI.
+
+```toml
+[insights]
+endpoint = "http://127.0.0.1:11434/v1"
+model = "llama3.1"
+api_key_env = "OPENAI_API_KEY" # optional; the value is read at runtime
+# allow_http = true            # required for non-loopback HTTP endpoints
+```
+
+Loopback HTTP endpoints are allowed for local models. Remote endpoints must use
+HTTPS unless `allow_http = true` explicitly opts into plaintext transport. The
+endpoint receives transcript-derived content, so review the provider's privacy
+and retention behavior. API keys stay in the environment and are sent only as a
+bearer header; they are not stored in the AgentsView configuration. Canned
+insight cache keys include the effective backend, model, and a safe endpoint
+identity, so changing `[insights]` after restarting the server selects a
+separate cached report. Changes to credentials or transport opt-ins do not
+change that identity; use force refresh when those changes should regenerate a
+report under the same endpoint and model.
+
+### Configuring agent binaries
+
+AgentsView normally resolves `claude`, `codex`, `copilot`, `gemini`, and
+`kiro-cli` through `PATH`. To pin a particular executable, configure its agent
+table:
+
+```toml
+[agent.claude]
+binary = "/usr/local/bin/claude"
+
+[agent.gemini]
+binary = "/usr/local/bin/gemini"
+```
+
+Each known agent has an independent override. This setting affects report
+generation only; session discovery continues to read the configured session
+directories.
+
 Reviewed JSONL import is a guarded laboratory inlet, not a stable or recommended
 end-user workflow. Use an isolated `AGENTSVIEW_DATA_DIR` for experiments. The
 import command refuses the default data directory unless the operator explicitly
 overrides that guard.
 
-Recall is not available through PostgreSQL or DuckDB stores. The web UI is
-limited to a read-only panel in Session Vital Signs: it lists entries sourced
-from the open session and links their evidence ranges back to the transcript.
-Recall population, corpus management, and general querying remain CLI and HTTP
-API workflows.
+The Corpus tab is not available through PostgreSQL or DuckDB stores, so those
+read-only servers open Recall on Generated insights instead. On the local SQLite
+UI, Session Vital Signs also includes a read-only Recall panel for the open
+session and links each evidence range back to the transcript. Corpus population,
+review, extraction-generation management, and ranked querying remain CLI and
+HTTP API workflows.
 
 The daemon exposes the same inspection and query operations over its HTTP API.
 Ordinary queries record measurement data when the SQLite store is writable, but
@@ -77,8 +145,14 @@ one-time consent for that invocation.
 Vector and hybrid queries fail closed when the active Recall corpus is newer
 than its last completed vector build. Rebuild the Recall store, or continue
 using lexical mode while an automatic refresh catches up. See
-[Semantic Search](/semantic-search/#enabling-vector) for the shared embedding
-configuration and endpoint privacy considerations.
+[Semantic Search](/docs/semantic-search/#enabling-vector) for the shared
+embedding configuration and endpoint privacy considerations.
+
+Vector candidates are ranked before Recall filters are applied. The embedding
+backend bounds the candidate window, so a narrow project, cwd, or other filter
+can produce a short vector page when that boundary is reached. Hybrid search
+still ranks the lexical candidates selected for the query, then fuses those
+results with the available vector candidates.
 
 ## Automatic extraction
 
@@ -117,7 +191,8 @@ Optional keys: `deployment` (labels which serving instance produced the corpus),
 `server` (selects among multiple named servers), `quiet_period` (default `"30m"`
 — how long a session must have been ended before extraction),
 `backstop_interval` (default `"1h"`), `failure_backoff` (default `"1h"`),
-`max_window_chars` (default 50000), `max_tokens`, per-server `api_key_env`, a
+`max_window_chars` (default 50000), `max_tokens`, `candidate_findings`
+(`"block"` default, or `"allow"` — see below), per-server `api_key_env`, a
 `[recall.extract.prompts]` table (`profile`, `dir`), and a
 `[recall.extract.request]` table (`temperature`, `extra_body`).
 
@@ -130,11 +205,22 @@ names, and even a same-origin allowance can be steered elsewhere by re-resolving
 the hostname. Configure the endpoint with its final URL.
 
 Sessions are only ever extracted when they are not automated, not trashed, and
-have a clean, current **full** secret scan — a session with secret findings of
-any confidence, one never scanned, or one covered only by the fast inline sync
-scan never reaches the model. Run `agentsview secrets scan --backfill` to make
-sessions eligible. These filters are not configurable. Session content is sent
-only to the endpoints you configure.
+have a clean, current **full** secret scan. By default, a session with secret
+findings of any confidence, one never scanned, or one covered only by the fast
+inline sync scan never reaches the model. Run
+`agentsview secrets scan --backfill` to make sessions eligible. Session content
+is sent only to the endpoints you configure.
+
+One knob narrows that boundary deliberately: `candidate_findings = "allow"`
+under `[recall.extract]`. Candidate-confidence findings — the false-positive-
+prone heuristics (`high-entropy-assignment`, JWT-shaped tokens, basic-auth URLs)
+that `secrets list` hides unless asked — then stay recorded for review but no
+longer exclude a session; only definite findings do, in discovery, in the
+pre-send transcript check, at commit, and in reconciliation. The default,
+`"block"`, keeps every recorded finding blocking. Consider `"allow"` when the
+endpoint is a machine you own and the archive is full of paths and identifiers
+that trip the entropy heuristic; keep the default for any endpoint you would not
+send a suspected secret to.
 
 Each distillation configuration (model, prompts, segmentation, request shape) is
 fingerprinted as a *generation*; changing the configuration builds a new corpus

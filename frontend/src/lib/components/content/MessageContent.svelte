@@ -16,7 +16,6 @@
   import { sessionTiming } from "../../stores/sessionTiming.svelte.js";
   import { liveTick } from "../../stores/liveTick.svelte.js";
   import {
-    configureGeneratedClient,
     isRemoteConnection,
   } from "../../api/runtime.js";
   import {
@@ -338,18 +337,16 @@
     if (!canForkFromMessage) return;
     clearTimeout(forkTimer);
     try {
-      configureGeneratedClient();
-      const resp =
-        await SessionsService.postApiV1SessionsIdResume({
-          id: message.session_id,
-          requestBody: {
+      const resp = await SessionsService.postApiV1SessionsByIdResume(
+        { id: message.session_id },
+        {
             ...(sync.readOnly && !isRemoteConnection()
               ? { command_only: true }
               : {}),
             from_ordinal: message.ordinal,
             fork_session: true,
           } satisfies ResumeRequest,
-        }) as ResumeResponse;
+      );
       if (resp.launched) {
         forkFeedback = m.session_breadcrumb_resumed_in({
           target: resp.terminal ?? "terminal",
@@ -512,7 +509,9 @@
               current: isCurrentHighlight,
             }}
           >
-            {@html renderMarkdown(segment.content)}
+            {@html renderMarkdown(segment.content, {
+              renderUnknownXmlBlocksAsPreformatted: ui.renderUnknownXmlBlocksAsPreformatted,
+            })}
           </div>
         {/if}
       {/if}
@@ -781,7 +780,7 @@
     padding: 0.15em 0.4em;
   }
 
-  .markdown :global(pre) {
+  .markdown :global(pre:not(.unknown-xml-block)) {
     background: var(--code-bg);
     color: var(--code-text);
     border-radius: var(--radius-md);

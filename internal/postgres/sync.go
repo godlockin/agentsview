@@ -166,6 +166,14 @@ type Sync struct {
 	syncStateTarget        string
 	migrateLegacySyncState bool
 
+	// archiveID caches this local archive's stable identifier, populated at
+	// the top of Push and stamped onto every pushed session's
+	// source_archive_id column.
+	archiveID string
+	// databaseGeneration identifies the exact local database generation that
+	// produced each pushed session and its identity snapshot.
+	databaseGeneration string
+
 	// Project filtering for push scope.
 	projects        []string
 	excludeProjects []string
@@ -424,6 +432,16 @@ func (s *Sync) ensureSchemaLocked(ctx context.Context) error {
 		// leaves semantic search unavailable but must not fail the push.
 		if _, err := ensureVectorBaseSchemaPG(ctx, s.pg); err != nil {
 			log.Printf("pg schema: vector schema setup failed: %v", err)
+		}
+		// A restricted push role may lack CREATE on a schema that a
+		// privileged role provisioned. Raw custody is server-side only,
+		// so skip it here rather than failing every push; the full
+		// EnsureSchema bootstrap path still requires it.
+		if err := ensureRawIngestSchemaPG(ctx, s.pg); err != nil {
+			if !isInsufficientPrivilege(err) {
+				return err
+			}
+			log.Printf("pg schema: raw custody schema skipped, insufficient privilege: %v", err)
 		}
 		s.schemaDone = true
 		return nil

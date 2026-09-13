@@ -2,7 +2,6 @@ package db
 
 import (
 	"context"
-	"database/sql"
 	"fmt"
 )
 
@@ -38,7 +37,14 @@ func (db *DB) ReplaceSessionSecretFindings(
 	}
 	defer func() { _ = tx.Rollback() }()
 
-	if err := replaceSecretFindingsTx(tx, sessionID, findings, leakCount, rulesVersion); err != nil {
+	if db.usageOnlyStorage() {
+		err = settleUsageOnlySignalsTx(tx, sessionID)
+	} else {
+		err = replaceSecretFindingsTx(
+			tx, sessionID, findings, leakCount, rulesVersion,
+		)
+	}
+	if err != nil {
 		return err
 	}
 	return tx.Commit()
@@ -48,7 +54,7 @@ func (db *DB) ReplaceSessionSecretFindings(
 // inserts the new set, and updates the sessions summary columns. Caller owns
 // the lock and transaction lifecycle.
 func replaceSecretFindingsTx(
-	tx *sql.Tx,
+	tx transactionQueries,
 	sessionID string,
 	findings []SecretFinding,
 	leakCount int,

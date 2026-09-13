@@ -2,7 +2,8 @@ name: Desktop Artifacts
 
 on:
   workflow_call:
-  # Linux builds use the managed public fleet for main and same-repository PRs.
+  workflow_dispatch:
+  # Linux AMD64 and Windows builds use Namespace for pushes and all PRs.
   # macOS builds live in desktop-macos-main.yml.
   push:
     branches: [main]
@@ -23,19 +24,19 @@ concurrency:
 jobs:
   build:
     name: Desktop Build (${{ matrix.name }})
-    runs-on: ${{ contains(fromJSON('["ubuntu-latest","ubuntu-24.04","ubuntu-22.04"]'), matrix.os) && github.repository == 'kenn-io/agentsview' && (github.event_name == 'push' && github.ref == 'refs/heads/main' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.base.repo.full_name == github.repository)) && 'kenn-linux-x64-public' || matrix.os }}
+    runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
         include:
           - name: Windows
-            os: windows-latest
+            os: namespace-profile-windows-8cpu
             bundle: nsis
             target_triple: ""
             artifact_name: agentsview-desktop-windows
             artifact_dir: desktop/src-tauri/target/release/bundle/nsis/
           - name: Linux
-            os: ubuntu-22.04
+            os: namespace-profile-linux-8cpu
             bundle: appimage
             target_triple: ""
             artifact_name: agentsview-desktop-linux
@@ -47,12 +48,13 @@ jobs:
             artifact_name: agentsview-desktop-linux-arm64
             artifact_dir: desktop/src-tauri/target/aarch64-unknown-linux-gnu/release/bundle/appimage/
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
           persist-credentials: false
 
       - uses: ./.github/actions/build-desktop-artifact
         with:
+          namespace-cache: ${{ matrix.name != 'Linux (arm64)' }}
           bundle: ${{ matrix.bundle }}
           target_triple: ${{ matrix.target_triple }}
           artifact_name: ${{ matrix.artifact_name }}

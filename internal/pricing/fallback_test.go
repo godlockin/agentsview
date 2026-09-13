@@ -20,6 +20,17 @@ func testRate(dollars string) money.Money {
 	return rate
 }
 
+func assertFlatPricing(t *testing.T, want, got ModelPricing) {
+	t.Helper()
+	assert.Equal(t, want.ModelPattern, got.ModelPattern)
+	assert.Equal(t, want.InputPerMTok, got.InputPerMTok)
+	assert.Equal(t, want.OutputPerMTok, got.OutputPerMTok)
+	assert.Equal(t, want.CacheCreationPerMTok, got.CacheCreationPerMTok)
+	assert.Equal(t, want.CacheCreation1hPerMTok, got.CacheCreation1hPerMTok)
+	assert.Equal(t, want.CacheReadPerMTok, got.CacheReadPerMTok)
+	assert.Empty(t, got.Bands)
+}
+
 func TestFallbackPricing_Opus46Rates(t *testing.T) {
 	prices := requireEmbeddedFallbackPricing(t)
 	var got *ModelPricing
@@ -33,13 +44,14 @@ func TestFallbackPricing_Opus46Rates(t *testing.T) {
 
 	// Source: https://claude.com/pricing — Opus 4.5/4.6 tier.
 	want := ModelPricing{
-		ModelPattern:         "claude-opus-4-6",
-		InputPerMTok:         testRate("5"),
-		OutputPerMTok:        testRate("25"),
-		CacheCreationPerMTok: testRate("6.25"),
-		CacheReadPerMTok:     testRate("0.50"),
+		ModelPattern:           "claude-opus-4-6",
+		InputPerMTok:           testRate("5"),
+		OutputPerMTok:          testRate("25"),
+		CacheCreationPerMTok:   testRate("6.25"),
+		CacheCreation1hPerMTok: testRate("10"),
+		CacheReadPerMTok:       testRate("0.50"),
 	}
-	assert.Equal(t, want, *got)
+	assertFlatPricing(t, want, *got)
 }
 
 func TestFallbackPricing_Opus47Rates(t *testing.T) {
@@ -57,13 +69,14 @@ func TestFallbackPricing_Opus47Rates(t *testing.T) {
 	// it, but the fallback ships it too so offline and fresh-seed
 	// pricing covers the whole current Opus generation.
 	want := ModelPricing{
-		ModelPattern:         "claude-opus-4-7",
-		InputPerMTok:         testRate("5"),
-		OutputPerMTok:        testRate("25"),
-		CacheCreationPerMTok: testRate("6.25"),
-		CacheReadPerMTok:     testRate("0.50"),
+		ModelPattern:           "claude-opus-4-7",
+		InputPerMTok:           testRate("5"),
+		OutputPerMTok:          testRate("25"),
+		CacheCreationPerMTok:   testRate("6.25"),
+		CacheCreation1hPerMTok: testRate("10"),
+		CacheReadPerMTok:       testRate("0.50"),
 	}
-	assert.Equal(t, want, *got)
+	assertFlatPricing(t, want, *got)
 }
 
 func TestFallbackPricing_Opus48Rates(t *testing.T) {
@@ -81,13 +94,14 @@ func TestFallbackPricing_Opus48Rates(t *testing.T) {
 	// not yet in the LiteLLM catalog, so the shipped fallback must
 	// price it at the current Opus tier.
 	want := ModelPricing{
-		ModelPattern:         "claude-opus-4-8",
-		InputPerMTok:         testRate("5"),
-		OutputPerMTok:        testRate("25"),
-		CacheCreationPerMTok: testRate("6.25"),
-		CacheReadPerMTok:     testRate("0.50"),
+		ModelPattern:           "claude-opus-4-8",
+		InputPerMTok:           testRate("5"),
+		OutputPerMTok:          testRate("25"),
+		CacheCreationPerMTok:   testRate("6.25"),
+		CacheCreation1hPerMTok: testRate("10"),
+		CacheReadPerMTok:       testRate("0.50"),
 	}
-	assert.Equal(t, want, *got)
+	assertFlatPricing(t, want, *got)
 }
 
 func TestFallbackPricing_Fable5Rates(t *testing.T) {
@@ -105,13 +119,14 @@ func TestFallbackPricing_Fable5Rates(t *testing.T) {
 	// Fable 5 launched at double the Opus 4.8 rates and is not yet in
 	// the LiteLLM catalog, so the shipped fallback must price it.
 	want := ModelPricing{
-		ModelPattern:         "claude-fable-5",
-		InputPerMTok:         testRate("10"),
-		OutputPerMTok:        testRate("50"),
-		CacheCreationPerMTok: testRate("12.50"),
-		CacheReadPerMTok:     testRate("1"),
+		ModelPattern:           "claude-fable-5",
+		InputPerMTok:           testRate("10"),
+		OutputPerMTok:          testRate("50"),
+		CacheCreationPerMTok:   testRate("12.50"),
+		CacheCreation1hPerMTok: testRate("20"),
+		CacheReadPerMTok:       testRate("1"),
 	}
-	assert.Equal(t, want, *got)
+	assertFlatPricing(t, want, *got)
 }
 
 func TestFallbackPricing_HermesModels(t *testing.T) {
@@ -141,6 +156,26 @@ func TestFallbackPricing_Deterministic(t *testing.T) {
 	second := FallbackPricing()
 
 	assert.Equal(t, first, second, "FallbackPricing should be deterministic")
+}
+
+func TestFallbackPricing_DeepClonesPricingBands(t *testing.T) {
+	original := fallbackPricing
+	fallbackPricing = []ModelPricing{{
+		ModelPattern: "banded-model",
+		Bands: []PricingBand{{
+			AboveInputTokens: 200_000,
+			InputPerMTok:     testRate("2"),
+		}},
+	}}
+	t.Cleanup(func() {
+		fallbackPricing = original
+	})
+
+	first := FallbackPricing()
+	first[0].Bands[0].AboveInputTokens = 1
+	second := FallbackPricing()
+
+	assert.Equal(t, 200_000, second[0].Bands[0].AboveInputTokens)
 }
 
 func TestFallbackPricing_SortedByModelPattern(t *testing.T) {
@@ -235,6 +270,7 @@ func TestFallbackPricing_OverlayOnlyRates(t *testing.T) {
 func TestDecodeFallbackSnapshotFromFS(t *testing.T) {
 	snapshot := []byte(`{
 		"version": "litellm-test",
+		"source_ref": "551e5d097c11f08fd2400a25a651b1844fcf89c2",
 		"models": [
 			{"ModelPattern": "z-model", "InputPerMTok": {"microdollars": 2000000}},
 			{"ModelPattern": "a-model", "InputPerMTok": {"microdollars": 1000000}}
@@ -254,6 +290,91 @@ func TestDecodeFallbackSnapshotFromFS(t *testing.T) {
 	require.Len(t, got.Models, 2)
 	assert.Equal(t, "a-model", got.Models[0].ModelPattern)
 	assert.Equal(t, "z-model", got.Models[1].ModelPattern)
+}
+
+func TestDecodeFallbackSnapshotFromFS_Preserves1hCacheWriteRate(t *testing.T) {
+	snapshot := []byte(`{
+		"version": "litellm-test",
+		"source_ref": "551e5d097c11f08fd2400a25a651b1844fcf89c2",
+		"models": [{
+			"ModelPattern": "claude-fable-5",
+			"InputPerMTok": {"microdollars": 10000000},
+			"OutputPerMTok": {"microdollars": 50000000},
+			"CacheCreationPerMTok": {"microdollars": 12500000},
+			"CacheCreation1hPerMTok": {"microdollars": 20000000},
+			"CacheReadPerMTok": {"microdollars": 1000000}
+		}]
+	}`)
+	fsys := fstest.MapFS{
+		"snapshot/litellm_snapshot.json.gz": &fstest.MapFile{
+			Data: gzipData(t, snapshot),
+		},
+	}
+
+	got, err := decodeFallbackSnapshotFromFS(fsys)
+	require.NoError(t, err)
+	require.Len(t, got.Models, 1)
+	assert.Equal(t, int64(20_000_000),
+		got.Models[0].CacheCreation1hPerMTok.Microdollars,
+		"a regenerated snapshot's 1h cache-write rate must survive decode")
+}
+
+func TestDecodeFallbackSnapshotFromFS_SortsPricingBands(t *testing.T) {
+	snapshot := []byte(`{
+		"version": "litellm-test",
+		"source_ref": "551e5d097c11f08fd2400a25a651b1844fcf89c2",
+		"models": [{
+			"ModelPattern": "banded-model",
+			"InputPerMTok": {"microdollars": 1000000},
+			"Bands": [
+				{"above_input_tokens": 272000, "input_per_mtok": {"microdollars": 3000000}},
+				{"above_input_tokens": 200000, "input_per_mtok": {"microdollars": 2000000}}
+			]
+		}]
+	}`)
+	fys := fstest.MapFS{
+		"snapshot/litellm_snapshot.json.gz": &fstest.MapFile{Data: gzipData(t, snapshot)},
+	}
+
+	got, err := decodeFallbackSnapshotFromFS(fys)
+	require.NoError(t, err)
+	require.Len(t, got.Models, 1)
+	require.Len(t, got.Models[0].Bands, 2)
+	assert.Equal(t, 200_000, got.Models[0].Bands[0].AboveInputTokens)
+	assert.Equal(t, 272_000, got.Models[0].Bands[1].AboveInputTokens)
+}
+
+func TestDecodeFallbackSnapshotFromFS_RejectsInvalidPricingBands(t *testing.T) {
+	tests := []struct {
+		name  string
+		bands string
+		want  string
+	}{
+		{
+			name:  "non-positive threshold",
+			bands: `[{"above_input_tokens": 0}]`,
+			want:  "pricing threshold must be positive",
+		},
+		{
+			name:  "duplicate threshold",
+			bands: `[{"above_input_tokens": 200000}, {"above_input_tokens": 200000}]`,
+			want:  "duplicate pricing threshold 200000",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			snapshot := []byte(`{"version":"litellm-test","source_ref":"551e5d097c11f08fd2400a25a651b1844fcf89c2","models":[{"ModelPattern":"model","Bands":` + tt.bands + `}]}`)
+			fys := fstest.MapFS{
+				"snapshot/litellm_snapshot.json.gz": &fstest.MapFile{Data: gzipData(t, snapshot)},
+			}
+
+			_, err := decodeFallbackSnapshotFromFS(fys)
+
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), tt.want)
+		})
+	}
 }
 
 func TestDecodeFallbackSnapshotFromFS_MissingSnapshot(t *testing.T) {
@@ -287,6 +408,7 @@ func TestDecodeFallbackSnapshotFromFS_RejectsOversizedDecompressedPayload(t *tes
 func TestDecodeFallbackSnapshotFromFS_RejectsEmptyModels(t *testing.T) {
 	snapshot := []byte(`{
 		"version": "litellm-test",
+		"source_ref": "551e5d097c11f08fd2400a25a651b1844fcf89c2",
 		"models": []
 	}`)
 
@@ -299,6 +421,22 @@ func TestDecodeFallbackSnapshotFromFS_RejectsEmptyModels(t *testing.T) {
 	_, err := decodeFallbackSnapshotFromFS(fsys)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "missing snapshot models")
+}
+
+func TestDecodeFallbackSnapshotFromFSRejectsInvalidSourceRef(t *testing.T) {
+	for _, sourceRef := range []string{"", "main", "ABCDEF"} {
+		t.Run(sourceRef, func(t *testing.T) {
+			snapshot := []byte(`{"version":"litellm-test","source_ref":"` + sourceRef + `","models":[{"ModelPattern":"model"}]}`)
+			fys := fstest.MapFS{
+				"snapshot/litellm_snapshot.json.gz": &fstest.MapFile{Data: gzipData(t, snapshot)},
+			}
+
+			_, err := decodeFallbackSnapshotFromFS(fys)
+
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), "missing immutable LiteLLM source ref")
+		})
+	}
 }
 
 func gzipData(t *testing.T, data []byte) []byte {

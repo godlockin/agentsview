@@ -2,7 +2,7 @@ package main
 
 import (
 	"context"
-	"encoding/json"
+	"encoding/json/jsontext"
 	"errors"
 	"flag"
 	"fmt"
@@ -12,6 +12,7 @@ import (
 
 	"go.kenn.io/agentsview/internal/db"
 	duckdbsync "go.kenn.io/agentsview/internal/duckdb"
+	"go.kenn.io/agentsview/internal/export"
 	"go.kenn.io/agentsview/internal/money"
 )
 
@@ -119,6 +120,12 @@ func main() {
 		log.Fatalf("creating recent-edits fixture: %v", err)
 	}
 
+	if err := createProjectReclassificationFixture(
+		database, base.Add(120*time.Hour),
+	); err != nil {
+		log.Fatalf("creating project-reclassification fixture: %v", err)
+	}
+
 	fmt.Printf("Fixture DB written to %s\n", *out)
 	if *duckDBOut != "" {
 		if err := writeDuckDBMirror(database, *duckDBOut); err != nil {
@@ -126,6 +133,80 @@ func main() {
 		}
 		fmt.Printf("Fixture DuckDB mirror written to %s\n", *duckDBOut)
 	}
+}
+
+func createProjectReclassificationFixture(
+	database *db.DB, start time.Time,
+) error {
+	const (
+		machine      = "remote-example-host"
+		project      = "wrong_branch_label"
+		worktreeRoot = "/srv/worktrees/github.com/example-org/sample-service/example-worktree"
+		model        = "claude-sonnet-4-20250514"
+	)
+	cwds := []struct {
+		suffix string
+		cwd    string
+	}{
+		{suffix: "root", cwd: worktreeRoot},
+		{suffix: "nested", cwd: worktreeRoot + "/cmd/server"},
+	}
+	ctx := context.Background()
+	for index, item := range cwds {
+		sessionID := "test-session-project-reclassification-" + item.suffix
+		startedAt := start.Add(time.Duration(index) * time.Hour)
+		endedAt := startedAt.Add(12 * time.Minute)
+		firstMessage := "Inspect the sample service worktree."
+		session := db.Session{
+			ID:               sessionID,
+			Project:          project,
+			Machine:          machine,
+			Agent:            "claude",
+			StartedAt:        new(startedAt.Format(time.RFC3339Nano)),
+			EndedAt:          new(endedAt.Format(time.RFC3339Nano)),
+			MessageCount:     2,
+			UserMessageCount: 1,
+			FirstMessage:     new(firstMessage),
+			Cwd:              item.cwd,
+		}
+		if err := database.UpsertSession(session); err != nil {
+			return fmt.Errorf(
+				"upserting project-reclassification session: %w", err,
+			)
+		}
+		if err := database.InsertMessages(generateMessages(
+			sessionID, session.MessageCount, startedAt, model,
+		)); err != nil {
+			return fmt.Errorf(
+				"inserting project-reclassification messages: %w", err,
+			)
+		}
+		if err := database.UpsertProjectIdentityObservation(
+			ctx,
+			export.ProjectIdentityObservation{
+				SessionID:            sessionID,
+				Project:              project,
+				Machine:              machine,
+				RootPath:             worktreeRoot,
+				RepositoryPath:       "/srv/worktrees/github.com/example-org/sample-service",
+				WorktreeName:         "example-worktree",
+				WorktreeRootPath:     worktreeRoot,
+				WorktreeRelationship: export.WorktreeLinked,
+				CheckoutState:        export.CheckoutBranch,
+				GitBranch:            "example-worktree",
+				ObservedAt:           startedAt,
+			},
+		); err != nil {
+			return fmt.Errorf(
+				"upserting project-reclassification identity: %w", err,
+			)
+		}
+		fmt.Printf(
+			"  %s: %d messages (project reclassification)\n",
+			sessionID, session.MessageCount,
+		)
+	}
+	return nil
 }
 
 func writeDuckDBMirror(database *db.DB, path string) error {
@@ -240,7 +321,7 @@ func generateMessages(
 			outputTok := 200 + (i*89)%800
 			cacheCr := 50 + (i*31)%200
 			cacheRd := 1000 + (i*53)%4000
-			msg.TokenUsage = json.RawMessage(
+			msg.TokenUsage = jsontext.Value(
 				fmt.Sprintf(
 					`{"input_tokens":%d,`+
 						`"output_tokens":%d,`+
@@ -324,7 +405,7 @@ func generateMixedContentMessages(
 			outputTok := 150 + (i*67)%600
 			cacheCr := 30 + (i*23)%150
 			cacheRd := 800 + (i*41)%3000
-			msg.TokenUsage = json.RawMessage(
+			msg.TokenUsage = jsontext.Value(
 				fmt.Sprintf(
 					`{"input_tokens":%d,`+
 						`"output_tokens":%d,`+
@@ -334,6 +415,19 @@ func generateMixedContentMessages(
 					cacheCr, cacheRd,
 				),
 			)
+		}
+		if i == 3 {
+			const resultContent = "# Fixture output\n\n**safe** <script>alert(\"xss\")</script>"
+			msg.ToolCalls = []db.ToolCall{
+				{
+					ToolName:            "Read",
+					Category:            "Read",
+					ToolUseID:           "tu_mixed_read",
+					InputJSON:           `{"file_path":"/workspace/packages/agentsview/frontend/src/lib/components/content/ToolBlock.svelte"}`,
+					ResultContentLength: len(resultContent),
+					ResultContent:       resultContent,
+				},
+			}
 		}
 		msgs = append(msgs, msg)
 	}
@@ -449,6 +543,7 @@ func createDurationShowcaseFixture(
 		Project:          project,
 		Machine:          "test-machine",
 		Agent:            "claude",
+		Cwd:              "/workspace/مشروع/.worktrees/שלוםfeaturewithalongcheckoutnamefortooltipwrappingwithoutbreakopportunities",
 		StartedAt:        new(t0.Format(time.RFC3339Nano)),
 		EndedAt:          new(endParent.Format(time.RFC3339Nano)),
 		MessageCount:     len(parentMessages),
@@ -504,12 +599,12 @@ func buildDurationShowcaseMessages(
 		bashSlowID = "tu_bash_slow"
 	)
 
-	tokenUsage := func(seed int) json.RawMessage {
+	tokenUsage := func(seed int) jsontext.Value {
 		input := 600 + seed*150
 		output := 220 + seed*80
 		cacheCr := 60 + seed*15
 		cacheRd := 1100 + seed*40
-		return json.RawMessage(fmt.Sprintf(
+		return jsontext.Value(fmt.Sprintf(
 			`{"input_tokens":%d,`+
 				`"output_tokens":%d,`+
 				`"cache_creation_input_tokens":%d,`+
@@ -662,12 +757,12 @@ func buildDurationSubagentMessages(
 ) []db.Message {
 	const model = "claude-sonnet-4-20250514"
 
-	tokenUsage := func(seed int) json.RawMessage {
+	tokenUsage := func(seed int) jsontext.Value {
 		input := 350 + seed*90
 		output := 180 + seed*55
 		cacheCr := 40 + seed*12
 		cacheRd := 700 + seed*30
-		return json.RawMessage(fmt.Sprintf(
+		return jsontext.Value(fmt.Sprintf(
 			`{"input_tokens":%d,`+
 				`"output_tokens":%d,`+
 				`"cache_creation_input_tokens":%d,`+
@@ -825,7 +920,7 @@ func createRecentEditsFixture(
 				Format(time.RFC3339Nano),
 			ContentLength: 29,
 			Model:         model,
-			TokenUsage: json.RawMessage(
+			TokenUsage: jsontext.Value(
 				`{"input_tokens":800,` +
 					`"output_tokens":320,` +
 					`"cache_creation_input_tokens":80,` +

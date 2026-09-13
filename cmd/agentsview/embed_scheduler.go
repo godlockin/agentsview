@@ -44,8 +44,7 @@ func acquireVectorsWriteLockWithRetry(
 		if err == nil {
 			return lock, true, nil
 		}
-		var held writeOwnerLockHeldError
-		if !errors.As(err, &held) {
+		if _, ok := errors.AsType[writeOwnerLockHeldError](err); !ok {
 			return nil, false, err
 		}
 		if !time.Now().Before(deadline) {
@@ -147,18 +146,23 @@ func (s *embedScheduler) Stop() {
 // TryBuild calls and, independently, fires a Backstop TryBuild on every
 // backstop tick. It returns when ctx is done or Stop is called.
 func (s *embedScheduler) Run(ctx context.Context) {
-	defer close(s.done)
-
-	debounceTimer := time.NewTimer(s.debounce)
-	stopTimer(debounceTimer)
-	defer debounceTimer.Stop()
-
 	var backstopC <-chan time.Time
 	if s.backstop > 0 {
 		ticker := time.NewTicker(s.backstop)
 		defer ticker.Stop()
 		backstopC = ticker.C
 	}
+	s.run(ctx, backstopC)
+}
+
+func (s *embedScheduler) run(
+	ctx context.Context, backstopC <-chan time.Time,
+) {
+	defer close(s.done)
+
+	debounceTimer := time.NewTimer(s.debounce)
+	stopTimer(debounceTimer)
+	defer debounceTimer.Stop()
 
 	// pendingBackstop remembers a backstop tick that collided with another
 	// build or failed transiently. Without it, that reconciliation pass would
@@ -208,15 +212,14 @@ func (s *embedScheduler) Run(ctx context.Context) {
 			if err != nil {
 				log.Printf("embed scheduler: build failed: %v", err)
 				if buildErrorRetries >= embedBuildErrorRetryLimit {
-					log.Printf("embed scheduler: retry limit reached; deferring until new work")
+					log.Printf("embed scheduler: retry limit reached; deferring until next backstop or new work")
 					if pendingRelease != nil {
 						pendingRelease()
 						pendingRelease = nil
 					}
-					// A failed full reconciliation remains owed. Stop automatic
-					// retries and release the lease, but let the next fresh
-					// notification carry Backstop: true instead of deferring the
-					// full pass until the next periodic tick.
+					// A failed full reconciliation remains owed. End this bounded
+					// lifecycle and release its lease; a later periodic tick or
+					// fresh notification can begin another lifecycle.
 					buildErrorRetries = 0
 					continue
 				}
@@ -300,11 +303,9 @@ func stopTimer(t *time.Timer) {
 	}
 }
 
-// resetTimer stops and drains t before rearming it for d, the safe
-// stop-then-reset sequence for a timer whose channel may already hold an
-// unread tick.
+// resetTimer rearms t for d. Go 1.23 and later guarantee that Reset prevents a
+// subsequent receive from observing a stale value from the prior settings.
 func resetTimer(t *time.Timer, d time.Duration) {
-	stopTimer(t)
 	t.Reset(d)
 }
 
@@ -451,6 +452,10 @@ func (a recallSearcherAdapter) ValidateRecallSnapshot(
 		)
 	}
 	return nil
+}
+
+func (a recallSearcherAdapter) MaxRecallSearchCandidates() int {
+	return a.ix.MaxSearchCandidates()
 }
 
 // newSearcherAdapter builds a searcherAdapter for gen's configured
@@ -604,7 +609,7 @@ func setupVectorServing(
 	ctx context.Context, cfg config.Config, database *db.DB,
 	idle *server.IdleTracker,
 ) (vectorServing, error) {
-	if !cfg.Vector.Enabled {
+	if cfg.ArchiveContent.UsageOnly() || database.ArchiveContent().UsageOnly() || !cfg.Vector.Enabled {
 		return vectorServing{}, nil
 	}
 
@@ -719,8 +724,11 @@ func setupVectorServing(
 		RecallScheduler:      recallScheduler,
 		RecallMutationNotify: recallMutationNotify,
 		Close: func() error {
-			mgr.Wait()
-			recallMgr.Wait()
+			// Shutdown, not Wait: a detached API build may be waiting out
+			// provider rate limits indefinitely and must be canceled for
+			// daemon shutdown to complete.
+			mgr.Shutdown()
+			recallMgr.Shutdown()
 			ixErr := ix.Close()
 			recallErr := recallIX.Close()
 			lockErr := lock.Close()
@@ -769,7 +777,7 @@ func recallBackstop(cfg config.Config, configured time.Duration) time.Duration {
 // caller must call it when done with d to release the read-only index
 // handle.
 func installDirectVectorSearcher(cfg config.Config, d *db.DB) func() error {
-	if !cfg.Vector.Enabled {
+	if cfg.ArchiveContent.UsageOnly() || d.ArchiveContent().UsageOnly() || !cfg.Vector.Enabled {
 		return nil
 	}
 	path := cfg.Vector.ResolvedDBPath(cfg.DataDir)

@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -24,22 +25,43 @@ type fakeRecallVectorSearcher struct {
 }
 
 type boundedRecallVectorSearcher struct {
-	hits   []RecallVectorHit
-	limits []int
+	hits              []RecallVectorHit
+	limits            []int
+	maxCandidates     int
+	forceNotExhausted bool
+	err               error
+	errAt             int
+	snapshotErr       error
+	snapshotErrAt     int
 }
 
 func (f *boundedRecallVectorSearcher) SearchRecall(
 	_ context.Context, _ string, limit int,
 ) ([]RecallVectorHit, bool, RecallVectorSnapshot, error) {
 	f.limits = append(f.limits, limit)
+	if f.err != nil && (f.errAt == 0 || limit >= f.errAt) {
+		return nil, false, RecallVectorSnapshot{}, f.err
+	}
+	exhausted := len(f.hits) <= limit
+	if f.forceNotExhausted {
+		exhausted = false
+	}
 	return append([]RecallVectorHit(nil), f.hits[:min(limit, len(f.hits))]...),
-		len(f.hits) <= limit, RecallVectorSnapshot{}, nil
+		exhausted, RecallVectorSnapshot{}, nil
 }
 
 func (f *boundedRecallVectorSearcher) ValidateRecallSnapshot(
 	context.Context, RecallVectorSnapshot,
 ) error {
+	if f.snapshotErr != nil && len(f.limits) > 0 &&
+		(f.snapshotErrAt == 0 || f.limits[len(f.limits)-1] >= f.snapshotErrAt) {
+		return f.snapshotErr
+	}
 	return nil
+}
+
+func (f *boundedRecallVectorSearcher) MaxRecallSearchCandidates() int {
+	return f.maxCandidates
 }
 
 func (f *fakeRecallVectorSearcher) SearchRecall(
@@ -75,6 +97,29 @@ func (f *fakeRecallVectorSearcher) ValidateRecallSnapshot(
 		return NewSemanticUnavailableError("recall corpus changed during search")
 	}
 	return nil
+}
+
+func (f *fakeRecallVectorSearcher) MaxRecallSearchCandidates() int {
+	return 0
+}
+
+func TestClampRecallVectorCandidates(t *testing.T) {
+	for _, tt := range []struct {
+		name    string
+		k       int
+		ceiling int
+		want    int
+	}{
+		{name: "unbounded", k: 8192, ceiling: 0, want: 8192},
+		{name: "below ceiling", k: 2048, ceiling: 4096, want: 2048},
+		{name: "at ceiling", k: 4096, ceiling: 4096, want: 4096},
+		{name: "above ceiling", k: 8192, ceiling: 4096, want: 4096},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.want,
+				clampRecallVectorCandidates(tt.k, tt.ceiling))
+		})
+	}
 }
 
 func TestRecallEntriesSchemaIndexesSourceEpisode(t *testing.T) {
@@ -1860,7 +1905,7 @@ func TestQueryRecallEntriesVectorExpandsPastFilteredCandidates(t *testing.T) {
 	})
 	require.NoError(t, err)
 	hits = append(hits, RecallVectorHit{EntryID: "matching-project", Score: 0.5})
-	searcher := &boundedRecallVectorSearcher{hits: hits}
+	searcher := &boundedRecallVectorSearcher{hits: hits, maxCandidates: 4096}
 	d.SetRecallVectorSearcher(searcher)
 
 	page, err := d.QueryRecallEntries(ctx, RecallQuery{
@@ -1872,6 +1917,178 @@ func TestQueryRecallEntriesVectorExpandsPastFilteredCandidates(t *testing.T) {
 	require.Len(t, page.RecallEntries, 1)
 	assert.Equal(t, "matching-project", page.RecallEntries[0].ID)
 	assert.Equal(t, []int{SemanticOverfetchMin, SemanticOverfetchMin * 2}, searcher.limits)
+}
+
+func TestQueryRecallEntriesVectorStopsAtExhaustionBelowCandidateCeiling(t *testing.T) {
+	d := testDB(t)
+	ctx := context.Background()
+	insertSession(t, d, "s1", "agentsview")
+	hits := make([]RecallVectorHit, 0, SemanticOverfetchMin+1)
+	for i := range SemanticOverfetchMin + 1 {
+		id := fmt.Sprintf("excluded-%03d", i)
+		_, err := d.InsertRecallEntry(RecallEntry{
+			ID: id, Type: "fact", Scope: "project", Status: "accepted",
+			Title: "Other project", Body: "Excluded before the candidate ceiling.",
+			Project: "other", SourceSessionID: "s1",
+		})
+		require.NoError(t, err)
+		hits = append(hits, RecallVectorHit{EntryID: id, Score: float32(1 - float64(i)/1000)})
+	}
+	searcher := &boundedRecallVectorSearcher{hits: hits, maxCandidates: 4096}
+	d.SetRecallVectorSearcher(searcher)
+
+	page, err := d.QueryRecallEntries(ctx, RecallQuery{
+		Text: "semantic policy", Mode: RecallQueryModeVector,
+		Project: "agentsview", Limit: 1,
+	})
+
+	require.NoError(t, err)
+	assert.Empty(t, page.RecallEntries)
+	assert.Equal(t, []int{SemanticOverfetchMin, SemanticOverfetchMin * 2}, searcher.limits)
+}
+
+func TestQueryRecallEntriesVectorStopsAtSearcherCandidateCeiling(t *testing.T) {
+	d := testDB(t)
+	ctx := context.Background()
+	insertSession(t, d, "s1", "agentsview")
+	for _, entry := range []RecallEntry{
+		{
+			ID: "excluded", Type: "fact", Scope: "project", Status: "accepted",
+			Title: "Other project status", Body: "Filtered status result.",
+			Project: "other", SourceSessionID: "s1",
+		},
+		{
+			ID: "matching", Type: "fact", Scope: "project", Status: "accepted",
+			Title: "Matching project status", Body: "Eligible status result.",
+			Project: "agentsview", SourceSessionID: "s1",
+		},
+	} {
+		_, err := d.InsertRecallEntry(entry)
+		require.NoError(t, err)
+	}
+	searcher := &boundedRecallVectorSearcher{
+		hits: []RecallVectorHit{
+			{EntryID: "excluded", Score: 0.9},
+			{EntryID: "matching", Score: 0.8},
+		},
+		maxCandidates:     4096,
+		forceNotExhausted: true,
+	}
+	d.SetRecallVectorSearcher(searcher)
+
+	page, err := d.QueryRecallEntries(ctx, RecallQuery{
+		Text: "status", Mode: RecallQueryModeVector,
+		Project: "agentsview", Limit: 3,
+	})
+
+	require.NoError(t, err)
+	require.Len(t, page.RecallEntries, 1)
+	assert.Equal(t, "matching", page.RecallEntries[0].ID)
+	assert.Equal(t, []int{200, 400, 800, 1600, 3200, 4096}, searcher.limits)
+	for _, limit := range searcher.limits {
+		assert.LessOrEqual(t, limit, 4096)
+	}
+}
+
+func TestQueryRecallEntriesHybridReturnsPartialPageAtCandidateCeiling(t *testing.T) {
+	d := testDB(t)
+	ctx := context.Background()
+	insertSession(t, d, "s1", "agentsview")
+	for _, entry := range []RecallEntry{
+		{
+			ID: "excluded", Type: "fact", Scope: "project", Status: "accepted",
+			Title: "Other project status", Body: "Filtered status result.",
+			Project: "other", SourceSessionID: "s1",
+		},
+		{
+			ID: "matching", Type: "fact", Scope: "project", Status: "accepted",
+			Title: "Matching project status", Body: "Eligible status result.",
+			Project: "agentsview", SourceSessionID: "s1",
+		},
+	} {
+		_, err := d.InsertRecallEntry(entry)
+		require.NoError(t, err)
+	}
+	searcher := &boundedRecallVectorSearcher{
+		hits: []RecallVectorHit{
+			{EntryID: "excluded", Score: 0.9},
+			{EntryID: "matching", Score: 0.8},
+		},
+		maxCandidates:     4096,
+		forceNotExhausted: true,
+	}
+	d.SetRecallVectorSearcher(searcher)
+
+	page, err := d.QueryRecallEntries(ctx, RecallQuery{
+		Text: "status", Mode: RecallQueryModeHybrid,
+		Project: "agentsview", Limit: 3,
+	})
+
+	require.NoError(t, err)
+	require.Len(t, page.RecallEntries, 1)
+	assert.Equal(t, "matching", page.RecallEntries[0].ID)
+	assert.Equal(t, []int{2000, 4000, 4096}, searcher.limits)
+	for _, limit := range searcher.limits {
+		assert.LessOrEqual(t, limit, 4096)
+	}
+}
+
+func TestQueryRecallEntriesVectorPreservesSearcherErrorAtCandidateCeiling(t *testing.T) {
+	d := testDB(t)
+	ctx := context.Background()
+	insertSession(t, d, "s1", "agentsview")
+	_, err := d.InsertRecallEntry(RecallEntry{
+		ID: "excluded", Type: "fact", Scope: "project", Status: "accepted",
+		Title: "Other project status", Body: "Filtered status result.",
+		Project: "other", SourceSessionID: "s1",
+	})
+	require.NoError(t, err)
+	wantErr := errors.New("searcher failed at candidate ceiling")
+	searcher := &boundedRecallVectorSearcher{
+		hits:              []RecallVectorHit{{EntryID: "excluded", Score: 0.9}},
+		maxCandidates:     4096,
+		forceNotExhausted: true,
+		err:               wantErr,
+		errAt:             4096,
+	}
+	d.SetRecallVectorSearcher(searcher)
+
+	_, err = d.QueryRecallEntries(ctx, RecallQuery{
+		Text: "status", Mode: RecallQueryModeVector,
+		Project: "agentsview", Limit: 3,
+	})
+
+	assert.ErrorIs(t, err, wantErr)
+	assert.Equal(t, []int{200, 400, 800, 1600, 3200, 4096}, searcher.limits)
+}
+
+func TestQueryRecallEntriesVectorPreservesSnapshotErrorAtCandidateCeiling(t *testing.T) {
+	d := testDB(t)
+	ctx := context.Background()
+	insertSession(t, d, "s1", "agentsview")
+	_, err := d.InsertRecallEntry(RecallEntry{
+		ID: "excluded", Type: "fact", Scope: "project", Status: "accepted",
+		Title: "Other project status", Body: "Filtered status result.",
+		Project: "other", SourceSessionID: "s1",
+	})
+	require.NoError(t, err)
+	wantErr := errors.New("snapshot changed at candidate ceiling")
+	searcher := &boundedRecallVectorSearcher{
+		hits:              []RecallVectorHit{{EntryID: "excluded", Score: 0.9}},
+		maxCandidates:     4096,
+		forceNotExhausted: true,
+		snapshotErr:       wantErr,
+		snapshotErrAt:     4096,
+	}
+	d.SetRecallVectorSearcher(searcher)
+
+	_, err = d.QueryRecallEntries(ctx, RecallQuery{
+		Text: "status", Mode: RecallQueryModeVector,
+		Project: "agentsview", Limit: 3,
+	})
+
+	assert.ErrorIs(t, err, wantErr)
+	assert.Equal(t, []int{200, 400, 800, 1600, 3200, 4096}, searcher.limits)
 }
 
 func TestQueryRecallEntriesHybridUsesReciprocalRankFusion(t *testing.T) {
@@ -2416,6 +2633,59 @@ func TestCopyRecallEntriesFrom(t *testing.T) {
 	assert.Equal(t, "m1", cands[0].ID)
 }
 
+func TestCopyRecallEntriesFromAdvancesQueryRevisionWhenAllEntriesSkipped(
+	t *testing.T,
+) {
+	dir := t.TempDir()
+	ctx := context.Background()
+
+	srcPath := filepath.Join(dir, "old.db")
+	srcDB, err := Open(srcPath)
+	require.NoError(t, err)
+	insertSession(t, srcDB, "removed-session", "agentsview")
+	_, err = srcDB.InsertRecallEntry(RecallEntry{
+		ID:              "removed-entry",
+		Type:            "fact",
+		Scope:           "project",
+		Status:          "accepted",
+		Title:           "Removed during resync",
+		Body:            "The source session did not survive.",
+		SourceSessionID: "removed-session",
+	})
+	require.NoError(t, err)
+	sourceRevision, err := srcDB.RecallQueryRevision(ctx)
+	require.NoError(t, err)
+	require.NoError(t, srcDB.Close())
+
+	dstDB, err := Open(filepath.Join(dir, "new.db"))
+	require.NoError(t, err)
+	defer dstDB.Close()
+
+	require.NoError(t, dstDB.CopyRecallEntriesFrom(srcPath))
+
+	entries, err := dstDB.ListRecallEntries(ctx, RecallQuery{})
+	require.NoError(t, err)
+	assert.Empty(t, entries)
+
+	destinationRevision, err := dstDB.RecallQueryRevision(ctx)
+	require.NoError(t, err)
+	sourceRevisionNumber, ok := parseTestRecallQueryRevision(sourceRevision)
+	require.True(t, ok)
+	destinationRevisionNumber, ok := parseTestRecallQueryRevision(destinationRevision)
+	require.True(t, ok)
+	assert.Greater(t, destinationRevisionNumber, sourceRevisionNumber,
+		"replacing an archive must invalidate existing ranked cursors")
+}
+
+func parseTestRecallQueryRevision(revision string) (int64, bool) {
+	value, ok := strings.CutPrefix(revision, recallQueryRevisionPrefix)
+	if !ok {
+		return 0, false
+	}
+	parsed, err := strconv.ParseInt(value, 10, 64)
+	return parsed, err == nil
+}
+
 func TestCopyRecallEntriesFromPreservesPendingArchivedEmbeddingChange(
 	t *testing.T,
 ) {
@@ -2492,6 +2762,53 @@ func TestCopyRecallEntriesFromReconcilesShiftedEvidence(t *testing.T) {
 	assert.Equal(t, 11, got.Evidence[0].MessageStartOrdinal)
 	assert.Equal(t, 12, got.Evidence[0].MessageEndOrdinal)
 	assert.Equal(t, original.ContentDigest, got.Evidence[0].ContentDigest)
+}
+
+func TestCopyRecallEntriesFromRevokesIDEEnvelopeSplitEvidence(t *testing.T) {
+	dir := t.TempDir()
+	srcPath := filepath.Join(dir, "old-ide-evidence.db")
+	srcDB, err := Open(srcPath)
+	require.NoError(t, err)
+	seedRecallEvidenceWindow(t, srcDB, "s1", 10, "stable", "")
+	oldMessages, err := srcDB.GetAllMessages(context.Background(), "s1")
+	require.NoError(t, err)
+	const envelope = "<ide_opened_file>The user opened a.go.</ide_opened_file>"
+	oldMessages[0].Content = envelope + "  \nRun the formatter."
+	oldMessages[0].ContentLength = len(oldMessages[0].Content)
+	require.NoError(t, srcDB.ReplaceSessionMessages("s1", oldMessages))
+	insertVerifiedRecallSelection(
+		t, srcDB, "m1", "s1", 10, 11, []string{"tool-a"},
+	)
+	oldMessages, err = srcDB.GetAllMessages(context.Background(), "s1")
+	require.NoError(t, err)
+	_, err = srcDB.getWriter().Exec("PRAGMA user_version = 79")
+	require.NoError(t, err)
+	require.NoError(t, srcDB.Close())
+
+	dstPath := filepath.Join(dir, "new-ide-evidence.db")
+	dstDB, err := Open(dstPath)
+	require.NoError(t, err)
+	defer dstDB.Close()
+	insertSession(t, dstDB, "s1", "agentsview")
+	for i := range oldMessages {
+		oldMessages[i].ID = 0
+		oldMessages[i].Ordinal++
+	}
+	oldMessages[0].Content = "Run the formatter."
+	oldMessages[0].ContentLength = len(oldMessages[0].Content)
+	hidden := recallEvidenceMessage(
+		"s1", 10, "user", envelope, "stable-10:ide-context",
+	)
+	hidden.IsSystem = true
+	insertMessages(t, dstDB, append([]Message{hidden}, oldMessages...)...)
+
+	require.NoError(t, dstDB.CopyRecallEntriesFrom(srcPath))
+
+	got := requireRecallEntry(t, dstDB, "m1")
+	assert.False(t, got.ProvenanceOK,
+		"evidence spanning rewritten content must revoke fail-closed")
+	require.Len(t, got.Evidence, 1,
+		"revocation retains the historical evidence row")
 }
 
 func TestCopyRecallEntriesFromRevokesChangedEvidence(t *testing.T) {

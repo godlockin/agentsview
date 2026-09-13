@@ -1,4 +1,4 @@
-import type { MoneyMoney } from "./api/generated/models/MoneyMoney.js";
+import type { MoneyMoney } from "./api/generated/index.js";
 import { getLocale } from "./i18n/index.js";
 
 export type Money = MoneyMoney;
@@ -7,14 +7,6 @@ export const ZERO_MONEY: Money = Object.freeze({ microdollars: 0 });
 
 export function moneyFromMicrodollars(microdollars: number): Money {
   return { microdollars };
-}
-
-export function addMoney(left: Money, right: Money): Money {
-  return moneyFromMicrodollars(left.microdollars + right.microdollars);
-}
-
-export function subtractMoney(left: Money, right: Money): Money {
-  return moneyFromMicrodollars(left.microdollars - right.microdollars);
 }
 
 export function divideMoney(value: Money, divisor: number): Money {

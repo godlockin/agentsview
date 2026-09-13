@@ -16,13 +16,17 @@ import (
 func (s *Server) registerSettingsRoutes() {
 	group := newRouteGroup(s.api, "/api/v1/settings", "Settings")
 
-	get(s, group, "", "Get settings", s.humaGetSettings)
-	put(s, group, "", "Update settings", s.humaUpdateSettings)
-	get(s, group, "/worktree-mappings", "List worktree mappings", s.humaListWorktreeMappings)
-	post(s, group, "/worktree-mappings", "Create worktree mapping", s.humaCreateWorktreeMapping)
-	put(s, group, "/worktree-mappings/{id}", "Update worktree mapping", s.humaUpdateWorktreeMapping)
-	deleteRoute(s, group, "/worktree-mappings/{id}", "Delete worktree mapping", s.humaDeleteWorktreeMapping)
-	post(s, group, "/worktree-mappings/apply", "Apply worktree mappings", s.humaApplyWorktreeMappings)
+	s.get(group, "", "Get settings", s.humaGetSettings)
+	s.put(group, "", "Update settings", s.humaUpdateSettings)
+	s.get(group, "/worktree-mappings", "List worktree mappings", s.humaListWorktreeMappings)
+	s.post(group, "/worktree-mappings", "Create worktree mapping", s.humaCreateWorktreeMapping)
+	s.put(group, "/worktree-mappings/{id}", "Update worktree mapping", s.humaUpdateWorktreeMapping)
+	s.deleteRoute(group, "/worktree-mappings/{id}", "Delete worktree mapping", s.humaDeleteWorktreeMapping)
+	s.post(group, "/worktree-mappings/apply", "Apply worktree mappings", s.humaApplyWorktreeMappings)
+	s.post(group, "/worktree-mappings/preview",
+		"Preview worktree project reclassification", s.humaPreviewWorktreeReclassification)
+	s.post(group, "/worktree-mappings/reclassify",
+		"Apply worktree project reclassification", s.humaReclassifyWorktreeProject)
 }
 
 type settingsInput struct {
@@ -31,6 +35,10 @@ type settingsInput struct {
 
 type worktreeMappingCreateInput struct {
 	Body worktreeMappingRequest
+}
+
+type worktreeMappingListInput struct {
+	Machine string `query:"machine" doc:"Machine whose mappings should be listed"`
 }
 
 type worktreeMappingUpdateInput struct {
@@ -42,21 +50,46 @@ type worktreeMappingPathInput struct {
 	ID string `path:"id" required:"true" doc:"Mapping ID"`
 }
 
+type worktreeMappingApplyInput struct {
+	Body applyWorktreeMappingsRequest
+}
+
+type worktreeReclassificationPreviewInput struct {
+	Body worktreeReclassificationRequest
+}
+
+type worktreeReclassificationApplyInput struct {
+	Body worktreeReclassificationApplyRequest
+}
+
 func (s *Server) humaGetSettings(
 	ctx context.Context,
 	_ *emptyInput,
 ) (*jsonOutput[settingsResponse], error) {
 	s.mu.RLock()
 	dirs := make(map[string][]string)
+	providers := make([]sessionProviderResponse, 0, len(parser.Registry))
 	for _, def := range parser.Registry {
 		if !def.FileBased && def.EnvVar == "" {
 			continue
 		}
-		d := s.cfg.AgentDirs[def.Type]
+		d := s.cfg.ConfiguredDirs(def.Type)
 		if d == nil {
 			d = []string{}
 		}
 		dirs[string(def.Type)] = d
+		homes := s.cfg.ConfiguredAgentHomes(def.Type)
+		if homes == nil {
+			homes = []string{}
+		}
+		providers = append(providers, sessionProviderResponse{
+			ID:                 def.Type,
+			DisplayName:        def.DisplayName,
+			Dirs:               d,
+			PostAnswerToolWork: def.PostAnswerToolWork,
+			HomesSupported:     def.HomesSupported,
+			Homes:              homes,
+		})
 	}
 	tc := s.cfg.Terminal
 	if tc.Mode == "" {
@@ -64,17 +97,21 @@ func (s *Server) humaGetSettings(
 	}
 	githubToken := s.cfg.GithubToken
 	resp := settingsResponse{
-		AgentDirs: dirs,
+		AgentDirs:        dirs,
+		SessionProviders: providers,
+		DisabledAgents:   append([]parser.AgentType{}, s.cfg.DisabledAgents...),
 		Terminal: terminalResponse{
 			Mode:       tc.Mode,
 			CustomBin:  tc.CustomBin,
 			CustomArgs: tc.CustomArgs,
 		},
-		Host:         s.cfg.Host,
-		Port:         s.cfg.Port,
-		ChartPalette: s.cfg.ResolvedChartPalette(),
-		RequireAuth:  s.cfg.RequireAuth,
-		ReadOnly:     s.db.ReadOnly(),
+		Host:             s.cfg.Host,
+		Port:             s.cfg.Port,
+		ChartPalette:     s.cfg.ResolvedChartPalette(),
+		ZoomLevel:        s.cfg.ZoomLevel,
+		ToolResultImages: toolResultImagesValue(s.cfg.ToolResultImages),
+		RequireAuth:      s.cfg.RequireAuth,
+		ReadOnly:         s.db.ReadOnly(),
 	}
 	if isLocalhostContext(ctx) {
 		resp.AuthToken = s.cfg.AuthToken
@@ -104,6 +141,30 @@ func (s *Server) humaUpdateSettings(
 		}
 		patch["chart_palette"] = palette
 	}
+	if in.Body.ZoomLevel != nil {
+		patch["zoom_level"] = *in.Body.ZoomLevel
+	}
+	if in.Body.ToolResultImages != nil {
+		// The enum tag already constrained this to "keep" or "drop" before
+		// the handler ran, and those are the two spellings the configuration
+		// reference documents, so the value is persisted as sent. SaveSettings
+		// re-validates it for callers that bypass the HTTP layer.
+		patch["tool_result_images"] = config.ToolResultImages(*in.Body.ToolResultImages)
+	}
+	if in.Body.DisabledAgents != nil {
+		disabled, err := config.NormalizeDisabledAgents(*in.Body.DisabledAgents)
+		if err != nil {
+			return nil, apiError(http.StatusBadRequest, err.Error())
+		}
+		patch["disabled_agents"] = disabled
+	}
+	if in.Body.AgentHomes != nil {
+		homes, err := config.NormalizeAgentHomes(*in.Body.AgentHomes)
+		if err != nil {
+			return nil, apiError(http.StatusBadRequest, err.Error())
+		}
+		patch["agent_homes"] = homes
+	}
 	if in.Body.AuthToken != nil {
 		patch["auth_token"] = *in.Body.AuthToken
 	}
@@ -131,25 +192,40 @@ func (s *Server) localWorktreeMappingHumaDB() (*db.DB, string, error) {
 	}
 	machine := strings.TrimSpace(s.engine.Machine())
 	if machine == "" {
-		machine = s.cfg.LocalMachineName
+		machine = s.cfg.InstallationID
 	}
 	return localDB, machine, nil
 }
 
 func (s *Server) humaListWorktreeMappings(
 	ctx context.Context,
-	_ *emptyInput,
+	in *worktreeMappingListInput,
 ) (*jsonOutput[worktreeMappingsResponse], error) {
-	localDB, machine, err := s.localWorktreeMappingHumaDB()
+	localDB, localMachine, err := s.localWorktreeMappingHumaDB()
 	if err != nil {
 		return nil, err
+	}
+	machine := strings.TrimSpace(in.Machine)
+	if machine == "" {
+		machine = localMachine
+	}
+	machine, err = db.ResolveMachineFilter(ctx, localDB, machine)
+	if err != nil {
+		return nil, serverError(err)
 	}
 	mappings, err := localDB.ListWorktreeProjectMappings(ctx, machine)
 	if err != nil {
 		return nil, internalError("list worktree mappings", err)
 	}
+	machines, err := localDB.ListWorktreeProjectMappingMachines(ctx)
+	if err != nil {
+		return nil, internalError("list worktree mapping machines", err)
+	}
 	return &jsonOutput[worktreeMappingsResponse]{
-		Body: worktreeMappingsResponse{Machine: machine, Mappings: mappings},
+		Body: worktreeMappingsResponse{
+			Machine: machine, LocalMachine: localMachine,
+			Machines: machines, Mappings: mappings,
+		},
 	}, nil
 }
 
@@ -164,16 +240,20 @@ func (s *Server) humaCreateWorktreeMapping(
 	if in.Body.PathPrefix == nil {
 		return nil, apiError(http.StatusBadRequest, "path_prefix is required")
 	}
+	if in.Body.Machine != nil && strings.TrimSpace(*in.Body.Machine) != "" {
+		machine = strings.TrimSpace(*in.Body.Machine)
+	}
 	enabled := true
 	if in.Body.Enabled != nil {
 		enabled = *in.Body.Enabled
 	}
 	mapping, err := localDB.CreateWorktreeProjectMapping(ctx, db.WorktreeProjectMapping{
-		Machine:    machine,
-		PathPrefix: *in.Body.PathPrefix,
-		Layout:     valueOrDefault(in.Body.Layout, db.WorktreeMappingLayoutExplicit),
-		Project:    stringValueOrEmpty(in.Body.Project),
-		Enabled:    enabled,
+		Machine:         machine,
+		PathPrefix:      *in.Body.PathPrefix,
+		Layout:          valueOrDefault(in.Body.Layout, db.WorktreeMappingLayoutExplicit),
+		Project:         stringValueOrEmpty(in.Body.Project),
+		OriginalProject: stringValueOrEmpty(in.Body.OriginalProject),
+		Enabled:         enabled,
 	})
 	if err != nil {
 		return nil, humaWorktreeMappingError(err)
@@ -185,7 +265,7 @@ func (s *Server) humaUpdateWorktreeMapping(
 	ctx context.Context,
 	in *worktreeMappingUpdateInput,
 ) (*jsonOutput[db.WorktreeProjectMapping], error) {
-	localDB, machine, err := s.localWorktreeMappingHumaDB()
+	localDB, _, err := s.localWorktreeMappingHumaDB()
 	if err != nil {
 		return nil, err
 	}
@@ -193,15 +273,23 @@ func (s *Server) humaUpdateWorktreeMapping(
 	if err != nil {
 		return nil, err
 	}
+	existing, err := localDB.GetWorktreeProjectMapping(ctx, id)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, apiError(http.StatusNotFound, "mapping not found")
+	}
+	if err != nil {
+		return nil, internalError("get worktree mapping", err)
+	}
 	if in.Body.PathPrefix == nil || in.Body.Enabled == nil {
 		return nil, apiError(http.StatusBadRequest,
 			"path_prefix and enabled are required")
 	}
-	mapping, err := localDB.UpdateWorktreeProjectMapping(ctx, machine, id, db.WorktreeProjectMapping{
-		PathPrefix: *in.Body.PathPrefix,
-		Layout:     valueOrDefault(in.Body.Layout, db.WorktreeMappingLayoutExplicit),
-		Project:    stringValueOrEmpty(in.Body.Project),
-		Enabled:    *in.Body.Enabled,
+	mapping, err := localDB.UpdateWorktreeProjectMapping(ctx, existing.Machine, id, db.WorktreeProjectMapping{
+		PathPrefix:      *in.Body.PathPrefix,
+		Layout:          valueOrDefault(in.Body.Layout, db.WorktreeMappingLayoutExplicit),
+		Project:         stringValueOrEmpty(in.Body.Project),
+		OriginalProject: stringValueOrEmpty(in.Body.OriginalProject),
+		Enabled:         *in.Body.Enabled,
 	})
 	if err != nil {
 		return nil, humaWorktreeMappingError(err)
@@ -213,7 +301,7 @@ func (s *Server) humaDeleteWorktreeMapping(
 	ctx context.Context,
 	in *worktreeMappingPathInput,
 ) (*noContentOutput, error) {
-	localDB, machine, err := s.localWorktreeMappingHumaDB()
+	localDB, _, err := s.localWorktreeMappingHumaDB()
 	if err != nil {
 		return nil, err
 	}
@@ -221,7 +309,14 @@ func (s *Server) humaDeleteWorktreeMapping(
 	if err != nil {
 		return nil, err
 	}
-	err = localDB.DeleteWorktreeProjectMapping(ctx, machine, id)
+	existing, err := localDB.GetWorktreeProjectMapping(ctx, id)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, apiError(http.StatusNotFound, "mapping not found")
+	}
+	if err != nil {
+		return nil, internalError("get worktree mapping", err)
+	}
+	err = localDB.DeleteWorktreeProjectMapping(ctx, existing.Machine, id)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, apiError(http.StatusNotFound, "mapping not found")
 	}
@@ -241,13 +336,16 @@ func parseWorktreeMappingHumaID(raw string) (int64, error) {
 
 func (s *Server) humaApplyWorktreeMappings(
 	ctx context.Context,
-	_ *emptyInput,
+	in *worktreeMappingApplyInput,
 ) (*jsonOutput[applyWorktreeMappingsResponse], error) {
-	localDB, machine, err := s.localWorktreeMappingHumaDB()
+	_, machine, err := s.localWorktreeMappingHumaDB()
 	if err != nil {
 		return nil, err
 	}
-	result, err := localDB.ApplyWorktreeProjectMappings(ctx, machine)
+	if in.Body.Machine != nil && strings.TrimSpace(*in.Body.Machine) != "" {
+		machine = strings.TrimSpace(*in.Body.Machine)
+	}
+	result, err := s.engine.ApplyWorktreeProjectMappings(ctx, machine)
 	if err != nil {
 		return nil, internalError("apply worktree mappings", err)
 	}
@@ -257,6 +355,64 @@ func (s *Server) humaApplyWorktreeMappings(
 			ApplyWorktreeProjectMappingsResult: result,
 		},
 	}, nil
+}
+
+func (s *Server) humaPreviewWorktreeReclassification(
+	ctx context.Context,
+	in *worktreeReclassificationPreviewInput,
+) (*jsonOutput[db.WorktreeReclassificationPreview], error) {
+	localDB, _, err := s.localWorktreeMappingHumaDB()
+	if err != nil {
+		return nil, err
+	}
+	preview, err := localDB.PreviewWorktreeReclassification(ctx, in.Body.draft())
+	if err != nil {
+		return nil, humaWorktreeReclassificationError(err)
+	}
+	return &jsonOutput[db.WorktreeReclassificationPreview]{Body: preview}, nil
+}
+
+func (s *Server) humaReclassifyWorktreeProject(
+	ctx context.Context,
+	in *worktreeReclassificationApplyInput,
+) (*jsonOutput[worktreeReclassificationApplyResponse], error) {
+	localDB, _, err := s.localWorktreeMappingHumaDB()
+	if err != nil {
+		return nil, err
+	}
+	if strings.TrimSpace(in.Body.MappingToken) == "" {
+		return nil, apiError(http.StatusBadRequest, "mapping_token is required")
+	}
+	draft := in.Body.draft()
+	// The server, not the client, resolves the exact (machine, prefix)
+	// collision. Apply rechecks this identity plus the accepted draft and
+	// affected-session snapshot under the engine's exclusive write boundary.
+	current, err := localDB.PreviewWorktreeReclassification(ctx, draft)
+	if err != nil {
+		return nil, humaWorktreeReclassificationError(err)
+	}
+	mapping, result, err := s.engine.ApplyWorktreeReclassification(
+		ctx, draft, in.Body.MappingToken, current.ExistingMappingID,
+	)
+	if err != nil {
+		return nil, humaWorktreeReclassificationError(err)
+	}
+	return &jsonOutput[worktreeReclassificationApplyResponse]{
+		Body: worktreeReclassificationApplyResponse{Mapping: mapping, Result: result},
+	}, nil
+}
+
+func humaWorktreeReclassificationError(err error) error {
+	switch {
+	case errors.Is(err, db.ErrWorktreeMappingSetChanged):
+		return apiError(http.StatusConflict, err.Error())
+	case errors.Is(err, db.ErrWorktreeMappingInvalid):
+		return apiError(http.StatusBadRequest, err.Error())
+	case strings.Contains(err.Error(), "required"):
+		return apiError(http.StatusBadRequest, err.Error())
+	default:
+		return internalError("worktree reclassification", err)
+	}
 }
 
 func humaWorktreeMappingError(err error) error {

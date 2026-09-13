@@ -2,7 +2,8 @@ package main
 
 import (
 	"context"
-	"encoding/json"
+	"encoding/json/jsontext"
+	"encoding/json/v2"
 	"fmt"
 	"io"
 	"log"
@@ -23,6 +24,7 @@ import (
 	"go.kenn.io/agentsview/internal/pricingrefresh"
 	"go.kenn.io/agentsview/internal/service"
 	"go.kenn.io/agentsview/internal/sync"
+	"go.kenn.io/agentsview/internal/timeutil"
 )
 
 // quickSyncMargin pads the mtime cutoff backward from the
@@ -180,9 +182,8 @@ func runUsageDaily(cfg UsageDailyConfig) {
 	}
 
 	if cfg.JSON {
-		enc := json.NewEncoder(os.Stdout)
-		enc.SetIndent("", "  ")
-		if err := enc.Encode(result); err != nil {
+		enc := jsontext.NewEncoder(os.Stdout, jsontext.WithIndent("  "))
+		if err := json.MarshalEncode(enc, result); err != nil {
 			fmt.Fprintf(os.Stderr, "error: %v\n", err)
 			os.Exit(1)
 		}
@@ -219,18 +220,39 @@ func noTokenDataNote(agent string, totals db.UsageTotals) string {
 }
 
 type UsageStatuslineConfig struct {
+	JSON    bool
 	Agent   string
 	Offline bool
 	NoSync  bool
 }
 
+// usageStatuslineReport is the machine-readable form of the statusline. It
+// carries the same facts as the human line and nothing more: today's cost,
+// the day it covers, and the agent filter that produced it. Cost stays a
+// money.Money so callers read exact microdollars instead of scraping the
+// formatted string.
+type usageStatuslineReport struct {
+	Date  string      `json:"date"`
+	Cost  money.Money `json:"cost"`
+	Agent string      `json:"agent,omitempty"`
+}
+
+func usageDateForTimezone(now time.Time, timezone string) string {
+	loc, err := time.LoadLocation(timezone)
+	if err != nil {
+		loc = time.UTC
+	}
+	return now.In(loc).Format("2006-01-02")
+}
+
 func runUsageStatusline(cfg UsageStatuslineConfig) {
-	today := time.Now().Format("2006-01-02")
+	timezone := localTimezone()
+	today := usageDateForTimezone(time.Now(), timezone)
 	filter := db.UsageFilter{
 		From:     today,
 		To:       today,
 		Agent:    cfg.Agent,
-		Timezone: localTimezone(),
+		Timezone: timezone,
 	}
 
 	ctx := context.Background()
@@ -256,7 +278,27 @@ func runUsageStatusline(cfg UsageStatuslineConfig) {
 		os.Exit(1)
 	}
 
+	if cfg.JSON {
+		printUsageStatuslineJSON(result, cfg.Agent, today)
+		return
+	}
+
 	printUsageStatusline(result, cfg.Agent)
+}
+
+func printUsageStatuslineJSON(
+	result db.DailyUsageResult, agent, date string,
+) {
+	enc := jsontext.NewEncoder(os.Stdout, jsontext.WithIndent("  "))
+	report := usageStatuslineReport{
+		Date:  date,
+		Cost:  result.Totals.TotalCost,
+		Agent: agent,
+	}
+	if err := json.MarshalEncode(enc, report); err != nil {
+		fmt.Fprintf(os.Stderr, "error: %v\n", err)
+		os.Exit(1)
+	}
 }
 
 func printUsageStatusline(result db.DailyUsageResult, agent string) {
@@ -312,8 +354,13 @@ func ensureFreshData(
 	if database.NeedsResync() {
 		engine := sync.NewEngine(database, sync.EngineConfig{
 			AgentDirs:          appCfg.AgentDirs,
+			SourceMachines:     appCfg.SourceMachines,
+			ProviderMetadata:   appCfg.ProviderMetadata,
+			DisabledAgents:     appCfg.DisabledAgents,
 			IncludeCwdPrefixes: appCfg.SyncIncludeCwdPrefixes,
-			Machine:            appCfg.LocalMachineName,
+			ScanProtectedPaths: appCfg.ScanProtectedPaths,
+			Machine:            appCfg.InstallationID,
+			ArchiveContent:     appCfg.ArchiveContent,
 		})
 		defer engine.Close()
 		fmt.Fprintln(os.Stderr,
@@ -336,8 +383,13 @@ func ensureFreshData(
 
 	engine := sync.NewEngine(database, sync.EngineConfig{
 		AgentDirs:          appCfg.AgentDirs,
+		SourceMachines:     appCfg.SourceMachines,
+		ProviderMetadata:   appCfg.ProviderMetadata,
+		DisabledAgents:     appCfg.DisabledAgents,
 		IncludeCwdPrefixes: appCfg.SyncIncludeCwdPrefixes,
-		Machine:            appCfg.LocalMachineName,
+		ScanProtectedPaths: appCfg.ScanProtectedPaths,
+		Machine:            appCfg.InstallationID,
+		ArchiveContent:     appCfg.ArchiveContent,
 	})
 	defer engine.Close()
 
@@ -353,9 +405,12 @@ func ensureFreshData(
 // stderr so it does not pollute stdout-bound JSON or statusline output.
 func printSyncSummaryStderr(stats sync.SyncStats, t time.Time) {
 	summary := fmt.Sprintf(
-		"\nSync complete: %d sessions synced",
+		"Sync complete: %d sessions synced",
 		stats.Synced,
 	)
+	if isTerminalWriter(os.Stderr) {
+		summary = "\n" + summary
+	}
 	if stats.OrphanedCopied > 0 {
 		summary += fmt.Sprintf(
 			", %d archived sessions preserved",
@@ -396,126 +451,11 @@ func seedPricing(
 	if err != nil {
 		log.Printf("pricing seed: %v", err)
 	}
-	go refreshPricingFromSources(database)
-}
-
-// periodicPricingRefresh re-fetches LiteLLM + OpenRouter every
-// `interval` and upserts merged rows into model_pricing. It runs
-// forever until ctx is cancelled. custom_model_pricing rows
-// applied via SetCustomPricing live in-memory and are not
-// touched here; the config-driven override is reapplied after
-// each refresh so a newly-published upstream rate cannot silently
-// shadow the user's own value.
-//
-// Failures are logged inside refreshPricingFromSources; a bad
-// tick keeps the previous rows in place and the next tick tries
-// again, so a transient outage never wipes the table.
-func periodicPricingRefresh(
-	ctx context.Context, database *db.DB,
-	cfg *config.Config, interval time.Duration,
-) {
-	if interval <= 0 {
-		return
-	}
-	t := time.NewTicker(interval)
-	defer t.Stop()
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-t.C:
-			refreshPricingFromSources(database)
-			if cfg != nil && len(cfg.CustomModelPricing) > 0 {
-				database.SetCustomPricing(cfg.CustomModelPricing)
-			}
-		}
-	}
-}
-
-// refreshPricingFromSources walks the default pricing source
-// list and upserts whichever catalogs respond. LiteLLM is
-// tried first because it is the most complete for the public
-// models agentsview normally parses; OpenRouter is tried next
-// because its public /models endpoint frequently lists
-// fork-tuned and private model prices LiteLLM has not yet
-// picked up. Each fetch failure is logged but never aborts
-// the loop, so a partial outage of one upstream does not
-// prevent the other from seeding. All successful results are
-// merged (first non-zero field wins per model_pattern) and
-// upserted as a single batch.
-//
-// Each per-source fetch is bounded by
-// pricing.pricingFetchTimeout (45 s) so a hung upstream cannot
-// stall the goroutine indefinitely.
-func refreshPricingFromSources(database *db.DB) {
-	fetched := make(map[string][]pricing.ModelPricing)
-	for _, src := range pricing.DefaultPricingSources() {
-		prices, err := pricing.FetchWithTimeout(src, pricing.PricingFetchTimeout())
-		if err != nil {
-			log.Printf(
-				"pricing refresh: %s fetch failed: %v",
-				src.Name, err,
-			)
-			continue
-		}
-		fetched[src.Name] = prices
-		log.Printf(
-			"pricing refresh: %s returned %d model rows",
-			src.Name, len(prices),
-		)
-	}
-	if len(fetched) == 0 {
-		log.Printf(
-			"pricing refresh: every source failed; " +
-				"keeping embedded fallback pricing",
-		)
-		return
-	}
-	merged := pricing.MergePricing(fetched)
-	flat := make([]pricing.ModelPricing, 0, len(merged))
-	for _, p := range merged {
-		flat = append(flat, p)
-	}
-	if err := upsertPricing(database, flat); err != nil {
-		log.Printf("pricing refresh: upsert failed: %v", err)
-	}
-}
-
-// refreshPricingFromLiteLLM fetches the upstream LiteLLM
-// catalog and upserts it over whatever is in the table. Called
-// from a goroutine after the synchronous fallback seed so a
-// slow or failing fetch never blocks server startup.
-func refreshPricingFromLiteLLM(database *db.DB) {
-	if err := pricingrefresh.Refresh(
-		database, pricing.FetchLiteLLMPricing,
-	); err != nil {
-		log.Printf("pricing refresh: %v", err)
-	}
-}
-
-// upsertPricing converts merged catalog rates to db.ModelPricing
-// rows and upserts them. Used by refreshPricingFromSources, which
-// fans out to multiple upstream catalogs and merges before writing
-// a single batch.
-func upsertPricing(
-	database *db.DB, prices []pricing.ModelPricing,
-) error {
-	dbPrices := make([]db.ModelPricing, len(prices))
-	for i, p := range prices {
-		dbPrices[i] = db.ModelPricing{
-			ModelPattern:         p.ModelPattern,
-			InputPerMTok:         p.InputPerMTok,
-			OutputPerMTok:        p.OutputPerMTok,
-			CacheCreationPerMTok: p.CacheCreationPerMTok,
-			CacheReadPerMTok:     p.CacheReadPerMTok,
-		}
-	}
-	return database.UpsertModelPricing(dbPrices)
 }
 
 func ensurePricing(database *db.DB, offline bool) {
 	if _, err := pricingrefresh.Ensure(
-		database, offline, pricing.FetchLiteLLMPricing, time.Now(),
+		database, offline, pricing.FetchCatalog, time.Now(),
 	); err != nil {
 		fmt.Fprintf(os.Stderr,
 			"warning: pricing refresh failed: %v\n", err)
@@ -536,26 +476,66 @@ func ensureUsagePricing(
 func applyFallbackPricing(
 	database *db.DB, custom map[string]config.CustomModelRate,
 ) {
-	rates := make(map[string]config.CustomModelRate)
-	sources := make(map[string]export.PricingRowSource)
+	database.SetEffectivePricing(fallbackPricingRates(custom))
+}
+
+func applyEmptyCatalogPricing(
+	database *db.DB, custom map[string]config.CustomModelRate,
+) {
+	database.SetEmptyCatalogPricing(fallbackPricingRates(custom))
+}
+
+func fallbackPricingRates(
+	custom map[string]config.CustomModelRate,
+) map[string]export.ModelRates {
+	rates := make(map[string]export.ModelRates)
 	for _, p := range pricing.FallbackPricing() {
 		// These keys are the same concrete model-pattern keys that the
 		// model_pricing table stores. SQLite usage lookups run the merged map
 		// through pricing.Resolve, so normalized/canonical aliases still match
 		// when this read-only path cannot seed model_pricing rows.
-		rates[p.ModelPattern] = config.CustomModelRate{
-			InputMicrodollarsPerMTok:         p.InputPerMTok.Microdollars,
-			OutputMicrodollarsPerMTok:        p.OutputPerMTok.Microdollars,
-			CacheCreationMicrodollarsPerMTok: p.CacheCreationPerMTok.Microdollars,
-			CacheReadMicrodollarsPerMTok:     p.CacheReadPerMTok.Microdollars,
+		bands := make([]export.PricingBand, len(p.Bands))
+		for i, band := range p.Bands {
+			bands[i] = export.PricingBand{
+				AboveInputTokens:    band.AboveInputTokens,
+				InputPerMTok:        band.InputPerMTok,
+				OutputPerMTok:       band.OutputPerMTok,
+				CacheWritePerMTok:   band.CacheCreationPerMTok,
+				CacheWrite1hPerMTok: band.CacheCreation1hPerMTok,
+				CacheReadPerMTok:    band.CacheReadPerMTok,
+			}
 		}
-		sources[p.ModelPattern] = export.PricingRowSourceEmbedded
+		rates[p.ModelPattern] = export.ModelRates{
+			InputPerMTok:        p.InputPerMTok,
+			OutputPerMTok:       p.OutputPerMTok,
+			CacheWritePerMTok:   p.CacheCreationPerMTok,
+			CacheWrite1hPerMTok: p.CacheCreation1hPerMTok,
+			CacheReadPerMTok:    p.CacheReadPerMTok,
+			Source:              export.PricingRowSourceEmbedded,
+			Bands:               bands,
+		}
 	}
 	for model, rate := range custom {
-		rates[model] = rate
-		sources[model] = export.PricingRowSourceCustom
+		rates[model] = export.ModelRates{
+			InputPerMTok: money.Money{
+				Microdollars: rate.InputMicrodollarsPerMTok,
+			},
+			OutputPerMTok: money.Money{
+				Microdollars: rate.OutputMicrodollarsPerMTok,
+			},
+			CacheWritePerMTok: money.Money{
+				Microdollars: rate.CacheCreationMicrodollarsPerMTok,
+			},
+			CacheWrite1hPerMTok: money.Money{
+				Microdollars: rate.CacheCreation1hMicrodollarsPerMTok,
+			},
+			CacheReadPerMTok: money.Money{
+				Microdollars: rate.CacheReadMicrodollarsPerMTok,
+			},
+			Source: export.PricingRowSourceCustom,
+		}
 	}
-	database.SetEffectivePricing(rates, sources)
+	return rates
 }
 
 func fetchHTTPDailyUsage(
@@ -621,7 +601,7 @@ func fetchHTTPDailyUsage(
 		Daily         []db.DailyUsageEntry              `json:"daily"`
 		SessionCounts db.UsageSessionCounts             `json:"sessionCounts"`
 	}
-	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+	if err := json.UnmarshalRead(resp.Body, &out); err != nil {
 		return db.DailyUsageResult{}, err
 	}
 	if out.Projects == nil {
@@ -691,7 +671,7 @@ func printDailyTable(
 
 // localTimezone returns the IANA name of the system's local timezone.
 func localTimezone() string {
-	return time.Now().Location().String()
+	return timeutil.LocalTimezoneOrUTC()
 }
 
 // fmtCost formats a dollar amount with two decimal places,

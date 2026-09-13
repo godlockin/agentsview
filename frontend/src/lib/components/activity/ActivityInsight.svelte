@@ -1,10 +1,9 @@
 <script lang="ts">
   import { EmptyState, Spinner, Typeahead, type TypeaheadOption } from "@kenn-io/kit-ui";
   import { m } from "../../i18n/index.js";
-  import { InsightsService } from "../../api/generated/index";
+  import { InsightsService, type DbInsight } from "../../api/generated/index";
   import {
     callGenerated,
-    configureGeneratedClient,
     isAbortError,
   } from "../../api/runtime.js";
   import {
@@ -13,10 +12,11 @@
   } from "../../api/client.js";
   import { sync } from "../../stores/sync.svelte.js";
   import { insights } from "../../stores/insights.svelte.js";
-  import { router, getBasePath } from "../../stores/router.svelte.js";
+  import { router } from "../../stores/router.svelte.js";
+  import { ui } from "../../stores/ui.svelte.js";
   import { renderMarkdown } from "../../utils/markdown.js";
   import { highlightCodeFences } from "../../utils/highlight-fences.js";
-  import type { Insight, InsightsResponse, AgentName } from "../../api/types.js";
+  import type { AgentName } from "../../api/types.js";
   import { LightbulbIcon, PlusIcon } from "../../icons.js";
   import { LatestRead } from "../../utils/latest-read.js";
 
@@ -26,7 +26,7 @@
     timezone = "",
   }: { dateFrom: string; dateTo: string; timezone?: string } = $props();
 
-  let insight: Insight | null = $state(null);
+  let insight: DbInsight | null = $state(null);
   let loading = $state(false);
   let generating = $state(false);
   let phase = $state("");
@@ -43,11 +43,11 @@
   const insightListRead = new LatestRead();
 
   /**
-   * Open the standalone Insights page prefilled for this panel's range.
+   * Open Generated insights prefilled for this panel's range.
    * Modified or middle clicks fall through to the browser so the href opens in
    * a new tab/window; a plain left click is intercepted for SPA navigation.
    */
-  function openInsightsPage(e: MouseEvent) {
+  function openGeneratedInsights(e: MouseEvent) {
     if (e.metaKey || e.ctrlKey || e.shiftKey || e.altKey || e.button !== 0) {
       return;
     }
@@ -56,19 +56,19 @@
     insights.setDateFrom(dateFrom);
     insights.setDateTo(dateTo);
     insights.setProject("");
-    router.navigate("insights");
+    router.navigate("recall", { tab: "generated" });
   }
 
   const insightGenerationAvailable = $derived(
-    sync.serverVersion?.insight_generation_available === true ||
-      sync.serverVersion?.read_only !== true,
+    sync.serverVersion?.insight_generation_available ??
+      (sync.serverVersion?.read_only !== true),
   );
   const generationUnavailable = $derived(
     sync.serverVersion === null || !insightGenerationAvailable,
   );
   const unavailableTitle = $derived(
     sync.serverVersion !== null && !insightGenerationAvailable
-      ? m.activity_insight_unavailable_read_only()
+      ? m.insights_page_generate_disabled()
       : sync.serverVersion === null
         ? m.activity_insight_waiting_server()
         : m.activity_insight_generate_insight(),
@@ -100,13 +100,12 @@
     generating = false;
     loading = true;
 
-    configureGeneratedClient();
     callGenerated(
-      () => InsightsService.getApiV1Insights({
+      (options) => InsightsService.getApiV1Insights({
         type: "daily_activity",
-        dateFrom: from,
-        dateTo: to,
-      }),
+        date_from: from,
+        date_to: to,
+      }, options),
       signal,
     )
       .then((res) => {
@@ -116,7 +115,7 @@
         // (e.g. a single day) and project-scoped ones. This panel shows the
         // global insight for the exact range, so match both bounds and drop
         // project-scoped rows before taking the newest.
-        const list = (res as unknown as InsightsResponse).insights.filter(
+        const list = res.insights.filter(
           (i) => !i.project && i.date_from === from && i.date_to === to,
         );
         insight = list[0] ?? null;
@@ -136,7 +135,7 @@
     };
   });
 
-  // The agent choice is shared with the standalone Insights page via the
+  // The agent choice is shared with the Generated insights panel via the
   // insights store, so picking one here and there stays in sync.
   function onAgentChange(value: string) {
     insights.setAgent(value as AgentName);
@@ -194,10 +193,10 @@
     </span>
     <a
       class="insights-link"
-      href={getBasePath() + "/insights"}
-      onclick={openInsightsPage}
+      href={router.buildHref("recall", { tab: "generated" })}
+      onclick={openGeneratedInsights}
     >
-      {m.activity_insight_open_insights_page()}
+      {m.activity_insight_open_generated()}
     </a>
   </header>
 
@@ -243,7 +242,9 @@
       class="markdown-body"
       use:highlightCodeFences={{ content: insight.content }}
     >
-      {@html renderMarkdown(insight.content)}
+      {@html renderMarkdown(insight.content, {
+        renderUnknownXmlBlocksAsPreformatted: ui.renderUnknownXmlBlocksAsPreformatted,
+      })}
     </article>
   {:else}
     <EmptyState title={m.activity_insight_empty_text()}>
@@ -421,7 +422,7 @@
     border-radius: var(--radius-sm);
   }
 
-  .markdown-body :global(pre) {
+  .markdown-body :global(pre:not(.unknown-xml-block)) {
     background: var(--bg-inset);
     padding: 10px 14px;
     border-radius: var(--radius-md);

@@ -5,7 +5,7 @@ import (
 	"crypto/sha256"
 	"database/sql"
 	"encoding/hex"
-	"encoding/json"
+	"encoding/json/v2"
 	"errors"
 	"fmt"
 	"log"
@@ -107,7 +107,7 @@ type RecallEvidenceWindowToolCall struct {
 	ToolUseID           string `json:"tool_use_id,omitempty"`
 	InputJSON           string `json:"input_json,omitempty"`
 	SkillName           string `json:"skill_name,omitempty"`
-	ResultContentLength int    `json:"result_content_length,omitempty"`
+	ResultContentLength int    `json:"result_content_length,omitzero"`
 	ResultContent       string `json:"result_content,omitempty"`
 	SubagentSessionID   string `json:"subagent_session_id,omitempty"`
 }
@@ -264,7 +264,7 @@ func buildRecallEvidenceWindow(
 		       COALESCE(tc.input_json, ''),
 		       COALESCE(tc.skill_name, ''),
 		       COALESCE(tc.result_content_length, 0),
-		       COALESCE(tc.result_content, ''),
+		       `+ToolCallResultContentSQL("tc", "m.ordinal")+`,
 		       COALESCE(tc.subagent_session_id, '')
 		FROM tool_calls tc
 		JOIN messages m ON m.id = tc.message_id
@@ -504,12 +504,11 @@ func recallEvidenceAuthorizationDigest(
 }
 
 func digestRecallEvidenceCanonical(value any) (string, error) {
-	encoded, err := json.Marshal(value)
-	if err != nil {
+	digest := sha256.New()
+	if err := json.MarshalWrite(digest, value); err != nil {
 		return "", fmt.Errorf("encoding canonical recall evidence: %w", err)
 	}
-	digest := sha256.Sum256(encoded)
-	return hex.EncodeToString(digest[:]), nil
+	return hex.EncodeToString(digest.Sum(nil)), nil
 }
 
 func normalizeRecallEvidenceToolUseIDs(values []string) ([]string, error) {

@@ -13,8 +13,8 @@ import (
 func (s *Server) registerSearchRoutes() {
 	group := newRouteGroup(s.api, "/api/v1/search", "Search")
 
-	get(s, group, "", "Search sessions", s.humaSearch)
-	getLong(s, group, "/content", "Search session content", s.humaSearchContent)
+	s.get(group, "", "Search sessions", s.humaSearch)
+	s.getLong(group, "/content", "Search session content", s.humaSearchContent)
 }
 
 type searchSort string
@@ -24,11 +24,13 @@ type contentSearchMode string
 type contentSearchScope string
 
 type searchInput struct {
-	Query   string     `query:"q" required:"true" doc:"Search query"`
-	Project string     `query:"project" doc:"Filter by project"`
-	Sort    searchSort `query:"sort" enum:"relevance,recency" default:"relevance" doc:"Sort order"`
-	Limit   int        `query:"limit" minimum:"0" doc:"Maximum number of results"`
-	Cursor  int        `query:"cursor" minimum:"0" doc:"Pagination cursor"`
+	DateFrom string     `query:"date_from" format:"date" doc:"Filter sessions active on or after this date"`
+	DateTo   string     `query:"date_to" format:"date" doc:"Filter sessions active on or before this date"`
+	Query    string     `query:"q" required:"true" doc:"Search query"`
+	Project  string     `query:"project" doc:"Filter by project"`
+	Sort     searchSort `query:"sort" enum:"relevance,recency" default:"relevance" doc:"Sort order"`
+	Limit    int        `query:"limit" minimum:"0" doc:"Maximum number of results"`
+	Cursor   int        `query:"cursor" minimum:"0" doc:"Pagination cursor"`
 }
 
 type contentSearchInput struct {
@@ -52,6 +54,7 @@ type contentSearchInput struct {
 	IncludeChildren  bool               `query:"include_children" doc:"Include child sessions"`
 	IncludeAutomated bool               `query:"include_automated" doc:"Include automated sessions"`
 	IncludeOneShot   bool               `query:"include_one_shot" doc:"Include one-shot sessions"`
+	ExcludeSession   []string           `query:"exclude_session,explode" doc:"Session IDs to exclude; repeatable"`
 	Limit            int                `query:"limit" minimum:"0" doc:"Maximum number of results"`
 	Cursor           int                `query:"cursor" minimum:"0" doc:"Pagination cursor"`
 	Context          int                `query:"context" doc:"Include N messages of context before and after each match (max 10)"`
@@ -66,18 +69,19 @@ func (s *Server) humaSearch(
 		return nil, apiError(http.StatusBadRequest, "query required")
 	}
 	res, err := s.sessions.Search(ctx, service.SearchRequest{
-		Query:   query,
-		Project: in.Project,
-		Sort:    string(in.Sort),
-		Cursor:  in.Cursor,
-		Limit:   in.Limit,
+		DateFrom: in.DateFrom,
+		DateTo:   in.DateTo,
+		Query:    query,
+		Project:  in.Project,
+		Sort:     string(in.Sort),
+		Cursor:   in.Cursor,
+		Limit:    in.Limit,
 	})
 	if err != nil {
 		if errors.Is(err, service.ErrSearchUnavailable) {
 			return nil, apiError(http.StatusNotImplemented, "search not available")
 		}
-		var inputErr *db.SearchInputError
-		if errors.As(err, &inputErr) {
+		if _, ok := errors.AsType[*db.SearchInputError](err); ok {
 			return nil, apiError(http.StatusBadRequest, err.Error())
 		}
 		return nil, serverError(err)
@@ -120,28 +124,29 @@ func (s *Server) humaSearchContent(
 		return nil, apiError(http.StatusBadRequest, err.Error())
 	}
 	res, err := s.sessions.SearchContent(ctx, service.ContentSearchRequest{
-		Pattern:          in.Pattern,
-		Mode:             string(in.Mode),
-		Sources:          sources,
-		ExcludeSystem:    in.ExcludeSystem,
-		Reveal:           in.Reveal,
-		Project:          in.Project,
-		ExcludeProject:   in.ExcludeProject,
-		Machine:          in.Machine,
-		GitBranch:        in.GitBranch,
-		Agent:            in.Agent,
-		Date:             in.Date,
-		DateFrom:         in.DateFrom,
-		DateTo:           in.DateTo,
-		Timezone:         timezone,
-		ActiveSince:      in.ActiveSince,
-		IncludeChildren:  in.IncludeChildren,
-		IncludeAutomated: in.IncludeAutomated,
-		IncludeOneShot:   in.IncludeOneShot,
-		Scope:            string(in.Scope),
-		Limit:            in.Limit,
-		Cursor:           in.Cursor,
-		Context:          in.Context,
+		Pattern:           in.Pattern,
+		Mode:              string(in.Mode),
+		Sources:           sources,
+		ExcludeSystem:     in.ExcludeSystem,
+		Reveal:            in.Reveal,
+		Project:           in.Project,
+		ExcludeProject:    in.ExcludeProject,
+		Machine:           in.Machine,
+		GitBranch:         in.GitBranch,
+		Agent:             in.Agent,
+		Date:              in.Date,
+		DateFrom:          in.DateFrom,
+		DateTo:            in.DateTo,
+		Timezone:          timezone,
+		ActiveSince:       in.ActiveSince,
+		IncludeChildren:   in.IncludeChildren,
+		IncludeAutomated:  in.IncludeAutomated,
+		IncludeOneShot:    in.IncludeOneShot,
+		ExcludeSessionIDs: in.ExcludeSession,
+		Scope:             string(in.Scope),
+		Limit:             in.Limit,
+		Cursor:            in.Cursor,
+		Context:           in.Context,
 	})
 	if err != nil {
 		if handled := handleHumaContextError(err); handled != nil {
@@ -160,8 +165,7 @@ func (s *Server) humaSearchContent(
 		if errors.Is(err, db.ErrSemanticUnavailable) {
 			return nil, apiError(http.StatusNotImplemented, err.Error())
 		}
-		var inputErr *db.SearchInputError
-		if errors.As(err, &inputErr) {
+		if _, ok := errors.AsType[*db.SearchInputError](err); ok {
 			return nil, apiError(http.StatusBadRequest, err.Error())
 		}
 		return nil, apiError(http.StatusInternalServerError, err.Error())

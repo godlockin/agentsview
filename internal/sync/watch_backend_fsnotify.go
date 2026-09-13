@@ -10,6 +10,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 
 	"github.com/fsnotify/fsnotify"
@@ -17,8 +18,10 @@ import (
 
 type fsnotifyBackend struct {
 	watcher           *fsnotify.Watcher
+	eventInput        <-chan fsnotify.Event
 	errorInput        <-chan error
 	watchOps          fsnotifyWatchOps
+	queue             *nativeEventQueue
 	events            chan backendEvent
 	errors            chan error
 	excludes          []string
@@ -30,14 +33,105 @@ type fsnotifyBackend struct {
 	watchOwners       map[string]map[string]struct{}
 	watchBudgetCost   map[string]int
 	runtimeBudget     int
-	rootScopes        map[string][]string
+	rootScopes        map[string][]PollingScope
 	degradedRoots     map[string]struct{}
 	onPollingRequired func(PollingObligation) error
 	lifecycleMu       sync.Mutex
 	lifecycle         fsnotifyBackendLifecycle
 	stop              chan struct{}
+	pumpOnce          sync.Once
+	pumpStarted       atomic.Bool
+	pumpStop          chan struct{}
+	pumpDone          chan struct{}
 	done              chan struct{}
 	finishOnce        sync.Once
+}
+
+// nativeEventQueueLimit bounds events held between the native reader and the
+// translating loop. It matches inotify's default max_queued_events; past it
+// the queue drops pending events and reports an overflow, which the loop
+// already turns into a lost-events full sync.
+const nativeEventQueueLimit = 16384
+
+type nativeItem struct {
+	event fsnotify.Event
+	err   error
+}
+
+// nativeEventQueue decouples reading the native watcher from translating its
+// events. fsnotify's Windows backend services Add and Remove on the same
+// goroutine that delivers events over an unbuffered channel, so the goroutine
+// that consumes events must never be the one waiting on Add or Remove.
+type nativeEventQueue struct {
+	mu       sync.Mutex
+	items    []nativeItem
+	overflow bool
+	closed   bool
+	signal   chan struct{}
+}
+
+func newNativeEventQueue() *nativeEventQueue {
+	return &nativeEventQueue{signal: make(chan struct{}, 1)}
+}
+
+func (q *nativeEventQueue) push(item nativeItem) {
+	q.mu.Lock()
+	if len(q.items) >= nativeEventQueueLimit {
+		q.items = nil
+		q.overflow = true
+	} else {
+		q.items = append(q.items, item)
+	}
+	q.mu.Unlock()
+	q.wake()
+}
+
+func (q *nativeEventQueue) close() {
+	q.mu.Lock()
+	q.closed = true
+	q.mu.Unlock()
+	q.wake()
+}
+
+func (q *nativeEventQueue) wake() {
+	select {
+	case q.signal <- struct{}{}:
+	default:
+	}
+}
+
+// next blocks until an item is available, the queue is closed and drained, or
+// stop is closed. An overflow surfaces as fsnotify.ErrEventOverflow ahead of
+// anything queued after it.
+func (q *nativeEventQueue) next(stop <-chan struct{}) (nativeItem, bool) {
+	for {
+		q.mu.Lock()
+		if q.overflow {
+			q.overflow = false
+			q.mu.Unlock()
+			return nativeItem{err: fsnotify.ErrEventOverflow}, true
+		}
+		if len(q.items) > 0 {
+			item := q.items[0]
+			q.items[0] = nativeItem{}
+			q.items = q.items[1:]
+			if len(q.items) == 0 {
+				q.items = nil
+			}
+			q.mu.Unlock()
+			return item, true
+		}
+		closed := q.closed
+		q.mu.Unlock()
+		if closed {
+			return nativeItem{}, false
+		}
+		select {
+		case <-q.signal:
+		case <-stop:
+			return nativeItem{}, false
+		}
+	}
 }
 
 type fsnotifyWatchOps interface {
@@ -60,16 +154,20 @@ func newFSNotifyBackend(excludes []string) (*fsnotifyBackend, error) {
 	}
 	return &fsnotifyBackend{
 		watcher:         watcher,
+		eventInput:      watcher.Events,
 		errorInput:      watcher.Errors,
 		watchOps:        watcher,
+		queue:           newNativeEventQueue(),
 		events:          make(chan backendEvent),
 		errors:          make(chan error, 1),
 		excludes:        normalizeExcludePatterns(excludes),
 		watchOwners:     make(map[string]map[string]struct{}),
 		watchBudgetCost: make(map[string]int),
-		rootScopes:      make(map[string][]string),
+		rootScopes:      make(map[string][]PollingScope),
 		degradedRoots:   make(map[string]struct{}),
 		stop:            make(chan struct{}),
+		pumpStop:        make(chan struct{}),
+		pumpDone:        make(chan struct{}),
 		done:            make(chan struct{}),
 	}, nil
 }
@@ -78,6 +176,7 @@ func (b *fsnotifyBackend) Events() <-chan backendEvent { return b.events }
 func (b *fsnotifyBackend) Errors() <-chan error        { return b.errors }
 
 func (b *fsnotifyBackend) AddRecursive(root string, budget int) RecursiveWatchResult {
+	b.startPump()
 	b.watchMu.Lock()
 	defer b.watchMu.Unlock()
 
@@ -105,7 +204,23 @@ func (b *fsnotifyBackend) AddRecursive(root string, budget int) RecursiveWatchRe
 			if path != root && b.shouldExcludeForRoot(path, root) {
 				return filepath.SkipDir
 			}
-			if remaining <= 0 {
+			// A directory an earlier root already watches natively is shared,
+			// not installed again: the kernel watch is already paid for, so
+			// settle reuse before the budget check or an overlapping root
+			// would be refused coverage that already exists.
+			if len(b.watchOwners[path]) > 0 {
+				b.addWatchOwner(path, root)
+				result.Watched++
+				return nil
+			}
+			// The root's own directory is the mandatory part of a recursive
+			// registration and its subtree is the discretionary part. A
+			// shallow unit's watch is installed unconditionally, so a plan
+			// that merges one into a recursive unit at the same path would
+			// lose that coverage the moment the budget ran out. The subtree
+			// below still reports BudgetExhausted and hands off to polling.
+			mandatory := path == root
+			if remaining <= 0 && !mandatory {
 				result.BudgetExhausted = true
 				return filepath.SkipAll
 			}
@@ -118,9 +233,17 @@ func (b *fsnotifyBackend) AddRecursive(root string, budget int) RecursiveWatchRe
 				}
 				return nil
 			}
-			b.watchBudgetCost[path]++
+			// A mandatory watch installed past the budget sits outside the
+			// accounting entirely, the way a shallow root already does: it is
+			// not charged, so removing it must not refund a slot the process
+			// never spent. Charging it and refunding it would leave headroom
+			// above the cap that runtime subtree adds could then claim.
+			if remaining > 0 {
+				b.watchBudgetCost[path]++
+				remaining--
+				result.Allocated++
+			}
 			b.addWatchOwner(path, root)
-			remaining--
 			result.Watched++
 			return nil
 		})
@@ -134,16 +257,24 @@ func (b *fsnotifyBackend) AddRecursive(root string, budget int) RecursiveWatchRe
 func (b *fsnotifyBackend) setWatchRootPlan(roots []WatchRoot) {
 	b.watchMu.Lock()
 	defer b.watchMu.Unlock()
-	b.rootScopes = make(map[string][]string, len(roots))
+	b.rootScopes = make(map[string][]PollingScope, len(roots))
 	for _, root := range roots {
 		path := filepath.Clean(root.Path)
 		for _, scope := range root.Scopes {
-			if scope.SyncDir != "" {
-				b.rootScopes[path] = append(b.rootScopes[path], scope.SyncDir)
+			if scope.SyncDir == "" {
+				continue
+			}
+			ps := PollingScope{Agent: scope.Agent, Root: filepath.Clean(scope.SyncDir)}
+			if !slices.Contains(b.rootScopes[path], ps) {
+				b.rootScopes[path] = append(b.rootScopes[path], ps)
 			}
 		}
-		slices.Sort(b.rootScopes[path])
-		b.rootScopes[path] = slices.Compact(b.rootScopes[path])
+		slices.SortFunc(b.rootScopes[path], func(a, b PollingScope) int {
+			if a.Agent != b.Agent {
+				return strings.Compare(a.Agent, b.Agent)
+			}
+			return strings.Compare(a.Root, b.Root)
+		})
 	}
 }
 
@@ -157,6 +288,7 @@ func (b *fsnotifyBackend) bindPollingOwnership(
 }
 
 func (b *fsnotifyBackend) AddShallow(root string) error {
+	b.startPump()
 	b.watchMu.Lock()
 	defer b.watchMu.Unlock()
 
@@ -170,6 +302,7 @@ func (b *fsnotifyBackend) AddShallow(root string) error {
 }
 
 func (b *fsnotifyBackend) Remove(root string) error {
+	b.startPump()
 	b.watchMu.Lock()
 	defer b.watchMu.Unlock()
 
@@ -224,10 +357,16 @@ func (b *fsnotifyBackend) Start() error {
 		return nil
 	}
 	b.lifecycle = fsnotifyBackendRunning
+	b.startPump()
 	go b.loop()
 	return nil
 }
 
+// Stop ends event delivery and closes the native watcher. When the loop is
+// running it owns the shutdown order: it closes the native watcher only after
+// it has left any in-flight Add or Remove, so a pending request cannot be
+// abandoned by fsnotify's Close, then releases the pump. When the loop never
+// ran, Stop releases the pump itself before closing the native watcher.
 func (b *fsnotifyBackend) Stop() {
 	b.lifecycleMu.Lock()
 	if b.lifecycle == fsnotifyBackendStopped {
@@ -239,8 +378,12 @@ func (b *fsnotifyBackend) Stop() {
 	wasRunning := b.lifecycle == fsnotifyBackendRunning
 	b.lifecycle = fsnotifyBackendStopped
 	close(b.stop)
-	_ = b.watcher.Close()
 	if !wasRunning {
+		close(b.pumpStop)
+		if b.pumpStarted.Load() {
+			<-b.pumpDone
+		}
+		_ = b.watcher.Close()
 		b.finish()
 	}
 	done := b.done
@@ -250,43 +393,99 @@ func (b *fsnotifyBackend) Stop() {
 
 func (b *fsnotifyBackend) Name() string { return "fsnotify" }
 
-func (b *fsnotifyBackend) loop() {
-	defer b.finish()
+// startPump runs the native reader before the first native Add or Remove.
+// On Windows, fsnotify services those requests on the goroutine that
+// delivers events over an unbuffered channel, and registration installs
+// watches before Start runs, so an event arriving between registration Adds
+// would block the next Add forever if nothing consumed events yet. The input
+// channels are captured here so a test seam assigned before the first native
+// operation is never read concurrently with the pump.
+func (b *fsnotifyBackend) startPump() {
+	b.pumpOnce.Do(func() {
+		b.pumpStarted.Store(true)
+		go b.pump(b.eventInput, b.errorInput)
+	})
+}
+
+// pump is the sole reader of the native watcher's channels. It never calls
+// back into the native watcher, so fsnotify's reader is never left blocked
+// delivering an event while the loop waits on Add or Remove.
+func (b *fsnotifyBackend) pump(
+	eventInput <-chan fsnotify.Event,
+	errorInput <-chan error,
+) {
+	defer close(b.pumpDone)
+	defer b.queue.close()
 	for {
 		select {
+		case <-b.pumpStop:
+			return
+		case event, ok := <-eventInput:
+			if !ok {
+				return
+			}
+			b.queue.push(nativeItem{event: event})
+		case err, ok := <-errorInput:
+			if !ok {
+				return
+			}
+			b.queue.push(nativeItem{err: err})
+		}
+	}
+}
+
+func (b *fsnotifyBackend) loop() {
+	defer func() {
+		_ = b.watcher.Close()
+		close(b.pumpStop)
+		<-b.pumpDone
+		b.finish()
+	}()
+	for {
+		item, ok := b.queue.next(b.stop)
+		if !ok {
+			return
+		}
+		if item.err != nil {
+			if !b.forwardNativeError(item.err) {
+				return
+			}
+			continue
+		}
+		translated, relevant := b.translateEvent(item.event)
+		if !relevant {
+			continue
+		}
+		select {
+		case b.events <- translated:
 		case <-b.stop:
 			return
-		case event, ok := <-b.watcher.Events:
-			if !ok {
-				return
-			}
-			translated, relevant := b.translateEvent(event)
-			if !relevant {
-				continue
-			}
-			select {
-			case b.events <- translated:
-			case <-b.stop:
-				return
-			}
-		case err, ok := <-b.errorInput:
-			if !ok {
-				return
-			}
-			if errors.Is(err, fsnotify.ErrEventOverflow) {
-				select {
-				case b.events <- backendEvent{Op: backendOpFullSync}:
-				case <-b.stop:
-					return
-				}
-				continue
-			}
-			select {
-			case b.errors <- err:
-			case <-b.stop:
-				return
-			}
 		}
+	}
+}
+
+// forwardNativeError reports false when the backend is stopping.
+func (b *fsnotifyBackend) forwardNativeError(err error) bool {
+	if errors.Is(err, fsnotify.ErrEventOverflow) {
+		// Overflow dropped raw events before their watch-maintenance side
+		// effects ran, so creates under recursive roots may have left
+		// subtrees without native watches. The full sync recovers the data
+		// but not the watches; polling covers the lost subtrees. Shallow
+		// roots are revalidated in place instead.
+		b.requireRuntimePolling(b.recursiveRootsSnapshot())
+		b.reinstallShallowWatches()
+		select {
+		case b.events <- backendEvent{Op: backendOpFullSync}:
+			return true
+		case <-b.stop:
+			return false
+		}
+	}
+	select {
+	case b.errors <- err:
+		return true
+	case <-b.stop:
+		return false
 	}
 }
 
@@ -493,10 +692,10 @@ func (b *fsnotifyBackend) requireRuntimePolling(roots []string) {
 			continue
 		}
 		required := b.onPollingRequired
-		scopes := append([]string(nil), b.rootScopes[root]...)
+		scopes := append([]PollingScope(nil), b.rootScopes[root]...)
 		b.watchMu.Unlock()
 		if len(scopes) == 0 {
-			scopes = []string{root}
+			scopes = []PollingScope{{Root: root}}
 		}
 		if required == nil {
 			b.reportError(fmt.Errorf(
@@ -505,7 +704,7 @@ func (b *fsnotifyBackend) requireRuntimePolling(roots []string) {
 			continue
 		}
 		if err := required(PollingObligation{
-			Key: "fsnotify-runtime:" + root, Roots: scopes, Probe: root,
+			Key: "fsnotify-runtime:" + root, Scopes: scopes, Probe: root,
 		}); err != nil {
 			b.reportError(fmt.Errorf(
 				"transfer fsnotify coverage for %s to polling: %w", root, err,
@@ -540,6 +739,32 @@ func normalizeExcludePatterns(patterns []string) []string {
 		}
 	}
 	return out
+}
+
+// reinstallShallowWatches revalidates shallow-root coverage after overflow.
+// A dropped removal loses the native watch even when the directory was
+// recreated, so every shallow root is re-added; a root that cannot be
+// re-added moves to polling exactly as an observed removal would.
+func (b *fsnotifyBackend) reinstallShallowWatches() {
+	b.rootsMu.RLock()
+	shallow := append([]string(nil), b.shallow...)
+	b.rootsMu.RUnlock()
+	lost := make([]string, 0, len(shallow))
+	for _, root := range shallow {
+		b.watchMu.Lock()
+		err := b.watchOps.Add(root)
+		b.watchMu.Unlock()
+		if err != nil {
+			lost = append(lost, root)
+		}
+	}
+	b.requireRuntimePolling(lost)
+}
+
+func (b *fsnotifyBackend) recursiveRootsSnapshot() []string {
+	b.rootsMu.RLock()
+	defer b.rootsMu.RUnlock()
+	return append([]string(nil), b.recursive...)
 }
 
 func (b *fsnotifyBackend) addRecursiveRoot(root string) {

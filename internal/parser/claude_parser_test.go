@@ -1,7 +1,8 @@
 package parser
 
 import (
-	"encoding/json"
+	"encoding/json/jsontext"
+	"encoding/json/v2"
 	"os"
 	"path/filepath"
 	"strings"
@@ -324,6 +325,148 @@ func TestParseClaudeSession_SkippedMessages(t *testing.T) {
 		assert.Equal(t, "real user message", msgs[7].Content)
 	})
 
+	t.Run("splits IDE envelope prepended onto a real prompt", func(t *testing.T) {
+		content := testjsonl.JoinJSONL(
+			testjsonl.ClaudeUserJSON(
+				"<ide_opened_file>The user opened /workspace/app/README.md.</ide_opened_file> Explain this file.",
+				tsZero,
+			),
+			testjsonl.ClaudeUserJSON(
+				"<ide_selection>The user selected package main.</ide_selection>\n\nWhat does this do?",
+				tsZeroS1,
+			),
+		)
+		sess, msgs := runClaudeParserTest(t, "test.jsonl", content)
+		// Each entry splits into a hidden system-metadata message
+		// plus the real prompt that followed it.
+		require.Len(t, msgs, 4)
+		assert.Equal(t, 4, sess.MessageCount)
+		assert.Equal(t, 2, sess.UserMessageCount)
+		assert.Equal(t, "Explain this file.", sess.FirstMessage,
+			"first_message should show the real prompt, not the IDE envelope")
+
+		assert.True(t, msgs[0].IsSystem)
+		assert.Equal(t, RoleUser, msgs[0].Role)
+		assert.Equal(t, "system", msgs[0].SourceType)
+		assert.Equal(t, "ide_opened_file", msgs[0].SourceSubtype)
+		assert.Equal(t,
+			"<ide_opened_file>The user opened /workspace/app/README.md.</ide_opened_file>",
+			msgs[0].Content)
+
+		assert.False(t, msgs[1].IsSystem)
+		assert.Equal(t, RoleUser, msgs[1].Role)
+		assert.Equal(t, "Explain this file.", msgs[1].Content)
+
+		assert.True(t, msgs[2].IsSystem)
+		assert.Equal(t, "ide_selection", msgs[2].SourceSubtype)
+		assert.Equal(t,
+			"<ide_selection>The user selected package main.</ide_selection>",
+			msgs[2].Content)
+
+		assert.False(t, msgs[3].IsSystem)
+		assert.Equal(t, "What does this do?", msgs[3].Content)
+	})
+
+	t.Run("split IDE envelope remainder gets command preprocessing", func(t *testing.T) {
+		content := testjsonl.JoinJSONL(
+			testjsonl.ClaudeUserJSON(
+				"<ide_opened_file>The user opened /workspace/app/README.md.</ide_opened_file>\n"+
+					"<command-message>clear</command-message>\n"+
+					"<command-name>/clear</command-name>",
+				tsZero,
+			),
+			testjsonl.ClaudeUserJSON("real question", tsZeroS1),
+		)
+		sess, msgs := runClaudeParserTest(t, "test.jsonl", content)
+		// The command XML revealed by the split normalizes exactly
+		// like a bare command message instead of being stored as
+		// raw markup.
+		require.Len(t, msgs, 3)
+		assert.True(t, msgs[0].IsSystem)
+		assert.Equal(t, "ide_opened_file", msgs[0].SourceSubtype)
+		assert.False(t, msgs[1].IsSystem)
+		assert.Equal(t, "/clear", msgs[1].Content)
+		assert.Equal(t, "real question", msgs[2].Content)
+		assert.Equal(t, "real question", sess.FirstMessage,
+			"slash command must not become first_message")
+	})
+
+	t.Run("split IDE envelope remainder honors preprocessing skip", func(t *testing.T) {
+		content := testjsonl.JoinJSONL(
+			testjsonl.ClaudeUserJSON(
+				"<ide_selection>The user selected package main.</ide_selection>\n"+
+					"<command-message></command-message>",
+				tsZero,
+			),
+			testjsonl.ClaudeUserJSON("real question", tsZeroS1),
+		)
+		sess, msgs := runClaudeParserTest(t, "test.jsonl", content)
+		// The remainder is a command envelope that cannot be
+		// normalized: it is skipped like a standalone one, keeping
+		// only the hidden envelope message.
+		require.Len(t, msgs, 2)
+		assert.True(t, msgs[0].IsSystem)
+		assert.Equal(t, "ide_selection", msgs[0].SourceSubtype)
+		assert.Equal(t, "real question", msgs[1].Content)
+		assert.Equal(t, "real question", sess.FirstMessage)
+	})
+
+	t.Run("split IDE envelope with discarded remainder keeps tool results", func(t *testing.T) {
+		mixedEntry := `{"type":"user","timestamp":"` + tsZero +
+			`","message":{"content":[` +
+			`{"type":"tool_result","tool_use_id":"tu-1","content":"tool output"},` +
+			`{"type":"text","text":"<ide_selection>The user selected package main.</ide_selection>\n` +
+			`<command-message></command-message>"}]}}`
+		content := testjsonl.JoinJSONL(
+			mixedEntry,
+			testjsonl.ClaudeUserJSON("real question", tsZeroS1),
+		)
+
+		sess, msgs := runClaudeParserTest(t, "test.jsonl", content)
+		// The discarded command remainder leaves no visible message
+		// for the entry, so the tool result must ride the hidden
+		// envelope row instead of vanishing.
+		require.Len(t, msgs, 2)
+		assert.True(t, msgs[0].IsSystem)
+		assert.Equal(t, "ide_selection", msgs[0].SourceSubtype)
+		require.Len(t, msgs[0].ToolResults, 1)
+		assert.Equal(t, "tu-1", msgs[0].ToolResults[0].ToolUseID)
+		assert.Equal(t, "real question", sess.FirstMessage)
+
+		// The incremental path must preserve the same tool result.
+		path := createTestFile(t, "incremental.jsonl", content)
+		newMsgs, _, _, err := callParseClaudeSessionFrom(path, 0, 0, "")
+		require.NoError(t, err)
+		require.Len(t, newMsgs, 2)
+		assert.True(t, newMsgs[0].IsSystem)
+		require.Len(t, newMsgs[0].ToolResults, 1)
+		assert.Equal(t, "tu-1", newMsgs[0].ToolResults[0].ToolUseID)
+	})
+
+	t.Run("split IDE envelope gets a distinct source uuid", func(t *testing.T) {
+		content := testjsonl.JoinJSONL(
+			testjsonl.ClaudeEntryJSON(
+				"user",
+				"<ide_opened_file>The user opened /workspace/app/README.md.</ide_opened_file> Explain this file.",
+				tsZero, "uuid-entry-1", "uuid-parent-0",
+			),
+		)
+		_, msgs := runClaudeParserTest(t, "test.jsonl", content)
+		require.Len(t, msgs, 2)
+
+		// Pins and Recall evidence resolve messages by source_uuid and
+		// require it to be unique per session, so the entry's own uuid
+		// must stay on the real prompt only; the synthetic hidden
+		// envelope row gets a derived identity.
+		assert.True(t, msgs[0].IsSystem)
+		assert.Equal(t, "uuid-entry-1:ide-context", msgs[0].SourceUUID)
+		assert.Equal(t, "uuid-parent-0", msgs[0].SourceParentUUID)
+
+		assert.False(t, msgs[1].IsSystem)
+		assert.Equal(t, "uuid-entry-1", msgs[1].SourceUUID)
+		assert.Equal(t, "uuid-parent-0", msgs[1].SourceParentUUID)
+	})
+
 	t.Run("skill invocation shown as user message", func(t *testing.T) {
 		content := testjsonl.JoinJSONL(
 			testjsonl.ClaudeUserJSON(
@@ -386,6 +529,23 @@ func TestParseClaudeSession_SkippedMessages(t *testing.T) {
 }
 
 func TestParseClaudeSession_QueuedCommand(t *testing.T) {
+	t.Run("carries top-level promptSource when present", func(t *testing.T) {
+		queued := `{"type":"attachment","timestamp":"` + tsZeroS2 + `",` +
+			`"promptSource":"queued","attachment":{"type":"queued_command",` +
+			`"commandMode":"prompt","prompt":"also do X"}}`
+		content := testjsonl.JoinJSONL(
+			testjsonl.ClaudeUserJSON("first request", tsZero),
+			testjsonl.ClaudeAssistantJSON([]map[string]any{
+				{"type": "text", "text": "starting work"},
+			}, tsZeroS1),
+			queued,
+		)
+		_, msgs := runClaudeParserTest(t, "test.jsonl", content)
+		require.Len(t, msgs, 3)
+		assert.Equal(t, "queued_command", msgs[2].SourceSubtype)
+		assert.Equal(t, "queued", msgs[2].PromptSource)
+	})
+
 	t.Run("surfaces as user message between turns", func(t *testing.T) {
 		content := testjsonl.JoinJSONL(
 			testjsonl.ClaudeUserJSON("first request", tsZero),
@@ -867,6 +1027,85 @@ func TestParseClaudeSessionFrom_IDEContext(t *testing.T) {
 		assert.Equal(t, subtype, newMsgs[i].SourceSubtype)
 		assert.Equal(t, i+2, newMsgs[i].Ordinal)
 	}
+}
+
+func TestParseClaudeSessionFrom_IDEContextPrependedToPrompt(t *testing.T) {
+	t.Parallel()
+
+	initial := testjsonl.JoinJSONL(
+		testjsonl.ClaudeUserJSON("hello", tsEarly),
+		testjsonl.ClaudeAssistantJSON("hi", tsEarlyS1),
+	)
+	path := createTestFile(t, "inc-ide-context-prompt.jsonl", initial)
+	info, err := os.Stat(path)
+	require.NoError(t, err)
+
+	appended := testjsonl.JoinJSONL(
+		testjsonl.ClaudeUserJSON(
+			"<ide_opened_file>The user opened /workspace/app/README.md.</ide_opened_file> Explain this file.",
+			tsLate,
+		),
+	)
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0o644)
+	require.NoError(t, err)
+	_, err = f.WriteString(appended)
+	require.NoError(t, err)
+	require.NoError(t, f.Close())
+
+	newMsgs, _, _, err := callParseClaudeSessionFrom(path, info.Size(), 2, "")
+	require.NoError(t, err)
+	require.Len(t, newMsgs, 2,
+		"the entry splits into a hidden IDE-context message plus the real prompt")
+
+	assert.True(t, newMsgs[0].IsSystem)
+	assert.Equal(t, "system", newMsgs[0].SourceType)
+	assert.Equal(t, "ide_opened_file", newMsgs[0].SourceSubtype)
+	assert.Equal(t,
+		"<ide_opened_file>The user opened /workspace/app/README.md.</ide_opened_file>",
+		newMsgs[0].Content)
+
+	assert.False(t, newMsgs[1].IsSystem)
+	assert.Equal(t, RoleUser, newMsgs[1].Role)
+	assert.Equal(t, "Explain this file.", newMsgs[1].Content)
+}
+
+func TestParseClaudeSessionFrom_IDEContextPrependedToCommand(t *testing.T) {
+	t.Parallel()
+
+	initial := testjsonl.JoinJSONL(
+		testjsonl.ClaudeUserJSON("hello", tsEarly),
+		testjsonl.ClaudeAssistantJSON("hi", tsEarlyS1),
+	)
+	path := createTestFile(t, "inc-ide-context-command.jsonl", initial)
+	info, err := os.Stat(path)
+	require.NoError(t, err)
+
+	appended := testjsonl.JoinJSONL(
+		testjsonl.ClaudeUserJSON(
+			"<ide_opened_file>The user opened /workspace/app/README.md.</ide_opened_file>\n"+
+				"<command-message>clear</command-message>\n"+
+				"<command-name>/clear</command-name>",
+			tsLate,
+		),
+	)
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0o644)
+	require.NoError(t, err)
+	_, err = f.WriteString(appended)
+	require.NoError(t, err)
+	require.NoError(t, f.Close())
+
+	newMsgs, _, _, err := callParseClaudeSessionFrom(path, info.Size(), 2, "")
+	require.NoError(t, err)
+	require.Len(t, newMsgs, 2,
+		"the entry splits into a hidden IDE-context message plus the normalized command")
+
+	assert.True(t, newMsgs[0].IsSystem)
+	assert.Equal(t, "ide_opened_file", newMsgs[0].SourceSubtype)
+
+	assert.False(t, newMsgs[1].IsSystem)
+	assert.Equal(t, RoleUser, newMsgs[1].Role)
+	assert.Equal(t, "/clear", newMsgs[1].Content,
+		"command XML revealed by the split must normalize, not stay raw")
 }
 
 func TestParseClaudeSessionFrom_ReminderPrefixedCommand(t *testing.T) {
@@ -1431,6 +1670,33 @@ func TestParseClaudeSession_ResolvesPersistedToolResultOutput(
 	assert.Equal(t, fullOutput, DecodeContent(got.ContentRaw))
 }
 
+func TestReadClaudePersistedToolResultTruncatesOversizedFile(
+	t *testing.T,
+) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	sessionDir := filepath.Join(dir, "project", "parent-session")
+	resultPath := filepath.Join(sessionDir, "tool-results", "oversized.txt")
+	require.NoError(t, os.MkdirAll(filepath.Dir(resultPath), 0o755))
+	require.NoError(t, os.WriteFile(resultPath, []byte("prefix"), 0o644))
+	require.NoError(t, os.Truncate(resultPath, maxPersistedToolResultSize+1))
+
+	sessionPath := filepath.Join(dir, "project", "parent-session.jsonl")
+	got, ok := readClaudePersistedToolResult(sessionPath, resultPath)
+	require.True(t, ok)
+	assert.True(t, strings.HasPrefix(got, "prefix"))
+	assert.Equal(
+		t,
+		maxPersistedToolResultSize+len("\n\n[agentsview: persisted tool result truncated at 16 MiB]"),
+		len(got),
+	)
+	assert.True(t, strings.HasSuffix(
+		got,
+		"[agentsview: persisted tool result truncated at 16 MiB]",
+	))
+}
+
 func TestParseClaudeSession_PersistedToolResultDoesNotOverwriteSiblings(
 	t *testing.T,
 ) {
@@ -1468,6 +1734,27 @@ func TestParseClaudeSession_PersistedToolResultDoesNotOverwriteSiblings(
 	assert.Equal(t, fullOutput, DecodeContent(toolResults[0].ContentRaw))
 	assert.Equal(t, "small inline result", DecodeContent(toolResults[1].ContentRaw))
 	assert.Equal(t, len("small inline result"), toolResults[1].ContentLength)
+}
+
+func TestResolveClaudePersistedToolResultsPreservesUntouchedNumbers(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	sessionPath := filepath.Join(dir, "parent-session.jsonl")
+	resultPath := filepath.Join(dir, "parent-session", "tool-results", "result.txt")
+	require.NoError(t, os.MkdirAll(filepath.Dir(resultPath), 0o755))
+	require.NoError(t, os.WriteFile(resultPath, []byte("full output"), 0o644))
+
+	resultPathJSON := mustJSONString(t, resultPath)
+	contentJSON := mustJSONString(t, "Full output saved to: "+resultPath)
+	line := `{"future_counter":9007199254740993,"message":{"content":[` +
+		`{"type":"tool_result","content":` + contentJSON + `}` +
+		`]},"toolUseResult":{"persistedOutputPath":` + resultPathJSON + `}}`
+
+	got := resolveClaudePersistedToolResults(sessionPath, line)
+
+	assert.Equal(t, "9007199254740993", gjson.Get(got, "future_counter").Raw)
+	assert.Equal(t, "full output", gjson.Get(got, "message.content.0.content").Str)
 }
 
 func mustJSONString(t *testing.T, value string) string {
@@ -1914,7 +2201,7 @@ func TestParseClaudeSession_RecordsLinearParseVerdict(t *testing.T) {
 		"single-root resolvable chain must record a DAG verdict")
 }
 
-func TestParseClaudeSessionFrom_QueueOperationOnlyFallsBack(t *testing.T) {
+func TestParseClaudeSessionFrom_QueueOperationOnlyAppliesLink(t *testing.T) {
 	t.Parallel()
 
 	initial := testjsonl.JoinJSONL(
@@ -1940,12 +2227,19 @@ func TestParseClaudeSessionFrom_QueueOperationOnlyFallsBack(t *testing.T) {
 	require.NoError(t, err)
 	require.NoError(t, f.Close())
 
-	_, _, _, err = callParseClaudeSessionFrom(path, offset, 2, "a1")
-	assert.ErrorIs(t, err, ErrClaudeIncrementalNeedsFullParse)
-	assert.True(t, IsIncrementalFullParseFallback(err))
+	msgs, links, _, consumed, err := callParseClaudeSessionFromWithLinks(
+		path, offset, 2, "a1",
+	)
+	require.NoError(t, err)
+	assert.Empty(t, msgs)
+	assert.Equal(t, int64(len(appended)), consumed)
+	assert.Equal(t, []ClaudeSubagentLink{{
+		ToolUseID:         "toolu_queue",
+		SubagentSessionID: "agent-childqueue",
+	}}, links)
 }
 
-func TestParseClaudeSessionFrom_ProgressOnlyFallsBack(t *testing.T) {
+func TestParseClaudeSessionFrom_ProgressOnlyAppliesLink(t *testing.T) {
 	t.Parallel()
 
 	initial := testjsonl.JoinJSONL(
@@ -1971,9 +2265,16 @@ func TestParseClaudeSessionFrom_ProgressOnlyFallsBack(t *testing.T) {
 	require.NoError(t, err)
 	require.NoError(t, f.Close())
 
-	_, _, _, err = callParseClaudeSessionFrom(path, offset, 2, "a1")
-	assert.ErrorIs(t, err, ErrClaudeIncrementalNeedsFullParse)
-	assert.True(t, IsIncrementalFullParseFallback(err))
+	msgs, links, _, consumed, err := callParseClaudeSessionFromWithLinks(
+		path, offset, 2, "a1",
+	)
+	require.NoError(t, err)
+	assert.Empty(t, msgs)
+	assert.Equal(t, int64(len(appended)), consumed)
+	assert.Equal(t, []ClaudeSubagentLink{{
+		ToolUseID:         "toolu_progress",
+		SubagentSessionID: "agent-childprogress",
+	}}, links)
 }
 
 // Sanity: a benign incremental append (one user, one assistant
@@ -2051,7 +2352,7 @@ func TestParseClaudeSession_TerminationStatus(t *testing.T) {
 func TestParseClaudeSession_TokenUsage(t *testing.T) {
 	t.Run("explicit parser presence beats fallback inference", func(t *testing.T) {
 		msg := ParsedMessage{
-			TokenUsage:         json.RawMessage(`{"input_tokens":100,"output_tokens":50}`),
+			TokenUsage:         jsontext.Value(`{"input_tokens":100,"output_tokens":50}`),
 			tokenPresenceKnown: true,
 		}
 		msgHasCtx, msgHasOut := msg.TokenPresence()
@@ -2594,7 +2895,7 @@ func TestExtractTextContent_ReturnsThinkingText(t *testing.T) {
 			{"type":"thinking","thinking":"second thought"},
 			{"type":"text","text":"reply B"}
 		]`)
-		text, thinking, hasThinking, _, _, _ := ExtractTextContent(content)
+		text, thinking, hasThinking, _, _, _ := ExtractTextContent(t.Context(), content)
 		assert.True(t, hasThinking)
 		assert.Equal(t, "first thought\n\nsecond thought", thinking)
 		assert.Contains(t, text, "[Thinking]\nfirst thought\n[/Thinking]")
@@ -2606,7 +2907,7 @@ func TestExtractTextContent_ReturnsThinkingText(t *testing.T) {
 			{"type":"thinking","thinking":""},
 			{"type":"thinking","thinking":"real thought"}
 		]`)
-		_, thinking, _, _, _, _ := ExtractTextContent(content)
+		_, thinking, _, _, _, _ := ExtractTextContent(t.Context(), content)
 		assert.Equal(t, "real thought", thinking)
 	})
 }

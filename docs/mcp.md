@@ -21,6 +21,23 @@ Use the MCP server when you want a coding assistant to answer questions such as:
 The tools are read-only. They expose session history and usage data, but they do
 not mutate the archive or resync files directly.
 
+### Discover running HTTP listeners
+
+Run `agentsview mcp status --json` to list HTTP MCP listeners started by this
+version. The command reads local runtime records without starting a server. Each
+entry includes `transport`, `url`, `pid`, `backend_url` when known, and
+`token_path` when the listener requires a bearer token. Read the token from that
+private file; the status output does not print it.
+
+For wildcard binds, the URL uses loopback (`127.0.0.1` for IPv4 or `::1` for
+IPv6) so local clients can connect. Other bound addresses remain unchanged.
+
+The listener publishes its actual bound port after startup, including when
+started with port zero, and removes its record on orderly shutdown. Status omits
+records whose process has exited. Stdio sessions are not listening endpoints and
+do not appear. An empty JSON list means no HTTP listeners were found in this
+application's configured data directory.
+
 ## Quick Start
 
 For local desktop-style MCP clients, use stdio:
@@ -48,13 +65,27 @@ client will see these tools:
 | `search_content`       | Substring, regex, semantic, or hybrid search over raw session text |
 | `get_usage_summary`    | Aggregate token and cost usage                                     |
 
+`search_sessions` accepts optional `date_from` and `date_to` bounds in
+`YYYY-MM-DD` format, just like `list_sessions` and `search_content`. Dates
+include sessions whose activity overlaps the requested days in UTC. Either bound
+can be omitted; omitting both preserves unrestricted date matching. Malformed
+dates and ranges where `date_from` is after `date_to` return an error.
+
+When a vector search index is configured, prefer `search_content` with
+`mode: "hybrid"` or `mode: "semantic"` for questions about prior work,
+especially when the exact wording is unknown. Hybrid combines semantic
+similarity with keyword matching. Use `context` to include surrounding messages.
+If the index is unavailable, use `search_sessions` for keyword search, or
+`search_content` with substring/regex for exact errors, identifiers, and code
+fragments. The default search mode remains substring.
+
 `search_content` accepts a `mode` of `substring` (default), `regex`, `semantic`,
 or `hybrid`, plus a `scope` of `top`, `all` (default), or `subordinate` that is
 only valid with the semantic and hybrid modes. The `semantic` and `hybrid` modes
-need the opt-in [semantic search](/semantic-search/) index on the local SQLite
-archive; without it they return a "not available" error. In every mode, each
-match carries a conversation-unit citation: an `ordinal_range` of `[start, end]`
-ordinals around the match, plus `subordinate`, `relationship`,
+need the opt-in [semantic search](/docs/semantic-search/) index on the local
+SQLite archive; without it they return a "not available" error. In every mode,
+each match carries a conversation-unit citation: an `ordinal_range` of
+`[start, end]` ordinals around the match, plus `subordinate`, `relationship`,
 `parent_session_id`, and `is_sidechain` fields that flag hits from sidechain
 runs and subagent or fork sessions.
 
@@ -148,7 +179,7 @@ agentsview pg serve --port 8085
 }
 ```
 
-See [PostgreSQL Sync](/pg-sync/) for configuring `pg push` and `pg serve`.
+See [PostgreSQL Sync](/docs/pg-sync/) for configuring `pg push` and `pg serve`.
 
 ## StreamableHTTP Mode
 
@@ -189,5 +220,5 @@ project names, and usage totals. Treat it like access to your session archive.
 - Remember that MCP tools are read-only, but the data they expose may still be
   sensitive.
 
-For every flag, see [`agentsview mcp`](/commands/#agentsview-mcp) in the CLI
-reference.
+For every flag, see [`agentsview mcp`](/docs/commands/#agentsview-mcp) in the
+CLI reference.

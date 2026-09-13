@@ -60,7 +60,10 @@ func TestReconcileWatchRootsAiderScansOneLargeContainerOnce(t *testing.T) {
 	repo := filepath.Join(root, "repo")
 	require.NoError(t, os.MkdirAll(repo, 0o755))
 	var history strings.Builder
-	for i := range 600 {
+	// Cross the reconciliation page boundary so the fixture exercises a
+	// multi-page container without paying to archive hundreds of redundant
+	// rows beyond the boundary.
+	for i := range reconciliationPageSize + 1 {
 		history.WriteString("# aider chat started at 2026-06-09 14:01:00\n")
 		history.WriteString("#### prompt ")
 		history.WriteString(strings.Repeat("x", i%17+1))
@@ -116,12 +119,10 @@ func TestReconcileWatchRootsAiderTombstonesDeletedVirtualRun(t *testing.T) {
 
 	active, err := database.GetSession(t.Context(), deletedID)
 	require.NoError(t, err)
-	assert.Nil(t, active)
+	assert.NotNil(t, active)
 	archived, err := database.GetSessionFull(t.Context(), deletedID)
 	require.NoError(t, err)
-	require.NotNil(t, archived)
-	require.NotNil(t, archived.DeletionCause)
-	assert.Equal(t, "source_missing", *archived.DeletionCause)
+	assertSourceMissingState(t, archived)
 	surviving, err := database.GetSession(t.Context(), survivingID)
 	require.NoError(t, err)
 	assert.NotNil(t, surviving)
@@ -158,12 +159,10 @@ func TestReconcileWatchRootsAiderTombstonesDeletedRunWhenPositionIsReused(t *tes
 
 	deleted, err := database.GetSession(t.Context(), deletedID)
 	require.NoError(t, err)
-	assert.Nil(t, deleted)
+	assert.NotNil(t, deleted)
 	archived, err := database.GetSessionFull(t.Context(), deletedID)
 	require.NoError(t, err)
-	require.NotNil(t, archived)
-	require.NotNil(t, archived.DeletionCause)
-	assert.Equal(t, "source_missing", *archived.DeletionCause)
+	assertSourceMissingState(t, archived)
 	shifted, err := database.GetSessionFull(t.Context(), shiftedID)
 	require.NoError(t, err)
 	require.NotNil(t, shifted)

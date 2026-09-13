@@ -4,14 +4,19 @@ import (
 	"context"
 	"crypto/sha256"
 	"database/sql"
-	"encoding/json"
+	"encoding/json/jsontext"
+	"encoding/json/v2"
+	"errors"
 	"fmt"
+	"maps"
 	"os"
 	"path/filepath"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/tidwall/gjson"
@@ -25,6 +30,24 @@ type OpenCodeSessionMeta struct {
 	SessionID   string
 	VirtualPath string
 	FileMtime   int64
+	// CompositeMtime reports that FileMtime is the per-session composite
+	// (see openCodeCompositeMtimeExpr) rather than the session row's own
+	// time_updated. When true the fingerprint omits the shared container's
+	// size, because the composite already discriminates per session.
+	CompositeMtime bool
+	// ChildDigest is the per-session freshness identity carried into the
+	// fingerprint's Hash. It folds the composite watermark together with the
+	// child row counts, so a deletion that leaves the watermark untouched
+	// still changes it. Empty when the container has no composite support.
+	ChildDigest string
+	// WatermarkOnly reports that FileMtime is only the session-row watermark
+	// (session and project time_updated, no child tables) and ChildDigest is
+	// deliberately unresolved. Changed-path listings use this bounded form so
+	// a watcher event does not scan every child row in the container; the
+	// engine skips such a source when its stored composite watermark already
+	// covers the carried value, and resolves the full composite and digest
+	// through the indexed per-session lookup otherwise.
+	WatermarkOnly bool
 }
 
 // OpenCodeSQLiteSessionExists reports whether a session row with
@@ -48,9 +71,17 @@ func OpenCodeSQLiteSessionExists(dbPath, sessionID string) bool {
 		return false
 	}
 	defer db.Close()
+	table, err := openCodeSessionTableCached(db, dbPath, sessionID)
+	if err != nil {
+		return false
+	}
+	from, err := openCodeSessionFromCached(db, dbPath, table)
+	if err != nil {
+		return false
+	}
 	var found int
 	err = db.QueryRow(
-		"SELECT 1 FROM session WHERE id = ? LIMIT 1",
+		"SELECT 1 FROM "+from+" WHERE id = ? LIMIT 1",
 		sessionID,
 	).Scan(&found)
 	return err == nil
@@ -73,6 +104,141 @@ func ListOpenCodeSessionMeta(
 	return metas, err
 }
 
+// The two container freshness query shapes, counted so tests can pin that
+// watcher-driven passes stay bounded by the changed batch: the grouped
+// whole-container child scan must not run on a changed-path pass, and
+// per-session child lookups must scale with the number of changed sessions,
+// not the archive.
+var (
+	openCodeContainerChildScans atomic.Int64
+	openCodeSessionChildLookups atomic.Int64
+)
+
+// OpenCodeContainerChildScans returns how many whole-container child-table
+// identity scans (grouped message/part aggregation) have run.
+func OpenCodeContainerChildScans() int64 {
+	return openCodeContainerChildScans.Load()
+}
+
+// OpenCodeSessionChildLookups returns how many single-session indexed child
+// digest lookups have run.
+func OpenCodeSessionChildLookups() int64 {
+	return openCodeSessionChildLookups.Load()
+}
+
+// ListOpenCodeSessionWatermarkMeta is the materialized form of
+// ForEachOpenCodeSessionWatermarkMeta.
+func ListOpenCodeSessionWatermarkMeta(
+	dbPath string,
+) ([]OpenCodeSessionMeta, error) {
+	var metas []OpenCodeSessionMeta
+	err := ForEachOpenCodeSessionWatermarkMeta(
+		context.Background(), dbPath,
+		func(meta OpenCodeSessionMeta) error {
+			metas = append(metas, meta)
+			return nil
+		},
+	)
+	return metas, err
+}
+
+// ForEachOpenCodeSessionWatermarkMeta streams session rows carrying only the
+// session-row watermark: MAX(session.time_updated, project.time_updated),
+// touching no child tables. A watcher event on a shared container must not
+// pay a whole-archive child scan to find the one session that changed, so
+// changed-path classification lists sessions through this bounded form and
+// leaves the full composite and child digest to the indexed per-session
+// lookup, which the engine runs only for sessions it cannot skip against
+// their stored watermark. What this signal cannot see — a child-only write
+// that leaves the session and project rows untouched, wherever its
+// timestamps land relative to the stored composite — is a known, deliberate
+// deferral reconciled by the next full-discovery pass, which still carries
+// the complete child digest (see the change-detection entry in
+// docs/internal/session-format-sources.md). Legacy containers without
+// composite support keep the full listing; their conservative
+// container-size fingerprint must not be bypassed by a watermark-only skip.
+//
+// This listing scans the session table once and that scan is O(session
+// count) by design: OpenCode's schema indexes neither time_updated column,
+// and the schema is not ours to alter, so any sound candidate selection
+// must read every session row. The rows are few and fixed-width (one per
+// session, no transcript bytes), which is what makes this the bounded form
+// — the quantities that previously scaled with the archive were the child
+// tables (two orders of magnitude more rows) and the per-event
+// materialization downstream, and both are now bounded by the changed
+// batch.
+func ForEachOpenCodeSessionWatermarkMeta(
+	ctx context.Context,
+	dbPath string,
+	yield func(OpenCodeSessionMeta) error,
+) error {
+	if _, err := os.Stat(dbPath); os.IsNotExist(err) {
+		return nil
+	}
+
+	db, err := openOpenCodeDB(dbPath)
+	if err != nil {
+		return err
+	}
+	defer db.Close()
+
+	composite, err := openCodeCompositeMtimeSupportedCached(db, dbPath)
+	if err != nil {
+		return err
+	}
+	// Ordered by id so the virtual paths ("<db>#<id>") stream in ascending
+	// byte order: the changed-path merge walks a paged stored-freshness
+	// cursor in step with this stream, and both sides must share one order.
+	tables, idle, migration, err := openCodeSessionTablesCached(db, dbPath)
+	if err != nil {
+		return err
+	}
+	var queries []string
+	for _, table := range tables {
+		from := openCodeSessionFrom(table, idle, migration)
+		query := "SELECT s.id, s.time_updated FROM " + from + " s"
+		if composite {
+			query = "SELECT s.id, " + openCodeSessionRowWatermarkExpr +
+				" FROM " + from + " s" + openCodeSessionCompositeMtimeJoins
+		}
+
+		if table == "session" && len(tables) == 2 {
+			query += " WHERE NOT EXISTS (SELECT 1 FROM session_v2 WHERE id = s.id)"
+		}
+		queries = append(queries, query)
+	}
+	query := strings.Join(queries, " UNION ALL ") + " ORDER BY 1"
+
+	rows, err := db.QueryContext(ctx, query)
+	if err != nil {
+		return fmt.Errorf(
+			"listing opencode session watermarks: %w", err,
+		)
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var id string
+		var watermark int64
+		if err := rows.Scan(&id, &watermark); err != nil {
+			return fmt.Errorf(
+				"scanning opencode session watermark: %w", err,
+			)
+		}
+		observeStreamingDiscoveryBuffer(ctx, 1)
+		if err := yield(OpenCodeSessionMeta{
+			SessionID:      id,
+			VirtualPath:    dbPath + "#" + id,
+			FileMtime:      watermark * 1_000_000,
+			CompositeMtime: composite,
+			WatermarkOnly:  composite,
+		}); err != nil {
+			return err
+		}
+	}
+	return rows.Err()
+}
+
 // ForEachOpenCodeSessionMeta streams lightweight session rows directly from
 // SQLite. The callback runs while the read-only query is open and receives one
 // row at a time; callers must not retain database-owned values.
@@ -91,9 +257,42 @@ func ForEachOpenCodeSessionMeta(
 	}
 	defer db.Close()
 
-	rows, err := db.QueryContext(ctx,
-		"SELECT id, time_updated FROM session",
-	)
+	composite, err := openCodeCompositeMtimeSupportedCached(db, dbPath)
+	if err != nil {
+		return err
+	}
+	tables, idle, migration, err := openCodeSessionTablesCached(db, dbPath)
+	if err != nil {
+		return err
+	}
+	var queries []string
+	for _, table := range tables {
+		from := openCodeSessionFrom(table, idle, migration)
+		query := "SELECT s.id, s.time_updated, s.time_updated, 0, 0, 0, '', '', 0, 0, '' " +
+			"FROM " + from + " s"
+		if composite {
+			openCodeContainerChildScans.Add(1)
+			v2, err := openCodeV2SupportedCached(db, dbPath)
+			if err != nil {
+				return err
+			}
+			columns, joins := openCodeV2AggregateSQL(v2, false)
+			watermark, counts, baseJoins := openCodeCompositeMtimeExpr, openCodeCompositeCountsExpr, openCodeCompositeMtimeJoins
+			if table == "session_v2" {
+				watermark, counts, baseJoins = openCodeSessionRowWatermarkExpr, openCodeV2BaseCountsExpr, openCodeSessionCompositeMtimeJoins
+			}
+			query = "SELECT s.id, " + watermark + ", " + counts + columns +
+				" FROM " + from + " s" + baseJoins + joins
+		}
+
+		if table == "session" && len(tables) == 2 {
+			query += " WHERE NOT EXISTS (SELECT 1 FROM session_v2 WHERE id = s.id)"
+		}
+		queries = append(queries, query)
+	}
+	query := strings.Join(queries, " UNION ALL ") + " ORDER BY 1"
+
+	rows, err := db.QueryContext(ctx, query)
 	if err != nil {
 		return fmt.Errorf(
 			"listing opencode sessions: %w", err,
@@ -103,9 +302,12 @@ func ForEachOpenCodeSessionMeta(
 
 	for rows.Next() {
 		var id string
-		var timeUpdated int64
+		var agg openCodeChildAggregate
 		if err := rows.Scan(
-			&id, &timeUpdated,
+			&id, &agg.watermark, &agg.sessionTime, &agg.projectTime,
+			&agg.messages, &agg.parts,
+			&agg.messageIdent, &agg.partIdent,
+			&agg.projectionTime, &agg.projections, &agg.projectionIdent,
 		); err != nil {
 			return fmt.Errorf(
 				"scanning opencode session meta: %w", err,
@@ -113,14 +315,210 @@ func ForEachOpenCodeSessionMeta(
 		}
 		observeStreamingDiscoveryBuffer(ctx, 1)
 		if err := yield(OpenCodeSessionMeta{
-			SessionID:   id,
-			VirtualPath: dbPath + "#" + id,
-			FileMtime:   timeUpdated * 1_000_000,
+			SessionID:      id,
+			VirtualPath:    dbPath + "#" + id,
+			FileMtime:      max(agg.watermark, agg.projectionTime) * 1_000_000,
+			CompositeMtime: composite,
+			ChildDigest:    agg.digest(composite),
 		}); err != nil {
 			return err
 		}
 	}
 	return rows.Err()
+}
+
+// openCodeSessionCompositeMtime returns one session's composite change signal
+// in milliseconds, and whether the container schema supports it. Discovery,
+// single-session source lookup, and the parse path all resolve mtime through
+// this so a session's stored file_mtime always equals the value the freshness
+// gate compares it against.
+func openCodeSessionCompositeMtime(
+	db *sql.DB, dbPath, sessionID string,
+) (int64, string, bool, error) {
+	composite, err := openCodeCompositeMtimeSupportedCached(db, dbPath)
+	if err != nil {
+		return 0, "", false, err
+	}
+	table, err := openCodeSessionTableCached(db, dbPath, sessionID)
+	if err != nil {
+		return 0, "", false, err
+	}
+
+	from, err := openCodeSessionFromCached(db, dbPath, table)
+	if err != nil {
+		return 0, "", false, err
+	}
+
+	query := "SELECT s.time_updated, s.time_updated, 0, 0, 0, '', '', 0, 0, '' " +
+		"FROM " + from + " s WHERE s.id = ?"
+	if composite {
+		openCodeSessionChildLookups.Add(1)
+		v2, err := openCodeV2SupportedCached(db, dbPath)
+		if err != nil {
+			return 0, "", false, err
+		}
+		columns, _ := openCodeV2AggregateSQL(v2, true)
+		watermark, counts := openCodeSessionCompositeMtimeExpr, openCodeSessionCompositeCountsExpr
+		if table == "session_v2" {
+			watermark, counts = openCodeSessionRowWatermarkExpr, openCodeV2BaseCountsExpr
+		}
+		query = "SELECT " + watermark + ", " + counts + columns +
+			" FROM " + from + " s" + openCodeSessionCompositeMtimeJoins +
+			" WHERE s.id = ?"
+	}
+	var agg openCodeChildAggregate
+	if err := db.QueryRow(query, sessionID).Scan(
+		&agg.watermark, &agg.sessionTime, &agg.projectTime,
+		&agg.messages, &agg.parts,
+		&agg.messageIdent, &agg.partIdent,
+		&agg.projectionTime, &agg.projections, &agg.projectionIdent,
+	); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return 0, "", composite, nil
+		}
+		return 0, "", composite, fmt.Errorf(
+			"loading opencode session mtime %s#%s: %w",
+			dbPath, sessionID, err,
+		)
+	}
+	return max(agg.watermark, agg.projectionTime), agg.digest(composite), composite, nil
+}
+
+// openCodeSessionWatermark resolves only the composite watermark, skipping the
+// eight child COUNT/SUM/MIN/MAX subqueries that make up the digest. Callers
+// that stamp or compare an mtime do not need the digest, and one of them
+// (OpenCodeSourceMtime) backs the session watcher's 1.5s poll, so computing a
+// digest there would burn eight child-range scans per tick per watched session
+// for a value the caller discards.
+func openCodeSessionWatermark(
+	db *sql.DB, dbPath, sessionID string,
+) (int64, bool, error) {
+	composite, err := openCodeCompositeMtimeSupportedCached(db, dbPath)
+	if err != nil {
+		return 0, false, err
+	}
+	table, err := openCodeSessionTableCached(db, dbPath, sessionID)
+	if err != nil {
+		return 0, false, err
+	}
+
+	from, err := openCodeSessionFromCached(db, dbPath, table)
+	if err != nil {
+		return 0, false, err
+	}
+
+	query := "SELECT s.time_updated FROM " + from + " s WHERE s.id = ?"
+	if composite {
+		v2, err := openCodeV2SupportedCached(db, dbPath)
+		if err != nil {
+			return 0, false, err
+		}
+		watermark := openCodeSessionCompositeMtimeExpr
+		if table == "session_v2" {
+			watermark = openCodeSessionRowWatermarkExpr
+		}
+		if v2 {
+			watermark = "MAX(" + watermark + ", COALESCE((SELECT MAX(time_updated) FROM session_message WHERE session_id = s.id), 0))"
+		}
+		query = "SELECT " + watermark +
+			" FROM " + from + " s" + openCodeSessionCompositeMtimeJoins +
+			" WHERE s.id = ?"
+	}
+	var watermark int64
+	if err := db.QueryRow(query, sessionID).Scan(&watermark); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return 0, composite, nil
+		}
+		return 0, composite, fmt.Errorf(
+			"loading opencode session mtime %s#%s: %w",
+			dbPath, sessionID, err,
+		)
+	}
+	return watermark, composite, nil
+}
+
+// openCodeChildAggregate is the cheap per-session identity read alongside the
+// watermark. Each component covers a change the others cannot:
+//
+//   - watermark: an edit or insert that advances a timestamp
+//   - session/project times: a metadata update, including a worktree rename,
+//     that lands below an already-higher child watermark
+//   - counts: a deletion, which never moves a MAX
+//   - child identity: every ordered (id, time_updated) pair, hashed. Reduced
+//     aggregates are not collision-resistant — swapping a non-boundary row for
+//     one carrying the same timestamp preserves counts, sums and min/max ids
+//     alike, so only the complete set separates them.
+//
+// All of it lives in the child tables' main b-tree pages, so computing it does
+// not read the transcript text held in overflow pages.
+type openCodeChildAggregate struct {
+	watermark       int64
+	sessionTime     int64
+	projectTime     int64
+	messages        int64
+	parts           int64
+	messageIdent    string
+	partIdent       string
+	projectionTime  int64
+	projections     int64
+	projectionIdent string
+}
+
+// The field layout is load-bearing beyond equality comparison:
+// OpenCodeChildDigestMetadataWatermarkNS recovers the session/project times
+// from a stored digest by position. Any layout change must bump the prefix
+// version so stale digests fail that parse (and the equality gate) instead
+// of yielding wrong fields.
+func (a openCodeChildAggregate) digest(composite bool) string {
+	if !composite {
+		return ""
+	}
+	identity := a.messageIdent + "\x00" + a.partIdent
+	if a.projections != 0 {
+		identity += "\x00v2:" + a.projectionIdent
+	}
+	sum := sha256.Sum256([]byte(identity))
+	return fmt.Sprintf(
+		"%s%d:%d:%d:%d:%d:%x",
+		openCodeChildDigestPrefix,
+		max(a.watermark, a.projectionTime), a.sessionTime, a.projectTime,
+		a.messages+a.projections, a.parts,
+		sum[:16],
+	)
+}
+
+const openCodeChildDigestPrefix = "opencode-child:v1:"
+
+// OpenCodeChildDigestMetadataWatermarkNS recovers the session/project
+// metadata watermark (nanoseconds) embedded in a stored child digest. The
+// watermark filter compares the live session-row watermark like-for-like
+// against this value: the stored composite MTimeNS may be dominated by a
+// newer child timestamp, and comparing the session-row watermark against
+// that composite would hide a metadata update (title, directory, worktree)
+// whose stamp lands below it. Returns false for any other hash shape —
+// legacy fingerprints, storage fingerprints, future digest versions — which
+// callers treat as "compare against the composite instead", the
+// conservative pre-digest behavior.
+func OpenCodeChildDigestMetadataWatermarkNS(hash string) (int64, bool) {
+	rest, ok := strings.CutPrefix(hash, openCodeChildDigestPrefix)
+	if !ok {
+		return 0, false
+	}
+	fields := strings.Split(rest, ":")
+	if len(fields) != 6 {
+		return 0, false
+	}
+	// Validate every numeric field, not just the two consumed: a digest with
+	// any malformed component is not a digest this version wrote, and the
+	// caller's composite fallback is the safe answer for it.
+	for _, field := range fields[:5] {
+		if _, err := strconv.ParseInt(field, 10, 64); err != nil {
+			return 0, false
+		}
+	}
+	sessionTime, _ := strconv.ParseInt(fields[1], 10, 64)
+	projectTime, _ := strconv.ParseInt(fields[2], 10, 64)
+	return max(sessionTime, projectTime) * 1_000_000, true
 }
 
 // parseOpenCodeDBSession parses a single session by ID from the
@@ -148,14 +546,19 @@ func parseOpenCodeDBSession(
 		)
 	}
 
-	hasDirectory, err := openCodeSessionHasDirectoryCached(db, dbPath)
+	table, err := openCodeSessionTableCached(db, dbPath, sessionID)
 	if err != nil {
-		return nil, nil, fmt.Errorf(
-			"probing opencode session schema: %w", err,
-		)
+		return nil, nil, err
 	}
-
-	s, err := loadOneOpenCodeSession(db, sessionID, hasDirectory)
+	hasDirectory, err := openCodeSessionHasDirectoryCached(db, dbPath, table)
+	if err != nil {
+		return nil, nil, fmt.Errorf("probing opencode session schema: %w", err)
+	}
+	from, err := openCodeSessionFromCached(db, dbPath, table)
+	if err != nil {
+		return nil, nil, err
+	}
+	s, err := loadOneOpenCodeSession(db, from, sessionID, hasDirectory)
 	if err != nil {
 		return nil, nil, fmt.Errorf(
 			"loading opencode session %s: %w",
@@ -165,6 +568,16 @@ func parseOpenCodeDBSession(
 
 	projectWorktree := strings.TrimSpace(projects[s.projectID])
 	cwd := resolveOpenCodeWorktree(s.directory, projectWorktree)
+	if cwd == "" &&
+		(strings.TrimSpace(s.directory) == "" ||
+			strings.TrimSpace(s.directory) == string(filepath.Separator) ||
+			strings.TrimSpace(s.directory) == "/") &&
+		(strings.TrimSpace(projectWorktree) == string(filepath.Separator) ||
+			strings.TrimSpace(projectWorktree) == "/") {
+		// SQLite's global project uses / as its declared worktree. Preserve
+		// that source value; file-backed metadata applies the stricter policy.
+		cwd = "/"
+	}
 	if !openCodeUsableWorktree(projectWorktree) {
 		projectWorktree = cwd
 	}
@@ -183,7 +596,10 @@ func resolveOpenCodeWorktree(
 	if dir := strings.TrimSpace(sessionDirectory); openCodeUsableWorktree(dir) {
 		return dir
 	}
-	return strings.TrimSpace(projectWorktree)
+	if worktree := strings.TrimSpace(projectWorktree); openCodeUsableWorktree(worktree) {
+		return worktree
+	}
+	return ""
 }
 
 func openCodeUsableWorktree(path string) bool {
@@ -194,6 +610,46 @@ func openCodeUsableWorktree(path string) bool {
 	return path != string(filepath.Separator) && path != "/"
 }
 
+type openCodeProjectFile struct {
+	Worktree string `json:"worktree"`
+}
+
+func openCodeProjectPath(sessionPath string) string {
+	root := filepath.Dir(filepath.Dir(filepath.Dir(filepath.Dir(sessionPath))))
+	projectID := filepath.Base(filepath.Dir(sessionPath))
+	return filepath.Join(root, "storage", "project", projectID+".json")
+}
+
+// resolveOpenCodeStorageWorktree applies the file-backed session precedence
+// and reads only the project metadata named by the session path.
+func resolveOpenCodeStorageWorktree(
+	sessionPath, sessionDirectory string,
+) (string, error) {
+	sessionDirectory = strings.TrimSpace(sessionDirectory)
+	if openCodeUsableWorktree(sessionDirectory) {
+		return resolveOpenCodeWorktree(sessionDirectory, ""), nil
+	}
+	projectPath := openCodeProjectPath(sessionPath)
+	projectWorktree := ""
+	raw, err := os.ReadFile(projectPath)
+	if err != nil {
+		if !os.IsNotExist(err) {
+			return "", fmt.Errorf(
+				"reading opencode project file %s: %w", projectPath, err,
+			)
+		}
+	} else {
+		var project openCodeProjectFile
+		if err := json.Unmarshal(raw, &project); err != nil {
+			return "", fmt.Errorf(
+				"decoding opencode project file %s: %w", projectPath, err,
+			)
+		}
+		projectWorktree = project.Worktree
+	}
+	return resolveOpenCodeWorktree(sessionDirectory, projectWorktree), nil
+}
+
 // parseOpenCodeStorageFile parses a file-backed OpenCode storage
 // session rooted at storage/session/<project>/<session>.json. The
 // OpenCode-format provider owns this path; Kilo and MiMoCode reuse it
@@ -201,81 +657,53 @@ func openCodeUsableWorktree(path string) bool {
 func parseOpenCodeStorageFile(
 	sessionPath, machine string,
 ) (*ParsedSession, []ParsedMessage, error) {
-	raw, err := os.ReadFile(sessionPath)
-	if err != nil {
-		return nil, nil, fmt.Errorf(
-			"reading opencode session file %s: %w",
-			sessionPath, err,
-		)
-	}
-
-	var sf openCodeStorageSessionFile
-	if err := json.Unmarshal(raw, &sf); err != nil {
-		return nil, nil, fmt.Errorf(
-			"decoding opencode session file %s: %w",
-			sessionPath, err,
-		)
-	}
-	if sf.ID == "" {
-		return nil, nil, fmt.Errorf(
-			"opencode session file %s missing id",
-			sessionPath,
-		)
-	}
-
-	root := filepath.Dir(filepath.Dir(filepath.Dir(
-		filepath.Dir(sessionPath),
-	)))
-	// OpenCode session sync replaces the full stored transcript.
-	// If a child JSON is truncated mid-write, skipping it here
-	// would silently drop previously persisted content until the
-	// next successful sync, so malformed children abort the parse.
-	msgs, err := loadOpenCodeStorageMessages(root, sf.ID)
+	snapshot, err := loadOpenCodeStorageSnapshot(sessionPath, true)
 	if err != nil {
 		return nil, nil, err
 	}
-	parts, err := loadOpenCodeStorageParts(root, msgs)
-	if err != nil {
-		return nil, nil, err
-	}
-	fileMtime, err := OpenCodeSourceMtime(sessionPath)
-	if err != nil {
-		return nil, nil, err
-	}
-
 	sess, parsed, err := buildOpenCodeParsedSession(
-		openCodeSessionRow{
-			id:          sf.ID,
-			parentID:    sf.ParentID,
-			title:       sf.Title,
-			timeCreated: sf.Time.Created,
-			timeUpdated: sf.Time.Updated,
-		},
-		sf.Directory,
-		sf.Directory,
-		sessionPath,
-		fileMtime,
+		snapshot.session,
+		snapshot.worktree,
+		snapshot.worktree,
+		snapshot.sessionPath,
+		snapshot.fileMtime,
 		machine,
-		msgs,
-		parts,
+		snapshot.messages,
+		snapshot.parts,
 	)
 	if err != nil || sess == nil {
 		return sess, parsed, err
 	}
-	sess.File.Hash = buildOpenCodeSessionFingerprint(
-		openCodeSessionRow{
-			id:          sf.ID,
-			parentID:    sf.ParentID,
-			title:       sf.Title,
-			timeCreated: sf.Time.Created,
-			timeUpdated: sf.Time.Updated,
-		},
-		sf.Directory,
-		sf.Directory,
-		msgs,
-		parts,
-	)
+	sess.File.Size = snapshot.fileSize
+	sess.File.Hash = snapshot.fingerprint()
 	return sess, parsed, nil
+}
+
+// openCodeStorageSessionFingerprint hashes raw storage rows without parsing messages.
+func openCodeStorageSessionFingerprint(sessionPath string) (string, error) {
+	snapshot, err := loadOpenCodeStorageSnapshot(sessionPath, false)
+	if err != nil {
+		return "", err
+	}
+	return openCodeStorageFingerprintFromSnapshot(snapshot)
+}
+
+func openCodeStorageFingerprintFromSnapshot(
+	snapshot openCodeStorageSnapshot,
+) (string, error) {
+	if !snapshot.hasMaterializedMessages() {
+		// Empty or still-in-progress sessions intentionally map to SkipNoSession;
+		// fingerprinting must preserve that normal outcome.
+		return "", nil
+	}
+	hash := snapshot.fingerprint()
+	if !HasOpenCodeStorageFingerprint(hash) {
+		return "", fmt.Errorf(
+			"opencode storage session %s has no content fingerprint",
+			snapshot.sessionPath,
+		)
+	}
+	return hash, nil
 }
 
 func openOpenCodeDB(dbPath string) (*sql.DB, error) {
@@ -378,9 +806,19 @@ type openCodeSessionRow struct {
 	timeUpdated int64
 }
 
+// openCodeSessionSchemaCacheEntry memoizes schema probes for one
+// container. Each probe has its own "resolved" flag so populating one never
+// makes the other report a false negative from its zero value.
 type openCodeSessionSchemaCacheEntry struct {
-	state        SQLiteContainerState
-	hasDirectory bool
+	state             SQLiteContainerState
+	directoryColumns  map[string]bool
+	hasComposite      bool
+	compositeOnce     bool
+	hasV2             bool
+	v2Once            bool
+	sessionTables     []string
+	hasTimeIdle       bool
+	hasMigrationState bool
 }
 
 // openCodeSessionSchemaCache memoizes whether session.directory exists for
@@ -393,68 +831,251 @@ var (
 )
 
 func openCodeSessionHasDirectoryCached(
-	db *sql.DB, dbPath string,
+	db *sql.DB, dbPath, table string,
 ) (bool, error) {
 	state, ok := StatSQLiteContainerState(dbPath)
 	if !ok {
-		return openCodeSessionTableHasDirectory(db)
+		return openCodeTableHasColumn(db, table, "directory")
 	}
 	openCodeSessionSchemaCacheMu.Lock()
 	entry, hit := openCodeSessionSchemaCache[dbPath]
 	openCodeSessionSchemaCacheMu.Unlock()
-	if hit && entry.state == state {
-		return entry.hasDirectory, nil
+	if hasDirectory, resolved := entry.directoryColumns[table]; hit && entry.state == state && resolved {
+		return hasDirectory, nil
 	}
-	hasDirectory, err := openCodeSessionTableHasDirectory(db)
+	hasDirectory, err := openCodeTableHasColumn(db, table, "directory")
 	if err != nil {
 		return false, err
 	}
 	openCodeSessionSchemaCacheMu.Lock()
-	openCodeSessionSchemaCache[dbPath] = openCodeSessionSchemaCacheEntry{
-		state:        state,
-		hasDirectory: hasDirectory,
+	prev := openCodeSessionSchemaCache[dbPath]
+	if prev.state != state {
+		prev = openCodeSessionSchemaCacheEntry{}
 	}
+	prev.state = state
+	prev.directoryColumns = maps.Clone(prev.directoryColumns)
+	if prev.directoryColumns == nil {
+		prev.directoryColumns = make(map[string]bool)
+	}
+	prev.directoryColumns[table] = hasDirectory
+	openCodeSessionSchemaCache[dbPath] = prev
 	openCodeSessionSchemaCacheMu.Unlock()
 	return hasDirectory, nil
 }
 
-func openCodeSessionTableHasDirectory(db *sql.DB) (bool, error) {
-	rows, err := db.Query(`PRAGMA table_info(session)`)
+// openCodeCompositeMtimeExpr is the per-session change signal for a
+// SQLite-backed OpenCode container. Every session in a root shares one
+// physical opencode.db, so the container file's own size and mtime move
+// whenever any single session is written and cannot discriminate between
+// sessions. These four columns can:
+//
+//   - session.time_updated  — the session row itself
+//   - project.time_updated  — the owning project (worktree renames re-resolve
+//     every session in that project, which is the correct scope; verified on a
+//     production container that this does not track ordinary session activity)
+//   - max(message.time_updated) / max(part.time_updated) — child content,
+//     including in-place edits that leave time_created untouched
+//
+// The child scans read only small columns; OpenCode keeps each part's `data`
+// in SQLite overflow pages, so this does not read transcript bytes.
+// The streaming form groups the child tables once for the whole container, so
+// listing every session costs a single pass over each child table.
+const openCodeCompositeMtimeExpr = `MAX(s.time_updated,
+		COALESCE(pr.time_updated, 0),
+		COALESCE(m.mx, 0),
+		COALESCE(p.mx, 0))`
+
+const openCodeCompositeMtimeJoins = `
+	LEFT JOIN project pr ON pr.id = s.project_id
+	LEFT JOIN (
+		SELECT session_id, MAX(time_updated) mx, COUNT(*) n,
+		       group_concat(id || ':' || time_updated) ident
+		FROM (SELECT session_id, id, time_updated FROM message
+		      ORDER BY session_id, id)
+		GROUP BY session_id
+	) m ON m.session_id = s.id
+	LEFT JOIN (
+		SELECT session_id, MAX(time_updated) mx, COUNT(*) n,
+		       group_concat(id || ':' || time_updated) ident
+		FROM (SELECT session_id, id, time_updated FROM part
+		      ORDER BY session_id, id)
+		GROUP BY session_id
+	) p ON p.session_id = s.id`
+
+// openCodeCompositeCountsExpr yields the child row counts that make the
+// signal deletion-sensitive. A MAX over timestamps cannot see a delete: on a
+// real container the session or project row usually already holds the higher
+// value, so removing a message or part leaves the max untouched and the
+// session would look fresh with the deleted content still archived.
+const openCodeCompositeCountsExpr = `s.time_updated,
+	COALESCE(pr.time_updated, 0),
+	COALESCE(m.n, 0), COALESCE(p.n, 0),
+	COALESCE(m.ident, ''), COALESCE(p.ident, '')`
+
+const openCodeSessionCompositeCountsExpr = `
+	s.time_updated,
+	COALESCE(pr.time_updated, 0),
+	(SELECT COUNT(*) FROM message WHERE session_id = s.id),
+	(SELECT COUNT(*) FROM part WHERE session_id = s.id),
+	(SELECT COALESCE(group_concat(id || ':' || time_updated), '')
+	 FROM (SELECT id, time_updated FROM message
+	       WHERE session_id = s.id ORDER BY id)),
+	(SELECT COALESCE(group_concat(id || ':' || time_updated), '')
+	 FROM (SELECT id, time_updated FROM part
+	       WHERE session_id = s.id ORDER BY id))`
+
+// The single-session form must NOT reuse the grouped subqueries above: a
+// GROUP BY subquery is materialized over the whole container before the outer
+// WHERE narrows to one session, so every per-session lookup would scan every
+// message and part in the container. Correlated aggregates filtered by
+// session_id ride the message/part session_id indexes instead, which is the
+// difference between an index seek and an archive-wide scan on every call.
+const openCodeSessionCompositeMtimeExpr = `MAX(s.time_updated,
+		COALESCE(pr.time_updated, 0),
+		COALESCE((
+			SELECT MAX(time_updated) FROM message WHERE session_id = s.id
+		), 0),
+		COALESCE((
+			SELECT MAX(time_updated) FROM part WHERE session_id = s.id
+		), 0))`
+
+const openCodeSessionCompositeMtimeJoins = `
+	LEFT JOIN project pr ON pr.id = s.project_id`
+
+// openCodeSessionRowWatermarkExpr is the bounded change signal used by
+// watermark-only changed-path listings: the session and project rows alone,
+// no child aggregation. The session table holds one small row per session, so
+// listing every session through this costs a scan of the session and project
+// tables only — bounded by session count, never by message/part volume.
+const openCodeSessionRowWatermarkExpr = `MAX(s.time_updated,
+		COALESCE(pr.time_updated, 0))`
+
+// openCodeCompositeMtimeSupportedCached reports whether this container's schema
+// carries every column openCodeCompositeMtimeExpr needs. Older OpenCode-family
+// containers (Kilo, MiMoCode, ICodeMate, legacy OpenCode) omit the child
+// time_updated columns; those keep the previous session-only mtime and the
+// container-stat fallback in Fingerprint.
+func openCodeCompositeMtimeSupportedCached(
+	db *sql.DB, dbPath string,
+) (bool, error) {
+	state, ok := StatSQLiteContainerState(dbPath)
+	if !ok {
+		return openCodeSupportsCompositeMtime(db)
+	}
+	openCodeSessionSchemaCacheMu.Lock()
+	entry, hit := openCodeSessionSchemaCache[dbPath]
+	openCodeSessionSchemaCacheMu.Unlock()
+	if hit && entry.state == state && entry.compositeOnce {
+		return entry.hasComposite, nil
+	}
+	supported, err := openCodeSupportsCompositeMtime(db)
+	if err != nil {
+		return false, err
+	}
+	openCodeSessionSchemaCacheMu.Lock()
+	prev := openCodeSessionSchemaCache[dbPath]
+	if prev.state != state {
+		prev = openCodeSessionSchemaCacheEntry{state: state}
+	}
+	prev.state = state
+	prev.hasComposite = supported
+	prev.compositeOnce = true
+	openCodeSessionSchemaCache[dbPath] = prev
+	openCodeSessionSchemaCacheMu.Unlock()
+	return supported, nil
+}
+
+func openCodeSupportsCompositeMtime(db *sql.DB) (bool, error) {
+	hasV2, err := openCodeTableHasColumn(db, "session_v2", "id")
+	if err != nil {
+		return false, err
+	}
+	if hasV2 {
+		for _, table := range []string{"session_message", "project"} {
+			has, err := openCodeTableHasColumn(db, table, "time_updated")
+			if err != nil || !has {
+				return false, err
+			}
+		}
+		indexed, err := openCodeTableIndexesColumn(db, "session_message", "session_id")
+		if err != nil || !indexed {
+			return false, err
+		}
+		legacy, err := openCodeTableHasColumn(db, "session", "id")
+		if err != nil || !legacy {
+			return !legacy, err
+		}
+	}
+
+	for _, probe := range []struct{ table, column string }{
+		{"message", "time_updated"},
+		{"part", "time_updated"},
+		{"project", "time_updated"},
+	} {
+		has, err := openCodeTableHasColumn(db, probe.table, probe.column)
+		if err != nil || !has {
+			return false, err
+		}
+	}
+	// The per-session lookups are correlated aggregates keyed on session_id.
+	// SQLite does not index a foreign key automatically, so without a
+	// session_id index each one degrades to a full child-table scan — and one
+	// of these backs the session watcher's 1.5s poll. Fall back to the
+	// session-only mtime rather than put an archive scan on that path.
+	for _, table := range []string{"message", "part"} {
+		indexed, err := openCodeTableIndexesColumn(db, table, "session_id")
+		if err != nil || !indexed {
+			return false, err
+		}
+	}
+	return true, nil
+}
+
+// openCodeTableIndexesColumn reports whether table has an index whose leftmost
+// column is column, which is what makes a WHERE column = ? lookup a seek.
+func openCodeTableIndexesColumn(
+	db *sql.DB, table, column string,
+) (bool, error) {
+	rows, err := db.Query(
+		`SELECT 1 FROM pragma_index_list(?) il
+		 JOIN pragma_index_info(il.name) ii
+		 WHERE ii.seqno = 0 AND ii.name = ?`,
+		table, column,
+	)
 	if err != nil {
 		return false, fmt.Errorf(
-			"listing opencode session table info: %w", err,
+			"listing opencode %s indexes: %w", table, err,
 		)
 	}
 	defer rows.Close()
+	if rows.Next() {
+		return true, rows.Err()
+	}
+	return false, rows.Err()
+}
 
-	for rows.Next() {
-		var (
-			cid        int
-			name       string
-			typeName   string
-			notNull    int
-			defaultV   sql.NullString
-			primaryKey int
+// openCodeTableHasColumn reports whether table carries column. An unknown
+// table yields no PRAGMA rows and reports false rather than erroring, so a
+// container missing an optional table degrades to the legacy signal.
+func openCodeTableHasColumn(
+	db *sql.DB, table, column string,
+) (bool, error) {
+	rows, err := db.Query(`SELECT 1 FROM pragma_table_info(?) WHERE name = ?`,
+		table, column)
+	if err != nil {
+		return false, fmt.Errorf(
+			"listing opencode %s table info: %w", table, err,
 		)
-		if err := rows.Scan(
-			&cid, &name, &typeName, &notNull, &defaultV, &primaryKey,
-		); err != nil {
-			return false, fmt.Errorf(
-				"scanning opencode session table info: %w", err,
-			)
-		}
-		if strings.EqualFold(name, "directory") {
-			return true, nil
-		}
 	}
-	if err := rows.Err(); err != nil {
-		return false, err
+	defer rows.Close()
+	if rows.Next() {
+		return true, rows.Err()
 	}
-	return false, nil
+	return false, rows.Err()
 }
 
 func loadOneOpenCodeSession(
-	db *sql.DB, sessionID string, hasDirectory bool,
+	db *sql.DB, table, sessionID string, hasDirectory bool,
 ) (openCodeSessionRow, error) {
 	var (
 		row *sql.Row
@@ -468,7 +1089,7 @@ func loadOneOpenCodeSession(
 			       COALESCE(s.title, ''),
 			       COALESCE(s.directory, ''),
 			       s.time_created, s.time_updated
-			FROM session s
+			FROM `+table+` s
 			WHERE s.id = ?
 		`, sessionID)
 		err = row.Scan(
@@ -486,7 +1107,7 @@ func loadOneOpenCodeSession(
 		       COALESCE(s.parent_id, ''),
 		       COALESCE(s.title, ''),
 		       s.time_created, s.time_updated
-		FROM session s
+		FROM `+table+` s
 		WHERE s.id = ?
 	`, sessionID)
 	err = row.Scan(
@@ -559,14 +1180,13 @@ type openCodeStorageFingerprintPart struct {
 }
 
 func loadOpenCodeMessages(
-	db *sql.DB, sessionID string,
+	db *sql.DB, sessionID string, projections bool,
 ) ([]openCodeMessageRow, error) {
-	rows, err := db.Query(`
-		SELECT id, data, time_created
-		FROM message
-		WHERE session_id = ?
-		ORDER BY time_created
-	`, sessionID)
+	query := "SELECT id, data, time_created FROM message WHERE session_id = ?"
+	if projections {
+		query += " AND NOT EXISTS (SELECT 1 FROM session_message WHERE session_message.id = message.id AND session_message.session_id = message.session_id)"
+	}
+	rows, err := db.Query(query+" ORDER BY time_created, id", sessionID)
 	if err != nil {
 		return nil, err
 	}
@@ -622,36 +1242,83 @@ func buildOpenCodeSession(
 	s openCodeSessionRow,
 	cwd, projectWorktree, dbPath, machine string,
 ) (*ParsedSession, []ParsedMessage, error) {
-	msgs, err := loadOpenCodeMessages(db, s.id)
-	if err != nil {
-		return nil, nil, fmt.Errorf(
-			"loading messages for %s: %w", s.id, err,
-		)
+	// Capture the watermark BEFORE reading children. Messages and parts are
+	// read through separate autocommit queries, so a concurrent write landing
+	// between them would otherwise be stamped with a watermark newer than the
+	// content actually read, and every later sync would skip the session as
+	// fresh — permanently archiving a torn transcript. Reading the watermark
+	// first inverts the race: the stamp is never newer than the content, so a
+	// concurrent change leaves the stored value behind the source and the next
+	// pass re-syncs it.
+	//
+	// Stamp the same composite the fingerprint reports, so the stored
+	// file_mtime is directly comparable to it. Falling back to the session
+	// row's own time_updated keeps legacy containers on their prior value.
+	fileMtime := s.timeUpdated
+	if composite, _, err := openCodeSessionWatermark(
+		db, dbPath, s.id,
+	); err != nil {
+		return nil, nil, err
+	} else if composite != 0 {
+		fileMtime = composite
 	}
 
-	parts, err := loadOpenCodeParts(db, s.id)
+	v2, err := openCodeV2SupportedCached(db, dbPath)
 	if err != nil {
-		return nil, nil, fmt.Errorf(
-			"loading parts for %s: %w", s.id, err,
-		)
+		return nil, nil, err
 	}
-
-	sess, parsed, err := buildOpenCodeParsedSession(
-		s,
-		cwd,
-		projectWorktree,
-		dbPath+"#"+s.id,
-		s.timeUpdated*1_000_000,
-		machine,
-		msgs,
-		parts,
-	)
+	table, err := openCodeSessionTableCached(db, dbPath, s.id)
+	if err != nil {
+		return nil, nil, err
+	}
+	var projected []ParsedMessage
+	var projectionHash string
+	if v2 {
+		projected, _, projectionHash, err = loadOpenCodeV2Messages(db, s.id, cwd)
+		if err != nil {
+			return nil, nil, err
+		}
+	}
+	var msgs []openCodeMessageRow
+	var parts map[string][]openCodePartRow
+	parsed := projected
+	if table == "session" {
+		msgs, err = loadOpenCodeMessages(db, s.id, v2)
+		if err != nil {
+			return nil, nil, fmt.Errorf("loading messages for %s: %w", s.id, err)
+		}
+		parts, err = loadOpenCodeParts(db, s.id)
+		if err != nil {
+			return nil, nil, fmt.Errorf("loading parts for %s: %w", s.id, err)
+		}
+		_, legacy, err := buildOpenCodeParsedSession(s, cwd, projectWorktree, dbPath+"#"+s.id, fileMtime*1_000_000, machine, msgs, parts)
+		if err != nil {
+			return nil, nil, err
+		}
+		// Cross-path reuse in 1.18.25 appends projections without converting old
+		// messages. Keep v2 seq order and insert unmatched v1 rows by creation time.
+		parsed = make([]ParsedMessage, 0, len(legacy)+len(projected))
+		for _, message := range projected {
+			for len(legacy) > 0 && !legacy[0].Timestamp.After(message.Timestamp) {
+				parsed = append(parsed, legacy[0])
+				legacy = legacy[1:]
+			}
+			parsed = append(parsed, message)
+		}
+		parsed = append(parsed, legacy...)
+	}
+	for i := range parsed {
+		parsed[i].Ordinal = i
+	}
+	sess, parsed, err := finishOpenCodeSession(s, cwd, projectWorktree, dbPath+"#"+s.id, fileMtime*1_000_000, machine, parsed)
 	if err != nil || sess == nil {
 		return sess, parsed, err
 	}
-	sess.File.Hash = buildOpenCodeSessionFingerprint(
-		s, cwd, projectWorktree, msgs, parts,
-	)
+	metadata := buildOpenCodeSessionFingerprint(s, cwd, projectWorktree, msgs, parts)
+	sess.File.Hash = metadata
+	if v2 {
+		sess.File.Hash = fmt.Sprintf("opencode-v2:%x", sha256.Sum256([]byte(metadata+projectionHash)))
+	}
 	return sess, parsed, nil
 }
 
@@ -666,18 +1333,9 @@ func buildOpenCodeParsedSession(
 
 	var (
 		parsed       []ParsedMessage
-		firstMsg     string
 		hasUserOrAst bool
 		ordinal      int
 	)
-
-	// Prefer OpenCode's LLM-generated title when available.
-	// Skip default placeholders that match OpenCode's exact
-	// format: "New session - " or "Child session - " followed
-	// by an ISO-8601 timestamp.
-	if s.title != "" && !isOpenCodeDefaultTitle(s.title) {
-		firstMsg = truncate(s.title, 300)
-	}
 
 	for _, m := range msgs {
 		var md openCodeMessageData
@@ -701,19 +1359,12 @@ func buildOpenCodeParsedSession(
 		})
 
 		pm := buildOpenCodeMessage(
-			ordinal, role, m.timeCreated, msgParts, cwd,
+			ordinal, m.id, role, m.timeCreated, msgParts, cwd,
 		)
 		applyOpenCodeTokenUsage(&pm, md, m.data, msgParts)
 		if strings.TrimSpace(pm.Content) == "" &&
 			!pm.HasToolUse {
 			continue
-		}
-
-		if role == RoleUser && firstMsg == "" {
-			firstMsg = truncate(
-				strings.ReplaceAll(pm.Content, "\n", " "),
-				300,
-			)
 		}
 
 		parsed = append(parsed, pm)
@@ -722,6 +1373,28 @@ func buildOpenCodeParsedSession(
 
 	if !hasUserOrAst || len(parsed) == 0 {
 		return nil, nil, nil
+	}
+
+	return finishOpenCodeSession(s, cwd, projectWorktree, filePath, fileMtime, machine, parsed)
+}
+
+func finishOpenCodeSession(
+	s openCodeSessionRow, cwd, projectWorktree, filePath string,
+	fileMtime int64, machine string, parsed []ParsedMessage,
+) (*ParsedSession, []ParsedMessage, error) {
+	if len(parsed) == 0 {
+		return nil, nil, nil
+	}
+	firstMsg := ""
+	if s.title != "" && !isOpenCodeDefaultTitle(s.title) {
+		firstMsg = truncate(s.title, 300)
+	} else {
+		for _, m := range parsed {
+			if m.Role == RoleUser && !m.IsSystem {
+				firstMsg = truncate(strings.ReplaceAll(m.Content, "\n", " "), 300)
+				break
+			}
+		}
 	}
 
 	project := ExtractProjectFromCwd(projectWorktree)
@@ -739,7 +1412,7 @@ func buildOpenCodeParsedSession(
 
 	userCount := 0
 	for _, m := range parsed {
-		if m.Role == RoleUser && m.Content != "" {
+		if m.Role == RoleUser && !m.IsSystem && m.Content != "" {
 			userCount++
 		}
 	}
@@ -807,7 +1480,7 @@ func applyOpenCodeTokenUsage(
 		"cache_read_input_tokens":     fields.cacheRead,
 		"cache_creation_input_tokens": fields.cacheCreate,
 	}
-	j, err := json.Marshal(normalized)
+	j, err := json.Marshal(normalized, json.Deterministic(true))
 	if err != nil {
 		return
 	}
@@ -894,6 +1567,7 @@ func normalizeOpenCodeRole(role string) RoleType {
 
 func buildOpenCodeMessage(
 	ordinal int,
+	messageID string,
 	role RoleType,
 	timeCreatedMs int64,
 	parts []openCodePartRow,
@@ -933,9 +1607,12 @@ func buildOpenCodeMessage(
 
 	content := strings.Join(texts, "\n")
 	return ParsedMessage{
-		Ordinal:       ordinal,
-		Role:          role,
-		Content:       content,
+		Ordinal: ordinal,
+		Role:    role,
+		Content: content,
+		// The storage message ID is the stable identity archive guards use
+		// to match stored rows when ordinals shift or are sparse.
+		SourceUUID:    messageID,
 		Timestamp:     millisToTime(timeCreatedMs),
 		HasThinking:   hasThinking,
 		HasToolUse:    hasToolUse,
@@ -977,15 +1654,15 @@ func extractOpenCodeText(data string) string {
 
 // openCodeToolData is the JSON structure for a tool part's data.
 type openCodeToolData struct {
-	ToolName string          `json:"tool"`
-	CallID   string          `json:"callID"`
-	State    json.RawMessage `json:"state"`
+	ToolName string         `json:"tool"`
+	CallID   string         `json:"callID"`
+	State    jsontext.Value `json:"state"`
 }
 
 // openCodeToolState holds the nested state of a tool call.
 type openCodeToolState struct {
-	Input    json.RawMessage `json:"input"`
-	Metadata json.RawMessage `json:"metadata"`
+	Input    jsontext.Value `json:"input"`
+	Metadata jsontext.Value `json:"metadata"`
 }
 
 // openCodeToolMetadata holds the optional metadata from a tool state.
@@ -1066,13 +1743,13 @@ func inferOpenCodeSkillName(toolName, inputJSON, cwd string) string {
 		// paths and falls back to the parent directory name. Try the
 		// file_path directly against the session worktree first.
 		if fp := gjson.Get(inputJSON, "file_path").Str; fp != "" && cwd != "" {
-			if name := skillNameFromPath(fp, cwd); name != "" {
+			if name := skillNameFromPath(context.Background(), fp, cwd); name != "" {
 				return name
 			}
 		}
-		return inferSkillNameFromJSONPaths(inputJSON)
+		return inferSkillNameFromJSONPaths(context.Background(), inputJSON)
 	}
-	return inferCodexSkillNameWithBase(toolName, inputJSON, cwd)
+	return inferCodexSkillNameWithBase(context.Background(), toolName, inputJSON, cwd)
 }
 
 type openCodeStorageTime struct {
@@ -1114,6 +1791,119 @@ type openCodeStorageSessionFile struct {
 	ParentID  string              `json:"parentID"`
 	Title     string              `json:"title"`
 	Time      openCodeStorageTime `json:"time"`
+}
+
+type openCodeStorageSnapshot struct {
+	sessionPath string
+	fileSize    int64
+	fileMtime   int64
+	session     openCodeSessionRow
+	directory   string
+	worktree    string
+	messages    []openCodeMessageRow
+	parts       map[string][]openCodePartRow
+}
+
+func loadOpenCodeStorageSnapshot(
+	sessionPath string,
+	includeMtime bool,
+) (openCodeStorageSnapshot, error) {
+	raw, err := os.ReadFile(sessionPath)
+	if err != nil {
+		return openCodeStorageSnapshot{}, fmt.Errorf(
+			"reading opencode session file %s: %w",
+			sessionPath, err,
+		)
+	}
+
+	var sf openCodeStorageSessionFile
+	if err := json.Unmarshal(raw, &sf); err != nil {
+		return openCodeStorageSnapshot{}, fmt.Errorf(
+			"decoding opencode session file %s: %w",
+			sessionPath, err,
+		)
+	}
+	if sf.ID == "" {
+		return openCodeStorageSnapshot{}, fmt.Errorf(
+			"opencode session file %s missing id",
+			sessionPath,
+		)
+	}
+
+	root := filepath.Dir(filepath.Dir(filepath.Dir(
+		filepath.Dir(sessionPath),
+	)))
+	msgs, err := loadOpenCodeStorageMessages(root, sf.ID)
+	if err != nil {
+		return openCodeStorageSnapshot{}, err
+	}
+	parts, err := loadOpenCodeStorageParts(root, msgs)
+	if err != nil {
+		return openCodeStorageSnapshot{}, err
+	}
+	var fileMtime int64
+	if includeMtime {
+		fileMtime, err = OpenCodeSourceMtime(sessionPath)
+		if err != nil {
+			return openCodeStorageSnapshot{}, err
+		}
+	}
+	worktree, err := resolveOpenCodeStorageWorktree(sessionPath, sf.Directory)
+	if err != nil {
+		return openCodeStorageSnapshot{}, err
+	}
+
+	return openCodeStorageSnapshot{
+		sessionPath: sessionPath,
+		fileSize:    int64(len(raw)),
+		fileMtime:   fileMtime,
+		session: openCodeSessionRow{
+			id:          sf.ID,
+			parentID:    sf.ParentID,
+			title:       sf.Title,
+			timeCreated: sf.Time.Created,
+			timeUpdated: sf.Time.Updated,
+		},
+		directory: sf.Directory,
+		worktree:  worktree,
+		messages:  msgs,
+		parts:     parts,
+	}, nil
+}
+
+func (s openCodeStorageSnapshot) fingerprint() string {
+	return buildOpenCodeSessionFingerprint(
+		s.session,
+		s.directory,
+		s.worktree,
+		s.messages,
+		s.parts,
+	)
+}
+
+func (s openCodeStorageSnapshot) hasMaterializedMessages() bool {
+	for _, msg := range s.messages {
+		var md openCodeMessageData
+		if json.Unmarshal([]byte(msg.data), &md) != nil ||
+			normalizeOpenCodeRole(md.Role) == "" {
+			continue
+		}
+		for _, part := range s.parts[msg.id] {
+			switch extractOpenCodePartType(part.data) {
+			case "tool":
+				return true
+			case "text":
+				if strings.TrimSpace(extractOpenCodeText(part.data)) != "" {
+					return true
+				}
+			case "reasoning":
+				if extractOpenCodeText(part.data) != "" {
+					return true
+				}
+			}
+		}
+	}
+	return false
 }
 
 type openCodeStorageMessageFile struct {
@@ -1403,6 +2193,39 @@ func openCodeStorageFingerprintHash(raw string) string {
 	return fmt.Sprintf("%x", sum)
 }
 
+// openCodeSQLiteSessionMtimeComposite is openCodeSQLiteSessionMtime with the
+// schema-support flag the fingerprint needs to decide whether the shared
+// container's size still has to act as a fallback change signal.
+func openCodeSQLiteSessionMtimeComposite(
+	dbPath, sessionID string,
+) (int64, string, bool, error) {
+	if _, err := os.Stat(dbPath); err != nil {
+		if os.IsNotExist(err) {
+			return 0, "", false, nil
+		}
+		return 0, "", false, fmt.Errorf(
+			"stat opencode db %s: %w", dbPath, err,
+		)
+	}
+
+	db, err := openOpenCodeDB(dbPath)
+	if err != nil {
+		return 0, "", false, err
+	}
+	defer db.Close()
+
+	timeUpdated, digest, composite, err := openCodeSessionCompositeMtime(
+		db, dbPath, sessionID,
+	)
+	if err != nil {
+		return 0, "", false, err
+	}
+	if timeUpdated == 0 {
+		return 0, digest, composite, nil
+	}
+	return timeUpdated * 1_000_000, digest, composite, nil
+}
+
 func openCodeSQLiteSessionMtime(
 	dbPath, sessionID string,
 ) (int64, error) {
@@ -1421,19 +2244,12 @@ func openCodeSQLiteSessionMtime(
 	}
 	defer db.Close()
 
-	row := db.QueryRow(
-		"SELECT time_updated FROM session WHERE id = ?",
-		sessionID,
-	)
-	var timeUpdated int64
-	if err := row.Scan(&timeUpdated); err != nil {
-		if err == sql.ErrNoRows {
-			return 0, nil
-		}
-		return 0, fmt.Errorf(
-			"loading opencode session mtime %s#%s: %w",
-			dbPath, sessionID, err,
-		)
+	timeUpdated, _, err := openCodeSessionWatermark(db, dbPath, sessionID)
+	if err != nil {
+		return 0, err
+	}
+	if timeUpdated == 0 {
+		return 0, nil
 	}
 	return timeUpdated * 1_000_000, nil
 }
@@ -1464,6 +2280,15 @@ func openCodeStorageSessionMtime(
 
 	messageDir := filepath.Join(root, "storage", "message", sessionID)
 	fileMtime = max(fileMtime, statMtime(messageDir))
+	var session struct {
+		Directory string `json:"directory"`
+	}
+	if raw, readErr := os.ReadFile(sessionPath); readErr == nil {
+		if json.Unmarshal(raw, &session) == nil &&
+			!openCodeUsableWorktree(strings.TrimSpace(session.Directory)) {
+			fileMtime = max(fileMtime, statMtime(openCodeProjectPath(sessionPath)))
+		}
+	}
 	msgEntries, err := os.ReadDir(messageDir)
 	if err != nil {
 		if os.IsNotExist(err) {
