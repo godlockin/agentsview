@@ -37,7 +37,14 @@ func runPruneRestore(cfg PruneRestoreConfig) {
 	deps := pruneRestoreDeps{
 		store: trash.New(appCfg.DataDir),
 		openDB: func() (*db.DB, func(), error) {
-			return openWriteDB(context.Background(), appCfg)
+			database, writeLock, err := openWriteDB(
+				context.Background(), appCfg)
+			if err != nil {
+				return nil, nil, err
+			}
+			return database, func() {
+				closeWriteDB(database, writeLock)
+			}, nil
 		},
 	}
 	if err := pruneRestore(cfg, deps); err != nil {
