@@ -50,6 +50,7 @@ func (s *Server) registerSessionRoutes() {
 	s.post(group, "/sessions/batch-delete", "Batch delete sessions", s.humaBatchDeleteSessions)
 	s.deleteRoute(group, "/sessions/{id}", "Delete session", s.humaDeleteSession)
 	s.post(group, "/sessions/{id}/restore", "Restore session", s.humaRestoreSession)
+	s.post(group, "/sessions/{id}/trash-source", "Trash session source files", s.humaTrashSource)
 	s.deleteRoute(group, "/sessions/{id}/permanent", "Permanently delete session", s.humaPermanentDeleteSession)
 	s.get(group, "/trash", "List trash", s.humaListTrash)
 	s.deleteRoute(group, "/trash", "Empty trash", s.humaEmptyTrash)
@@ -599,8 +600,9 @@ type publishResponse struct {
 }
 
 type renameSessionInput struct {
-	ID   string `path:"id" required:"true" doc:"Session ID"`
-	Body renameRequest
+	ID          string `path:"id" required:"true" doc:"Session ID"`
+	WriteSource bool   `query:"write_source" doc:"Also write the title back to the Codex session index"`
+	Body        renameRequest
 }
 
 type renameRequest struct {
@@ -741,6 +743,16 @@ func (s *Server) humaRenameSession(
 			return nil, handled
 		}
 		return nil, internalError("rename session", err)
+	}
+
+	if in.WriteSource && session.Agent == "codex" && displayName != nil {
+		if err := parser.AppendCodexThreadName(
+			derefSessionPath(session.FilePath), in.ID, *displayName,
+		); err != nil {
+			// The archive rename already succeeded; surface the
+			// write-back failure without failing the request.
+			return nil, apiError(http.StatusConflict, err.Error())
+		}
 	}
 
 	updated, err := s.db.GetSession(ctx, in.ID)

@@ -233,6 +233,15 @@
     }
   }
 
+  async function handleTrashSource() {
+    closeContextMenu();
+    try {
+      await sessions.trashSource(session.id);
+    } catch {
+      // silently fail
+    }
+  }
+
   async function handleDelete() {
     closeContextMenu();
     try {
@@ -520,6 +529,9 @@
       }}
     >
       {m.sidebar_row_open_in_new_tab()}
+    </button>
+    <button class="context-menu-item" onclick={handleTrashSource}>
+      {m.sidebar_row_trash_source()}
     </button>
     <button class="context-menu-item danger" onclick={handleDelete}>
       {m.sidebar_row_delete()}

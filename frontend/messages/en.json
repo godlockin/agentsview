@@ -420,6 +420,7 @@
   "sidebar_row_rename": "Rename",
   "sidebar_row_open_in_new_tab": "Open in new tab",
   "sidebar_row_delete": "Delete",
+  "sidebar_row_trash_source": "Trash source files",
   "shared_all_projects": "All Projects",
   "shared_project_filter_placeholder": "Filter projects...",
   "shared_select_project": "Select project",

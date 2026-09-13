@@ -420,6 +420,7 @@
   "sidebar_row_rename": "Renommer",
   "sidebar_row_open_in_new_tab": "Ouvrir dans un nouvel onglet",
   "sidebar_row_delete": "Supprimer",
+  "sidebar_row_trash_source": "Mettre les fichiers source a la corbeille",
   "shared_all_projects": "Tous les projets",
   "shared_project_filter_placeholder": "Filtrer les projets...",
   "shared_select_project": "Sélectionner un projet",

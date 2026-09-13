@@ -1314,6 +1314,18 @@ class SessionsStore {
     this.selectedIds = new Set();
   }
 
+  async trashSource(id: string): Promise<string[]> {
+    const result =
+      await SessionsService.postApiV1SessionsByIdTrashSource({ id });
+    if (this.activeSessionId === id) {
+      this.setActiveSession(null);
+    }
+    this.addRecentlyDeleted([id]);
+    this.invalidateFilterCaches();
+    await this.load({ force: true });
+    return result.paths ?? [];
+  }
+
   async deleteSession(id: string) {
     await SessionsService.deleteApiV1SessionsById({ id });
     if (this.activeSessionId === id) {

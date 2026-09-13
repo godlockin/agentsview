@@ -407,6 +407,7 @@
   "sidebar_row_rename": "이름 변경",
   "sidebar_row_open_in_new_tab": "새 탭에서 열기",
   "sidebar_row_delete": "삭제",
+  "sidebar_row_trash_source": "소스 파일 휴지통으로",
   "shared_all_projects": "모든 프로젝트",
   "shared_project_filter_placeholder": "프로젝트 필터링...",
   "shared_select_project": "프로젝트 선택",

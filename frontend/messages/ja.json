@@ -420,6 +420,7 @@
   "sidebar_row_rename": "名前の変更",
   "sidebar_row_open_in_new_tab": "新しいタブで開く",
   "sidebar_row_delete": "消去",
+  "sidebar_row_trash_source": "ソースファイルをゴミ箱へ",
   "shared_all_projects": "すべてのプロジェクト",
   "shared_project_filter_placeholder": "プロジェクトをフィルタリング...",
   "shared_select_project": "プロジェクトの選択",

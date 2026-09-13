@@ -407,6 +407,7 @@
   "sidebar_row_rename": "重命名",
   "sidebar_row_open_in_new_tab": "在新标签页打开",
   "sidebar_row_delete": "删除",
+  "sidebar_row_trash_source": "删除源文件（移到废纸篓）",
   "shared_all_projects": "所有项目",
   "shared_project_filter_placeholder": "筛选项目...",
   "shared_select_project": "选择项目",

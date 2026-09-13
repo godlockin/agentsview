@@ -32,12 +32,14 @@ import type {
   OpenRequest,
   OpenSessionResponse,
   OrdinalsResponse,
+  PatchApiV1SessionsByIdRenameParams,
   PatchApiV1SessionsByIdRenamePathParameters,
   PostApiV1SessionsByIdOpenPathParameters,
   PostApiV1SessionsByIdPublishParams,
   PostApiV1SessionsByIdPublishPathParameters,
   PostApiV1SessionsByIdRestorePathParameters,
   PostApiV1SessionsByIdResumePathParameters,
+  PostApiV1SessionsByIdTrashSourcePathParameters,
   PostApiV1SessionsUploadBody,
   PostApiV1SessionsUploadParams,
   PublishResponse,
@@ -52,6 +54,7 @@ import type {
   SessionDirectoryResponse,
   SessionUsageResponse,
   TrashResponse,
+  TrashSourceOutputBody,
   UploadSessionResponse,
 } from "../models";
 
@@ -481,10 +484,23 @@ export const postApiV1SessionsByIdPublish = async (
   });
 };
 
-export const getPatchApiV1SessionsByIdRenameUrl = ({
-  id,
-}: PatchApiV1SessionsByIdRenamePathParameters) => {
-  return `/api/v1/sessions/${encodeURIComponent(String(id))}/rename`;
+export const getPatchApiV1SessionsByIdRenameUrl = (
+  { id }: PatchApiV1SessionsByIdRenamePathParameters,
+  params?: PatchApiV1SessionsByIdRenameParams,
+) => {
+  const normalizedParams = new URLSearchParams();
+
+  Object.entries(params || {}).forEach(([key, value]) => {
+    if (value !== undefined) {
+      normalizedParams.append(key, value === null ? "null" : String(value));
+    }
+  });
+
+  const stringifiedParams = normalizedParams.toString();
+
+  return stringifiedParams.length > 0
+    ? `/api/v1/sessions/${encodeURIComponent(String(id))}/rename?${stringifiedParams}`
+    : `/api/v1/sessions/${encodeURIComponent(String(id))}/rename`;
 };
 
 /**
@@ -493,6 +509,7 @@ export const getPatchApiV1SessionsByIdRenameUrl = ({
 export const patchApiV1SessionsByIdRename = async (
   { id }: PatchApiV1SessionsByIdRenamePathParameters,
   renameRequest: RenameRequest,
+  params?: PatchApiV1SessionsByIdRenameParams,
   options?: Parameters<typeof orvalFetch>[1],
 ): Promise<DbSession> => {
   const getHeaders = (
@@ -503,7 +520,7 @@ export const patchApiV1SessionsByIdRename = async (
     if (Array.isArray(h)) return Object.fromEntries(h);
     return h;
   };
-  return orvalFetch<DbSession>(getPatchApiV1SessionsByIdRenameUrl({ id }), {
+  return orvalFetch<DbSession>(getPatchApiV1SessionsByIdRenameUrl({ id }, params), {
     ...options,
     method: "PATCH",
     headers: { "Content-Type": "application/json", ...getHeaders(options?.headers) },
@@ -628,6 +645,25 @@ export const getApiV1SessionsByIdToolCalls = async (
   return orvalFetch<ServiceToolCallList>(getGetApiV1SessionsByIdToolCallsUrl({ id }), {
     ...options,
     method: "GET",
+  });
+};
+
+export const getPostApiV1SessionsByIdTrashSourceUrl = ({
+  id,
+}: PostApiV1SessionsByIdTrashSourcePathParameters) => {
+  return `/api/v1/sessions/${encodeURIComponent(String(id))}/trash-source`;
+};
+
+/**
+ * @summary Trash session source files
+ */
+export const postApiV1SessionsByIdTrashSource = async (
+  { id }: PostApiV1SessionsByIdTrashSourcePathParameters,
+  options?: Parameters<typeof orvalFetch>[1],
+): Promise<TrashSourceOutputBody> => {
+  return orvalFetch<TrashSourceOutputBody>(getPostApiV1SessionsByIdTrashSourceUrl({ id }), {
+    ...options,
+    method: "POST",
   });
 };
 
