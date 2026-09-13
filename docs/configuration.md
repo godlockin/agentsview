@@ -1308,6 +1308,29 @@ and re-stamps the hash, so edits to `[automated]` patterns apply to history
 immediately — no manual resync required. The same backfill also corrects rows
 pulled in from PostgreSQL sync or copied from other archives.
 
+## Retention
+
+The daemon can prune old sessions on a daily schedule. Retention is
+disabled unless you add a `[retention]` table to `config.toml`:
+
+```toml
+[retention]
+enabled = true
+older_than = "30d"   # 7d, 30d, 2w, 1y
+schedule = "daily"   # the only cadence today
+dry_run = true       # default; set false to actually delete
+```
+
+While `dry_run` is true (the default) the daemon only logs how many
+sessions and source files would be removed. A real run moves source
+files to the operating system trash (restorable with
+`agentsview prune restore`) and deletes their archive rows; deletions
+propagate to PostgreSQL and DuckDB mirrors on the next push. Sessions
+stored inside app-owned databases (Trae, OpenCode's SQLite container)
+are report-only and never touched. Run results are recorded in
+`retention-state.json` in the data directory, and a daemon restart
+within 20 hours of the last run does not re-run the schedule.
+
 ## Database
 
 The SQLite database uses WAL mode for concurrent reads and includes FTS5

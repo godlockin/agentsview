@@ -4,6 +4,27 @@ description: Release history for AgentsView
 ---
 
 ## Unreleased
+## Unreleased
+
+**New features**
+
+- Prune and retention now move agent source files to the operating
+  system trash instead of deleting them, and `agentsview prune restore`
+  undoes the most recent prune. Sessions living inside app-owned
+  databases (Trae, OpenCode's SQLite container) are reported but never
+  touched.
+- The web UI session menu gains a "Trash source files" action, and
+  session renames can optionally write the title back to Codex's
+  session index with `PATCH ...?write_source=true`.
+- New `agentsview continue` writes a handoff briefing for the last (or
+  a chosen) session: where it stopped, the final messages, and
+  same-project recall context.
+- New `agentsview backup create` snapshots the archive (and optionally
+  every agent source directory) while the daemon keeps running, with
+  `--keep` rotation and `backup list` to inspect destinations.
+- New `[retention]` config schedules daily pruning of sessions older
+  than a cutoff. It reports only until you set `dry_run = false`.
+
 
 **New features**
 

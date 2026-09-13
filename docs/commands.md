@@ -410,9 +410,16 @@ agentsview prune [flags]
 | `--project`       |         | Sessions whose project contains this substring      |
 | `--max-messages`  | `-1`    | Sessions with at most N messages                    |
 | `--before`        |         | Sessions that ended before this date (`YYYY-MM-DD`) |
+| `--age`           |         | Sessions older than this age (`7d`, `30d`, `2w`, `1y`); shorthand for `--before` |
 | `--first-message` |         | Sessions whose first message starts with this text  |
+| `--source-only`   | `false` | Trash source files but keep archive rows            |
 | `--dry-run`       | `false` | Show what would be pruned without deleting          |
 | `--yes`           | `false` | Skip confirmation prompt                            |
+
+Source files are moved to the operating system trash and recorded in a
+restore manifest, so `agentsview prune restore` can undo a prune.
+Sessions stored inside app-owned databases (Trae, OpenCode's SQLite
+container) are report-only: their sources are left in place.
 
 **Examples:**
 
@@ -432,6 +439,20 @@ agentsview prune --project "old-project" --max-messages 5 --before 2025-06-01
 
 The prune command displays the number of sessions deleted and disk space
 reclaimed. Use `--dry-run` first to verify the filter matches what you expect.
+
+### `agentsview prune restore`
+
+Undo the most recent prune by moving trashed source files back and
+re-enabling their archive rows for re-import:
+
+```bash
+agentsview prune restore            # most recent batch
+agentsview prune restore --batch <id>
+```
+
+Restores fail safely: if a file now exists at the original path, the
+trashed copy comes back as `<name>.restored-<timestamp>` instead of
+overwriting it.
 
 ______________________________________________________________________
 
@@ -1546,6 +1567,55 @@ Print usage information.
 ```bash
 agentsview help
 ```
+
+### `agentsview continue`
+
+Write a handoff briefing for the most recent (or a chosen) session so a
+new conversation can pick up where the last one stopped:
+
+```bash
+agentsview continue                    # pick the latest active session
+agentsview continue <session-id> --out handoff.md
+```
+
+| Flag         | Default | Description                                       |
+| ------------ | ------- | ------------------------------------------------- |
+| `--last`     | `10`    | Trailing user/assistant messages to include       |
+| `--max-chars`| `400`   | Per-message character cap before truncation       |
+| `--recall`   | `true`  | Embed same-project recall entries in the briefing |
+| `--out`      |         | Write the briefing to a file instead of stdout    |
+
+The briefing reports where the session stopped (awaiting input, tool
+call pending, clean end, or truncated), the last messages, and prior
+recall context. It does not relaunch agents; open the session in the
+original tool yourself.
+
+______________________________________________________________________
+
+### `agentsview backup`
+
+Back up the archive database and agent source directories:
+
+```bash
+agentsview backup create --dest ~/backups --mode all --keep 7
+agentsview backup list --dest ~/backups
+```
+
+| Flag       | Default    | Description                                        |
+| ---------- | ---------- | -------------------------------------------------- |
+| `--dest`   |            | Backup destination directory (required)            |
+| `--mode`   | `archive`  | `archive`, `sources`, or `all`                     |
+| `--keep`   | `0`        | Keep only the N newest backups (0 keeps everything)|
+| `--dry-run`| `false`    | Estimate the backup without copying                |
+
+The archive snapshot is taken through SQLite's online backup path, so
+it is safe to run while the daemon serves traffic. Backups land in
+`<dest>/agentsview-backup-<timestamp>/` with a `manifest.json`
+recording sizes and checksums. The asset store is copied alongside the
+database; source directories are copied file-by-file, skipping live
+SQLite sidecars (`-wal`, `-shm`).
+
+______________________________________________________________________
 
 ## Environment Variables
 
