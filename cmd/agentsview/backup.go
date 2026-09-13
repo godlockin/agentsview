@@ -195,7 +195,7 @@ func runBackupCreate(cmd *cobra.Command, opts backupCreateOptions) error {
 
 // reportBackupEstimate prints what a backup would contain without
 // touching the destination.
-func reportBackupEstimate(cfg *config.Config, opts backupCreateOptions) error {
+func reportBackupEstimate(cfg config.Config, opts backupCreateOptions) error {
 	if opts.Mode == "archive" || opts.Mode == "all" {
 		info, err := os.Stat(cfg.DBPath)
 		if err == nil {

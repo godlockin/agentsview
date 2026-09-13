@@ -47,12 +47,9 @@ func TestBackupArchiveToProducesOpenableSnapshot(t *testing.T) {
 
 func TestBackupArchiveToBusyMessageIsRetried(t *testing.T) {
 	assert.False(t, isSQLiteBusy(nil))
-	assert.True(t, isSQLiteBusy(
-		assert.AnError))
-	// A busy-looking error is detected by text so both drivers work.
-	assert.True(t, isSQLiteBusy(
-		wrapForTest("database is locked")))
 	assert.False(t, isSQLiteBusy(wrapForTest("no such table")))
+	assert.True(t, isSQLiteBusy(wrapForTest("database is locked")))
+	assert.True(t, isSQLiteBusy(wrapForTest("database is busy")))
 }
 
 type wrappedError struct{ msg string }
