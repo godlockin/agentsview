@@ -78,12 +78,10 @@ func retentionRunOnce(
 		}
 	}
 
-	result, err := runRetentionTick(ctx, cfg, database, runner, time.Now(), os.Stdout)
+	_, err := runRetentionTick(ctx, cfg, database, runner, time.Now(), os.Stdout)
 	if err != nil {
 		log.Printf("retention: %v", err)
-		return
 	}
-	writeRetentionState(statePath, result)
 }
 
 // runRetentionTick prunes (or, in the default dry-run mode, only
@@ -162,6 +160,7 @@ func runRetentionTick(
 		"retention: pruned %d sessions and trashed %d source files"+
 			" (%d report-only) older than %s\n",
 		result.Pruned, result.Trashed, result.Unsupported, before)
+	writeRetentionState(filepath.Join(cfg.DataDir, "retention-state.json"), result)
 	return result, nil
 }
 
