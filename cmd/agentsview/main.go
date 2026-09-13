@@ -459,6 +459,7 @@ func runServe(cfg config.Config, opts serveOptions) {
 	}
 	seedPricing(database, pricingRefreshRunner)
 	go startPeriodicPricingRefresh(ctx, database, pricingRefreshRunner)
+	startRetention(ctx, cfg, database, pricingRefreshRunner)
 
 	// Apply the config-driven custom pricing map on top of the
 	// pricing that seedPricing just wrote into model_pricing so

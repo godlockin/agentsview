@@ -733,7 +733,10 @@ type Config struct {
 
 	// SessionSources contains resolved structured sources. SourceMachines maps
 	// each effective configured root to its machine label for sync.
-	SessionSources []SessionSource                        `json:"-" toml:"-"`
+	SessionSources []SessionSource `json:"-" toml:"-"`
+	// Retention drives the daemon's scheduled prune of old sessions
+	// (the [retention] table). Zero value keeps the scheduler off.
+	Retention      RetentionConfig                        `json:"retention,omitempty" toml:"retention"`
 	SourceMachines map[parser.AgentType]map[string]string `json:"-" toml:"-"`
 	// ProviderMetadata holds provider-resolved metadata directories keyed by
 	// canonical transcript root. It is computed once while loading configuration.
