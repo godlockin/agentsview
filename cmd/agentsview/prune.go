@@ -91,6 +91,26 @@ func parsePruneFlags(args []string) (PruneConfig, error) {
 		SourceOnly: *sourceOnly,
 	}
 
+	cfg, err := resolvePruneBefore(cfg)
+	if err != nil {
+		return PruneConfig{}, err
+	}
+
+	if !cfg.Filter.HasFilters() {
+		return PruneConfig{}, fmt.Errorf(
+			"at least one filter is required\n" +
+				"use --project, --max-messages, --before," +
+				" or --first-message",
+		)
+	}
+
+	return cfg, nil
+}
+
+// resolvePruneBefore converts --age into Filter.Before so every flag
+// path (the cobra command and parsePruneFlags alike) shares one set
+// of filter semantics. It rejects combining --age with --before.
+func resolvePruneBefore(cfg PruneConfig) (PruneConfig, error) {
 	if cfg.Age != "" && cfg.Filter.Before != "" {
 		return PruneConfig{}, fmt.Errorf("--age and --before are mutually exclusive")
 	}
@@ -103,15 +123,6 @@ func parsePruneFlags(args []string) (PruneConfig, error) {
 			AddDate(0, 0, -days).
 			Format("2006-01-02")
 	}
-
-	if !cfg.Filter.HasFilters() {
-		return PruneConfig{}, fmt.Errorf(
-			"at least one filter is required\n" +
-				"use --project, --max-messages, --before," +
-				" or --first-message",
-		)
-	}
-
 	return cfg, nil
 }
 

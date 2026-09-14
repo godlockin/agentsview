@@ -408,22 +408,15 @@ func newPruneCommand() *cobra.Command {
 		SilenceUsage: true,
 		Args:         cobra.NoArgs,
 		Run: func(cmd *cobra.Command, args []string) {
-			var mm *int
-			if maxMessages != -1 {
-				mm = &maxMessages
+			cfg, err := buildPruneConfigFromFlags(
+				project, maxMessages, before, firstMessage,
+				age, sourceOnly, dryRun, yes,
+			)
+			if err != nil {
+				fatal(err.Error())
+				return
 			}
-			runPrune(PruneConfig{
-				Filter: db.PruneFilter{
-					Project:      project,
-					MaxMessages:  mm,
-					Before:       before,
-					FirstMessage: firstMessage,
-				},
-				DryRun:     dryRun,
-				Yes:        yes,
-				Age:        age,
-				SourceOnly: sourceOnly,
-			})
+			runPrune(cfg)
 		},
 	}
 	cmd.Flags().StringVar(&project, "project", "", "Sessions whose project contains this substring")
@@ -436,6 +429,32 @@ func newPruneCommand() *cobra.Command {
 	cmd.Flags().BoolVar(&yes, "yes", false, "Skip confirmation prompt")
 	cmd.AddCommand(newPruneRestoreCommand())
 	return cmd
+}
+
+// buildPruneConfigFromFlags assembles PruneConfig from the cobra
+// flag values, applying the shared --age conversion. Both flag paths
+// (this and parsePruneFlags) must produce identical semantics.
+func buildPruneConfigFromFlags(
+	project string, maxMessages int,
+	before, firstMessage, age string,
+	sourceOnly, dryRun, yes bool,
+) (PruneConfig, error) {
+	var mm *int
+	if maxMessages != -1 {
+		mm = &maxMessages
+	}
+	return resolvePruneBefore(PruneConfig{
+		Filter: db.PruneFilter{
+			Project:      project,
+			MaxMessages:  mm,
+			Before:       before,
+			FirstMessage: firstMessage,
+		},
+		DryRun:     dryRun,
+		Yes:        yes,
+		Age:        age,
+		SourceOnly: sourceOnly,
+	})
 }
 
 func newPruneRestoreCommand() *cobra.Command {
