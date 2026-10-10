@@ -1,0 +1,2 @@
+- f56225d0 fix(s3): preserve cursor conversations with shared session ids (#2179)
+- ea6429f9 test(e2e): anchor activity day to seeded session (#2182)
