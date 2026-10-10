@@ -12,6 +12,9 @@ import (
 const telemetryScreensFilename = "telemetry-screen-views"
 
 // ClaimScreenView serializes enqueueing and persists only accepted events.
+// When the send fails after the lock is held, the caller may retry with the
+// same claimer: the failed screen is not treated as already recorded, so the
+// retry sends again instead of being deduped.
 func (c *Config) ClaimScreenView(screen string, send func() error) (day string, claimed bool, err error) {
 	sendAttempted := false
 	err = c.withConfigLock(func() error {
@@ -38,6 +41,8 @@ func (c *Config) ClaimScreenView(screen string, send func() error) (day string, 
 		return nil
 	})
 	if err != nil && !sendAttempted {
+		// The lock itself could not be taken: send without it so a
+		// transient lock failure never drops an event.
 		day = time.Now().UTC().Format(time.DateOnly)
 		if sendErr := send(); sendErr != nil {
 			return day, false, sendErr

@@ -674,16 +674,16 @@ func TestLoadPFlags_AppliesExplicitFlags(t *testing.T) {
 
 func TestPortExplicitProvenance(t *testing.T) {
 	t.Run("standard flag marks explicit default", func(t *testing.T) {
-		cfg, err := loadConfigFromFlags(t, "-port", "8080")
+		cfg, err := loadConfigFromFlags(t, "-port", "9765")
 		require.NoError(t, err)
-		assert.Equal(t, 8080, cfg.Port)
+		assert.Equal(t, 9765, cfg.Port)
 		assert.True(t, cfg.PortExplicit)
 	})
 
 	t.Run("pflag marks explicit default", func(t *testing.T) {
-		cfg, err := loadConfigFromPFlags(t, "--port", "8080")
+		cfg, err := loadConfigFromPFlags(t, "--port", "9765")
 		require.NoError(t, err)
-		assert.Equal(t, 8080, cfg.Port)
+		assert.Equal(t, 9765, cfg.Port)
 		assert.True(t, cfg.PortExplicit)
 	})
 
@@ -699,9 +699,9 @@ func TestPortExplicitProvenance(t *testing.T) {
 		require.NoError(t, err)
 		pflagConfig, err := loadConfigFromPFlags(t)
 		require.NoError(t, err)
-		assert.Equal(t, 8080, standard.Port)
+		assert.Equal(t, 9765, standard.Port)
 		assert.False(t, standard.PortExplicit)
-		assert.Equal(t, 8080, pflagConfig.Port)
+		assert.Equal(t, 9765, pflagConfig.Port)
 		assert.False(t, pflagConfig.PortExplicit)
 	})
 
@@ -729,10 +729,10 @@ func TestPortExplicitProvenance(t *testing.T) {
 				setupTestEnv(t)
 				fs := pflag.NewFlagSet("test", pflag.ContinueOnError)
 				RegisterServePFlags(fs)
-				require.NoError(t, fs.Parse([]string{"--port", "8080"}))
+				require.NoError(t, fs.Parse([]string{"--port", "9765"}))
 				cfg, err := load.fn(fs)
 				require.NoError(t, err)
-				assert.Equal(t, 8080, cfg.Port)
+				assert.Equal(t, 9765, cfg.Port)
 				assert.True(t, cfg.PortExplicit)
 			})
 		}
@@ -2650,7 +2650,7 @@ func TestLoadFile_RemoteHostsHTTP(t *testing.T) {
 	f.WriteConfigText(t, `[[remote_hosts]]
 host = "devbox1"
 transport = "http"
-url = "http://devbox1.tailnet.ts.net:8080"
+url = "http://devbox1.tailnet.ts.net:9765"
 token = "remote-token"
 interval = "5m"
 `)
@@ -2661,7 +2661,7 @@ interval = "5m"
 	assert.Equal(t, RemoteHost{
 		Host:      "devbox1",
 		Transport: RemoteTransportHTTP,
-		URL:       "http://devbox1.tailnet.ts.net:8080",
+		URL:       "http://devbox1.tailnet.ts.net:9765",
 		Token:     "remote-token",
 		Interval:  5 * time.Minute,
 	}, cfg.RemoteHosts[0])
@@ -2707,7 +2707,7 @@ func TestValidateRemoteHosts(t *testing.T) {
 		{"http requires url", []RemoteHost{{Host: "a", Transport: RemoteTransportHTTP}}, []string{"url is required"}},
 		{"http requires token", []RemoteHost{{Host: "a", Transport: RemoteTransportHTTP, URL: "https://a.example.test"}}, []string{"token is required"}},
 		{"http rejects bad scheme", []RemoteHost{{Host: "a", Transport: RemoteTransportHTTP, URL: "ftp://a.example.test"}}, []string{"url must use http or https"}},
-		{"http rejects empty hostname with port", []RemoteHost{{Host: "a", Transport: RemoteTransportHTTP, URL: "http://:8080"}}, []string{"url must include a host"}},
+		{"http rejects empty hostname with port", []RemoteHost{{Host: "a", Transport: RemoteTransportHTTP, URL: "http://:9765"}}, []string{"url must include a host"}},
 		{"http rejects query", []RemoteHost{{Host: "a", Transport: RemoteTransportHTTP, URL: "https://a.example.test?token=x"}}, []string{"url must not include query"}},
 		{"http rejects empty query delimiter", []RemoteHost{{Host: "a", Transport: RemoteTransportHTTP, URL: "https://a.example.test?", Token: "token"}}, []string{"url must not include query"}},
 		{"http rejects fragment", []RemoteHost{{Host: "a", Transport: RemoteTransportHTTP, URL: "https://a.example.test/#remote"}}, []string{"url must not include fragment"}},
