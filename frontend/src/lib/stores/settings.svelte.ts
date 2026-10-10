@@ -1,3 +1,4 @@
+import { m } from "../i18n/index.js";
 import {
   SettingsService,
   type SettingsResponse,
@@ -8,12 +9,14 @@ import {
   ApiError,
   generatedErrorMessage,
   setAuthToken,
+  getServerUrl,
   isRemoteConnection,
 } from "../api/runtime.js";
 import { DEFAULT_CHART_PALETTE, isChartPalette, type ChartPalette } from "../utils/chartPalette.js";
+import { insights } from "./insights.svelte.js";
 import { ui } from "./ui.svelte.js";
 
-export type ToolResultImagesPolicy = "keep" | "drop";
+export type ToolResultImagesPolicy = "keep" | "drop" | "offload";
 
 type TerminalConfig = TerminalResponse;
 
@@ -55,6 +58,7 @@ function forbiddenMessage(serverMessage: string): string {
 class SettingsStore {
   private mutationQueue: Promise<void> | null = null;
   private loadVersion = 0;
+  private serverUrl = getServerUrl();
   agentDirs: Record<string, string[]> = $state({});
   sessionProviders: SessionProvider[] = $state([]);
   disabledAgents: string[] = $state([]);
@@ -79,6 +83,11 @@ class SettingsStore {
   needsAuth: boolean = $state(false);
 
   async load(): Promise<void> {
+    const serverUrl = getServerUrl();
+    if (serverUrl !== this.serverUrl) {
+      this.serverUrl = serverUrl;
+      insights.resetAgent();
+    }
     if (this.saving && this.mutationQueue) {
       await this.mutationQueue;
       return this.load();
@@ -110,9 +119,15 @@ class SettingsStore {
       this.readOnly = data.read_only === true;
       this.chartPalette = data.chart_palette;
       ui.applyZoomDefault(data.zoom_level);
+      // Older servers omit the field; applyDefaultAgent then keeps the
+      // built-in agent.
+      insights.applyDefaultAgent(data.insight_default_agent);
       // A response without the field, including every fixture that predates
       // it, reads as the default keep policy instead of failing the load.
-      this.toolResultImages = data.tool_result_images === "drop" ? "drop" : "keep";
+      this.toolResultImages =
+        data.tool_result_images === "drop" || data.tool_result_images === "offload"
+          ? data.tool_result_images
+          : "keep";
       // When the server returns an auth token (localhost only), persist
       // it so the client stays authenticated after remote access is
       // toggled on (which starts requiring auth for all requests).
@@ -126,7 +141,7 @@ class SettingsStore {
       } else if (e instanceof ApiError && e.status === 403) {
         this.error = forbiddenMessage(generatedErrorMessage(e));
       } else {
-        this.error = e instanceof Error ? e.message : "Failed to load settings";
+        this.error = e instanceof Error ? e.message : m.settings_load_failed();
       }
     } finally {
       if (isCurrentLoad()) {
@@ -178,13 +193,16 @@ class SettingsStore {
       this.chartPalette = data.chart_palette;
       // A response without the field, including every fixture that predates
       // it, reads as the default keep policy instead of failing the load.
-      this.toolResultImages = data.tool_result_images === "drop" ? "drop" : "keep";
+      this.toolResultImages =
+        data.tool_result_images === "drop" || data.tool_result_images === "offload"
+          ? data.tool_result_images
+          : "keep";
       if (data.auth_token && !isRemoteConnection()) {
         setAuthToken(data.auth_token);
       }
       return true;
     } catch (e) {
-      this.saveError = e instanceof Error ? e.message : "Failed to save settings";
+      this.saveError = e instanceof Error ? e.message : m.settings_save_failed();
       return false;
     }
   }

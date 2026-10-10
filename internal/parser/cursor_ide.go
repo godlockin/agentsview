@@ -3,12 +3,15 @@ package parser
 import (
 	"context"
 	"database/sql"
+	"encoding/json/jsontext"
 	"encoding/json/v2"
+	"errors"
 	"fmt"
 	"hash/fnv"
 	"os"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	_ "github.com/mattn/go-sqlite3"
@@ -38,6 +41,21 @@ const (
 	cursorIDEBubbleTypeAssistant = 2
 )
 
+// cursorIDEHashVersion prefixes stored hashes that carry the composer
+// document digest the watcher compares, ahead of the full content digest.
+const cursorIDEHashVersion = "cide1"
+
+var (
+	cursorIDEComposerParses  atomic.Int64
+	cursorIDEComposerDigests atomic.Int64
+)
+
+// CursorIDEComposerParses returns how many composers have been parsed.
+func CursorIDEComposerParses() int64 { return cursorIDEComposerParses.Load() }
+
+// CursorIDEComposerDigests returns how many composer content digests have run.
+func CursorIDEComposerDigests() int64 { return cursorIDEComposerDigests.Load() }
+
 // cursorIDEDefaultDirs returns platform-specific default directories holding
 // state.vscdb.
 func cursorIDEDefaultDirs() []string {
@@ -52,8 +70,7 @@ func cursorIDEDefaultDirs() []string {
 }
 
 func openCursorIDEDB(dbPath string) (*sql.DB, error) {
-	dsn := "file:" + sqliteURIPath(dbPath) + "?mode=ro&_busy_timeout=3000"
-	db, err := sql.Open("sqlite3", dsn)
+	db, err := openSQLiteReadOnly(dbPath, sqliteReadOptions{busyTimeoutMS: 3000})
 	if err != nil {
 		return nil, fmt.Errorf("opening cursor IDE db %s: %w", dbPath, err)
 	}
@@ -87,7 +104,7 @@ func beginCursorIDESnapshot(
 
 // CursorIDEComposerExists reports whether a composerData row with the given
 // composer ID exists in state.vscdb.
-func CursorIDEComposerExists(dbPath, composerID string) bool {
+func CursorIDEComposerExists(ctx context.Context, dbPath, composerID string) bool {
 	if dbPath == "" || composerID == "" || !IsValidSessionID(composerID) {
 		return false
 	}
@@ -97,7 +114,7 @@ func CursorIDEComposerExists(dbPath, composerID string) bool {
 	}
 	defer conn.Close()
 	var one int
-	err = conn.QueryRow(
+	err = conn.QueryRowContext(ctx,
 		`SELECT 1 FROM cursorDiskKV WHERE key = ? LIMIT 1`,
 		cursorIDEComposerKeyPrefix+composerID,
 	).Scan(&one)
@@ -141,8 +158,9 @@ type cursorIDEComposerDoc struct {
 }
 
 // cursorIDEComposerMeta is a per-composer descriptor for the engine's
-// freshness check: the composer's lastUpdatedAt plus a content digest over
-// every byte the parser reads for that composer.
+// freshness check: the composer's lastUpdatedAt plus digest, the stored hash
+// form (cursorIDEComposerHash) of the document digest and a content digest
+// over every byte the parser reads for that composer.
 type cursorIDEComposerMeta struct {
 	rawID         string
 	lastUpdatedAt int64
@@ -162,6 +180,7 @@ type cursorIDEComposerMeta struct {
 func cursorIDEComposerDigest(
 	ctx context.Context, q cursorIDEQuerier, composerID string, rawComposer []byte,
 ) (string, error) {
+	cursorIDEComposerDigests.Add(1)
 	h := fnv.New64a()
 	_, _ = h.Write(rawComposer)
 	rows, err := q.QueryContext(ctx,
@@ -193,6 +212,30 @@ func cursorIDEComposerDigest(
 	return strconv.FormatUint(h.Sum64(), 16), nil
 }
 
+// cursorIDEComposerDocDigest hashes one raw composerData value; the watcher
+// compares it because every bubble the parser reads is listed in it.
+func cursorIDEComposerDocDigest(raw []byte) string {
+	h := fnv.New64a()
+	_, _ = h.Write(raw)
+	return strconv.FormatUint(h.Sum64(), 16)
+}
+
+// cursorIDEComposerHash is the stored and fingerprinted hash of a composer:
+// its document digest, then the full content digest.
+func cursorIDEComposerHash(raw []byte, fullDigest string) string {
+	return cursorIDEHashVersion + ":" + cursorIDEComposerDocDigest(raw) + ":" + fullDigest
+}
+
+// cursorIDEStoredComposerToken recovers the document digest from a stored
+// hash; any other form, including pre-cide1 hashes, cannot vouch.
+func cursorIDEStoredComposerToken(hash string) (string, bool) {
+	parts := strings.Split(hash, ":")
+	if len(parts) != 3 || parts[0] != cursorIDEHashVersion || parts[1] == "" || parts[2] == "" {
+		return "", false
+	}
+	return parts[1], true
+}
+
 func loadCursorIDEComposerMeta(
 	ctx context.Context, conn *sql.DB, composerID string,
 ) (cursorIDEComposerMeta, bool, error) {
@@ -206,7 +249,7 @@ func loadCursorIDEComposerMeta(
 		`SELECT value FROM cursorDiskKV WHERE key = ?`,
 		cursorIDEComposerKeyPrefix+composerID,
 	).Scan(&raw)
-	if err == sql.ErrNoRows {
+	if errors.Is(err, sql.ErrNoRows) {
 		return cursorIDEComposerMeta{}, false, nil
 	}
 	if err != nil {
@@ -238,7 +281,7 @@ func loadCursorIDEComposerMeta(
 	return cursorIDEComposerMeta{
 		rawID:         composerID,
 		lastUpdatedAt: doc.LastUpdatedAt,
-		digest:        digest,
+		digest:        cursorIDEComposerHash(raw, digest),
 	}, true, nil
 }
 
@@ -266,14 +309,56 @@ func listCursorIDEComposerIDs(ctx context.Context, conn *sql.DB) ([]string, erro
 	return ids, rows.Err()
 }
 
+// listCursorIDEComposerTokens streams every composer whose document lists
+// at least one conversation header, in ascending composer-ID order, with the
+// digest of that document. It reads only composerData rows; NULL, malformed,
+// and headerless values are left out, and the whole-container pass keeps
+// handling them.
+func listCursorIDEComposerTokens(
+	ctx context.Context, conn *sql.DB,
+	yield func(composerID, token string) error,
+) error {
+	rows, err := conn.QueryContext(ctx,
+		`SELECT key, value FROM cursorDiskKV
+		WHERE key >= ? AND key < ?
+		  AND CASE WHEN json_valid(CAST(value AS TEXT))
+		           THEN coalesce(json_array_length(CAST(value AS TEXT), '$.fullConversationHeadersOnly'), 0)
+		           ELSE 0 END > 0
+		ORDER BY key`,
+		cursorIDEComposerKeyPrefix, "composerData;",
+	)
+	if err != nil {
+		return fmt.Errorf("listing cursor IDE composer tokens: %w", err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var key string
+		var value []byte
+		if err := rows.Scan(&key, &value); err != nil {
+			return fmt.Errorf("listing cursor IDE composer tokens: %w", err)
+		}
+		id := strings.TrimPrefix(key, cursorIDEComposerKeyPrefix)
+		if !IsValidSessionID(id) {
+			continue
+		}
+		if err := yield(id, cursorIDEComposerDocDigest(value)); err != nil {
+			return err
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("listing cursor IDE composer tokens: %w", err)
+	}
+	return nil
+}
+
 // cursorIDEToolFormerData is a bubble's embedded tool call: unlike Claude's
 // separate call/result blocks, Cursor stores one tool invocation (input,
 // status, and output) inline on the assistant bubble that issued it.
 type cursorIDEToolFormerData struct {
-	ToolCallID string `json:"toolCallId"`
-	Name       string `json:"name"`
-	RawArgs    string `json:"rawArgs"`
-	Result     string `json:"result"`
+	ToolCallID string         `json:"toolCallId"`
+	Name       string         `json:"name"`
+	RawArgs    string         `json:"rawArgs"`
+	Result     jsontext.Value `json:"result,omitzero"`
 }
 
 type cursorIDEBubble struct {
@@ -281,6 +366,20 @@ type cursorIDEBubble struct {
 	Text           string                   `json:"text"`
 	CreatedAt      string                   `json:"createdAt"`
 	ToolFormerData *cursorIDEToolFormerData `json:"toolFormerData"`
+}
+
+func cursorIDEToolResultText(v jsontext.Value) string {
+	if len(v) == 0 || v.Kind() == 'n' {
+		return ""
+	}
+	if v.Kind() == '"' {
+		var text string
+		if err := json.Unmarshal(v, &text); err != nil {
+			return ""
+		}
+		return text
+	}
+	return string(v)
 }
 
 func loadCursorIDEBubble(
@@ -357,12 +456,12 @@ func cursorIDEMessageFromBubble(ordinal int, bubble cursorIDEBubble) (ParsedMess
 			Category:  NormalizeToolCategory(tfd.Name),
 			InputJSON: tfd.RawArgs,
 		}}
-		if tfd.Result != "" {
-			quoted, err := json.Marshal(tfd.Result)
+		if text := cursorIDEToolResultText(tfd.Result); text != "" {
+			quoted, err := json.Marshal(text)
 			if err == nil {
 				msg.ToolResults = []ParsedToolResult{{
 					ToolUseID:     tfd.ToolCallID,
-					ContentLength: len(tfd.Result),
+					ContentLength: len(text),
 					ContentRaw:    string(quoted),
 				}}
 			}
@@ -425,7 +524,7 @@ func parseCursorIDEComposer(
 		`SELECT value FROM cursorDiskKV WHERE key = ?`,
 		cursorIDEComposerKeyPrefix+composerID,
 	).Scan(&raw)
-	if err == sql.ErrNoRows {
+	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
 	}
 	if err != nil {
@@ -439,6 +538,7 @@ func parseCursorIDEComposer(
 		// session is preserved through the source-missing seam.
 		return nil, nil
 	}
+	cursorIDEComposerParses.Add(1)
 	var doc cursorIDEComposerDoc
 	if err := json.Unmarshal(raw, &doc); err != nil {
 		// Malformed is not missing: a nil result would read as a clean
@@ -513,9 +613,20 @@ func parseCursorIDEComposer(
 		}
 	}
 
-	startedAt := cursorIDETime(doc.CreatedAt)
-	if startedAt.IsZero() && len(messages) > 0 {
-		startedAt = messages[0].Timestamp
+	// The session starts at its earliest timestamped message. composerData
+	// createdAt has been observed days or months away from every bubble in
+	// either direction, and header order does not guarantee chronological
+	// order, so the composer stamp is only a fallback for composers whose
+	// bubbles carry no timestamp.
+	var startedAt time.Time
+	for _, m := range messages {
+		if !m.Timestamp.IsZero() &&
+			(startedAt.IsZero() || m.Timestamp.Before(startedAt)) {
+			startedAt = m.Timestamp
+		}
+	}
+	if startedAt.IsZero() {
+		startedAt = cursorIDETime(doc.CreatedAt)
 	}
 	// lastUpdatedAt has been observed lagging behind the bubbles' own
 	// timestamps, so the session ends at the later of the two: a stale
@@ -553,7 +664,7 @@ func parseCursorIDEComposer(
 			Path:  VirtualSourcePath(dbPath, composerID),
 			Size:  dbInfo.Size(),
 			Mtime: endedAt.UnixNano(),
-			Hash:  digest,
+			Hash:  cursorIDEComposerHash(raw, digest),
 		},
 	}
 

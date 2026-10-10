@@ -15,6 +15,8 @@ describe("KNOWN_AGENTS", () => {
       "cowork",
       "codex",
       "traex",
+      "augure-code",
+      "augure-desktop",
       "copilot",
       "devin",
       "evener",
@@ -24,6 +26,7 @@ describe("KNOWN_AGENTS", () => {
       "opencodereview",
       "kilo",
       "kilo-legacy",
+      "cline",
       "openhands",
       "cursor",
       "cursor-ide",
@@ -33,6 +36,7 @@ describe("KNOWN_AGENTS", () => {
       "vscode-copilot",
       "visualstudio-copilot",
       "pi",
+      "stepcode",
       "tau",
       "prime-agent",
       "qwen",
@@ -42,6 +46,7 @@ describe("KNOWN_AGENTS", () => {
       "openclaw",
       "qclaw",
       "iflow",
+      "junie",
       "kimi",
       "kimi-work",
       "claude-ai",
@@ -50,6 +55,7 @@ describe("KNOWN_AGENTS", () => {
       "kiro-ide",
       "cortex",
       "workbuddy",
+      "codebuddy",
       "qoder",
       "piebald",
       "antigravity",
@@ -61,6 +67,7 @@ describe("KNOWN_AGENTS", () => {
       "omnigent",
       "codebuff",
       "freebuff",
+      "crush",
     ]);
   });
 
@@ -76,6 +83,8 @@ describe("agentColor", () => {
     expect(agentColor("claude")).toBe("var(--accent-blue)");
     expect(agentColor("codex")).toBe("var(--accent-green)");
     expect(agentColor("traex")).toBe("var(--accent-coral)");
+    expect(agentColor("augure-code")).toBe("var(--accent-lime)");
+    expect(agentColor("augure-desktop")).toBe("var(--accent-violet)");
     expect(agentColor("copilot")).toBe("var(--accent-amber)");
     expect(agentColor("devin")).toBe("var(--accent-red)");
     expect(agentColor("evener")).toBe("var(--accent-teal)");
@@ -88,6 +97,7 @@ describe("agentColor", () => {
     expect(agentColor("zencoder")).toBe("var(--accent-red)");
     expect(agentColor("zed")).toBe("var(--accent-green)");
     expect(agentColor("pi")).toBe("var(--accent-indigo)");
+    expect(agentColor("stepcode")).toBe("var(--accent-indigo)");
     expect(agentColor("tau")).toBe("var(--accent-amber)");
     expect(agentColor("prime-agent")).toBe("var(--accent-indigo)");
     expect(agentColor("qwen")).toBe("var(--accent-cyan)");
@@ -98,9 +108,12 @@ describe("agentColor", () => {
     expect(agentColor("visualstudio-copilot")).toBe("var(--accent-blue)");
     expect(agentColor("qclaw")).toBe("var(--accent-orange)");
     expect(agentColor("workbuddy")).toBe("var(--accent-violet)");
+    expect(agentColor("codebuddy")).toBe("var(--accent-blue)");
     expect(agentColor("piebald")).toBe("var(--accent-orange)");
     expect(agentColor("roocode")).toBe("var(--accent-rose)");
     expect(agentColor("omnigent")).toBe("var(--accent-teal)");
+    expect(agentColor("cline")).toBe("var(--accent-violet)");
+    expect(agentColor("crush")).toBe("var(--accent-coral)");
   });
 
   it("falls back to blue for unknown agents", () => {
@@ -158,8 +171,10 @@ describe("agentLabel", () => {
     expect(agentLabel("openclaw")).toBe("OpenClaw");
     expect(agentLabel("qclaw")).toBe("QClaw");
     expect(agentLabel("iflow")).toBe("iFlow");
+    expect(agentLabel("junie")).toBe("Junie");
     expect(agentLabel("kimi-work")).toBe("Kimi Work");
     expect(agentLabel("workbuddy")).toBe("WorkBuddy");
+    expect(agentLabel("codebuddy")).toBe("CodeBuddy");
     expect(agentLabel("piebald")).toBe("Piebald");
     expect(agentLabel("zed")).toBe("Zed");
     expect(agentLabel("qwen")).toBe("Qwen Code");
@@ -167,11 +182,15 @@ describe("agentLabel", () => {
     expect(agentLabel("deepseek-tui")).toBe("DeepSeek TUI");
     expect(agentLabel("deepseek-harness")).toBe("DeepSeek Harness");
     expect(agentLabel("prime-agent")).toBe("Prime Agent");
+    expect(agentLabel("stepcode")).toBe("StepCode");
     expect(agentLabel("qoder")).toBe("Qoder");
     expect(agentLabel("roocode")).toBe("RooCode");
     expect(agentLabel("omnigent")).toBe("Omnigent");
     expect(agentLabel("traex")).toBe("TraeX");
+    expect(agentLabel("augure-code")).toBe("Augure Code");
+    expect(agentLabel("augure-desktop")).toBe("Augure Desktop");
     expect(agentLabel("opencodereview")).toBe("Open Code Review");
+    expect(agentLabel("crush")).toBe("Charm Crush");
   });
 
   it("capitalizes simple agent names", () => {

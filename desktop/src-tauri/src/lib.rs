@@ -16,7 +16,12 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use tauri::async_runtime::Receiver;
-use tauri::menu::{MenuBuilder, MenuItemBuilder, SubmenuBuilder};
+#[cfg(target_os = "macos")]
+use tauri::menu::{CheckMenuItem, CheckMenuItemBuilder};
+use tauri::menu::{
+    MenuBuilder, MenuItemBuilder, PredefinedMenuItem, SubmenuBuilder, HELP_SUBMENU_ID,
+    WINDOW_SUBMENU_ID,
+};
 use tauri::plugin::Builder as PluginBuilder;
 #[cfg(any(target_os = "macos", target_os = "windows"))]
 use tauri::tray::TrayIconBuilder;
@@ -33,6 +38,13 @@ const READY_TIMEOUT: Duration = Duration::from_secs(30);
 const DAEMON_STARTUP_LONG_NOTICE_AFTER: Duration = Duration::from_secs(300);
 const DAEMON_UNHEALTHY_GRACE: Duration = Duration::from_secs(15);
 const READY_POLL_INTERVAL: Duration = Duration::from_millis(125);
+/// How often the Rust side probes the backend while the app is running. The
+/// web view's own recovery paths are JavaScript, and macOS stops executing the
+/// web view when the app has no window on screen, so this probe is the only
+/// recovery that keeps running. Kept well below a minute so an outage is
+/// noticed soon after it ends, and well above the request cost of one
+/// loopback GET.
+const BACKEND_PROBE_INTERVAL: Duration = Duration::from_secs(30);
 const STATUS_POLL_MAX_INTERVAL: Duration = Duration::from_secs(1);
 const STATUS_PROBE_TIMEOUT: Duration = Duration::from_millis(1250);
 const STATUS_PROBE_FAILURE_NOTICE_AFTER: u32 = 10;
@@ -55,8 +67,12 @@ const DEEP_LINK_SESSIONS_HOST: &str = "sessions";
 const ABOUT_MENU_ID: &str = "about";
 const CHECK_UPDATES_MENU_ID: &str = "check_updates";
 const OPEN_LOGS_FOLDER_MENU_ID: &str = "open_logs_folder";
+const DOCUMENTATION_MENU_ID: &str = "documentation";
 const SHOW_MAIN_WINDOW_MENU_ID: &str = "show_main_window";
 const QUIT_FROM_STATUS_ITEM_MENU_ID: &str = "quit_from_status_item";
+#[cfg(target_os = "macos")]
+const DOCK_MODE_MENU_ID: &str = "dock_mode";
+const DOCK_MODE_SETTINGS_FILE_NAME: &str = "settings.json";
 // Delay after navigating to the backend before probing whether the
 // Linux WebKitGTK web content process is actually alive. Gives the
 // process time to spawn so we don't false-positive on slow startup.
@@ -77,7 +93,8 @@ struct SidecarState {
     terminated_generation: Mutex<u64>,
     termination: Condvar,
     next_generation: AtomicU64,
-    background_status_poll_generation: AtomicU64,
+    // Held across an update stop's start and retirement and across each window action a launch takes.
+    launch_gate: Mutex<()>,
 }
 
 struct SidecarProcess {
@@ -99,7 +116,7 @@ struct DeepLinkState {
 enum DeepLinkDispatch {
     Deferred(Option<String>),
     Redirecting(Option<String>),
-    Live,
+    Live(BackendProbeState),
 }
 
 impl DeepLinkDispatch {
@@ -110,7 +127,7 @@ impl DeepLinkDispatch {
                 *pending = Some(route);
                 None
             }
-            DeepLinkDispatch::Live => match port {
+            DeepLinkDispatch::Live(_) => match port {
                 Some(port) => Some((port, route)),
                 // Sidecar is down; hold the route for the next redirect.
                 None => {
@@ -128,7 +145,7 @@ impl DeepLinkDispatch {
                 *self = DeepLinkDispatch::Redirecting(None);
                 route
             }
-            DeepLinkDispatch::Live => None,
+            DeepLinkDispatch::Live(_) => None,
         }
     }
 
@@ -142,10 +159,10 @@ impl DeepLinkDispatch {
         match self {
             DeepLinkDispatch::Redirecting(pending) => {
                 let route = pending.take();
-                *self = DeepLinkDispatch::Live;
+                *self = DeepLinkDispatch::Live(BackendProbeState::default());
                 route
             }
-            DeepLinkDispatch::Deferred(_) | DeepLinkDispatch::Live => None,
+            DeepLinkDispatch::Deferred(_) | DeepLinkDispatch::Live(_) => None,
         }
     }
 
@@ -154,12 +171,21 @@ impl DeepLinkDispatch {
     // redirect's fallback root navigation; hold routes until it runs.
     fn defer(&mut self) {
         match self {
-            DeepLinkDispatch::Live => *self = DeepLinkDispatch::Deferred(None),
+            DeepLinkDispatch::Live(_) => *self = DeepLinkDispatch::Deferred(None),
             DeepLinkDispatch::Redirecting(pending) => {
                 let route = pending.take();
                 *self = DeepLinkDispatch::Deferred(route);
             }
             DeepLinkDispatch::Deferred(_) => {}
+        }
+    }
+
+    // Startup owns navigation until its redirect finishes. Completing that
+    // redirect starts fresh probe history so a later probe cannot repeat it.
+    fn observe_backend(&mut self, port: u16, reachable: bool) -> bool {
+        match self {
+            DeepLinkDispatch::Live(probe) => probe.observe(port, reachable),
+            DeepLinkDispatch::Deferred(_) | DeepLinkDispatch::Redirecting(_) => false,
         }
     }
 }
@@ -172,13 +198,24 @@ impl Default for DeepLinkState {
     }
 }
 
+/// Retained handle to the tray dock-mode checkbox. muda flips the
+/// checkmark before the menu event fires and Tauri 2.10 cannot look up
+/// tray items by id, so the toggle needs this handle to read the new
+/// checked state and to revert the mark when persisting fails.
+#[cfg(target_os = "macos")]
+#[derive(Default)]
+struct DockModeCheckItem(Mutex<Option<CheckMenuItem<tauri::Wry>>>);
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum DesktopMenuAction {
     About,
     CheckUpdates,
     OpenLogsFolder,
+    Documentation,
     Quit,
     ShowMainWindow,
+    #[cfg(target_os = "macos")]
+    ToggleDockMode,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -236,7 +273,7 @@ pub fn run() {
         }
     }
 
-    tauri::Builder::default()
+    let builder = tauri::Builder::default()
         .plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
             show_main_window(app);
         }))
@@ -247,7 +284,12 @@ pub fn run() {
         .plugin(tauri_plugin_deep_link::init())
         .plugin(init_navigation_guard_plugin())
         .manage(SidecarState::default())
-        .manage(DeepLinkState::default())
+        .manage(DeepLinkState::default());
+
+    #[cfg(target_os = "macos")]
+    let builder = builder.manage(DockModeCheckItem::default());
+
+    builder
         .setup(|app| {
             setup_deep_link_handling(app);
             if let Err(err) = setup_menu(app) {
@@ -306,6 +348,15 @@ pub fn run() {
             if let RunEvent::MenuEvent(event) = &event {
                 handle_desktop_menu_event(app_handle, event.id().0.as_str());
             }
+            // macOS asks a running app to show itself again through
+            // applicationShouldHandleReopen (Dock icon click, Cmd-Tab
+            // activation with no visible windows, `open -a AgentsView`).
+            // Restore the close-to-tray window here; otherwise the app
+            // stays hidden with no way back in until it is relaunched.
+            #[cfg(target_os = "macos")]
+            if let RunEvent::Reopen { .. } = &event {
+                show_main_window(app_handle);
+            }
         });
 }
 
@@ -314,8 +365,11 @@ fn desktop_menu_action(id: &str) -> Option<DesktopMenuAction> {
         ABOUT_MENU_ID => Some(DesktopMenuAction::About),
         CHECK_UPDATES_MENU_ID => Some(DesktopMenuAction::CheckUpdates),
         OPEN_LOGS_FOLDER_MENU_ID => Some(DesktopMenuAction::OpenLogsFolder),
+        DOCUMENTATION_MENU_ID => Some(DesktopMenuAction::Documentation),
         QUIT_FROM_STATUS_ITEM_MENU_ID => Some(DesktopMenuAction::Quit),
         SHOW_MAIN_WINDOW_MENU_ID => Some(DesktopMenuAction::ShowMainWindow),
+        #[cfg(target_os = "macos")]
+        DOCK_MODE_MENU_ID => Some(DesktopMenuAction::ToggleDockMode),
         _ => None,
     }
 }
@@ -334,16 +388,72 @@ fn handle_desktop_menu_event(handle: &AppHandle, id: &str) {
             });
         }
         Some(DesktopMenuAction::OpenLogsFolder) => open_logs_folder(handle),
+        Some(DesktopMenuAction::Documentation) => {
+            if let Err(err) = handle
+                .opener()
+                .open_url("https://agentsview.io/docs/", Option::<&str>::None)
+            {
+                eprintln!("[agentsview] failed to open documentation: {err}");
+            }
+        }
         Some(DesktopMenuAction::Quit) => handle.exit(0),
         Some(DesktopMenuAction::ShowMainWindow) => show_main_window(handle),
+        #[cfg(target_os = "macos")]
+        Some(DesktopMenuAction::ToggleDockMode) => toggle_dock_mode(handle),
         None => {}
     }
+}
+
+/// Flips the persisted dock mode from the tray checkbox and applies the
+/// new Dock presence immediately, so a change while the window is hidden
+/// takes effect without showing and re-hiding the window.
+///
+/// muda flips the checkmark before the menu event fires, so the target
+/// mode is derived from the item's checked state (UI and intent cannot
+/// diverge); if persisting fails the mark is flipped back so the menu
+/// still reports the mode that is actually stored.
+#[cfg(target_os = "macos")]
+fn toggle_dock_mode(handle: &AppHandle) {
+    let Some(item) = dock_mode_check_item(handle) else {
+        return;
+    };
+    let Ok(checked) = item.is_checked() else {
+        return;
+    };
+    let Some(path) = dock_mode_settings_path(handle) else {
+        let _ = item.set_checked(!checked);
+        return;
+    };
+    let next = DockMode::from_checked(checked);
+    if let Err(err) = write_dock_mode(&path, next) {
+        eprintln!("[agentsview] failed to persist dock mode: {err}");
+        let _ = item.set_checked(!checked);
+        return;
+    }
+    let window_visible = handle
+        .get_webview_window("main")
+        .and_then(|window| window.is_visible().ok())
+        .unwrap_or(false);
+    apply_dock_presence(handle, next, window_visible);
+}
+
+#[cfg(target_os = "macos")]
+fn dock_mode_check_item(handle: &AppHandle) -> Option<CheckMenuItem<tauri::Wry>> {
+    handle
+        .state::<DockModeCheckItem>()
+        .0
+        .lock()
+        .expect("lock dock mode item")
+        .as_ref()
+        .cloned()
 }
 
 fn show_main_window(handle: &AppHandle) {
     let Some(window) = handle.get_webview_window("main") else {
         return;
     };
+    #[cfg(target_os = "macos")]
+    sync_dock_presence(handle, true);
     restore_main_window(&window);
 }
 
@@ -565,11 +675,140 @@ fn restore_main_window(window: &impl MainWindowVisibility) {
     window.focus_main_window();
 }
 
+/// Controls whether AgentsView keeps its Dock and Cmd-Tab presence while
+/// the main window is hidden. `Dock` keeps today's behavior (always
+/// present while running); `Hybrid` leaves the Dock and Cmd-Tab while
+/// the window is hidden, like a menu-bar-only app, and comes back when
+/// the window is restored.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DockMode {
+    Dock,
+    Hybrid,
+}
+
+impl DockMode {
+    fn as_str(self) -> &'static str {
+        match self {
+            DockMode::Dock => "dock",
+            DockMode::Hybrid => "hybrid",
+        }
+    }
+
+    fn from_str(value: &str) -> Option<DockMode> {
+        match value {
+            "dock" => Some(DockMode::Dock),
+            "hybrid" => Some(DockMode::Hybrid),
+            _ => None,
+        }
+    }
+
+    fn from_checked(checked: bool) -> DockMode {
+        if checked {
+            DockMode::Hybrid
+        } else {
+            DockMode::Dock
+        }
+    }
+}
+
+// Dock mode is persisted next to the other desktop app state as
+// {"dock_mode":"dock"|"hybrid"}. Any read failure falls back to Dock so
+// a missing or corrupt file never flips behavior behind the user's back.
+fn read_dock_mode(path: &Path) -> DockMode {
+    let Ok(content) = fs::read_to_string(path) else {
+        return DockMode::Dock;
+    };
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(&content) else {
+        return DockMode::Dock;
+    };
+    value
+        .get("dock_mode")
+        .and_then(|value| value.as_str())
+        .and_then(DockMode::from_str)
+        .unwrap_or(DockMode::Dock)
+}
+
+fn write_dock_mode(path: &Path, mode: DockMode) -> io::Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    // Read-modify-write: keep any other keys in the settings file so a
+    // future setting added next to dock_mode is not wiped on toggle.
+    let mut settings = fs::read_to_string(path)
+        .ok()
+        .and_then(|content| serde_json::from_str::<serde_json::Value>(&content).ok())
+        .and_then(|value| value.as_object().cloned())
+        .unwrap_or_default();
+    settings.insert(
+        "dock_mode".to_string(),
+        serde_json::Value::String(mode.as_str().to_string()),
+    );
+    let content =
+        serde_json::to_vec(&serde_json::Value::Object(settings)).map_err(io::Error::other)?;
+    fs::write(path, content)
+}
+
+fn dock_mode_settings_path(handle: &AppHandle) -> Option<PathBuf> {
+    handle
+        .path()
+        .app_config_dir()
+        .ok()
+        .map(|dir| dir.join(DOCK_MODE_SETTINGS_FILE_NAME))
+}
+
+/// Which Dock presence macOS should show for a dock mode and window
+/// visibility. Kept as an own type so the decision is testable without
+/// constructing Tauri's non-exhaustive ActivationPolicy.
+#[cfg(target_os = "macos")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DockPresence {
+    Regular,
+    Accessory,
+}
+
+#[cfg(target_os = "macos")]
+fn dock_presence_for(mode: DockMode, window_visible: bool) -> DockPresence {
+    match (mode, window_visible) {
+        (DockMode::Hybrid, false) => DockPresence::Accessory,
+        _ => DockPresence::Regular,
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn apply_dock_presence(handle: &AppHandle, mode: DockMode, window_visible: bool) {
+    let policy = match dock_presence_for(mode, window_visible) {
+        DockPresence::Regular => tauri::ActivationPolicy::Regular,
+        DockPresence::Accessory => tauri::ActivationPolicy::Accessory,
+    };
+    if let Err(err) = handle.set_activation_policy(policy) {
+        eprintln!("[agentsview] failed to apply dock presence: {err}");
+    }
+}
+
+/// Reapplies the Dock presence for the current window state. Call after
+/// hiding or before showing the window.
+#[cfg(target_os = "macos")]
+fn sync_dock_presence(handle: &AppHandle, window_visible: bool) {
+    if let Some(path) = dock_mode_settings_path(handle) {
+        apply_dock_presence(handle, read_dock_mode(&path), window_visible);
+    }
+}
+
+/// Initial checked state for the tray dock-mode checkbox: checked only
+/// when hybrid mode is persisted.
+#[cfg(target_os = "macos")]
+fn dock_mode_checked(app: &App) -> bool {
+    dock_mode_settings_path(app.handle())
+        .map(|path| read_dock_mode(&path) == DockMode::Hybrid)
+        .unwrap_or(false)
+}
+
 fn launch_backend(app: &mut App) -> Result<(), DynError> {
     let window = main_window(app)?;
     let handle = app.handle().clone();
     let (rx, child) = spawn_sidecar(&handle)?;
 
+    let sidecar_pid = child.pid();
     let generation = save_sidecar(&handle, child)?;
 
     let focus_window = window.clone();
@@ -588,7 +827,9 @@ fn launch_backend(app: &mut App) -> Result<(), DynError> {
         }
     });
 
-    forward_sidecar_logs(rx, window, generation);
+    spawn_backend_probe(window.clone(), app.handle().clone());
+
+    forward_sidecar_logs(rx, window, generation, sidecar_pid);
 
     Ok(())
 }
@@ -596,8 +837,9 @@ fn launch_backend(app: &mut App) -> Result<(), DynError> {
 fn launch_backend_from_handle(handle: &AppHandle) -> Result<(), DynError> {
     let window = main_window_from_handle(handle)?;
     let (rx, child) = spawn_sidecar(handle)?;
+    let sidecar_pid = child.pid();
     let generation = save_sidecar(handle, child)?;
-    forward_sidecar_logs(rx, window, generation);
+    forward_sidecar_logs(rx, window, generation, sidecar_pid);
     Ok(())
 }
 
@@ -1277,6 +1519,7 @@ fn take_restart_after_stop_timeout_if_current(state: &SidecarState, generation: 
 }
 
 fn begin_update_stop_wait(state: &SidecarState) {
+    let _gate = state.launch_gate.lock();
     state
         .active_update_stop_waiters
         .fetch_add(1, Ordering::SeqCst);
@@ -1291,6 +1534,49 @@ fn end_update_stop_wait(state: &SidecarState) {
 
 fn has_active_update_stop_waiter(state: &SidecarState) -> bool {
     state.active_update_stop_waiters.load(Ordering::SeqCst) > 0
+}
+
+// A completed update stop retires the launch it stopped; a failed one leaves it in charge.
+fn finish_update_stop_wait(state: &SidecarState, stopped: bool) {
+    let _gate = state.launch_gate.lock();
+    if stopped {
+        state.next_generation.fetch_add(1, Ordering::SeqCst);
+    }
+    end_update_stop_wait(state);
+}
+
+fn launch_superseded(state: &SidecarState, generation: u64) -> bool {
+    state.next_generation.load(Ordering::SeqCst) != generation
+}
+
+// While an update stop is in flight the launch's fate is unknown, so it must not act yet.
+fn launch_is_current(state: &SidecarState, generation: u64) -> bool {
+    !has_active_update_stop_waiter(state) && !launch_superseded(state, generation)
+}
+
+// Waits out an update stop, then acts only if the launch survived, holding the gate so no stop starts mid-action.
+fn with_current_launch<T>(
+    state: &SidecarState,
+    generation: u64,
+    act: impl FnOnce() -> T,
+) -> Option<T> {
+    loop {
+        let gate = state.launch_gate.lock().ok()?;
+        if launch_superseded(state, generation) {
+            return None;
+        }
+        if !has_active_update_stop_waiter(state) {
+            return Some(act());
+        }
+        drop(gate);
+        thread::sleep(READY_POLL_INTERVAL);
+    }
+}
+
+// Non-blocking variant for async callers: acts only if the launch is current right now.
+fn act_if_current<T>(state: &SidecarState, generation: u64, act: impl FnOnce() -> T) -> Option<T> {
+    let _gate = state.launch_gate.lock().ok()?;
+    launch_is_current(state, generation).then(act)
 }
 
 fn take_restart_after_stop_timeout_for_terminated_sidecar(
@@ -1359,11 +1645,26 @@ fn wait_for_sidecar_termination(state: &SidecarState, generation: u64, timeout: 
     }
 }
 
-fn forward_sidecar_logs(mut rx: CommandRx, window: WebviewWindow, generation: u64) {
+fn forward_sidecar_logs(
+    mut rx: CommandRx,
+    window: WebviewWindow,
+    generation: u64,
+    sidecar_pid: u32,
+) {
     let startup_handled = Arc::new(AtomicBool::new(false));
     let first_output = Arc::new(AtomicBool::new(false));
     let startup_output = Arc::new(Mutex::new(String::new()));
     let log_sender = spawn_sidecar_log_writer(window.app_handle().clone());
+    queue_startup_log_record(
+        &log_sender,
+        generation,
+        format!(
+            "started by desktop {} (pid {}), sidecar pid {sidecar_pid}",
+            window.app_handle().package_info().version,
+            std::process::id()
+        )
+        .as_str(),
+    );
     let timeout_window = window.clone();
     let timeout_state = startup_handled.clone();
     thread::spawn(move || {
@@ -1414,7 +1715,13 @@ fn forward_sidecar_logs(mut rx: CommandRx, window: WebviewWindow, generation: u6
                                 "window.__setStage(2); \
                                  window.__setStatus('Connecting to interface...');",
                             );
-                            redirect_when_ready(window.clone(), port);
+                            redirect_when_ready(
+                                window.clone(),
+                                port,
+                                generation,
+                                "sidecar stdout",
+                                log_sender.clone(),
+                            );
                         }
                     }
                 }
@@ -1473,12 +1780,17 @@ fn forward_sidecar_logs(mut rx: CommandRx, window: WebviewWindow, generation: u6
                             "window.__setStatus(\
                              'Waiting for background daemon to become ready...');",
                         );
-                        poll_background_status_after_launcher_exit(window.clone(), generation);
+                        poll_background_status_after_launcher_exit(
+                            window.clone(),
+                            generation,
+                            log_sender.clone(),
+                        );
                         break;
                     }
                     if handle_sidecar_terminated(&state, startup_handled.as_ref(), generation) {
-                        spawn_startup_error_render(
+                        spawn_launch_error_render(
                             window.clone(),
+                            generation,
                             "AgentsView backend failed",
                             "The local backend exited before startup completed.",
                             startup_failure_detail(
@@ -1505,8 +1817,9 @@ fn forward_sidecar_logs(mut rx: CommandRx, window: WebviewWindow, generation: u6
                     );
                     eprintln!("[agentsview:error] {err}");
                     if !startup_handled.swap(true, Ordering::SeqCst) {
-                        spawn_startup_error_render(
+                        spawn_launch_error_render(
                             window.clone(),
+                            generation,
                             "AgentsView backend failed",
                             "The desktop wrapper received an error from the backend process.",
                             startup_failure_detail(
@@ -1543,6 +1856,27 @@ fn main_window_from_handle(handle: &AppHandle) -> Result<WebviewWindow, DynError
 }
 
 fn spawn_startup_error_render(window: WebviewWindow, title: &str, message: &str, detail: &str) {
+    render_startup_error(window, title, message, detail, None);
+}
+
+// Rechecks the launch before every attempt so an update stop that lands mid-retry drops the render.
+fn spawn_launch_error_render(
+    window: WebviewWindow,
+    generation: u64,
+    title: &str,
+    message: &str,
+    detail: &str,
+) {
+    render_startup_error(window, title, message, detail, Some(generation));
+}
+
+fn render_startup_error(
+    window: WebviewWindow,
+    title: &str,
+    message: &str,
+    detail: &str,
+    generation: Option<u64>,
+) {
     let title = title.to_string();
     let message = message.to_string();
     let detail = detail.to_string();
@@ -1554,14 +1888,24 @@ fn spawn_startup_error_render(window: WebviewWindow, title: &str, message: &str,
             detail.as_str(),
             footer.as_str(),
         );
+        let state = window.app_handle().state::<SidecarState>();
+        let eval = || window.eval(script.as_str()).is_ok();
+        // The script no-ops until the loading page is ready, so keep resubmitting until the deadline.
         let deadline = Instant::now() + READY_TIMEOUT;
+        let mut submitted = false;
         while Instant::now() < deadline {
-            if window.eval(script.as_str()).is_ok() {
-                return;
-            }
+            submitted |= match generation {
+                Some(g) => match with_current_launch(&state, g, eval) {
+                    Some(ok) => ok,
+                    None => return,
+                },
+                None => eval(),
+            };
             thread::sleep(READY_POLL_INTERVAL);
         }
-        eprintln!("[agentsview] timed out waiting to render startup error");
+        if !submitted {
+            eprintln!("[agentsview] timed out waiting to render startup error");
+        }
     });
 }
 
@@ -1570,13 +1914,11 @@ fn startup_error_script(title: &str, message: &str, detail: &str, footer: &str) 
     let message = js_string_literal(message);
     let detail = js_string_literal(detail);
     let footer = js_string_literal(footer);
-    let retry_ms = READY_POLL_INTERVAL.as_millis();
     format!(
         "(function renderStartupError() {{\
             var h = document.querySelector('h1');\
             var status = document.getElementById('status');\
             if (!h || !status) {{\
-                window.setTimeout(renderStartupError, {retry_ms});\
                 return;\
             }}\
             var shell = document.querySelector('.shell');\
@@ -1776,9 +2118,21 @@ fn recover_webview(window: &WebviewWindow, port: u16) {
     }
 }
 
-fn redirect_when_ready(window: WebviewWindow, port: u16) {
+fn redirect_when_ready(
+    window: WebviewWindow,
+    port: u16,
+    generation: u64,
+    source: &'static str,
+    log_sender: SyncSender<SidecarLogRecord>,
+) {
     thread::spawn(move || {
-        if wait_for_server(port, READY_TIMEOUT) {
+        let ready = wait_for_selected_backend(&log_sender, generation, source, port, READY_TIMEOUT);
+        let handle = window.app_handle().clone();
+        let state = handle.state::<SidecarState>();
+        if with_current_launch(&state, generation, || ()).is_none() {
+            return;
+        }
+        if ready {
             let deferred_route = take_pending_deep_link_route(window.app_handle());
             let target_url = match deferred_route.as_deref() {
                 Some(route) => {
@@ -1790,12 +2144,25 @@ fn redirect_when_ready(window: WebviewWindow, port: u16) {
                 }
                 None => desktop_redirect_url(port),
             };
-            // Failures after a deferred route was consumed go to the
-            // desktop log: packaged builds discard stderr, and the
-            // "redirecting" line above would otherwise read as success.
+            // Packaged builds discard stderr, so record navigation
+            // failures in the desktop log as well.
             match Url::parse(target_url.as_str()) {
                 Ok(url) => {
-                    if let Err(err) = window.navigate(url) {
+                    let Some(navigated) =
+                        with_current_launch(&state, generation, || window.navigate(url))
+                    else {
+                        // Hand the consumed route back so the replacement launch opens it.
+                        if let Some(route) = deferred_route {
+                            dispatch_deep_link_route(window.app_handle(), route);
+                        }
+                        return;
+                    };
+                    if let Err(err) = navigated {
+                        queue_startup_log_record(
+                            &log_sender,
+                            generation,
+                            format!("port {port} navigation failed: {err}").as_str(),
+                        );
                         if deferred_route.is_some() {
                             log_deep_link_event(
                                 window.app_handle(),
@@ -1811,9 +2178,14 @@ fn redirect_when_ready(window: WebviewWindow, port: u16) {
                     // the system browser. See
                     // https://github.com/kenn-io/agentsview/issues/635
                     #[cfg(target_os = "linux")]
-                    spawn_webview_health_fallback(window.clone(), port);
+                    spawn_webview_health_fallback(window.clone(), port, generation);
                 }
                 Err(err) => {
+                    queue_startup_log_record(
+                        &log_sender,
+                        generation,
+                        format!("port {port} invalid redirect URL: {err}").as_str(),
+                    );
                     if deferred_route.is_some() {
                         log_deep_link_event(
                             window.app_handle(),
@@ -1831,13 +2203,19 @@ fn redirect_when_ready(window: WebviewWindow, port: u16) {
                     format!("navigating to deep link route {route} queued during startup redirect")
                         .as_str(),
                 );
-                navigate_main_window_to_route(window.app_handle(), port, route.as_str());
+                let routed = with_current_launch(&state, generation, || {
+                    navigate_main_window_to_route(window.app_handle(), port, route.as_str())
+                });
+                if routed.is_none() {
+                    dispatch_deep_link_route(window.app_handle(), route);
+                }
             }
             return;
         }
 
-        spawn_startup_error_render(
+        spawn_launch_error_render(
             window,
+            generation,
             "AgentsView interface did not respond",
             "The backend reported a port, but the desktop window could not connect to it.",
             format!("Backend URL: {}", desktop_redirect_url(port)).as_str(),
@@ -1845,12 +2223,12 @@ fn redirect_when_ready(window: WebviewWindow, port: u16) {
     });
 }
 
-fn poll_background_status_after_launcher_exit(window: WebviewWindow, generation: u64) {
+fn poll_background_status_after_launcher_exit(
+    window: WebviewWindow,
+    generation: u64,
+    log_sender: SyncSender<SidecarLogRecord>,
+) {
     let handle = window.app_handle().clone();
-    handle
-        .state::<SidecarState>()
-        .background_status_poll_generation
-        .store(generation, Ordering::SeqCst);
     tauri::async_runtime::spawn(async move {
         let started = Instant::now();
         let mut failed_status_probes = 0;
@@ -1858,23 +2236,39 @@ fn poll_background_status_after_launcher_exit(window: WebviewWindow, generation:
         let mut long_startup_notice_shown = false;
         let mut unhealthy_since: Option<Instant> = None;
         loop {
-            if !background_status_poll_is_current(&handle, generation) {
+            if launch_superseded(&handle.state::<SidecarState>(), generation) {
                 return;
             }
-            let status = probe_backend_status(&handle).await;
+            // Hold without probing while an update stop decides this launch's fate.
+            if !launch_is_current(&handle.state::<SidecarState>(), generation) {
+                tokio::time::sleep(READY_POLL_INTERVAL).await;
+                continue;
+            }
+            let status = probe_backend_status(&handle, &log_sender, generation).await;
+            if !launch_is_current(&handle.state::<SidecarState>(), generation) {
+                continue;
+            }
             status_poll_backoff_attempts =
                 next_background_status_poll_attempts(&status, status_poll_backoff_attempts);
             match status {
                 BackendStatusProbe::Ready(port) => {
-                    if !background_status_poll_is_current(&handle, generation) {
-                        return;
+                    let acted = act_if_current(&handle.state::<SidecarState>(), generation, || {
+                        save_sidecar_port(&handle, port);
+                        let _ = window.eval(
+                            "window.__setStage(2); \
+                             window.__setStatus('Connecting to interface...');",
+                        );
+                        redirect_when_ready(
+                            window.clone(),
+                            port,
+                            generation,
+                            "serve status",
+                            log_sender.clone(),
+                        );
+                    });
+                    if acted.is_none() {
+                        continue;
                     }
-                    save_sidecar_port(&handle, port);
-                    let _ = window.eval(
-                        "window.__setStage(2); \
-                         window.__setStatus('Connecting to interface...');",
-                    );
-                    redirect_when_ready(window.clone(), port);
                     return;
                 }
                 BackendStatusProbe::Starting(status) => {
@@ -1889,8 +2283,9 @@ fn poll_background_status_after_launcher_exit(window: WebviewWindow, generation:
                     failed_status_probes = 0;
                     let first_seen = unhealthy_since.get_or_insert_with(Instant::now);
                     if first_seen.elapsed() >= DAEMON_UNHEALTHY_GRACE {
-                        spawn_startup_error_render(
+                        spawn_launch_error_render(
                             window,
+                            generation,
                             "AgentsView backend is not responding",
                             "A backend process is running, but it is not answering health checks.",
                             startup_failure_detail(
@@ -1907,8 +2302,9 @@ fn poll_background_status_after_launcher_exit(window: WebviewWindow, generation:
                     );
                 }
                 BackendStatusProbe::NotRunning(status) => {
-                    spawn_startup_error_render(
+                    spawn_launch_error_render(
                         window,
+                        generation,
                         "AgentsView backend stopped",
                         "The background launcher exited, and no AgentsView server is running.",
                         startup_failure_detail(
@@ -1920,8 +2316,9 @@ fn poll_background_status_after_launcher_exit(window: WebviewWindow, generation:
                     return;
                 }
                 BackendStatusProbe::Incompatible(status) => {
-                    spawn_startup_error_render(
+                    spawn_launch_error_render(
                         window,
+                        generation,
                         "AgentsView backend is incompatible",
                         "AgentsView found a running backend that this desktop app cannot use.",
                         status.as_str(),
@@ -1929,8 +2326,9 @@ fn poll_background_status_after_launcher_exit(window: WebviewWindow, generation:
                     return;
                 }
                 BackendStatusProbe::ReadOnly(status) => {
-                    spawn_startup_error_render(
+                    spawn_launch_error_render(
                         window,
+                        generation,
                         "AgentsView backend is read-only",
                         "AgentsView Desktop needs a writable local backend to sync and migrate the archive.",
                         startup_failure_detail(
@@ -1942,8 +2340,9 @@ fn poll_background_status_after_launcher_exit(window: WebviewWindow, generation:
                     return;
                 }
                 BackendStatusProbe::Unusable(status) => {
-                    spawn_startup_error_render(
+                    spawn_launch_error_render(
                         window,
+                        generation,
                         "AgentsView backend status is unusable",
                         "The background launcher exited, but the backend did not report a usable writable server.",
                         startup_failure_detail(
@@ -1957,8 +2356,9 @@ fn poll_background_status_after_launcher_exit(window: WebviewWindow, generation:
                 BackendStatusProbe::Unavailable => {
                     failed_status_probes += 1;
                     if status_probe_failures_should_stop(failed_status_probes) {
-                        spawn_startup_error_render(
+                        spawn_launch_error_render(
                             window,
+                            generation,
                             "AgentsView backend status is unavailable",
                             "The background launcher exited, but the desktop app could not confirm backend status.",
                             startup_failure_detail(
@@ -1995,14 +2395,6 @@ fn poll_background_status_after_launcher_exit(window: WebviewWindow, generation:
     });
 }
 
-fn background_status_poll_is_current(handle: &AppHandle, generation: u64) -> bool {
-    handle
-        .state::<SidecarState>()
-        .background_status_poll_generation
-        .load(Ordering::SeqCst)
-        == generation
-}
-
 fn background_status_poll_interval(backoff_attempts: u32) -> Duration {
     let multiplier = match backoff_attempts {
         0..=8 => 1,
@@ -2032,42 +2424,24 @@ fn status_probe_failures_should_stop(failed_status_probes: u32) -> bool {
     failed_status_probes >= STATUS_PROBE_FAILURE_FAIL_AFTER
 }
 
-async fn probe_backend_status(handle: &AppHandle) -> BackendStatusProbe {
+async fn probe_backend_status(
+    handle: &AppHandle,
+    log_sender: &SyncSender<SidecarLogRecord>,
+    generation: u64,
+) -> BackendStatusProbe {
     let Ok(mut command) = handle.shell().sidecar("agentsview") else {
         return BackendStatusProbe::Unavailable;
     };
     for (key, value) in sidecar_env() {
         command = command.env(key, value);
     }
-    let Ok((mut rx, child)) = command.args(sidecar_status_args()).spawn() else {
+    let Ok((rx, child)) = command.args(sidecar_status_args()).spawn() else {
         return BackendStatusProbe::Unavailable;
     };
-    let mut stdout_buffer = String::new();
-    let mut stderr_buffer = String::new();
-    let status = tokio::time::timeout(STATUS_PROBE_TIMEOUT, async {
-        while let Some(event) = rx.recv().await {
-            match event {
-                CommandEvent::Stdout(bytes) => {
-                    stdout_buffer.push_str(String::from_utf8_lossy(&bytes).as_ref());
-                }
-                CommandEvent::Stderr(bytes) => {
-                    stderr_buffer.push_str(String::from_utf8_lossy(&bytes).as_ref());
-                }
-                CommandEvent::Terminated(_) => {
-                    return Ok(classify_backend_status_output(
-                        stdout_buffer.as_str(),
-                        stderr_buffer.as_str(),
-                    ));
-                }
-                CommandEvent::Error(err) => {
-                    eprintln!("[agentsview:error] {err}");
-                    return Err(());
-                }
-                _ => {}
-            }
-        }
-        Ok(BackendStatusProbe::Unavailable)
-    })
+    let status = tokio::time::timeout(
+        STATUS_PROBE_TIMEOUT,
+        read_backend_status(rx, log_sender, generation),
+    )
     .await;
     match status {
         Ok(Ok(status)) => status,
@@ -2076,6 +2450,47 @@ async fn probe_backend_status(handle: &AppHandle) -> BackendStatusProbe {
             BackendStatusProbe::Unavailable
         }
     }
+}
+
+async fn read_backend_status(
+    mut rx: CommandRx,
+    log_sender: &SyncSender<SidecarLogRecord>,
+    generation: u64,
+) -> Result<BackendStatusProbe, ()> {
+    let mut stdout_buffer = String::new();
+    let mut stderr_buffer = String::new();
+    while let Some(event) = rx.recv().await {
+        match event {
+            CommandEvent::Stdout(bytes) => {
+                stdout_buffer.push_str(String::from_utf8_lossy(&bytes).as_ref());
+            }
+            CommandEvent::Stderr(bytes) => {
+                stderr_buffer.push_str(String::from_utf8_lossy(&bytes).as_ref());
+            }
+            CommandEvent::Terminated(_) => {
+                let status =
+                    classify_backend_status_output(stdout_buffer.as_str(), stderr_buffer.as_str());
+                if matches!(status, BackendStatusProbe::Ready(_)) {
+                    queue_startup_log_record(
+                        log_sender,
+                        generation,
+                        format!(
+                            "serve status: {}",
+                            redact_sidecar_log_line(stdout_buffer.trim())
+                        )
+                        .as_str(),
+                    );
+                }
+                return Ok(status);
+            }
+            CommandEvent::Error(err) => {
+                eprintln!("[agentsview:error] {err}");
+                return Err(());
+            }
+            _ => {}
+        }
+    }
+    Ok(BackendStatusProbe::Unavailable)
 }
 
 fn classify_backend_status_output(stdout: &str, stderr: &str) -> BackendStatusProbe {
@@ -2144,7 +2559,7 @@ fn combined_probe_output(stdout: &str, stderr: &str) -> String {
 /// user where the UI went. If no browser can be opened the window stays
 /// visible and the dialog shows the URL to open manually.
 #[cfg(target_os = "linux")]
-fn spawn_webview_health_fallback(window: WebviewWindow, port: u16) {
+fn spawn_webview_health_fallback(window: WebviewWindow, port: u16, generation: u64) {
     // One-shot guard so focus/navigation retries can't open many tabs.
     static FALLBACK_TRIGGERED: AtomicBool = AtomicBool::new(false);
 
@@ -2156,46 +2571,49 @@ fn spawn_webview_health_fallback(window: WebviewWindow, port: u16) {
         if window.eval("void 0").is_ok() {
             return;
         }
-        if FALLBACK_TRIGGERED.swap(true, Ordering::SeqCst) {
-            return;
-        }
-
-        let url = format!("http://{HOST}:{port}");
-        eprintln!(
-            "[agentsview] WebView content process is not responding \
-             (likely a GPU/EGL initialization failure); opening {url} \
-             in the system browser instead"
-        );
-
-        let handle = window.app_handle().clone();
-        match handle.opener().open_url(url.as_str(), Option::<&str>::None) {
-            Ok(()) => {
-                let _ = window.hide();
-                handle
-                    .dialog()
-                    .message(format!(
-                        "AgentsView could not render its window, likely due to a \
-                         graphics driver (EGL) issue. It has been opened in your \
-                         web browser instead:\n\n{url}"
-                    ))
-                    .title("AgentsView")
-                    .show(|_| {});
+        let state = window.app_handle().state::<SidecarState>();
+        with_current_launch(&state, generation, || {
+            if FALLBACK_TRIGGERED.swap(true, Ordering::SeqCst) {
+                return;
             }
-            Err(err) => {
-                eprintln!("[agentsview] failed to open system browser fallback: {err}");
-                // Keep the window up so the app stays visible and quittable.
-                handle
-                    .dialog()
-                    .message(format!(
-                        "AgentsView could not render its window, likely due to a \
-                         graphics driver (EGL) issue, and no web browser could be \
-                         opened automatically. Open this URL in a browser to use \
-                         AgentsView:\n\n{url}"
-                    ))
-                    .title("AgentsView")
-                    .show(|_| {});
+
+            let url = format!("http://{HOST}:{port}");
+            eprintln!(
+                "[agentsview] WebView content process is not responding \
+                 (likely a GPU/EGL initialization failure); opening {url} \
+                 in the system browser instead"
+            );
+
+            let handle = window.app_handle().clone();
+            match handle.opener().open_url(url.as_str(), Option::<&str>::None) {
+                Ok(()) => {
+                    let _ = window.hide();
+                    handle
+                        .dialog()
+                        .message(format!(
+                            "AgentsView could not render its window, likely due to a \
+                             graphics driver (EGL) issue. It has been opened in your \
+                             web browser instead:\n\n{url}"
+                        ))
+                        .title("AgentsView")
+                        .show(|_| {});
+                }
+                Err(err) => {
+                    eprintln!("[agentsview] failed to open system browser fallback: {err}");
+                    // Keep the window up so the app stays visible and quittable.
+                    handle
+                        .dialog()
+                        .message(format!(
+                            "AgentsView could not render its window, likely due to a \
+                             graphics driver (EGL) issue, and no web browser could be \
+                             opened automatically. Open this URL in a browser to use \
+                             AgentsView:\n\n{url}"
+                        ))
+                        .title("AgentsView")
+                        .show(|_| {});
+                }
             }
-        }
+        });
     });
 }
 
@@ -2288,31 +2706,75 @@ fn setup_menu(app: &mut App) -> Result<(), DynError> {
     let check_updates =
         MenuItemBuilder::with_id(CHECK_UPDATES_MENU_ID, "Check for Updates...").build(app)?;
 
-    let builder = SubmenuBuilder::new(app, "File")
+    #[cfg(target_os = "macos")]
+    let app_submenu = SubmenuBuilder::new(app, "AgentsView")
         .item(&about)
         .separator()
         .item(&open_logs_folder)
         .item(&check_updates)
-        .separator();
-
-    #[cfg(target_os = "macos")]
-    let builder = builder.hide().hide_others().separator();
-
-    let app_submenu = builder.quit().build()?;
-
-    let edit_submenu = SubmenuBuilder::new(app, "Edit")
-        .undo()
-        .redo()
         .separator()
-        .cut()
-        .copy()
-        .paste()
-        .select_all()
+        .item(&PredefinedMenuItem::services(app, None)?)
+        .separator()
+        .item(&PredefinedMenuItem::hide(app, None)?)
+        .item(&PredefinedMenuItem::hide_others(app, None)?)
+        .item(&PredefinedMenuItem::show_all(app, None)?)
+        .separator()
+        .item(&PredefinedMenuItem::quit(app, None)?)
         .build()?;
 
+    #[cfg(not(target_os = "macos"))]
+    let file_submenu = SubmenuBuilder::new(app, "File")
+        .item(&about)
+        .separator()
+        .item(&open_logs_folder)
+        .item(&check_updates)
+        .separator()
+        .item(&PredefinedMenuItem::close_window(app, None)?)
+        .separator()
+        .item(&PredefinedMenuItem::quit(app, None)?)
+        .build()?;
+
+    #[cfg(target_os = "macos")]
+    let file_submenu = SubmenuBuilder::new(app, "File")
+        .item(&PredefinedMenuItem::close_window(app, None)?)
+        .build()?;
+
+    let edit_submenu = SubmenuBuilder::new(app, "Edit")
+        .item(&PredefinedMenuItem::undo(app, None)?)
+        .item(&PredefinedMenuItem::redo(app, None)?)
+        .separator()
+        .item(&PredefinedMenuItem::cut(app, None)?)
+        .item(&PredefinedMenuItem::copy(app, None)?)
+        .item(&PredefinedMenuItem::paste(app, None)?)
+        .item(&PredefinedMenuItem::select_all(app, None)?)
+        .build()?;
+
+    #[cfg(target_os = "macos")]
+    let window_submenu = SubmenuBuilder::with_id(app, WINDOW_SUBMENU_ID, "Window")
+        .item(&PredefinedMenuItem::minimize(app, None)?)
+        .item(&PredefinedMenuItem::maximize(app, None)?)
+        .build()?;
+
+    let documentation =
+        MenuItemBuilder::with_id(DOCUMENTATION_MENU_ID, "Documentation").build(app)?;
+    let help_submenu = SubmenuBuilder::with_id(app, HELP_SUBMENU_ID, "Help")
+        .item(&documentation)
+        .build()?;
+
+    #[cfg(target_os = "macos")]
     let menu = MenuBuilder::new(app)
         .item(&app_submenu)
+        .item(&file_submenu)
         .item(&edit_submenu)
+        .item(&window_submenu)
+        .item(&help_submenu)
+        .build()?;
+
+    #[cfg(not(target_os = "macos"))]
+    let menu = MenuBuilder::new(app)
+        .item(&file_submenu)
+        .item(&edit_submenu)
+        .item(&help_submenu)
         .build()?;
     app.set_menu(menu)?;
     Ok(())
@@ -2327,14 +2789,34 @@ fn setup_status_item(app: &mut App) -> Result<(), DynError> {
         MenuItemBuilder::with_id(CHECK_UPDATES_MENU_ID, "Check for Updates...").build(app)?;
     let quit =
         MenuItemBuilder::with_id(QUIT_FROM_STATUS_ITEM_MENU_ID, "Quit AgentsView").build(app)?;
+    #[cfg(target_os = "macos")]
+    let hide_from_dock = CheckMenuItemBuilder::with_id(
+        DOCK_MODE_MENU_ID,
+        "Hide from Dock and Cmd-Tab when window closed",
+    )
+    .checked(dock_mode_checked(app))
+    .build(app)?;
+
+    #[cfg(target_os = "macos")]
+    {
+        let item = hide_from_dock.clone();
+        *app.state::<DockModeCheckItem>()
+            .0
+            .lock()
+            .expect("lock dock mode item") = Some(item);
+    }
+
     let menu = MenuBuilder::new(app)
         .item(&show)
         .separator()
         .item(&open_logs)
         .item(&check_updates)
-        .separator()
-        .item(&quit)
-        .build()?;
+        .separator();
+
+    #[cfg(target_os = "macos")]
+    let menu = menu.item(&hide_from_dock).separator();
+
+    let menu = menu.item(&quit).build()?;
 
     let builder = TrayIconBuilder::with_id("agentsview")
         .tooltip("AgentsView")
@@ -2370,9 +2852,13 @@ fn setup_close_to_tray_with<T>(
 fn setup_window_lifecycle(app: &App) -> Result<(), DynError> {
     let window = main_window(app)?;
     let close_window = window.clone();
+    #[cfg(target_os = "macos")]
+    let dock_presence_handle = app.handle().clone();
     window.on_window_event(move |event| {
         if let tauri::WindowEvent::CloseRequested { api, .. } = event {
             hide_main_window_on_close(&close_window, || api.prevent_close());
+            #[cfg(target_os = "macos")]
+            sync_dock_presence(&dock_presence_handle, false);
         }
     });
     Ok(())
@@ -2641,6 +3127,46 @@ fn try_send_sidecar_log_record(
             );
         }
     }
+}
+
+fn queue_startup_log_record(
+    log_sender: &SyncSender<SidecarLogRecord>,
+    generation: u64,
+    message: &str,
+) {
+    try_send_sidecar_log_record(
+        log_sender,
+        SidecarLogRecord::new("startup", format!("launch {generation}: {message}")),
+    );
+}
+
+fn wait_for_selected_backend(
+    log_sender: &SyncSender<SidecarLogRecord>,
+    generation: u64,
+    source: &str,
+    port: u16,
+    timeout: Duration,
+) -> bool {
+    queue_startup_log_record(
+        log_sender,
+        generation,
+        format!("selected port {port} from {source}").as_str(),
+    );
+    let ready = wait_for_server(port, timeout);
+    if ready {
+        queue_startup_log_record(
+            log_sender,
+            generation,
+            format!("port {port} ready").as_str(),
+        );
+    } else {
+        queue_startup_log_record(
+            log_sender,
+            generation,
+            format!("port {port} did not respond within {timeout:?}").as_str(),
+        );
+    }
+    ready
 }
 
 #[cfg(test)]
@@ -3049,7 +3575,7 @@ fn stop_backend_inner(app: &AppHandle, wait_timeout: Option<Duration>) -> bool {
         } else {
             stop_detached_backend_for_update_with_port(app, deadline, detached_port)
         };
-        end_update_stop_wait(&state);
+        finish_update_stop_wait(&state, stopped);
         if let Some(generation) = waited_generation {
             restart_backend_after_stop_timeout_if_terminated(app, &state, generation);
         }
@@ -3289,6 +3815,73 @@ fn restart_backend_after_update(handle: AppHandle) {
     }
 }
 
+/// Records what the Rust-side probe last saw of the backend, so a restart the
+/// suspended web view could not notice can be recovered from.
+#[derive(Debug, Default)]
+struct BackendProbeState {
+    last: Option<(u16, bool)>,
+}
+
+impl BackendProbeState {
+    /// Records one probe result and reports whether the current page needs
+    /// to be reloaded.
+    ///
+    /// The window is reloaded when a reachable backend is not the one the
+    /// window was last known to be on: it answers on a different port, or it
+    /// answers again after having been unreachable. A backend that comes back
+    /// on the same port may be a different process, and the version endpoint
+    /// carries no per-process identity to tell them apart, so the
+    /// down-then-up transition is the signal. Recovery fires once per
+    /// transition, never on every probe, and never while the backend is down,
+    /// because there would be nothing to reload.
+    ///
+    /// The first observation never reloads: start-up has already pointed the
+    /// window at the backend.
+    fn observe(&mut self, port: u16, reachable: bool) -> bool {
+        let previous = self.last.replace((port, reachable));
+        if !reachable {
+            return false;
+        }
+        match previous {
+            None => false,
+            Some((last_port, last_reachable)) => !last_reachable || last_port != port,
+        }
+    }
+}
+
+/// Starts the Rust-side backend probe for the app's lifetime.
+///
+/// Recovery used to be wired to `WindowEvent::Focused(true)` alone, and the
+/// frontend's own health check is disabled in desktop mode on the grounds that
+/// Tauri owns recovery. With the window closed to the tray macOS suspends the
+/// web view, so neither path can fire: the backend can restart, or go away and
+/// come back, and the window stays on a dead page until the app is quit and
+/// started again. This probe runs on the side that keeps executing.
+fn spawn_backend_probe(window: WebviewWindow, handle: AppHandle) {
+    thread::spawn(move || {
+        loop {
+            if let Some(port) = current_backend_port(&handle) {
+                let reachable = backend_endpoint_ready(port);
+                let deep_link_state = handle.state::<DeepLinkState>();
+                if let Ok(mut dispatch) = deep_link_state.dispatch.lock() {
+                    // Recheck after HTTP: startup may have published a new port.
+                    // Hold dispatch through the asynchronous reload request so
+                    // a new deep link or startup redirect always follows it.
+                    if current_backend_port(&handle) == Some(port)
+                        && dispatch.observe_backend(port, reachable)
+                    {
+                        eprintln!("[agentsview] backend returned on port {port}, reloading window");
+                        if let Err(err) = window.reload() {
+                            eprintln!("[agentsview] backend recovery reload failed: {err}");
+                        }
+                    }
+                };
+            }
+            thread::sleep(BACKEND_PROBE_INTERVAL);
+        }
+    });
+}
+
 fn wait_for_server(port: u16, timeout: Duration) -> bool {
     let deadline = Instant::now() + timeout;
     while Instant::now() < deadline {
@@ -3318,7 +3911,9 @@ fn backend_endpoint_ready(port: u16) -> bool {
         Some(resp) => resp,
         None => return false,
     };
-    version_response_looks_valid(response.as_slice())
+    response.starts_with(b"HTTP/1.1 401 ")
+        || response.starts_with(b"HTTP/1.0 401 ")
+        || version_response_looks_valid(response.as_slice())
 }
 
 fn read_http_response(port: u16, request: &str) -> Option<Vec<u8>> {
@@ -3370,6 +3965,8 @@ mod tests {
     use serde_json::Value;
     use std::collections::{HashMap, VecDeque};
     use std::fs;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
     #[cfg(unix)]
     use std::os::unix::ffi::OsStrExt;
     #[cfg(unix)]
@@ -3964,25 +4561,95 @@ mod tests {
     }
 
     #[test]
-    fn forward_sidecar_logs_stdout_path_keeps_status_and_port_parsing() {
-        let source = include_str!("lib.rs");
-        let stdout_arm = source
-            .split("CommandEvent::Stdout(chunk_bytes) => {")
-            .nth(1)
-            .and_then(|segment| {
-                segment
-                    .split("CommandEvent::Stderr(line_bytes) => {")
-                    .next()
-            })
-            .expect("stdout arm");
+    fn wait_for_selected_backend_logs_readiness_timeout() {
+        let (log_sender, log_receiver) = sync_channel(DESKTOP_LOG_QUEUE_CAPACITY);
+        let listener = TcpListener::bind((HOST, 0)).expect("bind closed port");
+        let port = listener.local_addr().expect("local address").port();
+        drop(listener);
 
-        assert!(stdout_arm.contains("prepare_sidecar_stdout_update("));
-        assert!(stdout_arm.contains("stdout_update.status"));
-        assert!(stdout_arm.contains("stdout_update.port"));
-        assert!(stdout_arm.contains("window.__setStage(2)"));
-        assert!(source.contains(
-            "flush_pending_sidecar_log_record(&log_sender, \"stdout\", &mut stdout_log_buffer)"
+        assert!(!wait_for_selected_backend(
+            &log_sender,
+            1,
+            "serve status",
+            port,
+            Duration::from_millis(300),
         ));
+        let records: Vec<_> = log_receiver.try_iter().collect();
+        assert!(records.iter().any(|record| record.label == "startup"
+            && record.record == format!("launch 1: port {port} did not respond within 300ms")));
+    }
+
+    #[test]
+    fn wait_for_selected_backend_logs_stdout_decision_and_readiness() {
+        let (log_sender, log_receiver) = sync_channel(DESKTOP_LOG_QUEUE_CAPACITY);
+        let response = concat!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n",
+            r#"{"version":"1.0.0","commit":"abc","build_date":"2026-01-01T00:00:00Z","#,
+            r#""api_version":1,"data_version":50}"#,
+        );
+        let (port, server) = spawn_response_server(response.as_bytes());
+
+        assert!(wait_for_selected_backend(
+            &log_sender,
+            2,
+            "sidecar stdout",
+            port,
+            Duration::from_secs(5),
+        ));
+        server.join().expect("join server");
+
+        let selected = log_receiver.try_recv().expect("port decision");
+        assert_eq!(selected.label, "startup");
+        assert_eq!(
+            selected.record,
+            format!("launch 2: selected port {port} from sidecar stdout")
+        );
+        let ready = log_receiver.try_recv().expect("readiness record");
+        assert_eq!(ready.label, "startup");
+        assert_eq!(ready.record, format!("launch 2: port {port} ready"));
+    }
+
+    #[test]
+    fn read_backend_status_logs_daemon_identity() {
+        let (log_sender, log_receiver) = sync_channel(DESKTOP_LOG_QUEUE_CAPACITY);
+        let (sender, receiver) = tauri::async_runtime::channel(3);
+        let status = tauri::async_runtime::block_on(async {
+            sender
+                .send(CommandEvent::Stdout(
+                    b"agentsview running at http://127.0.0.1:8080\n  pid:     123\n".to_vec(),
+                ))
+                .await
+                .expect("send status");
+            sender
+                .send(CommandEvent::Stdout(
+                    b"  Authorization: Bearer test-token\n".to_vec(),
+                ))
+                .await
+                .expect("send status detail");
+            sender
+                .send(CommandEvent::Terminated(
+                    tauri_plugin_shell::process::TerminatedPayload {
+                        code: Some(0),
+                        signal: None,
+                    },
+                ))
+                .await
+                .expect("terminate status command");
+            read_backend_status(receiver, &log_sender, 3)
+                .await
+                .expect("status probe")
+        });
+
+        assert_eq!(status, BackendStatusProbe::Ready(8080));
+        let logged = log_receiver.try_recv().expect("daemon status record");
+        assert_eq!(logged.label, "startup");
+        assert_eq!(
+            logged.record,
+            concat!(
+                "launch 3: serve status: agentsview running at http://127.0.0.1:8080\n",
+                "  pid:     123\n  Authorization: Bearer <redacted>",
+            )
+        );
     }
 
     #[test]
@@ -4293,7 +4960,80 @@ agentsview running at http://127.0.0.1:18082
             desktop_menu_action(QUIT_FROM_STATUS_ITEM_MENU_ID),
             Some(DesktopMenuAction::Quit)
         );
+        #[cfg(target_os = "macos")]
+        assert_eq!(
+            desktop_menu_action(DOCK_MODE_MENU_ID),
+            Some(DesktopMenuAction::ToggleDockMode)
+        );
         assert_eq!(desktop_menu_action("unknown"), None);
+    }
+
+    #[test]
+    fn dock_mode_round_trips_through_json_settings() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join(DOCK_MODE_SETTINGS_FILE_NAME);
+
+        write_dock_mode(&path, DockMode::Hybrid).expect("write hybrid");
+        assert_eq!(read_dock_mode(&path), DockMode::Hybrid);
+
+        write_dock_mode(&path, DockMode::Dock).expect("write dock");
+        assert_eq!(read_dock_mode(&path), DockMode::Dock);
+    }
+
+    #[test]
+    fn write_dock_mode_preserves_other_settings_keys() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join(DOCK_MODE_SETTINGS_FILE_NAME);
+        fs::write(&path, r#"{"other":"value"}"#).expect("seed settings");
+
+        write_dock_mode(&path, DockMode::Hybrid).expect("write hybrid");
+
+        let content = fs::read_to_string(&path).expect("read settings");
+        let value: serde_json::Value = serde_json::from_str(&content).expect("valid json");
+        assert_eq!(value["dock_mode"], "hybrid");
+        assert_eq!(value["other"], "value");
+    }
+
+    #[test]
+    fn dock_mode_falls_back_to_dock_for_unreadable_settings() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let missing = dir.path().join("missing.json");
+        assert_eq!(read_dock_mode(&missing), DockMode::Dock);
+
+        let corrupt = dir.path().join("corrupt.json");
+        fs::write(&corrupt, "not json").expect("write corrupt settings");
+        assert_eq!(read_dock_mode(&corrupt), DockMode::Dock);
+
+        let other_key = dir.path().join("other.json");
+        fs::write(&other_key, r#"{"other":"hybrid"}"#).expect("write settings");
+        assert_eq!(read_dock_mode(&other_key), DockMode::Dock);
+    }
+
+    #[test]
+    fn dock_mode_from_checked_reflects_the_tray_mark() {
+        assert_eq!(DockMode::from_checked(true), DockMode::Hybrid);
+        assert_eq!(DockMode::from_checked(false), DockMode::Dock);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn hybrid_dock_presence_is_accessory_only_while_window_is_hidden() {
+        assert_eq!(
+            dock_presence_for(DockMode::Hybrid, false),
+            DockPresence::Accessory
+        );
+        assert_eq!(
+            dock_presence_for(DockMode::Hybrid, true),
+            DockPresence::Regular
+        );
+        assert_eq!(
+            dock_presence_for(DockMode::Dock, false),
+            DockPresence::Regular
+        );
+        assert_eq!(
+            dock_presence_for(DockMode::Dock, true),
+            DockPresence::Regular
+        );
     }
 
     #[cfg(any(target_os = "macos", target_os = "windows"))]
@@ -4477,6 +5217,75 @@ agentsview running at http://127.0.0.1:18082
         assert!(!take_restart_after_stop_timeout_if_current(&state, 1));
         assert!(take_restart_after_stop_timeout_if_current(&state, 2));
         assert!(!take_restart_after_stop_timeout_if_current(&state, 2));
+    }
+
+    #[test]
+    fn update_stop_retires_running_launch() {
+        let state = SidecarState::default();
+        state.next_generation.store(1, Ordering::SeqCst);
+        assert!(launch_is_current(&state, 1));
+
+        begin_update_stop_wait(&state);
+        assert!(!launch_is_current(&state, 1));
+        assert!(!launch_superseded(&state, 1));
+
+        finish_update_stop_wait(&state, true);
+        assert!(launch_superseded(&state, 1));
+
+        let replacement = state.next_generation.fetch_add(1, Ordering::SeqCst) + 1;
+        assert!(launch_is_current(&state, replacement));
+        assert!(launch_superseded(&state, 1));
+    }
+
+    #[test]
+    fn failed_update_stop_keeps_launch_current() {
+        let state = SidecarState::default();
+        state.next_generation.store(7, Ordering::SeqCst);
+        begin_update_stop_wait(&state);
+        finish_update_stop_wait(&state, false);
+        assert!(launch_is_current(&state, 7));
+        assert!(!launch_superseded(&state, 7));
+    }
+
+    #[test]
+    fn launch_survives_update_stop_waits_for_outcome() {
+        for (stopped, survives) in [(true, false), (false, true)] {
+            let state = Arc::new(SidecarState::default());
+            state.next_generation.store(1, Ordering::SeqCst);
+            begin_update_stop_wait(&state);
+            let (tx, rx) = std::sync::mpsc::channel();
+            let waiter = Arc::clone(&state);
+            thread::spawn(move || {
+                let _ = tx.send(with_current_launch(&waiter, 1, || ()).is_some());
+            });
+            assert!(rx.recv_timeout(Duration::from_millis(200)).is_err());
+            finish_update_stop_wait(&state, stopped);
+            assert_eq!(rx.recv_timeout(Duration::from_secs(5)), Ok(survives));
+        }
+    }
+
+    #[test]
+    fn launch_survives_update_stop_returns_at_once_without_stop() {
+        let state = SidecarState::default();
+        state.next_generation.store(3, Ordering::SeqCst);
+        assert_eq!(with_current_launch(&state, 3, || 7), Some(7));
+        assert_eq!(with_current_launch(&state, 2, || 7), None);
+    }
+
+    #[test]
+    fn update_stop_waits_for_launch_action() {
+        let state = Arc::new(SidecarState::default());
+        state.next_generation.store(1, Ordering::SeqCst);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let stopper = Arc::clone(&state);
+        with_current_launch(&state, 1, || {
+            thread::spawn(move || {
+                begin_update_stop_wait(&stopper);
+                let _ = tx.send(());
+            });
+            assert!(rx.recv_timeout(Duration::from_millis(200)).is_err());
+        });
+        assert!(rx.recv_timeout(Duration::from_secs(5)).is_ok());
     }
 
     #[test]
@@ -4726,6 +5535,126 @@ agentsview running at http://127.0.0.1:18082
 
         let wrong_status = b"HTTP/1.1 404 Not Found\r\n\r\n{}";
         assert!(!version_response_looks_valid(wrong_status));
+    }
+
+    #[test]
+    fn wait_for_server_accepts_auth_challenge() {
+        let response =
+            b"HTTP/1.1 401 Unauthorized\r\nContent-Length: 13\r\nConnection: close\r\n\r\nUnauthorized\n";
+        let (port, request) = spawn_response_server(response);
+        let ready = wait_for_server(port, Duration::from_secs(1));
+        let request = request.join().expect("response server should finish");
+
+        assert!(request.starts_with("GET /api/v1/version HTTP/1.1\r\n"));
+        assert!(request.contains(&format!("Host: {HOST}:{port}\r\n")));
+        assert!(!request.contains("Authorization:"));
+        assert!(ready);
+    }
+
+    #[test]
+    fn wait_for_server_stopped_rejects_auth_challenge() {
+        let response = b"HTTP/1.1 401 Unauthorized\r\nConnection: close\r\n\r\nUnauthorized\n";
+        let (port, request) = spawn_response_server(response);
+        let stopped = wait_for_server_stopped(port, Duration::ZERO);
+        request.join().expect("response server should finish");
+
+        assert!(!stopped);
+    }
+
+    #[test]
+    fn backend_endpoint_ready_preserves_status_boundaries() {
+        let cases: &[(&str, &[u8], bool)] = &[
+            (
+                "HTTP/1.0 401",
+                b"HTTP/1.0 401 Unauthorized\r\nConnection: close\r\n\r\nUnauthorized\n",
+                true,
+            ),
+            (
+                "HTTP/1.1 401",
+                b"HTTP/1.1 401 Unauthorized\r\nConnection: close\r\n\r\nUnauthorized\n",
+                true,
+            ),
+            (
+                "valid 200",
+                b"HTTP/1.1 200 OK\r\n\r\n{\"version\":\"1.0.0\",\"commit\":\"abc\",\"build_date\":\"2026-01-01T00:00:00Z\",\"api_version\":1,\"data_version\":50}",
+                true,
+            ),
+            ("unrelated HTML 200", b"HTTP/1.1 200 OK\r\n\r\n<html></html>", false),
+            ("403", b"HTTP/1.1 403 Forbidden\r\n\r\n", false),
+            ("503", b"HTTP/1.1 503 Service Unavailable\r\n\r\n", false),
+            ("HTTP/1.1 4010", b"HTTP/1.1 4010 Invalid\r\n\r\n", false),
+        ];
+
+        for &(name, response, expected) in cases {
+            let (port, request) = spawn_response_server(response);
+            let ready = backend_endpoint_ready(port);
+            request.join().expect("response server should finish");
+            assert_eq!(ready, expected, "{name}");
+        }
+
+        let (port, request) = spawn_response_server(b"");
+        let ready = backend_endpoint_ready(port);
+        request.join().expect("response server should finish");
+        assert!(!ready, "empty response");
+    }
+
+    fn spawn_response_server(response: &[u8]) -> (u16, std::thread::JoinHandle<String>) {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("bind response server");
+        listener
+            .set_nonblocking(true)
+            .expect("set response server nonblocking");
+        let port = listener
+            .local_addr()
+            .expect("get response server address")
+            .port();
+        let response = response.to_vec();
+        let handle = thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(2);
+            let mut stream = loop {
+                match listener.accept() {
+                    Ok((stream, _)) => break stream,
+                    Err(err)
+                        if err.kind() == io::ErrorKind::WouldBlock && Instant::now() < deadline =>
+                    {
+                        thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(err) => panic!("accept response request: {err}"),
+                }
+            };
+            stream
+                .set_nonblocking(false)
+                .expect("set response stream blocking");
+            stream
+                .set_read_timeout(Some(Duration::from_secs(1)))
+                .expect("set response read timeout");
+
+            let mut request = Vec::new();
+            let mut buf = [0; 1024];
+            loop {
+                match stream.read(&mut buf) {
+                    Ok(0) => break,
+                    Ok(size) => {
+                        request.extend_from_slice(&buf[..size]);
+                        if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                            break;
+                        }
+                    }
+                    Err(err)
+                        if err.kind() == io::ErrorKind::TimedOut
+                            || err.kind() == io::ErrorKind::WouldBlock =>
+                    {
+                        break;
+                    }
+                    Err(err) => panic!("read response request: {err}"),
+                }
+            }
+
+            if !response.is_empty() {
+                stream.write_all(&response).expect("write response");
+            }
+            String::from_utf8_lossy(&request).into_owned()
+        });
+        (port, handle)
     }
 
     #[test]
@@ -5322,5 +6251,113 @@ agentsview running at http://127.0.0.1:18082
             }
             other => panic!("expected NonZero{{code=42}}; got {other:?}"),
         }
+    }
+
+    // The desktop window's only recovery path was a window-focus event, and
+    // every other recovery path is JavaScript inside the web view. With no
+    // window on screen macOS stops executing that web view, so a backend that
+    // restarts leaves the window permanently stale. These tests pin the
+    // Rust-side probe that recovers it, because the Rust side is the part that
+    // keeps running.
+
+    #[test]
+    fn backend_probe_does_not_navigate_on_the_first_observation() {
+        let mut state = BackendProbeState::default();
+        assert!(
+            !state.observe(8080, true),
+            "start-up has already navigated; the first probe must not repeat it"
+        );
+        assert!(
+            !state.observe(8080, true),
+            "a backend that stays up must not be navigated again"
+        );
+    }
+
+    #[test]
+    fn backend_probe_navigates_when_the_backend_comes_back() {
+        let mut state = BackendProbeState::default();
+        assert!(!state.observe(8080, true));
+        assert!(
+            !state.observe(8080, false),
+            "there is nothing to navigate to while the backend is down"
+        );
+        assert!(
+            state.observe(8080, true),
+            "a backend that came back may be a new process, and a suspended \
+             web view cannot have noticed"
+        );
+        assert!(
+            !state.observe(8080, true),
+            "recovery happens once per outage, not on every later probe"
+        );
+    }
+
+    #[test]
+    fn backend_probe_navigates_when_the_port_changes() {
+        let mut state = BackendProbeState::default();
+        assert!(!state.observe(8080, true));
+        assert!(
+            state.observe(9090, true),
+            "a backend on a new port is a different backend"
+        );
+    }
+
+    #[test]
+    fn backend_probe_does_not_navigate_to_an_unreachable_backend() {
+        let mut state = BackendProbeState::default();
+        assert!(!state.observe(8080, true));
+        assert!(!state.observe(9090, false));
+        assert!(
+            state.observe(9090, true),
+            "the new port is navigated to once it answers"
+        );
+    }
+
+    #[test]
+    fn backend_probe_preserves_startup_deep_link() {
+        let mut dispatch = DeepLinkDispatch::Deferred(Some("/sessions/a".to_string()));
+        assert!(!dispatch.observe_backend(8080, false));
+        assert!(!dispatch.observe_backend(8080, true));
+        assert_eq!(dispatch.take_pending().as_deref(), Some("/sessions/a"));
+        assert!(!dispatch.observe_backend(8080, true));
+        assert_eq!(dispatch.finish_redirect(), None);
+        assert!(!dispatch.observe_backend(8080, true));
+    }
+
+    #[test]
+    fn backend_probe_does_not_repeat_completed_restart_redirect() {
+        for port in [8080, 9090] {
+            let mut dispatch = DeepLinkDispatch::Live(BackendProbeState::default());
+            assert!(!dispatch.observe_backend(8080, true));
+            assert!(!dispatch.observe_backend(8080, false));
+            dispatch.defer();
+            assert_eq!(
+                dispatch.route_for_navigation("/sessions/a".to_string(), Some(port)),
+                None
+            );
+            assert_eq!(dispatch.take_pending().as_deref(), Some("/sessions/a"));
+            assert_eq!(dispatch.finish_redirect(), None);
+            // The whole redirect can complete between scheduled probes.
+            assert!(!dispatch.observe_backend(port, true));
+
+            // A later outage still reloads the current page exactly once.
+            assert!(!dispatch.observe_backend(port, false));
+            assert!(dispatch.observe_backend(port, true));
+            assert!(!dispatch.observe_backend(port, true));
+        }
+    }
+
+    #[test]
+    fn backend_probe_recovers_live_deep_link_after_outage() {
+        let mut dispatch = DeepLinkDispatch::Live(BackendProbeState::default());
+        assert!(!dispatch.observe_backend(8080, true));
+        assert!(!dispatch.observe_backend(8080, false));
+        assert_eq!(
+            dispatch.route_for_navigation("/sessions/a".to_string(), Some(8080)),
+            Some((8080, "/sessions/a".to_string()))
+        );
+        // Opening a link does not establish readiness; the navigation can
+        // fail while the backend is down and still needs recovery afterward.
+        assert!(dispatch.observe_backend(8080, true));
     }
 }

@@ -20,13 +20,15 @@ func validRecallExtractConfig() RecallExtractConfig {
 		FailureBackoff:   "1h",
 		Servers: map[string]RecallExtractServerConfig{
 			"local": {
-				Endpoint: "http://127.0.0.1:30000/v1",
-				Timeout:  "120s",
+				Endpoint:    "http://127.0.0.1:30000/v1",
+				Timeout:     "120s",
+				Concurrency: 1,
 			},
 			"remote": {
-				Endpoint:  "http://build-box:30000/v1",
-				Timeout:   "300s",
-				AllowHTTP: true,
+				Endpoint:    "http://build-box:30000/v1",
+				Timeout:     "300s",
+				AllowHTTP:   true,
+				Concurrency: 1,
 			},
 		},
 	}
@@ -167,6 +169,24 @@ func TestRecallExtractConfigValidate(t *testing.T) {
 			wantErr: "timeout must be positive",
 		},
 		{
+			name: "zero server concurrency",
+			mutate: func(c *RecallExtractConfig) {
+				s := c.Servers["local"]
+				s.Concurrency = 0
+				c.Servers["local"] = s
+			},
+			wantErr: "concurrency must be greater than 0",
+		},
+		{
+			name: "negative server concurrency",
+			mutate: func(c *RecallExtractConfig) {
+				s := c.Servers["local"]
+				s.Concurrency = -2
+				c.Servers["local"] = s
+			},
+			wantErr: "concurrency must be greater than 0",
+		},
+		{
 			name:    "negative max_tokens",
 			mutate:  func(c *RecallExtractConfig) { c.MaxTokens = -1 },
 			wantErr: "max_tokens",
@@ -242,10 +262,10 @@ func TestRecallExtractConfigValidate(t *testing.T) {
 
 func TestRecallExtractServerConfigAPIKeyEnv(t *testing.T) {
 	var server RecallExtractServerConfig
-	assert.Equal(t, "", server.APIKey(), "no env var configured")
+	assert.Empty(t, server.APIKey(), "no env var configured")
 
 	server.APIKeyEnv = "AGENTSVIEW_TEST_RECALL_API_KEY"
-	assert.Equal(t, "", server.APIKey(), "configured env var not set in environment")
+	assert.Empty(t, server.APIKey(), "configured env var not set in environment")
 
 	t.Setenv("AGENTSVIEW_TEST_RECALL_API_KEY", "secret-123")
 	assert.Equal(t, "secret-123", server.APIKey())
@@ -380,7 +400,7 @@ func TestRecallExtractServerResolution(t *testing.T) {
 	require.Error(t, err, "ambiguous selection with two servers")
 
 	cfg.Servers = map[string]RecallExtractServerConfig{
-		"only": {Endpoint: "http://one/v1", Timeout: "120s"},
+		"only": {Endpoint: "http://one/v1", Timeout: "120s", Concurrency: 1},
 	}
 	name, _, err = cfg.ResolvedServer()
 	require.NoError(t, err)
@@ -416,9 +436,10 @@ func TestRecallExtractConfigTOMLLoad(t *testing.T) {
 						"endpoint": "http://127.0.0.1:30000/v1",
 					},
 					"slow": map[string]any{
-						"endpoint":   "http://build-box:30000/v1",
-						"timeout":    "600s",
-						"allow_http": true,
+						"endpoint":    "http://build-box:30000/v1",
+						"timeout":     "600s",
+						"allow_http":  true,
+						"concurrency": 4,
 					},
 				},
 				"prompts": map[string]any{
@@ -451,15 +472,37 @@ func TestRecallExtractConfigTOMLLoad(t *testing.T) {
 	assert.Equal(t, "120s", extract.Servers["local"].Timeout,
 		"unset timeout keeps default")
 	assert.Equal(t, "600s", extract.Servers["slow"].Timeout)
+	assert.Equal(t, 1, extract.Servers["local"].Concurrency,
+		"unset concurrency keeps the one-session-at-a-time default")
+	assert.Equal(t, 4, extract.Servers["slow"].Concurrency)
 	assert.True(t, extract.Servers["slow"].AllowHTTP,
 		"allow_http opts a non-loopback plaintext endpoint in")
 	assert.Equal(t, "qwen", extract.Prompts.Profile)
 	assert.Equal(t, "/etc/agentsview/prompts", extract.Prompts.Dir)
 	require.NotNil(t, extract.Request.Temperature)
-	assert.Equal(t, 0.2, *extract.Request.Temperature)
+	assert.InDelta(t, 0.2, *extract.Request.Temperature, 0)
 	kwargs, ok := extract.Request.ExtraBody["chat_template_kwargs"].(map[string]any)
 	require.True(t, ok, "extra_body nested tables decode as maps")
 	assert.Equal(t, false, kwargs["enable_thinking"])
+}
+
+func TestRecallExtractConfigTOMLLoadRejectsZeroConcurrency(t *testing.T) {
+	err := loadMinimalErrWithConfig(t, map[string]any{
+		"recall": map[string]any{
+			"extract": map[string]any{
+				"enabled": true,
+				"model":   "m",
+				"servers": map[string]any{
+					"local": map[string]any{
+						"endpoint":    "http://127.0.0.1:30000/v1",
+						"concurrency": 0,
+					},
+				},
+			},
+		},
+	})
+	require.Error(t, err, "an explicit zero must not fall back to the default")
+	assert.Contains(t, err.Error(), "concurrency must be greater than 0")
 }
 
 func TestRecallExtractConfigTOMLLoadInvalid(t *testing.T) {

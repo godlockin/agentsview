@@ -85,6 +85,7 @@ func forEachGooseSessionMeta(
 	if err != nil {
 		return err
 	}
+	observeSharedContainerScan(ctx)
 	rows, err := db.QueryContext(ctx, gooseSessionSelect(columns, "", true))
 	if err != nil {
 		return fmt.Errorf("listing goose sessions: %w", err)
@@ -234,7 +235,7 @@ func gooseSessionColumns(
 		return nil, err
 	}
 	if !hasMessages {
-		return nil, fmt.Errorf("unsupported goose sessions schema: missing messages table")
+		return nil, errors.New("unsupported goose sessions schema: missing messages table")
 	}
 	messageColumns, err := gooseTableColumns(ctx, db, "messages")
 	if err != nil {
@@ -905,6 +906,7 @@ func gooseSessionFingerprint(
 	if err != nil {
 		return "", false, fmt.Errorf("fingerprinting goose messages: %w", err)
 	}
+	defer messageRows.Close()
 	for messageRows.Next() {
 		var values [8]string
 		if err := messageRows.Scan(
@@ -945,6 +947,7 @@ func gooseSessionFingerprint(
 		if err != nil {
 			return "", false, fmt.Errorf("fingerprinting goose usage: %w", err)
 		}
+		defer usageRows.Close()
 		for usageRows.Next() {
 			values := make([]string, 12)
 			destinations := make([]any, len(values))

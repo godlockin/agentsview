@@ -6,14 +6,17 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 )
 
-var _ Provider = (*claudeProvider)(nil)
-var _ S3Provider = (*claudeProvider)(nil)
-var _ RawCaptureProvider = (*claudeProvider)(nil)
-var _ RawCaptureSourceProvider = (*claudeProvider)(nil)
-var _ StreamingRawCaptureSourceProvider = (*claudeProvider)(nil)
+var (
+	_ Provider                          = (*claudeProvider)(nil)
+	_ S3Provider                        = (*claudeProvider)(nil)
+	_ RawCaptureProvider                = (*claudeProvider)(nil)
+	_ RawCaptureSourceProvider          = (*claudeProvider)(nil)
+	_ StreamingRawCaptureSourceProvider = (*claudeProvider)(nil)
+)
 
 type claudeProviderFactory struct {
 	def AgentDef
@@ -206,6 +209,29 @@ func (p *claudeProvider) ComputeMultiFileStatHash(chatPath string) uint64 {
 	return fileStatTupleDigest(0xC1, chatPath)
 }
 
+func (p *claudeProvider) ParseSourceSize(ctx context.Context, source SourceRef) (int64, error) {
+	path, ok := p.sources.pathFromSource(source)
+	if !ok {
+		return 0, errors.New("claude source path unavailable")
+	}
+	paths, err := claudeSubagentSiblingTranscripts(path)
+	if err != nil {
+		return 0, err
+	}
+	var size int64
+	for _, input := range append(paths, path) {
+		if err := ctx.Err(); err != nil {
+			return 0, err
+		}
+		info, err := os.Stat(input)
+		if err != nil {
+			return 0, err
+		}
+		size += info.Size()
+	}
+	return size, nil
+}
+
 func (p *claudeProvider) Parse(
 	ctx context.Context,
 	req ParseRequest,
@@ -215,7 +241,7 @@ func (p *claudeProvider) Parse(
 	}
 	path, ok := p.sources.pathFromSource(req.Source)
 	if !ok {
-		return ParseOutcome{}, fmt.Errorf("claude source path unavailable")
+		return ParseOutcome{}, errors.New("claude source path unavailable")
 	}
 	machine := firstNonEmptyJSONLString(req.Machine, p.Config.Machine)
 	project := claudeProviderProject(ctx, req.Source.ProjectHint, path)
@@ -236,6 +262,7 @@ func (p *claudeProvider) Parse(
 		ctx:                         ctx,
 		siblingLineage:              claudeSourceIsProjectLevel(req.Source, path),
 		persistedOutputPathResolver: persistedOutputPathResolver,
+		aiTitleFallback:             true,
 	}
 	results, excludedIDs, err := claudeParseFile(path, project, machine, opts)
 	if err != nil {
@@ -246,9 +273,23 @@ func (p *claudeProvider) Parse(
 			results[i].Session.File.Hash = req.Fingerprint.Hash
 		}
 	}
+	// A sub-agent that ran again under a second parent session wrote a second
+	// transcript with the same name. Both are the same sub-agent session, so the
+	// later entries are appended here rather than colliding with the first
+	// file's session row and replacing it.
+	results, joined, err := p.joinClaudeSubagentContinuations(
+		ctx, path, project, machine, opts, results,
+	)
+	if err != nil {
+		return ParseOutcome{}, err
+	}
 	InferRelationshipTypes(results)
 	out := make([]ParseResultOutcome, 0, len(results))
 	for _, result := range results {
+		if _, _, subagent := claudeSubagentTranscriptRel(result.Session.File.Path); subagent &&
+			result.Session.ClaudeSubagentSources == nil {
+			result.Session.ClaudeSubagentSources = []string{result.Session.File.Path}
+		}
 		out = append(out, ParseResultOutcome{
 			Result:      result,
 			DataVersion: DataVersionCurrent,
@@ -258,6 +299,7 @@ func (p *claudeProvider) Parse(
 		Results:            out,
 		ExcludedSessionIDs: excludedIDs,
 		ResultSetComplete:  true,
+		ForceReplace:       joined,
 	}, nil
 }
 
@@ -300,7 +342,7 @@ func (p *claudeProvider) ParseIncremental(
 	path, ok := p.sources.pathFromSource(req.Source)
 	if !ok {
 		return IncrementalOutcome{}, IncrementalUnsupported,
-			fmt.Errorf("claude source path unavailable")
+			errors.New("claude source path unavailable")
 	}
 	if req.Offset > 0 && req.Fingerprint.Size < req.Offset {
 		return IncrementalOutcome{ForceReplace: true},
@@ -308,6 +350,20 @@ func (p *claudeProvider) ParseIncremental(
 	}
 	if req.Fingerprint.Size == req.Offset {
 		return IncrementalOutcome{}, IncrementalNoNewData, nil
+	}
+	siblings, err := claudeSubagentSiblingTranscripts(path)
+	if err != nil {
+		return IncrementalOutcome{}, IncrementalNeedsFullParse, err
+	}
+	if len(siblings) > 0 {
+		// This sub-agent session's messages end in a companion transcript under
+		// another parent, so an offset into this file is not the end of the
+		// session: appending its tail would interleave with entries that already
+		// carry later ordinals. The session rebuilds authoritatively. The check
+		// sits after the no-new-data arm so an unchanged transcript never pays
+		// for the companion lookup.
+		return IncrementalOutcome{ForceReplace: true},
+			IncrementalNeedsFullParse, nil
 	}
 	newMsgs, links, endedAt, consumed, err := claudeParseSessionFrom(
 		path,
@@ -322,6 +378,7 @@ func (p *claudeProvider) ParseIncremental(
 			},
 			storedLinearParse:         req.StoredClaudeLinearParse,
 			storedTailClaudeMessageID: req.StoredLastClaudeMessageID,
+			storedSessionName:         req.StoredSessionName,
 		},
 	)
 	if err != nil {
@@ -346,6 +403,9 @@ func (p *claudeProvider) ParseIncremental(
 			}, IncrementalApplied, nil
 		}
 		return IncrementalOutcome{}, IncrementalNoNewData, nil
+	}
+	if req.StoredUserMessageCount == 0 && req.StoredSessionKind == "" && req.StoredEntrypoint == "sdk-cli" && slices.ContainsFunc(newMsgs, isRealClaudeUserMessage) {
+		return IncrementalOutcome{ForceReplace: true}, IncrementalNeedsFullParse, nil
 	}
 	totalOut, peakCtx, hasTotalOut, hasPeakCtx := claudeProviderTokenTotals(newMsgs)
 	return IncrementalOutcome{
@@ -834,7 +894,7 @@ func claudeProviderProject(ctx context.Context, projectHint, path string) string
 }
 
 func errorsIsClaudeDAG(err error) bool {
-	return err == ErrDAGDetected
+	return errors.Is(err, ErrDAGDetected)
 }
 
 func claudeProviderUserMessageCount(msgs []ParsedMessage) int {

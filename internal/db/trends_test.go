@@ -1,7 +1,6 @@
 package db
 
 import (
-	"context"
 	"testing"
 	"time"
 
@@ -79,7 +78,7 @@ func TestCountTrendOccurrences(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			assert.Equal(t, tc.want, countTrendOccurrences(tc.text, term))
+			assert.Equal(t, tc.want, CountTrendOccurrences(tc.text, term))
 		})
 	}
 }
@@ -87,7 +86,7 @@ func TestCountTrendOccurrences(t *testing.T) {
 func TestCountTrendOccurrencesSilentEStem(t *testing.T) {
 	terms, err := ParseTrendTerms([]string{"slic"})
 	require.NoError(t, err, "ParseTrendTerms")
-	got := countTrendOccurrences(
+	got := CountTrendOccurrences(
 		"slice slices sliced slicing slicer sliced-up",
 		terms[0],
 	)
@@ -100,30 +99,61 @@ func TestCountTrendOccurrencesPhrases(t *testing.T) {
 		Variants: []string{"load bearing", "load-bearing"},
 		Matchers: []string{"load bearing", "load-bearing"},
 	}
-	got := countTrendOccurrences("Load bearing and load-bearing", term)
+	got := CountTrendOccurrences("Load bearing and load-bearing", term)
 	assert.Equal(t, 2, got)
 }
 
 func TestTrendBucketDate(t *testing.T) {
-	loc := time.UTC
+	// America/Asuncion skipped local midnight on 2023-10-01 for DST.
+	asuncion, err := time.LoadLocation("America/Asuncion")
+	require.NoError(t, err)
 	cases := []struct {
 		gran string
 		ts   string
+		loc  *time.Location
 		want string
 	}{
-		{"day", "2024-06-05T12:00:00Z", "2024-06-05"},
-		{"week", "2024-06-05T12:00:00Z", "2024-06-03"},
-		{"month", "2024-06-05T12:00:00Z", "2024-06-01"},
+		{"day", "2024-06-05T12:00:00Z", time.UTC, "2024-06-05"},
+		{"week", "2024-06-05T12:00:00Z", time.UTC, "2024-06-03"},
+		{"month", "2024-06-05T12:00:00Z", time.UTC, "2024-06-01"},
+		{"month", "2023-10-15T12:00:00Z", asuncion, "2023-10-01"},
+		{"week", "2023-10-03T12:00:00Z", asuncion, "2023-10-02"},
 	}
 	for _, tc := range cases {
-		parsed, _ := time.Parse(time.RFC3339, tc.ts)
-		assert.Equal(t, tc.want, trendBucketDate(parsed, loc, tc.gran), tc.gran)
+		parsed, err := time.Parse(time.RFC3339, tc.ts)
+		require.NoError(t, err)
+		assert.Equal(t, tc.want, TrendBucketDate(parsed, tc.loc, tc.gran),
+			"%s %s in %s", tc.gran, tc.ts, tc.loc)
 	}
+}
+
+func TestGetTrendsTermsSQLiteCountsMonthWithDSTMidnightGap(t *testing.T) {
+	d := testDB(t)
+	ts := "2023-10-15T12:00:00Z"
+	insertSession(t, d, "s1", "proj-a", func(s *Session) {
+		s.StartedAt = &ts
+		s.CreatedAt = ts
+		s.MessageCount = 1
+		s.UserMessageCount = 1
+	})
+	insertMessages(t, d, Message{
+		SessionID: "s1", Ordinal: 0, Role: "user", Content: "seam",
+		Timestamp: ts, ContentLength: 4,
+	})
+	terms, err := ParseTrendTerms([]string{"seam"})
+	require.NoError(t, err)
+	got, err := d.GetTrendsTerms(t.Context(), AnalyticsFilter{
+		From: "2023-10-01", To: "2023-10-31", Timezone: "America/Asuncion",
+	}, terms, "month")
+	require.NoError(t, err)
+	assert.Equal(t, 1, got.MessageCount)
+	require.Len(t, got.Series, 1)
+	assert.Equal(t, []TrendPoint{{Date: "2023-10-01", Count: 1}}, got.Series[0].Points)
 }
 
 func TestGetTrendsTermsSQLite(t *testing.T) {
 	d := testDB(t)
-	ctx := context.Background()
+	ctx := t.Context()
 	start := "2024-06-01T09:00:00Z"
 	insertSession(t, d, "s1", "proj-a", func(s *Session) {
 		s.StartedAt = &start
@@ -158,7 +188,7 @@ func TestGetTrendsTermsSQLite(t *testing.T) {
 
 func TestGetTrendsTermsSQLiteProjectFilter(t *testing.T) {
 	d := testDB(t)
-	ctx := context.Background()
+	ctx := t.Context()
 	start := "2024-06-01T09:00:00Z"
 	insertSession(t, d, "s1", "proj-a", func(s *Session) {
 		s.StartedAt = &start
@@ -188,7 +218,7 @@ func TestGetTrendsTermsSQLiteProjectFilter(t *testing.T) {
 
 func TestGetTrendsTermsSQLiteModelFilter(t *testing.T) {
 	d := testDB(t)
-	ctx := context.Background()
+	ctx := t.Context()
 	start := "2024-06-01T09:00:00Z"
 	insertSession(t, d, "s1", "proj-a", func(s *Session) {
 		s.StartedAt = &start
@@ -230,7 +260,7 @@ func TestGetTrendsTermsSQLiteModelFilterStaysOnMatchingMessages(
 	t *testing.T,
 ) {
 	d := testDB(t)
-	ctx := context.Background()
+	ctx := t.Context()
 	start := "2024-06-01T09:00:00Z"
 	insertSession(t, d, "s1", "proj-a", func(s *Session) {
 		s.StartedAt = &start
@@ -268,7 +298,7 @@ func TestGetTrendsTermsSQLiteModelFilterStaysOnMatchingMessages(
 
 func TestGetTrendsTermsSQLiteUsesMessageTimestampRange(t *testing.T) {
 	d := testDB(t)
-	ctx := context.Background()
+	ctx := t.Context()
 	start := "2024-05-01T09:00:00Z"
 	created := "2024-05-01T08:00:00Z"
 	insertSession(t, d, "s1", "proj-a", func(s *Session) {
@@ -292,7 +322,7 @@ func TestGetTrendsTermsSQLiteUsesMessageTimestampRange(t *testing.T) {
 
 func TestGetTrendsTermsSQLiteDoesNotFilterBySessionTimestamp(t *testing.T) {
 	d := testDB(t)
-	ctx := context.Background()
+	ctx := t.Context()
 	start := "not-a-time"
 	insertSession(t, d, "s1", "proj-a", func(s *Session) {
 		s.StartedAt = &start
@@ -314,7 +344,7 @@ func TestGetTrendsTermsSQLiteDoesNotFilterBySessionTimestamp(t *testing.T) {
 
 func TestGetTrendsTermsSQLiteAppliesDayAndHourToMessageTimestamp(t *testing.T) {
 	d := testDB(t)
-	ctx := context.Background()
+	ctx := t.Context()
 	start := "2024-06-04T08:00:00Z"
 	insertSession(t, d, "s1", "proj-a", func(s *Session) {
 		s.StartedAt = &start
@@ -343,7 +373,7 @@ func TestGetTrendsTermsSQLiteAppliesDayAndHourToMessageTimestamp(t *testing.T) {
 
 func TestGetTrendsTermsSQLiteTimestampFallback(t *testing.T) {
 	d := testDB(t)
-	ctx := context.Background()
+	ctx := t.Context()
 	start := "2024-06-05T09:00:00Z"
 	created := "2024-06-04T08:00:00Z"
 	insertSession(t, d, "s1", "proj-a", func(s *Session) {
@@ -367,7 +397,7 @@ func TestGetTrendsTermsSQLiteTimestampFallback(t *testing.T) {
 
 func TestGetTrendsTermsSQLiteExcludesLegacySystemPrefixes(t *testing.T) {
 	d := testDB(t)
-	ctx := context.Background()
+	ctx := t.Context()
 	start := "2024-06-01T09:00:00Z"
 	insertSession(t, d, "s1", "proj-a", func(s *Session) {
 		s.StartedAt = &start

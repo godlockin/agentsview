@@ -1,13 +1,26 @@
+import { createRequire } from "node:module";
 import { test, expect } from "@playwright/test";
 import { SessionsPage } from "./pages/sessions-page";
 import { clickNavTab } from "./helpers/nav";
+import {
+  createMockSessions,
+  handleSessionsRoute,
+  sessionsRoutePattern,
+} from "./helpers/mock-sessions";
 
-// Test-fixture assumptions: project-alpha has 2 sessions,
-// project-beta has 3, project-duration has 1 (the duration UX
-// showcase), project-edits has 1 (the recent-edits fixture), and the
-// project-reclassification fixture has 2, totalling 12 sessions.
-const TOTAL_SESSIONS = 12;
-const ALPHA_SESSIONS = 2;
+type RenderLintModule = {
+  renderLintSnippet: (scopeSelector: string, options?: Record<string, unknown>) => string;
+};
+
+const require = createRequire(import.meta.url);
+const renderLintPath = process.env.PR_RENDER_LINT_PATH;
+const renderLint = renderLintPath ? (require(renderLintPath) as RenderLintModule) : undefined;
+
+// Test-fixture assumptions: project-alpha has 3 sessions (including the
+// tool-sequences fixture), project-beta has 3, project-duration has 1,
+// project-edits has 1, and project-reclassification has 2, totalling 13.
+const TOTAL_SESSIONS = 13;
+const ALPHA_SESSIONS = 3;
 const BETA_SESSIONS = 3;
 const SLOW_SESSION_RESPONSE_MS = 5_500;
 
@@ -27,6 +40,46 @@ test("CI session startup tolerates a slow initial response", async ({ browserNam
 
   expect(delayedRequests).toBeGreaterThan(0);
   await expect(sp.sessionItems.first()).toBeVisible();
+});
+
+test("session previews hide a leading system-reminder envelope", async ({ page }) => {
+  const session = {
+    ...createMockSessions(1, "preview", () => "project-preview")[0]!,
+    first_message:
+      '<system-reminder data-role="user-context">ctx</system-reminder>\nrefactor the auth guard',
+  };
+  await page.route(
+    sessionsRoutePattern,
+    handleSessionsRoute([{ sessions: [session], project: null }]),
+  );
+  await page.route("**/api/v1/projects*", (route) =>
+    route.fulfill({ json: { projects: [{ name: "project-preview", session_count: 1 }] } }),
+  );
+
+  const sp = new SessionsPage(page);
+  for (const width of [1280, 768, 400]) {
+    await page.setViewportSize({ width, height: 900 });
+    await page.goto("/sessions");
+    if (width === 400) {
+      const drawer = page.locator("#session-sidebar");
+      if (!(await drawer.evaluate((sidebar) => sidebar.classList.contains("open")))) {
+        await page.locator("button.hamburger").click();
+      }
+      await expect(drawer).toHaveClass(/open/);
+    }
+    await expect(sp.sessionItems.first()).toBeVisible();
+    const name = sp.sessionItems.first().locator(".session-name");
+    await expect(name).toHaveText("refactor the auth guard");
+    await expect(name).toHaveAttribute("title", "refactor the auth guard");
+    if (renderLint) {
+      const violations = await page.evaluate(
+        (snippet) => (0, eval)(snippet),
+        renderLint.renderLintSnippet("#session-sidebar"),
+      );
+      console.log(`render-lint width=${width}px violations=${JSON.stringify(violations)}`);
+      expect(violations).toEqual([]);
+    }
+  }
 });
 
 test.describe("Session list", () => {

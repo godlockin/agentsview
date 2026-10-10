@@ -4,45 +4,23 @@ import { fileURLToPath } from "node:url";
 import { test, expect, type Locator, type Page } from "@playwright/test";
 
 const LOC = {
-  sessionItem: ".session-item",
-  sessionProject: ".session-project",
-  sessionCount: ".session-count",
   listScroll: ".message-list-scroll",
   row: ".virtual-row",
 } as const;
 
 const COLD_WEBKIT_TEST_TIMEOUT_MS = 30_000;
 
-const BETA_7 = {
-  project: "project-beta",
-  count: 3, // user_message_count shown in sidebar
-  displayRows: 6,
-};
+const MIXED_CONTENT_SESSION_ID = "test-session-mixed-content-7";
+const MIXED_CONTENT_DISPLAY_ROWS = 6;
 
 const TOOL_BLOCK_PATH =
   "/workspace/packages/agentsview/frontend/src/lib/components/content/ToolBlock.svelte";
 const TOOL_VIEWPORTS = [1280, 768] as const;
 const TOOL_THEMES = ["light", "dark"] as const;
 
-function getSessionItem(page: Page, project: string, count: number) {
-  return page
-    .locator(LOC.sessionItem)
-    .filter({
-      has: page.locator(`${LOC.sessionProject}:text-is("${project}")`),
-    })
-    .filter({
-      has: page.locator(`${LOC.sessionCount}:text-is("${count}")`),
-    });
-}
-
-async function selectSession(page: Page, project: string, count: number): Promise<string> {
-  const item = getSessionItem(page, project, count);
-  const sessionId = await item.getAttribute("data-session-id");
-  expect(sessionId).toBeTruthy();
-  await expect(item).toBeVisible();
-  await page.goto(`/sessions/${encodeURIComponent(sessionId!)}`);
-  await expect(item).toHaveClass(/active/);
-  return sessionId!;
+async function selectSession(page: Page): Promise<string> {
+  await page.goto(`/sessions/${MIXED_CONTENT_SESSION_ID}`);
+  return MIXED_CONTENT_SESSION_ID;
 }
 
 async function expectSessionLoaded(page: Page, sessionId: string, expectedRows?: number) {
@@ -61,15 +39,9 @@ async function expectSessionLoaded(page: Page, sessionId: string, expectedRows?:
 test.describe("Mixed content rendering", () => {
   test.describe.configure({ timeout: COLD_WEBKIT_TEST_TIMEOUT_MS });
 
-  test.beforeEach(async ({ page }) => {
-    await page.goto("/sessions");
-    await expect(page.locator(LOC.sessionItem).first()).toBeVisible({ timeout: 5_000 });
-  });
-
   test("tool group renders for consecutive tool-only messages", async ({ page }) => {
-    const { project, count, displayRows } = BETA_7;
-    const sid = await selectSession(page, project, count);
-    await expectSessionLoaded(page, sid, displayRows);
+    const sid = await selectSession(page);
+    await expectSessionLoaded(page, sid, MIXED_CONTENT_DISPLAY_ROWS);
 
     const toolGroup = page.locator(".tool-group");
     await expect(toolGroup).toBeVisible();
@@ -85,9 +57,8 @@ test.describe("Mixed content rendering", () => {
   });
 
   test("tool block expands on click and text is selectable", async ({ page }) => {
-    const { project, count, displayRows } = BETA_7;
-    const sid = await selectSession(page, project, count);
-    await expectSessionLoaded(page, sid, displayRows);
+    const sid = await selectSession(page);
+    await expectSessionLoaded(page, sid, MIXED_CONTENT_DISPLAY_ROWS);
 
     const toolBlock = page.locator(".tool-block").first();
     await expect(toolBlock).toBeVisible();
@@ -119,15 +90,13 @@ test.describe("Mixed content rendering", () => {
   });
 
   test("tool output raw/formatted selection preserves the current output", async ({ page }) => {
-    const { project, count, displayRows } = BETA_7;
     for (const theme of TOOL_THEMES) {
+      await page.goto(`/sessions/${MIXED_CONTENT_SESSION_ID}`);
       await page.evaluate((value) => localStorage.setItem("theme", value), theme);
       for (const width of TOOL_VIEWPORTS) {
         await page.setViewportSize({ width, height: 900 });
-        await page.reload();
-        await expect(page.locator(LOC.sessionItem).first()).toBeVisible({ timeout: 5_000 });
-        const sid = await selectSession(page, project, count);
-        await expectSessionLoaded(page, sid, displayRows);
+        const sid = await selectSession(page);
+        await expectSessionLoaded(page, sid, MIXED_CONTENT_DISPLAY_ROWS);
         const pathTool = page
           .locator(".tool-block")
           .filter({
@@ -159,9 +128,8 @@ test.describe("Mixed content rendering", () => {
   });
 
   test("text selection does not collapse tool block", async ({ page }) => {
-    const { project, count, displayRows } = BETA_7;
-    const sid = await selectSession(page, project, count);
-    await expectSessionLoaded(page, sid, displayRows);
+    const sid = await selectSession(page);
+    await expectSessionLoaded(page, sid, MIXED_CONTENT_DISPLAY_ROWS);
 
     // Expand the tool block first
     const toolBlock = page.locator(".tool-block").first();
@@ -192,9 +160,8 @@ test.describe("Mixed content rendering", () => {
   });
 
   test("thinking block is collapsed by default", async ({ page }) => {
-    const { project, count, displayRows } = BETA_7;
-    const sid = await selectSession(page, project, count);
-    await expectSessionLoaded(page, sid, displayRows);
+    const sid = await selectSession(page);
+    await expectSessionLoaded(page, sid, MIXED_CONTENT_DISPLAY_ROWS);
 
     const thinkingBlock = page.locator(".thinking-block").first();
     await expect(thinkingBlock).toBeVisible();
@@ -213,9 +180,8 @@ test.describe("Mixed content rendering", () => {
   });
 
   test("thinking+text message shows response text", async ({ page }) => {
-    const { project, count, displayRows } = BETA_7;
-    const sid = await selectSession(page, project, count);
-    await expectSessionLoaded(page, sid, displayRows);
+    const sid = await selectSession(page);
+    await expectSessionLoaded(page, sid, MIXED_CONTENT_DISPLAY_ROWS);
 
     // The response text after thinking should be visible
     await expect(
@@ -226,9 +192,8 @@ test.describe("Mixed content rendering", () => {
   });
 
   test("response text remains after toggling thinking off", async ({ page }) => {
-    const { project, count, displayRows } = BETA_7;
-    const sid = await selectSession(page, project, count);
-    await expectSessionLoaded(page, sid, displayRows);
+    const sid = await selectSession(page);
+    await expectSessionLoaded(page, sid, MIXED_CONTENT_DISPLAY_ROWS);
 
     // Open block filter dropdown and toggle thinking off
     await page.locator('button[aria-label="Filter block types"]').click();
@@ -248,9 +213,13 @@ test.describe("Mixed content rendering", () => {
 });
 
 test.describe("retained tool images", () => {
-  test.describe.configure({ timeout: 60_000 });
+  // Rendering the 1.4 MB fixture in raw and fallback modes is slow in Linux
+  // WebKit under CPU contention. Keep the full payload and all assertions.
+  test.describe.configure({ timeout: 120_000 });
 
-  test("renders retained, image-only, migrated, and fallback tool images", async ({ page }, testInfo) => {
+  test("renders retained, image-only, migrated, and fallback tool images", async ({
+    page,
+  }, testInfo) => {
     const fixturePath = fileURLToPath(
       new URL("../src/lib/utils/__fixtures__/retained-tool-image-1735.json", import.meta.url),
     );
@@ -267,7 +236,9 @@ test.describe("retained tool images", () => {
       { type: "agentsview_image", version: 1, text: "![second](asset://nested/second)" },
       { type: "text", text: "After" },
     ]);
-    const unsupportedResult = retainedResult.replace("image/png", "image/svg+xml");
+    const unsupportedResult = JSON.stringify([
+      { type: "input_image", image_url: smallPNG.replace("image/png", "image/svg+xml") },
+    ]);
     const sessionId = "retained-tool-image-1735";
     const now = "2026-09-11T12:00:00Z";
     const session = {
@@ -365,12 +336,15 @@ test.describe("retained tool images", () => {
       }
       await route.abort();
     });
-    await page.route("**/api/v1/assets/first", (route) =>
-      route.fulfill({ body: assetBytes, contentType: "image/png" }),
-    );
-    await page.route("**/api/v1/assets/nested/second", (route) =>
-      route.fulfill({ body: assetBytes, contentType: "image/png" }),
-    );
+    await page.addInitScript(() => {
+      localStorage.setItem("agentsview-auth-token", "test-asset-token");
+    });
+    for (const assetPath of ["first", "nested%2Fsecond"]) {
+      await page.route(`**/api/v1/assets/${assetPath}`, async (route) => {
+        expect(route.request().headers()["authorization"]).toBe("Bearer test-asset-token");
+        await route.fulfill({ body: assetBytes, contentType: "image/png" });
+      });
+    }
 
     await page.setViewportSize({ width: 1280, height: 900 });
     await page.goto(`/sessions/${sessionId}`);
@@ -412,7 +386,7 @@ test.describe("retained tool images", () => {
     await retainedBlock.locator(".output-header").click();
     const retainedRaw = retainedBlock.locator(".output-content");
     await expect(retainedRaw).toBeVisible();
-    expect(await retainedRaw.textContent()).toBe(retainedResult.replace(/\r\n/g, "\n"));
+    expect(await retainedRaw.textContent()).toBe(retainedResult);
     const retainedMode = retainedBlock.getByRole("radiogroup", { name: "Output format" });
     await retainedMode.getByRole("radio", { name: "Formatted" }).click();
     const retainedFormatted = retainedBlock.locator(".formatted-output");
@@ -421,11 +395,15 @@ test.describe("retained tool images", () => {
     const retainedImage = retainedFormatted.locator("img");
     await expect(retainedImage).toHaveCount(1);
     await expect(retainedImage).toHaveAttribute("src", retainedImageURL!);
-    await expect.poll(() => retainedImage.evaluate((img: HTMLImageElement) => ({
-      complete: img.complete,
-      naturalWidth: img.naturalWidth,
-      naturalHeight: img.naturalHeight,
-    }))).toEqual({ complete: true, naturalWidth: 600, naturalHeight: 600 });
+    await expect
+      .poll(() =>
+        retainedImage.evaluate((img: HTMLImageElement) => ({
+          complete: img.complete,
+          naturalWidth: img.naturalWidth,
+          naturalHeight: img.naturalHeight,
+        })),
+      )
+      .toEqual({ complete: true, naturalWidth: 600, naturalHeight: 600 });
     const retainedText = await retainedFormatted.textContent();
     expect(retainedText).not.toContain("input_image");
     expect(retainedText).not.toContain(retainedImageURL!);
@@ -447,7 +425,9 @@ test.describe("retained tool images", () => {
       expect(measurement.imageWidth).toBeLessThanOrEqual(measurement.clientWidth + 2);
       console.log(`retained layout width=${width}px ${JSON.stringify(measurement)}`);
       if (width === 1280) {
-        await retainedFormatted.screenshot({ path: testInfo.outputPath("agentsview-1735-after.png") });
+        await retainedFormatted.screenshot({
+          path: testInfo.outputPath("agentsview-1735-after.png"),
+        });
       } else {
         await retainedFormatted.screenshot({
           path: testInfo.outputPath(
@@ -458,41 +438,44 @@ test.describe("retained tool images", () => {
     }
 
     await retainedMode.getByRole("radio", { name: "Raw" }).click();
-    await expect(retainedBlock.locator(".output-content")).toHaveText(
-      retainedResult.replace(/\r\n/g, "\n"),
-    );
+    await expect(retainedRaw).toBeVisible();
+    expect(await retainedRaw.textContent()).toBe(retainedResult);
     await expect(retainedBlock.locator(".output-content img")).toHaveCount(0);
 
     const imageOnly = await openFormatted(imageOnlyBlock);
     const imageOnlyImage = imageOnly.formatted.locator("img");
     await expect(imageOnlyImage).toHaveCount(1);
     await expect(imageOnlyImage).toHaveAttribute("src", smallPNG);
-    await expect.poll(() => imageOnlyImage.evaluate((img: HTMLImageElement) => ({
-      complete: img.complete,
-      naturalWidth: img.naturalWidth,
-      naturalHeight: img.naturalHeight,
-    }))).toEqual({ complete: true, naturalWidth: 1, naturalHeight: 1 });
+    await expect
+      .poll(() =>
+        imageOnlyImage.evaluate((img: HTMLImageElement) => ({
+          complete: img.complete,
+          naturalWidth: img.naturalWidth,
+          naturalHeight: img.naturalHeight,
+        })),
+      )
+      .toEqual({ complete: true, naturalWidth: 1, naturalHeight: 1 });
     expect(await imageOnly.formatted.textContent()).not.toContain("input_image");
 
     const migrated = await openFormatted(migratedBlock);
     const migratedImages = migrated.formatted.locator("img");
     await expect(migratedImages).toHaveCount(2);
-    const migratedAssetBase = "/api/v1/assets";
-    await expect(migratedImages.nth(0)).toHaveAttribute("src", `${migratedAssetBase}/first`);
-    await expect(migratedImages.nth(1)).toHaveAttribute(
-      "src",
-      `${migratedAssetBase}/nested/second`,
-    );
-    await expect.poll(() => migratedImages.evaluateAll((images) =>
-      images.map((image) => ({
-        complete: (image as HTMLImageElement).complete,
-        naturalWidth: (image as HTMLImageElement).naturalWidth,
-        naturalHeight: (image as HTMLImageElement).naturalHeight,
-      })),
-    )).toEqual([
-      { complete: true, naturalWidth: 1, naturalHeight: 1 },
-      { complete: true, naturalWidth: 1, naturalHeight: 1 },
-    ]);
+    await expect(migratedImages.nth(0)).toHaveAttribute("src", /^blob:/);
+    await expect(migratedImages.nth(1)).toHaveAttribute("src", /^blob:/);
+    await expect
+      .poll(() =>
+        migratedImages.evaluateAll((images) =>
+          images.map((image) => ({
+            complete: (image as HTMLImageElement).complete,
+            naturalWidth: (image as HTMLImageElement).naturalWidth,
+            naturalHeight: (image as HTMLImageElement).naturalHeight,
+          })),
+        ),
+      )
+      .toEqual([
+        { complete: true, naturalWidth: 1, naturalHeight: 1 },
+        { complete: true, naturalWidth: 1, naturalHeight: 1 },
+      ]);
     expect(await migrated.formatted.textContent()).toContain("Before");
     expect(await migrated.formatted.textContent()).toContain("After");
     expect(await migrated.formatted.textContent()).not.toContain("asset://");

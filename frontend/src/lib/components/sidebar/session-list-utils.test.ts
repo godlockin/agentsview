@@ -1,6 +1,6 @@
 import { describe, it, expect } from "vite-plus/test";
 import type { Session } from "../../api/types.js";
-import type { SessionGroup } from "../../stores/sessions.svelte.js";
+import { buildSessionGroups, type SessionGroup } from "../../stores/sessions.svelte.js";
 import {
   ITEM_HEIGHT,
   HEADER_HEIGHT,
@@ -21,6 +21,19 @@ import type { DisplayItem } from "./session-list-utils.js";
 
 function makeSession(overrides: Partial<Session> = {}): Session {
   return {
+    compaction_count: 0,
+    consecutive_failure_max: 0,
+    edit_churn_count: 0,
+    ended_with_role: "",
+    final_failure_streak: 0,
+    has_peak_context_tokens: false,
+    has_total_output_tokens: false,
+    mid_task_compaction_count: 0,
+    outcome: "",
+    outcome_confidence: "",
+    secret_leak_count: 0,
+    tool_failure_signal_count: 0,
+    tool_retry_count: 0,
     id: overrides.id ?? crypto.randomUUID(),
     project: "test-project",
     machine: "localhost",
@@ -725,6 +738,39 @@ describe("starred-only session count", () => {
 // ---------------------------------------------------------------------------
 
 describe("child classification precedence", () => {
+  it.each([
+    ["subagent", "continuation", "subagent-group"],
+    ["subagent", "fork", "subagent-group"],
+    ["teammate", "continuation", "team-group"],
+    ["teammate", "fork", "team-group"],
+  ] as const)("keeps a shared %s %s under its ancestors' section", (kind, relation, section) => {
+    const roots = [makeSession({ id: "root-a" }), makeSession({ id: "root-b" })];
+    const parents = roots.map((root, i) =>
+      makeSession({
+        id: `parent-${i}`,
+        parent_session_id: root.id,
+        relationship_type: kind === "subagent" ? "subagent" : undefined,
+        first_message: kind === "teammate" ? "<teammate-message>hello</teammate-message>" : "hello",
+      }),
+    );
+    const child = makeSession({
+      id: "shared-child",
+      relationship_type: relation,
+      parent_session_ids: ["parent-0", "parent-1"],
+    });
+    const groups = buildSessionGroups([...roots, ...parents, child]);
+    const items = buildDisplayItems(groups, [], "none", new Set(), new Set(["root-a", "root-b"]));
+    expect(
+      items
+        .filter((item) => item.memberSessionIds?.includes("shared-child"))
+        .map((item) => [item.group?.key, item.type]),
+    ).toEqual([
+      ["root-a", section],
+      ["root-b", section],
+    ]);
+    expect(items.some((item) => item.session?.id === "shared-child")).toBe(false);
+  });
+
   it("subagent child of teammate is classified as subagent", () => {
     // root -> teammate -> subagent
     const root = makeSession({ id: "root", agent: "claude" });

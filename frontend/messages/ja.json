@@ -1,4 +1,33 @@
 {
+  "data_reclassify_session_preview_filtered_empty": "プレビューするセッションがありません。自動セッションは非表示です。含めるにはフィルターボタンを使用してください。",
+  "data_batch_saving_progress": [
+    {
+      "declarations": [
+        "input saved",
+        "input count",
+        "local savedNumber = saved: number",
+        "local countNumber = count: number"
+      ],
+      "match": { "*": "{countNumber} 件中 {savedNumber} 件を保存中…" }
+    }
+  ],
+  "data_candidate_worktree_prefix": "ワークツリープレフィックス",
+  "data_candidate_common_parent": "共通の親フォルダー",
+  "data_candidate_paths_sample": "記録されたパスの一部を表示しています。",
+  "data_candidate_observed_paths": [
+    {
+      "declarations": [
+        "input count",
+        "local countPlural = count: plural",
+        "local countNumber = count: number"
+      ],
+      "selectors": ["countPlural"],
+      "match": {
+        "countPlural=one": "記録されたフォルダー {countNumber} 件",
+        "countPlural=other": "記録されたフォルダー {countNumber} 件"
+      }
+    }
+  ],
   "app_auth_title": "認証が必要です",
   "app_auth_description": "このサーバーにアクセスするには認証トークンが必要です。 ~/.agentsview/config.toml または AGENTSVIEW_AUTH_TOKEN から auth_token を入力します。",
   "app_auth_placeholder": "認証トークンを貼り付けます",
@@ -149,7 +178,6 @@
   "command_palette_recent_sessions": "最近のセッション",
   "session_breadcrumb_back_to_sessions": "セッションに戻る",
   "session_breadcrumb_sessions": "セッション",
-  "session_breadcrumb_session_health": "セッション品質",
   "session_breadcrumb_resume_session_in_terminal": "ターミナルでセッションを再開する",
   "session_breadcrumb_session_actions": "セッションアクション",
   "session_breadcrumb_resume_session": "セッションを再開する",
@@ -258,6 +286,10 @@
   "message_content_copy_message": "メッセージをコピーする",
   "message_content_copied_message": "コピーされたメッセージ",
   "message_content_copied": "コピーしました！",
+  "message_content_code_collapsed_with_language": "コードブロック（折りたたみ済み） · {language} · 展開",
+  "message_content_code_collapsed": "コードブロック（折りたたみ済み） · 展開",
+  "message_content_code_expanded_with_language": "コードブロック（展開済み） · {language} · 折りたたむ",
+  "message_content_code_expanded": "コードブロック（展開済み） · 折りたたむ",
   "message_content_unpin_message": "メッセージの固定を解除する",
   "message_content_pin_message": "メッセージをピン留め",
   "message_content_unpinned": "未ピン留め",
@@ -308,7 +340,6 @@
       }
     }
   ],
-  "parallel_group_each_duration": "≤ 各 {duration}",
   "parallel_group_running": "走っています...",
   "subagent_inline_label": "サブエージェントセッション",
   "subagent_inline_message_count": [
@@ -324,6 +355,7 @@
   "subagent_inline_open_as_full_session": "フルセッションとして開く",
   "subagent_inline_open_session": "オープンセッション",
   "subagent_inline_failed_to_load": "読み込めませんでした",
+  "shared_failed_to_load": "読み込めませんでした",
   "subagent_inline_loading": "読み込み中...",
   "subagent_inline_no_messages": "メッセージはありません",
   "skill_block_label": "スキル: {name}",
@@ -421,6 +453,7 @@
   "sidebar_row_open_in_new_tab": "新しいタブで開く",
   "sidebar_row_delete": "消去",
   "sidebar_row_trash_source": "ソースファイルをゴミ箱へ",
+  "sidebar_row_change_project": "プロジェクトを変更…",
   "shared_all_projects": "すべてのプロジェクト",
   "shared_project_filter_placeholder": "プロジェクトをフィルタリング...",
   "shared_select_project": "プロジェクトの選択",
@@ -482,6 +515,35 @@
   "shared_refresh_minutes_ago": "{count} 分前に更新されました",
   "shared_refresh_hours_ago": "{count} 時間前に更新されました",
   "shared_refresh_days_ago": "{count}日前に更新されました",
+  "shared_refresh_duration_ms": "{value} ミリ秒",
+  "shared_refresh_duration_seconds": "{value} 秒",
+  "shared_refresh_duration_minutes": "{minutes} 分 {seconds} 秒",
+  "shared_refresh_age_with_duration": "{age}・{duration}",
+  "shared_refresh_in_progress": "更新中…",
+  "shared_refresh_step_summary": "概要",
+  "shared_refresh_step_activity": "アクティビティ",
+  "shared_refresh_step_heatmap": "ヒートマップ",
+  "shared_refresh_step_projects": "プロジェクト",
+  "shared_refresh_step_hour_of_week": "曜日別時間帯",
+  "shared_refresh_step_session_shape": "セッション形状",
+  "shared_refresh_step_velocity": "ベロシティ",
+  "shared_refresh_step_tools": "ツール",
+  "shared_refresh_step_skills": "スキル",
+  "shared_refresh_step_top_sessions": "トップセッション",
+  "shared_refresh_step_context_summary": "期間全体の概要",
+  "shared_refresh_step_signals": "シグナル",
+  "shared_refresh_step_comparison": "比較",
+  "shared_refresh_step_pairwise": "ペア比較",
+  "shared_refresh_step_report": "レポート",
+  "shared_refresh_step_sessions": "セッション",
+  "shared_refresh_step_usage": "使用量",
+  "shared_refresh_step_scan": "アクティビティスキャン",
+  "shared_refresh_step_finalize": "集計",
+  "shared_refresh_step_entries": "エントリ",
+  "shared_refresh_step_status": "抽出ステータス",
+  "shared_refresh_phase_wait": "サーバー",
+  "shared_refresh_phase_download": "転送",
+  "shared_refresh_phase_apply": "描画",
   "shared_relative_just_now": "ちょうど今",
   "shared_relative_minutes_ago": "{count}分前",
   "shared_relative_hours_ago": "{count}時間前",
@@ -590,7 +652,9 @@
   "analytics_total_count": "合計 {countLabel}",
   "analytics_projects_empty": "プロジェクトデータがありません",
   "analytics_activity_timeline_tooltip_value": "{label}: {value} {metric}",
-  "analytics_activity_timeline_tooltip_messages": "ユーザー: {user} / アシスタント: {assistant}",
+  "analytics_activity_timeline_tooltip_messages": "ユーザー: {user} / アシスタント: {assistant} / その他: {other}",
+  "analytics_activity_timeline_mode_absolute": "絶対値",
+  "analytics_activity_timeline_mode_percent": "パーセント",
   "analytics_metric_messages": "メッセージ",
   "analytics_metric_sessions": "セッション",
   "analytics_metric_output_tokens": "出力トークン",
@@ -725,7 +789,7 @@
   "usage_summary_copilot_ai_credits": "Copilot AI クレジット",
   "usage_summary_unsupported_copilot_no_token_data": "Copilot セッションはこの範囲に一致しましたが、Copilot はメッセージごとのトークンの使用状況を記録しません。",
   "usage_summary_unsupported_generic": "一致するセッションでは、トークンの使用状況データは公開されません。",
-  "usage_summary_input_tokens": "入力トークン",
+  "usage_summary_total_input": "総入力",
   "usage_summary_daily_burn": "1日あたりのコスト",
   "usage_summary_daily_burn_tokens": "1日あたりのトークン消費",
   "usage_summary_peak_day": "ピーク日",
@@ -757,6 +821,11 @@
   "usage_tokens_attribution_title": "トークンの帰属",
   "usage_attribution_treemap": "ツリーマップ",
   "usage_attribution_list": "リスト",
+  "usage_chart_style": "グラフの表示",
+  "usage_chart_style_smooth": "なめらか",
+  "usage_chart_style_lines": "折れ線",
+  "usage_chart_style_bars": "棒",
+  "usage_chart_day_label": "{date}：{value}",
   "usage_click_to_hide_hint": "クリックしてチャートから非表示にします",
   "usage_click_to_hide": "クリックして {label} を非表示にします",
   "usage_hide_from_chart": "グラフから {label} を非表示にする",
@@ -792,6 +861,8 @@
   "settings_search_keywords_remote_access": "リモートサーバー接続認証トークンネットワーク",
   "settings_loading": "設定を読み込んでいます...",
   "settings_save_error_label": "エラー",
+  "settings_load_failed": "設定を読み込めませんでした",
+  "settings_save_failed": "設定を保存できませんでした",
   "settings_date_ranges_title": "日付範囲",
   "settings_date_ranges_description": "セッション、使用状況、活動、トレンド、品質全体で日付の選択を共有します。",
   "settings_date_ranges_link": "ページ間で日付範囲をリンクする",
@@ -807,6 +878,8 @@
   "settings_language_korean": "한국어",
   "settings_language_french": "フランセ",
   "settings_language_japanese": "日本語",
+  "settings_language_azerbaijani": "Azərbaycanca",
+  "settings_language_spanish": "Español",
   "settings_language_no_results": "言語が見つかりません",
   "nav_recent_edits": "最近の編集",
   "nav_data": "データ",
@@ -814,7 +887,7 @@
   "data_projects_heading": "プロジェクト",
   "data_view_toggle_label": "データビュー",
   "data_view_inventory": "インベントリ",
-  "data_view_rules": "ルール",
+  "data_view_rules": "プロジェクトマッピングルール",
   "data_summary_projects": [
     {
       "declarations": [
@@ -843,6 +916,34 @@
       }
     }
   ],
+  "data_summary_machines": [
+    {
+      "declarations": [
+        "input count",
+        "local countPlural = count: plural",
+        "local countNumber = count: number"
+      ],
+      "selectors": ["countPlural"],
+      "match": {
+        "countPlural=one": "{countNumber} 台のマシン",
+        "countPlural=other": "{countNumber} 台のマシン"
+      }
+    }
+  ],
+  "data_summary_folder_suggestions": [
+    {
+      "declarations": [
+        "input count",
+        "local countPlural = count: plural",
+        "local countNumber = count: number"
+      ],
+      "selectors": ["countPlural"],
+      "match": {
+        "countPlural=one": "{countNumber} 件のフォルダー候補",
+        "countPlural=other": "{countNumber} 件のフォルダー候補"
+      }
+    }
+  ],
   "data_summary_governed": [
     {
       "declarations": [
@@ -857,6 +958,64 @@
       }
     }
   ],
+  "data_selection_hint": "プロジェクトをクリックし、Shift キーを押しながらクリックして範囲を選択します。",
+  "data_selection_count": [
+    {
+      "declarations": [
+        "input count",
+        "local countPlural = count: plural",
+        "local countNumber = count: number"
+      ],
+      "selectors": ["countPlural"],
+      "match": { "countPlural=other": "{countNumber} 件のプロジェクトを選択中" }
+    }
+  ],
+  "data_selection_clear": "クリア",
+  "data_batch_workspace_label": "プロジェクトの一括修正",
+  "data_batch_heading": [
+    {
+      "declarations": [
+        "input count",
+        "local countPlural = count: plural",
+        "local countNumber = count: number"
+      ],
+      "selectors": ["countPlural"],
+      "match": { "countPlural=other": "{countNumber} 件のプロジェクトを選択中" }
+    }
+  ],
+  "data_batch_label": "一括",
+  "data_batch_folders_heading": "選択したフォルダー",
+  "data_batch_folders_intro": "記録されたフォルダーをプロジェクト、マシンの順にまとめ、各マシン内ではセッション数の多いグループから表示します。",
+  "data_batch_outside_selection": "この修正は選択外のプロジェクトにも一致します。確認すると、一致するすべてのセッションに対するルールを保存します。",
+  "data_date_filter_scope": "日付でプロジェクト一覧、フォルダー候補、セッションプレビューを絞り込みます。フォルダーの修正は、この期間外のセッションにも適用されることがあります。",
+  "data_batch_correction_heading": "一括修正",
+  "data_batch_correction_intro": "一覧のすべてのフォルダーを、選択した移動先に割り当てます。",
+  "data_batch_folder_count": [
+    {
+      "declarations": [
+        "input count",
+        "local countPlural = count: plural",
+        "local countNumber = count: number"
+      ],
+      "selectors": ["countPlural"],
+      "match": { "countPlural=other": "{countNumber} 個のフォルダー" }
+    }
+  ],
+  "data_batch_target_project": "選択したフォルダーの割り当て先",
+  "data_batch_saving": "一括修正を保存しています…",
+  "data_batch_save": [
+    {
+      "declarations": [
+        "input count",
+        "local countPlural = count: plural",
+        "local countNumber = count: number"
+      ],
+      "selectors": ["countPlural"],
+      "match": { "countPlural=other": "{countNumber} 件の修正を保存" }
+    }
+  ],
+  "data_batch_partial_save": "{count} 件中 {saved} 件を保存しました。",
+  "data_batch_saved": "一括修正を {project} に保存しました",
   "data_filter_projects": "プロジェクトをフィルタリングする",
   "data_col_project": "プロジェクト",
   "data_col_sessions": "セッション",
@@ -891,8 +1050,15 @@
   "data_reclassify_candidates_failed": "セッションフォルダーが見つかりませんでした",
   "data_reclassify_no_candidates": "このプロジェクトのセッション フォルダーが見つかりませんでした。",
   "data_reclassify_choose_worktree": "フォルダーを選択してください",
-  "data_mapping_observed_folders": "監視フォルダー",
-  "data_mapping_definition": "マッピング",
+  "data_mapping_observed_folders": "フォルダー候補",
+  "data_reclassify_suggestions_intro": "このプロジェクトのセッションから提案されたパスです。",
+  "data_mapping_definition": "プロジェクトの修正",
+  "data_reclassify_use_for_project": "このプロジェクトに使用",
+  "data_reclassify_evidence_snapshot": "スナップショット",
+  "data_reclassify_evidence_aggregate": "集計",
+  "data_reclassify_evidence_exact_cwd": "正確な cwd",
+  "data_reclassify_evidence_unavailable": "使用可能な接頭辞なし",
+  "data_reclassify_evidence_suggestion": "候補",
   "data_reclassify_candidate_sessions": [
     {
       "declarations": [
@@ -908,7 +1074,7 @@
     }
   ],
   "data_reclassify_cwd_unavailable": "このフォルダーは使用できないか、ファイルシステムのルートを表すため、安全にマップできません。",
-  "data_reclassify_path_prefix": "フォルダーパス",
+  "data_reclassify_path_prefix": "パス接頭辞",
   "data_reclassify_target_project": "プロジェクト",
   "data_reclassify_use_custom_project": "プロジェクト「{query}」を使用します",
   "data_reclassify_path_unavailable": "パスが利用できません",
@@ -973,18 +1139,64 @@
       }
     }
   ],
+  "data_reclassify_session_preview_count": [
+    {
+      "declarations": [
+        "input count",
+        "local countPlural = count: plural",
+        "local countNumber = count: number"
+      ],
+      "selectors": ["countPlural"],
+      "match": {
+        "countPlural=one": "{countNumber} 件のセッションプレビュー",
+        "countPlural=other": "{countNumber} 件のセッションプレビュー"
+      }
+    }
+  ],
+  "data_reclassify_session_preview_position": "{count} 件中 {current} 件目",
+  "data_reclassify_session_preview_previous": "前のセッション",
+  "data_reclassify_session_preview_next": "次のセッション",
+  "data_reclassify_session_preview_loading": "セッションプレビューを読み込み中…",
+  "data_reclassify_session_preview_failed": "セッションプレビューを読み込めませんでした",
+  "data_reclassify_session_preview_no_message": "表示できるセッションメッセージがありません",
+  "data_reclassify_session_preview_current_project": "現在のプロジェクト",
+  "data_reclassify_session_preview_next_project": "修正後",
+  "data_reclassify_session_preview_folder": "セッションフォルダー",
+  "data_session_assignment_heading": "セッションのプロジェクト",
+  "data_session_assignment_intro": "このセッションだけを変更します。フォルダーとフォルダールールは変更されません。",
+  "data_session_assignment_target": "このセッションの移動先",
+  "data_session_assignment_save": "セッションを割り当て",
+  "data_session_assignment_saving": "割り当て中…",
+  "data_session_assignment_failed": "セッションを割り当てられませんでした",
+  "data_session_assignment_saved": "セッションを {project} に割り当てました",
+  "data_session_assignment_refresh_failed": "セッションは割り当てられましたが、プロジェクト一覧を更新できませんでした。",
+  "data_session_assignment_manual": "手動オーバーライド",
+  "data_session_assignment_automatic": "自動",
+  "data_session_assignment_use_automatic": "自動割り当てを使用",
+  "data_session_assignment_clearing": "復元中…",
+  "data_session_assignment_cleared": "セッションを {project} に復元しました",
+  "data_session_assignment_clear_failed": "自動プロジェクト割り当ての復元に失敗しました",
   "data_reclassify_zero_matches": "このプレフィックスは、アーカイブ内のどのセッションにも一致しません。",
   "data_reclassify_conflict": "プレビュー以降、マッピングが変更されました。影響範囲を更新しました。適用前に確認してください。",
-  "data_reclassify_apply": "マッピングを保存して適用する",
-  "data_reclassify_applying": "保存して適用…",
-  "data_reclassify_apply_failed": "マッピングの保存と適用に失敗しました",
+  "data_reclassify_replaces_rule": "この修正は既存のプロジェクトマッピングルールを置き換えます。",
+  "data_reclassify_review_impact": "影響を確認",
+  "data_reclassify_back": "戻る",
+  "data_reclassify_confirm_save": "確認して保存",
+  "data_reclassify_cancel": "キャンセル",
+  "data_reclassify_apply": "修正を保存",
+  "data_reclassify_applying": "修正を保存中…",
+  "data_reclassify_apply_failed": "修正を保存できませんでした",
+  "data_reclassify_saved": "{project} のプロジェクト修正を保存しました",
+  "data_flash_success_label": "成功",
   "data_reclassify_applied_refresh_failed": "マッピングは保存されましたが、プロジェクト インベントリを更新できませんでした。更新のみを再試行します。",
   "data_reclassify_retry_refresh": "リフレッシュを再試行する",
   "data_reclassify_refreshing": "更新中…",
-  "data_reclassify_read_only": "このストアは読み取り専用です。このマシンのセッションを取り込む書き込み可能なアーカイブから分類ルールを管理します。",
-  "data_reclassify_managed_in_rules": "ここで作成したマッピングは、ルール ビューで編集できます。",
-  "data_reclassify_open_rules": "ルールを開く",
+  "data_reclassify_read_only": "ここでは変更できません。ソース Agents View を開いてプロジェクトマッピングルールを管理してください。",
+  "data_reclassify_managed_in_rules": "この修正はプロジェクトマッピングルールとして保存されます。",
+  "data_reclassify_open_rules": "プロジェクトマッピングルールを開く",
   "data_workspace_all_projects": "すべてのプロジェクト",
+  "data_workspace_map_whole_project": "すべてのフォルダー",
+  "data_workspace_correct_one_folder": "1つのフォルダー",
   "data_workspace_close": "プロジェクトの詳細を閉じる",
   "data_workspace_activity": "活動",
   "data_workspace_activity_range": "{first} – {last}",
@@ -1060,6 +1272,13 @@
   "activity_peak_at": "{time} にピーク {count}",
   "activity_all_sessions_overlay": "全セッションのオーバーレイ",
   "activity_class_split": "対話 {int} / サブ {sub} / 自動 {auto}",
+  "activity_message_bucket_label": "{range}、{metric}：{count}。この時間帯のセッションを絞り込みます。",
+  "activity_timeline_metric": "タイムラインの指標",
+  "activity_user_messages": "ユーザーメッセージ",
+  "activity_assistant_messages": "アシスタントメッセージ",
+  "activity_messages_per_interval": "{interval}あたりのメッセージ数",
+  "activity_user_messages_help": "対話型セッションのプロンプト。自動実行、サブエージェント、システム項目、ツール結果は除外されます。",
+  "activity_assistant_messages_help": "選択したセッションのアシスタントメッセージ。システム項目とツール結果は除外されます。",
   "activity_concurrency": "同時実行性",
   "activity_overlay": "オーバーレイ",
   "activity_overlay_metric": "同時実行オーバーレイ メトリック",
@@ -1292,6 +1511,19 @@
   "recall_page_all_generations": "全世代",
   "recall_page_review_filter": "レビュー状態",
   "recall_page_all_review_states": "すべてのレビュー状態",
+  "recall_page_review_state_human_reviewed": "人による承認済み",
+  "recall_page_review_state_human_rejected": "人による却下済み",
+  "recall_page_review_state_unreviewed_auto": "未レビューの自動抽出",
+  "recall_page_review_state_calibrated_auto": "校正済みの自動抽出",
+  "recall_page_review_state_eval_raw": "評価用の未加工データ",
+  "recall_page_review_approve": "承認",
+  "recall_page_review_archive": "アーカイブ",
+  "recall_page_review_approve_disabled": "出典となる証拠が取り消されたため、承認できません。",
+  "recall_page_review_archive_title": "Recall エントリをアーカイブ",
+  "recall_page_review_archive_message": "「{title}」を却下してアーカイブしますか？このエントリは提供中の Recall コーパスから除外されたままになります。",
+  "recall_page_review_cancel": "キャンセル",
+  "recall_page_review_close": "アーカイブの確認を閉じる",
+  "recall_page_review_error": "この Recall エントリをレビューできませんでした: {error}",
   "recall_page_table_label": "エントリの呼び出し",
   "recall_page_fact_column": "事実",
   "recall_page_project_column": "プロジェクト",
@@ -1345,7 +1577,6 @@
   "recall_page_generation_retire_message": "{model} ({fingerprint}) を廃止しますか？ 自動エントリはアーカイブとして残ります。",
   "recall_page_generation_action_error": "抽出世代を更新できませんでした: {error}",
   "session_vitals_title": "分析",
-  "session_vitals_subtitle": "セッションのバイタルサイン",
   "session_vitals_close": "セッション分析を閉じる",
   "session_vitals_resize": "セッション分析パネルのサイズを変更する",
   "session_vitals_session": "セッション",
@@ -1363,9 +1594,15 @@
   "session_vitals_jump_to_call": "呼び出しに移動",
   "session_vitals_turns": "ターン",
   "session_vitals_subagents": "サブエージェント",
+  "session_vitals_activity": "ターンごとのアクティビティ",
+  "session_vitals_activity_tool": "ツール実行",
+  "session_vitals_activity_unattributed": "未分類",
+  "session_vitals_activity_turn": "ターン {ordinal} · {duration}",
+  "session_vitals_not_measured": "未計測",
+  "session_vitals_activity_hint": "フェーズの開始・終了を測定できない時間は未分類です。",
   "session_vitals_time_spent": "費やした時間",
   "session_vitals_clear_category_filter": "カテゴリフィルターをクリア",
-  "session_vitals_completed_turns_hint": "完了したターン · クリックしてハイライト表示",
+  "session_vitals_completed_turns_hint": "測定されたツール時間 · クリックしてハイライト表示",
   "session_vitals_timeline": "タイムライン",
   "session_vitals_click_marks_to_scroll": "マークをクリックしてスクロールします",
   "session_vitals_jump_to_turn": "{category} に {time} ターンにジャンプ",
@@ -1750,6 +1987,7 @@
   "pinned_expand": "展開する",
   "pinned_copy_message": "メッセージをコピーする",
   "pinned_copied_message": "コピーされたメッセージ",
+  "pinned_unresolved": "ピン留めしたメッセージはこの会話に存在しません。",
   "pinned_unpin": "ピン留めを外す",
   "settings_session_providers_title": "セッションプロバイダー",
   "settings_session_providers_description": "AgentsView が検出して同期するエージェント セッション ソースを選択します。",
@@ -1757,7 +1995,7 @@
   "settings_session_providers_enable_aria": "{provider} セッション同期を有効にする",
   "settings_session_providers_enabled": "有効",
   "settings_session_providers_disabled": "無効",
-  "settings_session_providers_restart_notice": "AgentsView デーモンと別のプッシュ監視プロセスを再起動して、これらの変更を適用します。",
+  "settings_session_providers_applied_notice": "AgentsView にこれらの変更を適用しました。別のプッシュ監視プロセスにも適用するには、そのプロセスを再起動してください。",
   "settings_session_providers_save_failed": "セッションプロバイダーを更新できませんでした。以前の選択はまだ有効です。",
   "settings_session_providers_homes_title": "代替ホームディレクトリ",
   "settings_session_providers_homes_hint": "カスタムの {envVar} などのエージェントホームディレクトリを追加します。AgentsView がセッションディレクトリを自動的に導出します。",
@@ -1932,6 +2170,7 @@
   "system_boundary_interrupted": "リクエストが中断されました",
   "system_boundary_task_notification": "タスク通知",
   "system_boundary_stop_hook": "フックフィードバックを停止する",
+  "system_boundary_peer_message": "別のセッションからのメッセージ",
   "system_boundary_title": "システム境界: {subtype}",
   "system_boundary_show_content": "コンテンツを表示",
   "trash_loading": "ゴミ箱を読み込み中...",
@@ -1959,6 +2198,7 @@
   "trends_per1k_messages": "1,000 メッセージあたり",
   "trends_count": "カウント",
   "trends_occurrences_per1k": "発生数 / 1,000 メッセージ",
+  "trends_no_occurrences_in_range": "この範囲に出現はありません",
   "trends_occurrences": "出現数",
   "trends_no_trend_data": "トレンドデータがありません",
   "trends_chart_aria_normalized": "メッセージ 1,000 件あたりの用語の出現傾向",
@@ -2019,7 +2259,6 @@
   "usage_pairwise_total_tokens": "総トークン数",
   "usage_pairwise_tokens_per_session": "トークン/セッション",
   "usage_copilot_credits": "Copilot AI クレジット",
-  "usage_input_tokens": "入力トークン",
   "usage_cached_suffix": "+{tokens} 個がキャッシュされました",
   "usage_output_tokens": "出力トークン",
   "usage_daily_burn": "1日あたりの消費",
@@ -2049,8 +2288,9 @@
   "activity_loading_sessions": "セッションを読み込み中…",
   "activity_loading_usage": "使用状況を読み込み中…",
   "activity_finalizing_report": "レポートを仕上げています…",
-  "activity_next_sessions_page": "次のセッション",
   "activity_sessions_load_failed": "活動セッションのロードに失敗しました",
+  "activity_report_load_failed": "アクティビティレポートを読み込めませんでした",
+  "session_activity_load_failed": "アクティビティを読み込めませんでした",
   "appearance_high_contrast": "ハイコントラスト",
   "appearance_on": "オン",
   "appearance_off": "オフ",
@@ -2061,7 +2301,8 @@
   "settings_tool_result_images": "ツール結果の画像",
   "settings_tool_result_images_keep": "保持",
   "settings_tool_result_images_drop": "破棄",
-  "settings_tool_result_images_hint": "保存済みの結果は書き込み時のポリシーを保ち、保持に戻しても削除済みのデータは復元できません。既存の行は agentsview db strip --images で処理してください。",
+  "settings_tool_result_images_offload": "外部保存",
+  "settings_tool_result_images_hint": "保存済みの結果は書き込み時のポリシーを保ち、保持に戻しても削除済みのデータは復元できません。既存の行は agentsview db migrate --images で処理してください。",
   "settings_tool_result_images_restart_notice": "この変更を新しく取り込むセッションに適用するには、AgentsView デーモンを再起動してください。",
   "settings_tool_images_title": "ツール結果の画像",
   "settings_tool_images_description": "ツール結果内に保存されたインライン画像。",
@@ -2126,5 +2367,87 @@
     }
   ],
   "settings_image_cleanup_compact_note": "ペイロードの削除は保存済み行を書き換えます。agentsview db compact を実行するまでアーカイブファイルのサイズは変わりません。",
-  "appearance_render_unknown_xml_blocks": "不明なXMLブロックを整形済みテキストとして表示"
+  "appearance_render_unknown_xml_blocks": "不明なXMLブロックを整形済みテキストとして表示",
+  "go_to_session_title": "セッションへ移動",
+  "go_to_session_input_label": "セッションIDまたはUUID",
+  "go_to_session_placeholder": "セッションIDまたはUUIDを貼り付け",
+  "go_to_session_submit": "セッションを開く",
+  "go_to_session_close": "セッションへの移動を閉じる",
+  "go_to_session_empty": "セッションIDまたはUUIDを入力してください。",
+  "go_to_session_invalid": "セッションIDまたはUUIDを入力してください。",
+  "go_to_session_not_found": "一致するセッションIDまたはUUIDがありません。",
+  "go_to_session_ambiguous": "複数のセッションIDまたはUUIDが一致します。既存のリンクから目的のセッションを開いてください。",
+  "go_to_session_capped": "一致するセッションIDまたはUUIDが多すぎます。既存のリンクから目的のセッションを開いてください。",
+  "go_to_session_failed": "セッションを検索できませんでした。もう一度お試しください。",
+  "shortcuts_go_to_session": "検索を閉じてセッションへ移動",
+  "analytics_outcome_title": "成果",
+  "analytics_outcome_repositories": "リポジトリ",
+  "analytics_outcome_commits": "コミット",
+  "analytics_outcome_loc_added": "追加行数",
+  "analytics_outcome_loc_removed": "削除行数",
+  "analytics_outcome_files_changed": "変更ファイル数",
+  "analytics_outcome_prs_opened": "作成されたプルリクエスト",
+  "analytics_outcome_prs_merged": "マージされたプルリクエスト",
+  "analytics_outcome_include_prs": "プルリクエストを含める",
+  "analytics_outcome_include_prs_hint": "リポジトリごとに GitHub へ問い合わせるため、数分かかることがあります。",
+  "analytics_outcome_backend_unavailable": "このバックエンドでは成果の合計を利用できません。",
+  "analytics_outcome_configure_github": "プルリクエストの合計を読み込むには、設定で GitHub を構成してください。",
+  "analytics_outcome_loading": "git 履歴を読み込み中...",
+  "analytics_outcome_empty": "この期間に git の活動はありません。",
+  "analytics_outcome_filters_unsupported": "成果の合計を表示するには、マシン、モデル、終了状態、最小メッセージ数、最近のアクティビティ、時間帯のフィルターを解除してください。",
+  "analytics_outcome_partial": "未集計:",
+  "analytics_outcome_partial_entry": "{repo} ({op}): {reason}",
+  "session_breadcrumb_session_health_and_tool_sequences": "セッションの状態とツールシーケンス",
+  "tool_sequences_title": "観測されたツールシーケンス",
+  "tool_sequences_loading": "ツールシーケンスを読み込み中…",
+  "tool_sequences_error": "ツールシーケンスを読み込めませんでした。",
+  "tool_sequences_unavailable": "このアーカイブはトランスクリプトのバージョンを記録しないため、ツールシーケンスは利用できません。",
+  "tool_sequences_none_recorded": "このセッションにはツール呼び出しが記録されていません。",
+  "tool_sequences_no_sequences": "エラーまたは空の結果を返したツール呼び出しはありません。",
+  "tool_sequences_sequence_count": [{"declarations":["input count","input countLabel","local countPlural = count: plural"],"selectors":["countPlural"],"match":{"countPlural=one":"{countLabel} 件のシーケンス","countPlural=other":"{countLabel} 件のシーケンス"}}],
+  "tool_sequences_ending_recovered": "回復",
+  "tool_sequences_ending_abandoned": "終了",
+  "tool_sequences_ending_open": "未完了",
+  "tool_sequences_ending_unknown": "不明",
+  "tool_sequences_recovered_explanation": "後続の呼び出しが内容を返しました。",
+  "tool_sequences_abandoned_explanation": "エラーまたは空の結果の後にセッションが終了しました。",
+  "tool_sequences_open_explanation": "トレースはシーケンスが完了する前に終わっています。",
+  "tool_sequences_unknown_explanation": "記録からは、このシーケンスがどう終わったか分かりません。",
+  "tool_sequences_outcome_errored": "エラー",
+  "tool_sequences_outcome_empty": "空",
+  "tool_sequences_outcome_content": "内容あり",
+  "tool_sequences_outcome_unknown": "不明",
+  "tool_sequences_repeat_identical": "同じ入力",
+  "tool_sequences_repeat_near_identical": "同じ入力（形式違い）",
+  "tool_sequences_tool_changed": "ツール切り替え",
+  "tool_sequences_missing_identity": "ツール呼び出し ID なし",
+  "tool_sequences_input": "入力",
+  "tool_sequences_no_input": "入力は記録されていません。",
+  "tool_sequences_byte_count": [{"declarations":["input count","input countLabel","local countPlural = count: plural"],"selectors":["countPlural"],"match":{"countPlural=one":"{countLabel} バイト","countPlural=other":"{countLabel} バイト"}}],
+  "tool_sequences_result": "結果",
+  "tool_sequences_result_unknown": "この結果はテキストではないため、結果は不明です。",
+  "tool_sequences_result_unavailable": [{"declarations":["input count","input countLabel","local countPlural = count: plural"],"selectors":["countPlural"],"match":{"countPlural=one":"保持された {countLabel} バイトの結果テキストはここでは利用できません。","countPlural=other":"保持された {countLabel} バイトの結果テキストはここでは利用できません。"}}],
+  "tool_sequences_result_empty": "ツールは何も返しませんでした。",
+  "tool_sequences_result_size_unknown": "結果サイズ不明。",
+  "tool_sequences_not_measured": "未測定",
+  "tool_sequences_duration": "所要時間",
+  "tool_sequences_repeat_near_identical_title": "JSON 形式が異なる同じ入力",
+  "tool_sequences_flag_identical": "同じ入力の繰り返し",
+  "tool_sequences_flag_near_identical": "形式違いの繰り返し",
+  "tool_sequences_flag_tool_switch": "ツール切り替え",
+  "tool_sequences_sequence_calls": [{"declarations":["input count","input countLabel","local countPlural = count: plural"],"selectors":["countPlural"],"match":{"countPlural=one":"シーケンス内の呼び出し {countLabel} 回","countPlural=other":"シーケンス内の呼び出し {countLabel} 回"}}],
+  "tool_sequences_session_calls": [{"declarations":["input count","input countLabel","local countPlural = count: plural"],"selectors":["countPlural"],"match":{"countPlural=one":"セッション内のツール呼び出し {countLabel} 回","countPlural=other":"セッション内のツール呼び出し {countLabel} 回"}}],
+  "tool_sequences_legend": "結果の色",
+  "tool_sequences_message": "メッセージ {ordinal}",
+  "tool_sequences_messages_range": "メッセージ {first}–{last}",
+  "tool_sequences_jump_label": "メッセージ {ordinal}: トランスクリプトで {tool} の呼び出しを開く",
+  "tool_sequences_more_calls": [{"declarations":["input count","input countLabel","local countPlural = count: plural"],"selectors":["countPlural"],"match":{"countPlural=one":"+{countLabel} 件","countPlural=other":"+{countLabel} 件"}}],
+  "tool_sequences_calls_hidden_between": [{"declarations":["input count","input countLabel","input from","input to","local countPlural = count: plural"],"selectors":["countPlural"],"match":{"countPlural=one":"メッセージ {from} と {to} の間の呼び出し {countLabel} 回は表示されていません。","countPlural=other":"メッセージ {from} と {to} の間の呼び出し {countLabel} 回は表示されていません。"}}],
+  "tool_sequences_calls_in_row": [{"declarations":["input count","input countLabel","local countPlural = count: plural"],"selectors":["countPlural"],"match":{"countPlural=one":"{countLabel} 回連続の呼び出し。","countPlural=other":"{countLabel} 回連続の呼び出し。"}}],
+  "tool_sequences_showing_sequences": [{"declarations":["input count","input countLabel","input shownLabel","local countPlural = count: plural"],"selectors":["countPlural"],"match":{"countPlural=one":"{countLabel} 件中 {shownLabel} 件のシーケンスを表示しています。残りはセッションの後半にあります。","countPlural=other":"{countLabel} 件中 {shownLabel} 件のシーケンスを表示しています。残りはセッションの後半にあります。"}}],
+  "tool_sequences_calls_not_shown": [{"declarations":["input count","input countLabel","local countPlural = count: plural"],"selectors":["countPlural"],"match":{"countPlural=one":"この表示ではシーケンス内の呼び出し {countLabel} 回が表示されていません。","countPlural=other":"この表示ではシーケンス内の呼び出し {countLabel} 回が表示されていません。"}}],
+  "tool_sequences_preview_shows": [{"declarations":["input count","input countLabel","input shownLabel","local countPlural = count: plural"],"selectors":["countPlural"],"match":{"countPlural=one":"プレビューは {countLabel} バイト中 {shownLabel} バイトを表示しています。","countPlural=other":"プレビューは {countLabel} バイト中 {shownLabel} バイトを表示しています。"}}],
+  "tool_sequences_full_input_in_message": "完全な入力はメッセージ {ordinal} にあります。",
+  "tool_sequences_full_result_in_message": "完全な結果はメッセージ {ordinal} にあります。",
+  "tool_sequences_retry": "再試行"
 }

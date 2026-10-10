@@ -4,6 +4,7 @@ package parser
 
 import (
 	"encoding/binary"
+	"errors"
 	"os"
 )
 
@@ -85,6 +86,63 @@ const (
 
 var sqliteHeaderMagic = []byte("SQLite format 3\x00")
 
+// A SQLite WAL begins with a 32-byte header. Only bytes beyond the header
+// can contain transaction frames; read-only clients can create an empty WAL.
+const sqliteWALHeaderSize = int64(32)
+
+// sqliteDBJournalSuffixes is the sibling-file suffix list for
+// sqliteDBCompositeMtime: the database file itself plus its WAL. The "-shm"
+// index is left out on purpose. Every committed write lands in the main file
+// or the WAL, while readers, including this process's own scan connections,
+// rewrite the shared-memory file, so folding its mtime in would make every
+// scan report the container as changed and schedule the next scan.
+var sqliteDBJournalSuffixes = []string{"", "-wal"}
+
+// sqliteDBCompositeMtime returns the freshest mtime across a SQLite database
+// file and the listed sibling suffixes (e.g. "-wal", "-shm").
+func sqliteDBCompositeMtime(dbPath string, suffixes []string) (int64, error) {
+	var maxMtime int64
+	for _, suffix := range suffixes {
+		info, err := os.Stat(dbPath + suffix)
+		if err != nil {
+			continue
+		}
+		if suffix == "-wal" && !sqliteWALInfoHasFrames(info) {
+			// Read-only connections create and delete an empty WAL on
+			// open and close; its mtime says nothing about content.
+			continue
+		}
+		if mtime := info.ModTime().UnixNano(); mtime > maxMtime {
+			maxMtime = mtime
+		}
+	}
+	if maxMtime == 0 {
+		return 0, &os.PathError{Op: "stat", Path: dbPath, Err: os.ErrNotExist}
+	}
+	return maxMtime, nil
+}
+
+// sqliteWALInfoHasFrames reports whether a WAL sibling can hold committed
+// transaction frames. A WAL at or under header size is equivalent to an
+// absent one: read-only SQLite clients, including this process's own scan
+// connections, create an empty WAL when they open a WAL-mode database and
+// remove it again on close, so its presence, size, and mtime must not count
+// as a content change.
+func sqliteWALInfoHasFrames(info os.FileInfo) bool {
+	return info.Mode().IsRegular() && info.Size() > sqliteWALHeaderSize
+}
+
+// sqliteWALHasFrames is sqliteWALInfoHasFrames for a path. Only a WAL that
+// is confirmed missing (typically already deleted) holds no frames; any other
+// stat error fails open so a real update still syncs, at worst once more.
+func sqliteWALHasFrames(path string) bool {
+	info, err := os.Stat(path)
+	if err != nil {
+		return !errors.Is(err, os.ErrNotExist)
+	}
+	return sqliteWALInfoHasFrames(info)
+}
+
 // StatSQLiteContainerState captures the current change-detection state of a
 // shared SQLite container. ok is false when the container is missing or its
 // headers cannot be read, in which case the container must never be treated
@@ -113,8 +171,7 @@ func StatSQLiteContainerState(dbPath string) (SQLiteContainerState, bool) {
 		}
 		return SQLiteContainerState{}, false
 	}
-	if !walInfo.Mode().IsRegular() ||
-		walInfo.Size() <= sqliteWALHeaderSize {
+	if !sqliteWALInfoHasFrames(walInfo) {
 		// A WAL at or under header size carries no transaction frames, so
 		// it is equivalent to an absent WAL: read-only SQLite clients can
 		// leave an empty WAL behind without implying any content change.

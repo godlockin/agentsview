@@ -3,7 +3,6 @@
   import { m } from "../../i18n/index.js";
   import { InsightsService, type DbInsight } from "../../api/generated/index";
   import {
-    callGenerated,
     isAbortError,
   } from "../../api/runtime.js";
   import {
@@ -14,9 +13,11 @@
   import { insights } from "../../stores/insights.svelte.js";
   import { router } from "../../stores/router.svelte.js";
   import { ui } from "../../stores/ui.svelte.js";
-  import { renderMarkdown } from "../../utils/markdown.js";
+  import { loadAssetImages, renderMarkdown } from "../../utils/markdown.js";
   import { highlightCodeFences } from "../../utils/highlight-fences.js";
   import type { AgentName } from "../../api/types.js";
+  import { AGENT_NAMES } from "../../api/types/insights.js";
+  import { agentLabel } from "../../utils/agents.js";
   import { LightbulbIcon, PlusIcon } from "../../icons.js";
   import { LatestRead } from "../../utils/latest-read.js";
 
@@ -73,13 +74,11 @@
         ? m.activity_insight_waiting_server()
         : m.activity_insight_generate_insight(),
   );
-  const agentOptions: TypeaheadOption[] = [
-    { name: "claude", label: "Claude", displayLabel: "Claude" },
-    { name: "codex", label: "Codex", displayLabel: "Codex" },
-    { name: "copilot", label: "Copilot", displayLabel: "Copilot" },
-    { name: "gemini", label: "Gemini", displayLabel: "Gemini" },
-    { name: "kiro", label: "Kiro", displayLabel: "Kiro" },
-  ];
+  const agentOptions: TypeaheadOption[] = AGENT_NAMES.map((name) => ({
+    name,
+    label: agentLabel(name),
+    displayLabel: agentLabel(name),
+  }));
 
   function abortGeneration() {
     handle?.abort();
@@ -100,14 +99,11 @@
     generating = false;
     loading = true;
 
-    callGenerated(
-      (options) => InsightsService.getApiV1Insights({
+    InsightsService.getApiV1Insights({
         type: "daily_activity",
         date_from: from,
         date_to: to,
-      }, options),
-      signal,
-    )
+      }, { signal })
       .then((res) => {
         if (v !== fetchVersion || !insightListRead.isCurrent(signal)) return;
         // The list endpoint treats date_from/date_to as range BOUNDS, so a
@@ -154,7 +150,7 @@
         date_from: dateFrom,
         date_to: dateTo,
         timezone,
-        agent: insights.agent,
+        agent: insights.requestAgent,
       },
       (p) => {
         if (v !== genVersion) return;
@@ -241,6 +237,7 @@
     <article
       class="markdown-body"
       use:highlightCodeFences={{ content: insight.content }}
+      use:loadAssetImages={insight.content}
     >
       {@html renderMarkdown(insight.content, {
         renderUnknownXmlBlocksAsPreformatted: ui.renderUnknownXmlBlocksAsPreformatted,
@@ -355,12 +352,12 @@
   }
 
   .generate-btn:active:not(:disabled) {
-    transform: scale(0.98);
+    transform: var(--press-transform);
     box-shadow: none;
   }
 
   .generate-btn:disabled {
-    opacity: 0.45;
+    opacity: var(--opacity-disabled);
     box-shadow: none;
     cursor: default;
   }

@@ -1,6 +1,7 @@
 package duckdb
 
 import (
+	"cmp"
 	"context"
 	"database/sql"
 	"fmt"
@@ -17,11 +18,6 @@ import (
 	"go.kenn.io/agentsview/internal/money"
 	pricingpkg "go.kenn.io/agentsview/internal/pricing"
 	"go.kenn.io/agentsview/internal/signals"
-)
-
-const (
-	duckActiveWindow = 10 * time.Minute
-	duckStaleWindow  = 60 * time.Minute
 )
 
 type duckAnalyticsSession struct {
@@ -161,10 +157,8 @@ func (s *Store) analyticsSessionsModelTimeFiltered(
 		return nil, err
 	}
 	matched := make(map[string]struct{})
-	if scope != nil {
-		for id := range scope.MessagesBySession() {
-			matched[id] = struct{}{}
-		}
+	for id := range scope {
+		matched[id] = struct{}{}
 	}
 	out := make([]duckAnalyticsSession, 0, len(sessions))
 	for _, session := range sessions {
@@ -175,186 +169,49 @@ func (s *Store) analyticsSessionsModelTimeFiltered(
 	return out, nil
 }
 
-func duckBuildAnalyticsWhere(
-	f db.AnalyticsFilter,
-	dateCol string,
-	tablePrefix string,
-	includeDate bool,
-	includeTime bool,
-) (string, []any) {
-	q := func(col string) string { return tablePrefix + col }
-	preds := []string{
-		q("message_count") + " > 0",
-		// Mirror the SQLite analytics filter: subagent and fork rows are
-		// excluded unless the filter opts in (sum/count surfaces for
-		// subagents, the activity report for both). The shared helper
-		// qualifies the column with tablePrefix directly.
-		db.RelationshipExclusionSQL(f.IncludeSubagents, f.IncludeForks, tablePrefix),
-		q("deleted_at") + " IS NULL",
-	}
+func duckBuildAnalyticsWhere(f db.AnalyticsFilter, dateCol, tablePrefix string, includeDate, includeTime bool) (string, []any) {
+	var dates []string
 	var args []any
-
 	if includeDate {
 		if f.From != "" {
-			preds = append(preds, dateCol+" >= CAST(? AS TIMESTAMP)")
+			dates = append(dates, dateCol+" >= CAST(? AS TIMESTAMP)")
 			args = append(args, duckUsagePaddedUTCBound(f.From+"T00:00:00Z", -14))
 		}
 		if f.To != "" {
-			preds = append(preds, dateCol+" <= CAST(? AS TIMESTAMP)")
+			dates = append(dates, dateCol+" <= CAST(? AS TIMESTAMP)")
 			args = append(args, duckUsagePaddedUTCBound(f.To+"T23:59:59Z", 14))
 		}
 		localDate, localDateArgs := duckAnalyticsLocalDateExpr(dateCol, f)
 		if f.From != "" {
-			preds = append(preds, localDate+" >= ?")
+			dates = append(dates, localDate+" >= ?")
 			args = append(args, append(localDateArgs, f.From)...)
 		}
 		if f.To != "" {
-			preds = append(preds, localDate+" <= ?")
+			dates = append(dates, localDate+" <= ?")
 			args = append(args, append(localDateArgs, f.To)...)
 		}
 	}
 
-	if f.Machine != "" {
-		preds, args = appendDuckAnalyticsCSVFilter(preds, args, q("machine"), f.Machine)
-	}
-	if f.Project != "" {
-		preds = append(preds, q("project")+" = ?")
-		args = append(args, f.Project)
-	}
-	if f.GitBranch != "" {
-		var clause string
-		clause, args = db.BranchPairClauseArgs(q("project"), q("git_branch"), f.GitBranch, args)
-		preds = append(preds, clause)
-	}
-	if f.Agent != "" {
-		preds, args = appendDuckAnalyticsCSVFilter(preds, args, q("agent"), f.Agent)
-	}
-	if modelPred, modelArgs := duckAnalyticsCSVPredicate("m.model", f.Model); modelPred != "" {
-		preds = append(preds,
-			"EXISTS (SELECT 1 FROM messages m WHERE m.session_id = "+q("id")+" AND "+modelPred+")")
-		args = append(args, modelArgs...)
-	}
-	if f.MinUserMessages > 0 {
-		preds = append(preds, q("user_message_count")+" >= ?")
-		args = append(args, f.MinUserMessages)
-	}
-	scope := duckNormalizeAutomatedScope(
-		f.AutomatedScope, f.ExcludeAutomated)
-	if f.ExcludeOneShot {
-		// Exempt subagents from one-shot exclusion when counting them,
-		// mirroring db.AnalyticsFilter.OneShotExclusionSQL. Workflow
-		// subagents are inherently one-shot but represent real work.
-		oneShot := func(base string) string {
-			if f.IncludeSubagents {
-				return "(" + base + " OR " +
-					q("relationship_type") + " = 'subagent')"
-			}
-			return base
-		}
-		if scope != "human" {
-			preds = append(preds, oneShot("("+q("user_message_count")+" > 1 OR "+q("is_automated")+" = TRUE)"))
-		} else {
-			preds = append(preds, oneShot(q("user_message_count")+" > 1"))
-		}
-	}
-	if pred := duckAutomatedScopePredicate(
-		scope, q("is_automated")); pred != "" {
-		preds = append(preds, pred)
-	}
-	if f.ExcludeInteractive {
-		preds = append(preds, q("is_automated")+" = TRUE")
-	}
+	b := db.NewQueryBuilder(db.DuckDBQueryDialect(), 0)
 	if f.ActiveSince != "" {
-		activeSince := f.ActiveSince
 		if parsed, ok := parseAnalyticsTime(f.ActiveSince); ok {
-			activeSince = parsed.Format(time.RFC3339)
+			f.ActiveSince = parsed.Format(time.RFC3339)
 		}
-		preds = append(preds,
-			"COALESCE("+q("ended_at")+", "+q("started_at")+", "+q("created_at")+") >= CAST(? AS TIMESTAMP)")
-		args = append(args, activeSince)
 	}
-	if pred, predArgs := duckAnalyticsTerminationPred(
-		f.Termination,
-		"COALESCE("+q("ended_at")+", "+q("started_at")+", "+q("created_at")+")",
-		q("termination_status"),
-	); pred != "" {
-		preds = append(preds, pred)
-		args = append(args, predArgs...)
-	}
+	where := db.BuildAnalyticsWhere(f, b, tablePrefix, "", dates)
+	args = append(args, b.Args()...)
 	if includeTime && (f.DayOfWeek != nil || f.Hour != nil) {
-		pred, predArgs := duckAnalyticsMessageTimeExists(f, q("id"))
-		preds = append(preds, pred)
-		args = append(args, predArgs...)
+		pred, pargs := duckAnalyticsMessageTimeExists(f, tablePrefix+"id")
+		where += " AND " + pred
+		args = append(args, pargs...)
 	}
-
-	return strings.Join(preds, " AND "), args
+	return where, args
 }
 
-func duckNormalizeAutomatedScope(
-	scope string,
-	excludeAutomated bool,
-) string {
-	switch strings.TrimSpace(scope) {
-	case "human", "all", "automated":
-		return strings.TrimSpace(scope)
-	}
-	if excludeAutomated {
-		return "human"
-	}
-	return "all"
-}
-
-func duckAutomatedScopePredicate(scope, col string) string {
-	switch scope {
-	case "human":
-		return col + " = FALSE"
-	case "automated":
-		return col + " = TRUE"
-	default:
-		return ""
-	}
-}
-
-func appendDuckAnalyticsCSVFilter(
-	preds []string, args []any, col string, raw string,
-) ([]string, []any) {
-	pred, predArgs := duckAnalyticsCSVPredicate(col, raw)
-	if pred != "" {
-		preds = append(preds, pred)
-		args = append(args, predArgs...)
-	}
-	return preds, args
-}
-
-func duckAnalyticsCSVValues(raw string) []string {
-	values := strings.Split(raw, ",")
-	out := values[:0]
-	for _, value := range values {
-		trimmed := strings.TrimSpace(value)
-		if trimmed != "" {
-			out = append(out, trimmed)
-		}
-	}
-	return out
-}
-
-func duckAnalyticsCSVPredicate(
-	col string, raw string,
-) (string, []any) {
-	values := duckAnalyticsCSVValues(raw)
-	if len(values) == 0 {
-		return "", nil
-	}
-	if len(values) == 1 {
-		return col + " = ?", []any{values[0]}
-	}
-	placeholders := make([]string, len(values))
-	args := make([]any, 0, len(values))
-	for i, value := range values {
-		placeholders[i] = "?"
-		args = append(args, value)
-	}
-	return col + " IN (" + strings.Join(placeholders, ",") + ")", args
+func duckAnalyticsCSVPredicate(col, raw string) (string, []any) {
+	b := db.NewQueryBuilder(db.DuckDBQueryDialect(), 0)
+	pred := b.ValuesPredicate(col, db.CSVFilterValues(raw), true)
+	return pred, b.Args()
 }
 
 func duckAnalyticsLocalDateExpr(
@@ -402,49 +259,6 @@ func duckAnalyticsMessageTimeExists(
 	}
 	return "EXISTS (SELECT 1 FROM messages m WHERE " +
 		strings.Join(preds, " AND ") + ")", args
-}
-
-func duckAnalyticsTerminationPred(
-	status string,
-	activityExpr string,
-	statusExpr string,
-) (string, []any) {
-	if status == "" || status == "all" {
-		return "", nil
-	}
-	now := time.Now().UTC()
-	activeCutoff := now.Add(-duckActiveWindow)
-	staleCutoff := now.Add(-duckStaleWindow)
-	flagged := statusExpr + " IN ('tool_call_pending', 'truncated')"
-	var parts []string
-	var args []any
-	for part := range strings.SplitSeq(status, ",") {
-		switch strings.TrimSpace(part) {
-		case "active":
-			parts = append(parts, activityExpr+" > CAST(? AS TIMESTAMP)")
-			args = append(args, activeCutoff.Format(time.RFC3339))
-		case "stale":
-			parts = append(parts, "("+flagged+
-				" AND "+activityExpr+" > CAST(? AS TIMESTAMP)"+
-				" AND "+activityExpr+" <= CAST(? AS TIMESTAMP))")
-			args = append(args,
-				staleCutoff.Format(time.RFC3339),
-				activeCutoff.Format(time.RFC3339),
-			)
-		case "unclean":
-			parts = append(parts, "("+flagged+
-				" AND "+activityExpr+" <= CAST(? AS TIMESTAMP))")
-			args = append(args, staleCutoff.Format(time.RFC3339))
-		case "clean":
-			parts = append(parts, statusExpr+" = 'clean'")
-		case "awaiting_user":
-			parts = append(parts, statusExpr+" = 'awaiting_user'")
-		}
-	}
-	if len(parts) == 0 {
-		return "", nil
-	}
-	return "(" + strings.Join(parts, " OR ") + ")", args
 }
 
 func duckAnalyticsTimeMatches(t time.Time, f db.AnalyticsFilter) bool {
@@ -503,28 +317,6 @@ func parseAnalyticsTime(ts string) (time.Time, bool) {
 	return time.Time{}, false
 }
 
-func median(values []int) int {
-	if len(values) == 0 {
-		return 0
-	}
-	n := len(values)
-	if n%2 == 0 {
-		return (values[n/2-1] + values[n/2]) / 2
-	}
-	return values[n/2]
-}
-
-func firstNonEmpty(values ...string) string {
-	for _, v := range values {
-		if v != "" {
-			return v
-		}
-	}
-	return ""
-}
-
-func round1(v float64) float64 { return math.Round(v*10) / 10 }
-
 func (s *Store) getAnalyticsModelsForSessionIDs(
 	ctx context.Context, sessionIDs []string,
 ) ([]string, error) {
@@ -556,7 +348,7 @@ func (s *Store) getAnalyticsModelsForSessionIDs(
 	if err != nil {
 		return nil, err
 	}
-	return sortedBoolKeys(models), nil
+	return db.SortedKeys(models), nil
 }
 
 func (s *Store) getAnalyticsModelsForSessionIDsFiltered(
@@ -577,7 +369,7 @@ func (s *Store) getAnalyticsModelsForSessionIDsFiltered(
 		unique = append(unique, sessionID)
 	}
 
-	filterModels := duckAnalyticsCSVValues(f.Model)
+	filterModels := db.CSVFilterValues(f.Model)
 	allowedModels := make(map[string]struct{}, len(filterModels))
 	for _, model := range filterModels {
 		allowedModels[model] = struct{}{}
@@ -619,7 +411,7 @@ func (s *Store) getAnalyticsModelsForSessionIDsFiltered(
 	if err != nil {
 		return nil, err
 	}
-	return sortedBoolKeys(models), nil
+	return db.SortedKeys(models), nil
 }
 
 func (s *Store) getAnalyticsFilteredMessageStats(
@@ -719,16 +511,16 @@ func (s *Store) getAnalyticsSummaryWithModelCounts(
 	resp.Models = models
 	resp.ActiveProjects = len(projects)
 	resp.ActiveDays = len(days)
-	resp.AvgMessages = round1(float64(resp.TotalMessages) / float64(resp.TotalSessions))
+	resp.AvgMessages = db.Round1(float64(resp.TotalMessages) / float64(resp.TotalSessions))
 
 	sort.Ints(msgCounts)
-	resp.MedianMessages = median(msgCounts)
+	resp.MedianMessages = db.MedianInt(msgCounts, len(msgCounts))
 	if n := len(msgCounts); n > 0 {
 		resp.P90Messages = msgCounts[min(int(math.Floor(float64(n)*0.9))+1, n)-1]
 	}
 
 	maxMsgs := -1
-	for _, name := range sortedKeys(projects) {
+	for _, name := range db.SortedKeys(projects) {
 		if projects[name] > maxMsgs {
 			maxMsgs = projects[name]
 			resp.MostActive = name
@@ -829,6 +621,7 @@ func (s *Store) GetAnalyticsSummary(
 	if err != nil {
 		return db.AnalyticsSummary{}, fmt.Errorf("querying duckdb analytics summary: %w", err)
 	}
+	defer rows.Close()
 	resp := db.AnalyticsSummary{Agents: map[string]*db.AgentSummary{}}
 	if !rows.Next() {
 		rows.Close()
@@ -920,7 +713,7 @@ func (s *Store) getAnalyticsFilteredToolCallCounts(
 	}
 
 	allowedModels := make(map[string]struct{})
-	for _, model := range duckAnalyticsCSVValues(f.Model) {
+	for _, model := range db.CSVFilterValues(f.Model) {
 		allowedModels[model] = struct{}{}
 	}
 	loc := analyticsLocation(f.Timezone)
@@ -999,7 +792,7 @@ func (s *Store) getAnalyticsActivityFilteredByModelTime(
 	out := db.ActivityResponse{Granularity: granularity}
 	buckets := map[string]*db.ActivityEntry{}
 	for _, session := range sessions {
-		date := bucketAnalyticsDate(
+		date := db.BucketDate(
 			analyticsLocalDate(analyticsDateTime(session), f.Timezone),
 			granularity,
 		)
@@ -1021,7 +814,7 @@ func (s *Store) getAnalyticsActivityFilteredByModelTime(
 		entry.ByAgent[session.agent] += stat.Messages
 	}
 
-	for _, key := range sortedKeys(buckets) {
+	for _, key := range db.SortedKeys(buckets) {
 		entry := buckets[key]
 		if entry == nil {
 			continue
@@ -1050,7 +843,7 @@ func (s *Store) GetAnalyticsActivity(
 		return db.ActivityResponse{}, err
 	}
 	out := db.ActivityResponse{Granularity: granularity}
-	keys := sortedKeys(buckets)
+	keys := db.SortedKeys(buckets)
 	for _, key := range keys {
 		entry, ok := buckets[key]
 		if !ok || entry == nil {
@@ -1195,25 +988,6 @@ func (s *Store) addActivityAgentCounts(
 	return nil
 }
 
-func bucketAnalyticsDate(date, granularity string) string {
-	t, err := time.Parse("2006-01-02", date)
-	if err != nil {
-		return date
-	}
-	switch granularity {
-	case "week":
-		dow := int(t.Weekday())
-		if dow == 0 {
-			dow = 7
-		}
-		return t.AddDate(0, 0, -(dow - 1)).Format("2006-01-02")
-	case "month":
-		return t.Format("2006-01") + "-01"
-	default:
-		return date
-	}
-}
-
 func duckAnalyticsBucketExpr(dateExpr, granularity string) string {
 	switch granularity {
 	case "week":
@@ -1223,15 +997,6 @@ func duckAnalyticsBucketExpr(dateExpr, granularity string) string {
 	default:
 		return dateExpr
 	}
-}
-
-func sortedKeys[V any](m map[string]V) []string {
-	keys := make([]string, 0, len(m))
-	for k := range m {
-		keys = append(keys, k)
-	}
-	sort.Strings(keys)
-	return keys
 }
 
 func duckAnalyticsMessageFilterClause(col, raw string) string {
@@ -1288,27 +1053,7 @@ func (s *Store) GetAnalyticsHeatmap(
 				counts[date] += session.messageCount
 			}
 		}
-		entriesFrom := duckClampHeatmapFrom(f.From, f.To)
-		values := []int{}
-		for date, v := range counts {
-			if v > 0 && date >= entriesFrom && date <= f.To {
-				values = append(values, v)
-			}
-		}
-		sort.Ints(values)
-		levels := duckComputeHeatmapLevels(values)
-		entries := duckBuildHeatmapEntries(entriesFrom, f.To, counts, levels)
-		if metric == "output_tokens" && len(counts) == 0 {
-			return db.HeatmapResponse{
-				Metric:      metric,
-				EntriesFrom: entriesFrom,
-			}, nil
-		}
-		return db.HeatmapResponse{
-			Metric: metric, Entries: entries,
-			Levels:      levels,
-			EntriesFrom: entriesFrom,
-		}, nil
+		return db.BuildHeatmapResponse(f.From, f.To, metric, counts), nil
 	}
 	where, args := duckBuildAnalyticsWhere(
 		f, "COALESCE(s.started_at, s.created_at)", "s.", true, true)
@@ -1348,98 +1093,7 @@ func (s *Store) GetAnalyticsHeatmap(
 	if err := rows.Err(); err != nil {
 		return db.HeatmapResponse{}, fmt.Errorf("iterating duckdb analytics heatmap: %w", err)
 	}
-	if metric == "output_tokens" && len(counts) == 0 {
-		return db.HeatmapResponse{
-			Metric:      metric,
-			EntriesFrom: duckClampHeatmapFrom(f.From, f.To),
-		}, nil
-	}
-	entriesFrom := duckClampHeatmapFrom(f.From, f.To)
-	values := []int{}
-	for date, v := range counts {
-		if v > 0 && date >= entriesFrom && date <= f.To {
-			values = append(values, v)
-		}
-	}
-	sort.Ints(values)
-	levels := duckComputeHeatmapLevels(values)
-	entries := duckBuildHeatmapEntries(entriesFrom, f.To, counts, levels)
-	return db.HeatmapResponse{
-		Metric: metric, Entries: entries,
-		Levels:      levels,
-		EntriesFrom: entriesFrom,
-	}, nil
-}
-
-const duckMaxHeatmapDays = 366
-
-func duckClampHeatmapFrom(from, to string) string {
-	start, err := time.Parse("2006-01-02", from)
-	if err != nil {
-		return from
-	}
-	end, err := time.Parse("2006-01-02", to)
-	if err != nil {
-		return from
-	}
-	earliest := end.AddDate(0, 0, -(duckMaxHeatmapDays - 1))
-	if start.Before(earliest) {
-		return earliest.Format("2006-01-02")
-	}
-	return from
-}
-
-func duckComputeHeatmapLevels(sorted []int) db.HeatmapLevels {
-	if len(sorted) == 0 {
-		return db.HeatmapLevels{L1: 1, L2: 2, L3: 3, L4: 4}
-	}
-	n := len(sorted)
-	return db.HeatmapLevels{
-		L1: sorted[0],
-		L2: sorted[n/4],
-		L3: sorted[n/2],
-		L4: sorted[n*3/4],
-	}
-}
-
-func duckHeatmapLevel(value int, levels db.HeatmapLevels) int {
-	if value <= 0 {
-		return 0
-	}
-	if value <= levels.L2 {
-		return 1
-	}
-	if value <= levels.L3 {
-		return 2
-	}
-	if value <= levels.L4 {
-		return 3
-	}
-	return 4
-}
-
-func duckBuildHeatmapEntries(
-	from, to string, values map[string]int, levels db.HeatmapLevels,
-) []db.HeatmapEntry {
-	start, err := time.Parse("2006-01-02", from)
-	if err != nil {
-		return nil
-	}
-	end, err := time.Parse("2006-01-02", to)
-	if err != nil {
-		return nil
-	}
-	entries := []db.HeatmapEntry{}
-	for d := start; !d.After(end); d = d.AddDate(0, 0, 1) {
-		date := d.Format("2006-01-02")
-		v := values[date]
-		entries = append(entries, db.HeatmapEntry{
-			Date:  date,
-			Value: v,
-			Level: duckHeatmapLevel(v, levels),
-		})
-	}
-	return entries
+	return db.BuildHeatmapResponse(f.From, f.To, metric, counts), nil
 }
 
 func (s *Store) GetAnalyticsProjects(
@@ -1480,16 +1134,16 @@ func (s *Store) GetAnalyticsProjects(
 		a.days[date] += r.messageCount
 	}
 	resp := db.ProjectsAnalyticsResponse{}
-	for _, name := range sortedKeys(byProject) {
+	for _, name := range db.SortedKeys(byProject) {
 		a, ok := byProject[name]
 		if !ok || a == nil {
 			continue
 		}
 		sort.Ints(a.counts)
-		a.row.AvgMessages = round1(float64(a.row.Messages) / float64(a.row.Sessions))
-		a.row.MedianMessages = median(a.counts)
+		a.row.AvgMessages = db.Round1(float64(a.row.Messages) / float64(a.row.Sessions))
+		a.row.MedianMessages = db.MedianInt(a.counts, len(a.counts))
 		if len(a.days) > 0 {
-			a.row.DailyTrend = round1(float64(a.row.Messages) / float64(len(a.days)))
+			a.row.DailyTrend = db.Round1(float64(a.row.Messages) / float64(len(a.days)))
 		}
 		resp.Projects = append(resp.Projects, a.row)
 	}
@@ -1588,15 +1242,13 @@ func (s *Store) getAnalyticsHourOfWeekFilteredByModel(
 	}
 
 	var grid [7][24]int
-	if scope != nil {
-		for _, msgs := range scope.MessagesBySession() {
-			for _, m := range msgs {
-				if !m.HasLocalTime {
-					continue
-				}
-				dow := (int(m.LocalTime.Weekday()) + 6) % 7
-				grid[dow][m.LocalTime.Hour()]++
+	for _, msgs := range scope {
+		for _, m := range msgs {
+			if !m.HasLocalTime {
+				continue
 			}
+			dow := (int(m.LocalTime.Weekday()) + 6) % 7
+			grid[dow][m.LocalTime.Hour()]++
 		}
 	}
 
@@ -1617,11 +1269,11 @@ func (s *Store) GetAnalyticsSessionShape(
 	for _, r := range sessions {
 		ids = append(ids, r.id)
 		if !modelFilter {
-			lengths[lengthBucket(r.messageCount)]++
+			lengths[db.LengthBucket(r.messageCount)]++
 		}
 		if start, okS := parseAnalyticsTime(r.startedAt); okS {
 			if end, okE := parseAnalyticsTime(r.endedAt); okE && !end.Before(start) {
-				durations[durationBucket(end.Sub(start).Minutes())]++
+				durations[db.DurationBucket(end.Sub(start).Minutes())]++
 			}
 		}
 	}
@@ -1634,11 +1286,11 @@ func (s *Store) GetAnalyticsSessionShape(
 		lengths = map[string]int{}
 		for _, r := range sessions {
 			stat := stats[r.id]
-			lengths[lengthBucket(stat.Messages)]++
+			lengths[db.LengthBucket(stat.Messages)]++
 			if stat.UserMessages > 0 {
 				ratio := float64(stat.ToolUseMessages) /
 					float64(stat.UserMessages)
-				autonomy[autonomyBucket(ratio)]++
+				autonomy[db.AutonomyBucket(ratio)]++
 			}
 		}
 	} else {
@@ -1649,84 +1301,10 @@ func (s *Store) GetAnalyticsSessionShape(
 	}
 	return db.SessionShapeResponse{
 		Count:                len(sessions),
-		LengthDistribution:   mapBuckets(lengths, lengthOrder()),
-		DurationDistribution: mapBuckets(durations, durationOrder()),
-		AutonomyDistribution: mapBuckets(autonomy, autonomyOrder()),
+		LengthDistribution:   db.LengthDistributionBuckets(lengths),
+		DurationDistribution: db.DurationDistributionBuckets(durations),
+		AutonomyDistribution: db.AutonomyDistributionBuckets(autonomy),
 	}, nil
-}
-
-func lengthBucket(mc int) string {
-	switch {
-	case mc <= 5:
-		return "1-5"
-	case mc <= 15:
-		return "6-15"
-	case mc <= 30:
-		return "16-30"
-	case mc <= 60:
-		return "31-60"
-	case mc <= 120:
-		return "61-120"
-	default:
-		return "121+"
-	}
-}
-
-func durationBucket(mins float64) string {
-	switch {
-	case mins < 5:
-		return "<5m"
-	case mins < 15:
-		return "5-15m"
-	case mins < 30:
-		return "15-30m"
-	case mins < 60:
-		return "30-60m"
-	case mins < 120:
-		return "1-2h"
-	default:
-		return "2h+"
-	}
-}
-
-func lengthOrder() map[string]int {
-	return map[string]int{"1-5": 0, "6-15": 1, "16-30": 2, "31-60": 3, "61-120": 4, "121+": 5}
-}
-
-func durationOrder() map[string]int {
-	return map[string]int{"<5m": 0, "5-15m": 1, "15-30m": 2, "30-60m": 3, "1-2h": 4, "2h+": 5}
-}
-
-func autonomyBucket(ratio float64) string {
-	switch {
-	case ratio < 0.5:
-		return "<0.5"
-	case ratio < 1:
-		return "0.5-1"
-	case ratio < 2:
-		return "1-2"
-	case ratio < 5:
-		return "2-5"
-	case ratio < 10:
-		return "5-10"
-	default:
-		return "10+"
-	}
-}
-
-func autonomyOrder() map[string]int {
-	return map[string]int{"<0.5": 0, "0.5-1": 1, "1-2": 2, "2-5": 3, "5-10": 4, "10+": 5}
-}
-
-func mapBuckets(values map[string]int, order map[string]int) []db.DistributionBucket {
-	out := make([]db.DistributionBucket, 0, len(values))
-	for label, count := range values {
-		out = append(out, db.DistributionBucket{Label: label, Count: count})
-	}
-	sort.Slice(out, func(i, j int) bool {
-		return order[out[i].Label] < order[out[j].Label]
-	})
-	return out
 }
 
 func (s *Store) analyticsAutonomyBuckets(
@@ -1763,7 +1341,7 @@ func (s *Store) analyticsAutonomyBuckets(
 			return nil, fmt.Errorf("scanning duckdb autonomy: %w", err)
 		}
 		if userCount > 0 {
-			counts[autonomyBucket(float64(toolCount)/float64(userCount))]++
+			counts[db.AutonomyBucket(float64(toolCount)/float64(userCount))]++
 		}
 	}
 	return counts, rows.Err()
@@ -2031,7 +1609,7 @@ func (s *Store) GetAnalyticsVelocity(
 		}
 		info := sessionInfo[sid]
 		agentKey := info.agent
-		compKey := duckComplexityBucket(info.mc)
+		compKey := db.ComplexityBucket(info.mc)
 		if byAgent[agentKey] == nil {
 			byAgent[agentKey] = &duckVelocityAccumulator{}
 		}
@@ -2050,7 +1628,7 @@ func (s *Store) GetAnalyticsVelocity(
 		ByAgent:      []db.VelocityBreakdown{},
 		ByComplexity: []db.VelocityBreakdown{},
 	}
-	for _, key := range sortedKeys(byAgent) {
+	for _, key := range db.SortedKeys(byAgent) {
 		acc := byAgent[key]
 		if acc == nil {
 			continue
@@ -2063,7 +1641,7 @@ func (s *Store) GetAnalyticsVelocity(
 	}
 
 	compOrder := map[string]int{"1-15": 0, "16-60": 1, "61+": 2}
-	compKeys := sortedKeys(byComplexity)
+	compKeys := db.SortedKeys(byComplexity)
 	sort.Slice(compKeys, func(i, j int) bool {
 		return compOrder[compKeys[i]] < compOrder[compKeys[j]]
 	})
@@ -2222,17 +1800,6 @@ func duckLocalTime(ts string, loc *time.Location) (time.Time, bool) {
 	return t.In(loc), true
 }
 
-func duckComplexityBucket(mc int) string {
-	switch {
-	case mc <= 15:
-		return "1-15"
-	case mc <= 60:
-		return "16-60"
-	default:
-		return "61+"
-	}
-}
-
 func processDuckSessionVelocity(
 	accums []*duckVelocityAccumulator,
 	msgs []duckVelocityMsg,
@@ -2322,30 +1889,19 @@ func (a *duckVelocityAccumulator) computeOverview() db.VelocityOverview {
 
 	out := db.VelocityOverview{}
 	out.TurnCycleSec = db.Percentiles{
-		P50: round1(percentileFloat(a.turnCycles, 0.5)),
-		P90: round1(percentileFloat(a.turnCycles, 0.9)),
+		P50: db.Round1(db.PercentileFloat(a.turnCycles, 0.5)),
+		P90: db.Round1(db.PercentileFloat(a.turnCycles, 0.9)),
 	}
 	out.FirstResponseSec = db.Percentiles{
-		P50: round1(percentileFloat(a.firstResponses, 0.5)),
-		P90: round1(percentileFloat(a.firstResponses, 0.9)),
+		P50: db.Round1(db.PercentileFloat(a.firstResponses, 0.5)),
+		P90: db.Round1(db.PercentileFloat(a.firstResponses, 0.9)),
 	}
 	if a.activeMinutes > 0 {
-		out.MsgsPerActiveMin = round1(float64(a.totalMsgs) / a.activeMinutes)
-		out.CharsPerActiveMin = round1(float64(a.totalChars) / a.activeMinutes)
-		out.ToolCallsPerActiveMin = round1(float64(a.totalToolCalls) / a.activeMinutes)
+		out.MsgsPerActiveMin = db.Round1(float64(a.totalMsgs) / a.activeMinutes)
+		out.CharsPerActiveMin = db.Round1(float64(a.totalChars) / a.activeMinutes)
+		out.ToolCallsPerActiveMin = db.Round1(float64(a.totalToolCalls) / a.activeMinutes)
 	}
 	return out
-}
-
-func percentileFloat(values []float64, p float64) float64 {
-	if len(values) == 0 {
-		return 0
-	}
-	idx := int(float64(len(values)) * p)
-	if idx >= len(values) {
-		idx = len(values) - 1
-	}
-	return round1(values[idx])
 }
 
 func (s *Store) GetAnalyticsTopSessions(
@@ -2500,8 +2056,8 @@ func (s *Store) GetAnalyticsTopSessions(
 		endedAt := formatDBTime(endedRaw)
 		row.StartedAt = &startedAt
 		row.EndedAt = &endedAt
-		row.DurationMin = round1(row.DurationMin)
-		row.ActiveDurationMin = round1(row.ActiveDurationMin)
+		row.DurationMin = db.Round1(row.DurationMin)
+		row.ActiveDurationMin = db.Round1(row.ActiveDurationMin)
 		out.Sessions = append(out.Sessions, row)
 		if pairedSet != nil && len(out.Sessions) >= 10 {
 			break
@@ -2519,7 +2075,7 @@ func duckSessionDurationMinutes(session duckAnalyticsSession) float64 {
 	if !okStart || !okEnd || endedAt.Before(startedAt) {
 		return 0
 	}
-	return round1(endedAt.Sub(startedAt).Minutes())
+	return db.Round1(endedAt.Sub(startedAt).Minutes())
 }
 
 // GetAnalyticsSignals returns aggregated session signal data. Signals stay
@@ -2672,31 +2228,29 @@ func (s *Store) duckSignalMessages(
 		if err != nil {
 			return nil, err
 		}
-		if scope != nil {
-			for sessionID, scopedRows := range scope.MessagesBySession() {
-				for _, row := range scopedRows {
-					out[sessionID] = append(out[sessionID], db.SignalMessage{
-						SessionID:     row.SessionID,
-						Ordinal:       row.Ordinal,
-						Role:          row.Role,
-						SourceSubtype: row.SourceSubtype,
-						Content:       row.Content,
-						Timestamp:     row.Timestamp,
-						IsSystem:      row.IsSystem,
-						HasToolUse:    row.HasToolUse,
-					})
-				}
+		for sessionID, scopedRows := range scope {
+			for _, row := range scopedRows {
+				out[sessionID] = append(out[sessionID], db.SignalMessage{
+					SessionID:     row.SessionID,
+					Ordinal:       row.Ordinal,
+					Role:          row.Role,
+					SourceSubtype: row.SourceSubtype,
+					Content:       row.Content,
+					Timestamp:     row.Timestamp,
+					IsSystem:      row.IsSystem,
+					HasToolUse:    row.HasToolUse,
+				})
 			}
 		}
 		return out, nil
 	}
 	placeholders := make([]string, len(rows))
-	args := make([]any, len(rows))
+	args := make([]any, 0, len(rows))
 	for i, r := range rows {
 		placeholders[i] = "?"
-		args[i] = r.ID
+		args = append(args, r.ID)
 	}
-	filterModels := duckAnalyticsCSVValues(f.Model)
+	filterModels := db.CSVFilterValues(f.Model)
 	q := `SELECT session_id, ordinal, role, content,
 			timestamp, is_system, has_tool_use, COALESCE(source_subtype, '')
 		FROM messages
@@ -2745,16 +2299,7 @@ func (s *Store) GetTrendsTerms(
 	if granularity == "" {
 		granularity = "week"
 	}
-	buckets := db.TrendBucketRange(f.From, f.To, granularity)
-	index := map[string]int{}
-	for i, bucket := range buckets {
-		index[bucket.Date] = i
-	}
-	counts := make([][]int, len(terms))
-	for i := range counts {
-		counts[i] = make([]int, len(buckets))
-	}
-	messageCounts := make([]int, len(buckets))
+	acc := db.NewTrendAccumulator(f.From, f.To, granularity, terms)
 	sessionFilter := f
 	sessionFilter.From = ""
 	sessionFilter.To = ""
@@ -2770,15 +2315,13 @@ func (s *Store) GetTrendsTerms(
 		allowedSessions[sess.id] = true
 	}
 	if len(allowedSessions) == 0 {
-		return db.BuildTrendsTermsResponse(
-			f.From, f.To, granularity, buckets, terms, counts, messageCounts,
-		), nil
+		return acc.Response(), nil
 	}
 	loc := analyticsLocation(f.Timezone)
-	flt := messageScopeFilter(f)
+	flt := f.MessageScopeFilter()
 	modelFiltering := len(flt.Models) > 0
 	trendLocal := func(msgTS, startedAt, createdAt any) (time.Time, bool) {
-		ts := firstNonEmpty(formatDBTime(msgTS), formatDBTime(startedAt), formatDBTime(createdAt))
+		ts := cmp.Or(formatDBTime(msgTS), formatDBTime(startedAt), formatDBTime(createdAt))
 		t, ok := parseAnalyticsTime(ts)
 		if !ok {
 			return time.Time{}, false
@@ -2814,22 +2357,7 @@ func (s *Store) GetTrendsTerms(
 		if !allowedSessions[sessionID] {
 			return
 		}
-		date := local.Format("2006-01-02")
-		if f.From != "" && date < f.From {
-			return
-		}
-		if f.To != "" && date > f.To {
-			return
-		}
-		bucket := bucketAnalyticsDate(date, granularity)
-		pos, ok := index[bucket]
-		if !ok {
-			return
-		}
-		messageCounts[pos]++
-		for i, term := range terms {
-			counts[i][pos] += db.CountTrendOccurrences(content, term)
-		}
+		acc.Add(content, local)
 	}
 	emit := func(m db.ScopedMessage) {
 		if !m.HasLocalTime {
@@ -2867,23 +2395,10 @@ func (s *Store) GetTrendsTerms(
 	if err := rows.Err(); err != nil {
 		return db.TrendsTermsResponse{}, err
 	}
-	return db.BuildTrendsTermsResponse(
-		f.From, f.To, granularity, buckets, terms, counts, messageCounts,
-	), nil
+	return acc.Response(), nil
 }
 
-type duckRates struct {
-	input           money.Money
-	output          money.Money
-	cacheCreation   money.Money
-	cacheCreation1h money.Money
-	cacheRead       money.Money
-	updatedAt       *time.Time
-	source          export.PricingRowSource
-	bands           []export.PricingBand
-}
-
-func (s *Store) loadPricing(ctx context.Context) (map[string]duckRates, error) {
+func (s *Store) loadPricing(ctx context.Context) (map[string]export.ModelRates, error) {
 	rows, err := s.queryContext(ctx, `
 		SELECT p.model_pattern, p.input_microdollars_per_mtok,
 			p.output_microdollars_per_mtok,
@@ -2902,19 +2417,19 @@ func (s *Store) loadPricing(ctx context.Context) (map[string]duckRates, error) {
 		return nil, err
 	}
 	defer rows.Close()
-	out := map[string]duckRates{}
+	out := map[string]export.ModelRates{}
 	count := 0
 	for rows.Next() {
 		var model string
-		var rates duckRates
+		var rates export.ModelRates
 		var updatedAt string
 		var threshold, input, output, cacheCreation, cacheCreation1h,
 			cacheRead sql.NullInt64
 		var bandUpdatedAt sql.NullString
 		if err := rows.Scan(
-			&model, &rates.input, &rates.output,
-			&rates.cacheCreation, &rates.cacheCreation1h,
-			&rates.cacheRead, &updatedAt,
+			&model, &rates.InputPerMTok, &rates.OutputPerMTok,
+			&rates.CacheWritePerMTok, &rates.CacheWrite1hPerMTok,
+			&rates.CacheReadPerMTok, &updatedAt,
 			&threshold, &input, &output, &cacheCreation, &cacheCreation1h,
 			&cacheRead, &bandUpdatedAt,
 		); err != nil {
@@ -2927,7 +2442,7 @@ func (s *Store) loadPricing(ctx context.Context) (map[string]duckRates, error) {
 		if !exists {
 			if parsed, err := time.Parse(time.RFC3339Nano, updatedAt); err == nil {
 				t := parsed.UTC()
-				rates.updatedAt = &t
+				rates.UpdatedAt = &t
 			}
 			stored = rates
 			count++
@@ -2947,7 +2462,7 @@ func (s *Store) loadPricing(ctx context.Context) (map[string]duckRates, error) {
 				t := parsed.UTC()
 				parsedUpdatedAt = &t
 			}
-			stored.bands = append(stored.bands, export.PricingBand{
+			stored.Bands = append(stored.Bands, export.PricingBand{
 				AboveInputTokens:    aboveInputTokens,
 				InputPerMTok:        money.Money{Microdollars: input.Int64},
 				OutputPerMTok:       money.Money{Microdollars: output.Int64},
@@ -2963,29 +2478,29 @@ func (s *Store) loadPricing(ctx context.Context) (map[string]duckRates, error) {
 		return nil, err
 	}
 	if count == 0 {
-		out = duckFallbackPricingMap()
+		out = db.FallbackPricingMap()
 	} else {
-		fallback := duckFallbackPricingMap()
+		fallback := db.FallbackPricingMap()
 		for model, rates := range out {
-			rates.source = duckPricingSource(model, rates, fallback)
+			rates.Source = db.ModelPricingSource(model, rates, fallback)
 			out[model] = rates
 		}
 	}
 	for model, custom := range s.customPricing {
-		rates := duckRates{
-			input:  money.Money{Microdollars: custom.InputMicrodollarsPerMTok},
-			output: money.Money{Microdollars: custom.OutputMicrodollarsPerMTok},
-			cacheCreation: money.Money{
+		rates := export.ModelRates{
+			InputPerMTok:  money.Money{Microdollars: custom.InputMicrodollarsPerMTok},
+			OutputPerMTok: money.Money{Microdollars: custom.OutputMicrodollarsPerMTok},
+			CacheWritePerMTok: money.Money{
 				Microdollars: custom.CacheCreationMicrodollarsPerMTok,
 			},
-			cacheCreation1h: money.Money{
+			CacheWrite1hPerMTok: money.Money{
 				Microdollars: custom.CacheCreation1hMicrodollarsPerMTok,
 			},
-			cacheRead: money.Money{
+			CacheReadPerMTok: money.Money{
 				Microdollars: custom.CacheReadMicrodollarsPerMTok,
 			},
 		}
-		rates.source = duckCustomPricingSource()
+		rates.Source = export.PricingRowSourceCustom
 		out[model] = rates
 	}
 	return out, nil
@@ -3008,108 +2523,8 @@ func (s *Store) loadPricingResolver(
 	if err != nil {
 		return nil, err
 	}
-	rows := duckPricingRows(pricing)
+	rows := db.MirrorPricingRows(pricing)
 	return export.NewPricingResolver(append(rows, genAI)), nil
-}
-
-func duckCustomPricingSource() export.PricingRowSource {
-	return export.PricingRowSourceCustom
-}
-
-func duckFallbackPricingMap() map[string]duckRates {
-	prices := pricingpkg.FallbackPricing()
-	out := make(map[string]duckRates, len(prices))
-	for _, p := range prices {
-		if strings.HasPrefix(p.ModelPattern, "_") {
-			continue
-		}
-		out[p.ModelPattern] = duckRates{
-			input:           p.InputPerMTok,
-			output:          p.OutputPerMTok,
-			cacheCreation:   p.CacheCreationPerMTok,
-			cacheCreation1h: p.CacheCreation1hPerMTok,
-			cacheRead:       p.CacheReadPerMTok,
-			source:          export.PricingRowSourceEmbedded,
-			bands:           duckCatalogPricingBands(p.Bands),
-		}
-	}
-	return out
-}
-
-func duckPricingSource(
-	model string, rates duckRates, fallback map[string]duckRates,
-) export.PricingRowSource {
-	if f, ok := fallback[model]; ok &&
-		f.input == rates.input &&
-		f.output == rates.output &&
-		f.cacheCreation == rates.cacheCreation &&
-		f.cacheCreation1h == rates.cacheCreation1h &&
-		f.cacheRead == rates.cacheRead &&
-		duckPricingBandsEqual(f.bands, rates.bands) {
-		return export.PricingRowSourceEmbedded
-	}
-	return export.PricingRowSourceFetched
-}
-
-func duckCatalogPricingBands(
-	bands []pricingpkg.PricingBand,
-) []export.PricingBand {
-	out := make([]export.PricingBand, len(bands))
-	for i, band := range bands {
-		out[i] = export.PricingBand{
-			AboveInputTokens:    band.AboveInputTokens,
-			InputPerMTok:        band.InputPerMTok,
-			OutputPerMTok:       band.OutputPerMTok,
-			CacheWritePerMTok:   band.CacheCreationPerMTok,
-			CacheWrite1hPerMTok: band.CacheCreation1hPerMTok,
-			CacheReadPerMTok:    band.CacheReadPerMTok,
-		}
-	}
-	return out
-}
-
-func duckPricingBandsEqual(a, b []export.PricingBand) bool {
-	if len(a) != len(b) {
-		return false
-	}
-	for i := range a {
-		if a[i].AboveInputTokens != b[i].AboveInputTokens ||
-			a[i].InputPerMTok != b[i].InputPerMTok ||
-			a[i].OutputPerMTok != b[i].OutputPerMTok ||
-			a[i].CacheWritePerMTok != b[i].CacheWritePerMTok ||
-			a[i].CacheWrite1hPerMTok != b[i].CacheWrite1hPerMTok ||
-			a[i].CacheReadPerMTok != b[i].CacheReadPerMTok {
-			return false
-		}
-	}
-	return true
-}
-
-func duckPricingRows(
-	in map[string]duckRates,
-) []export.EffectivePricingRow {
-	out := make([]export.EffectivePricingRow, 0, len(in))
-	fallback := duckFallbackPricingMap()
-	for pattern, rates := range in {
-		source := rates.source
-		if source == "" {
-			source = duckPricingSource(pattern, rates, fallback)
-		}
-		out = append(out, export.EffectivePricingRow{
-			ModelPattern: pattern,
-			Rates: export.ModelRates{
-				InputPerMTok:        rates.input,
-				OutputPerMTok:       rates.output,
-				CacheWritePerMTok:   rates.cacheCreation,
-				CacheWrite1hPerMTok: rates.cacheCreation1h,
-				CacheReadPerMTok:    rates.cacheRead,
-				UpdatedAt:           rates.updatedAt,
-				Source:              source,
-				Bands:               append([]export.PricingBand(nil), rates.bands...),
-			},
-		})
-	}
-	return out
 }
 
 type duckUsageBounds struct {
@@ -3199,114 +2614,22 @@ func appendDuckUsageColumnBounds(
 	return where, args
 }
 
-func appendDuckUsageCSVFilter(
-	where string, args []any, col, csv string, include bool,
-) (string, []any) {
-	if csv == "" {
-		return where, args
-	}
-	parts := strings.Split(csv, ",")
-	vals := make([]string, 0, len(parts))
-	for _, value := range parts {
-		trimmed := strings.TrimSpace(value)
-		if trimmed != "" {
-			vals = append(vals, trimmed)
-		}
-	}
-	return appendDuckUsageValuesFilter(where, args, col, vals, include)
-}
-
-func appendDuckUsageValuesFilter(
-	where string, args []any, col string, vals []string, include bool,
-) (string, []any) {
-	if len(vals) == 0 {
-		return where, args
-	}
-	op := "IN"
-	if !include {
-		op = "NOT IN"
-	}
-	if len(vals) == 1 {
-		if include {
-			where += "\n\t\t\tAND " + col + " = ?"
-		} else {
-			where += "\n\t\t\tAND " + col + " != ?"
-		}
-		args = append(args, vals[0])
-		return where, args
-	}
-	ph := make([]string, len(vals))
-	for i, value := range vals {
-		ph[i] = "?"
-		args = append(args, value)
-	}
-	where += "\n\t\t\tAND " + col + " " + op +
-		" (" + strings.Join(ph, ",") + ")"
-	return where, args
-}
-
 func appendDuckUsageSourceFilterClauses(
 	where string, args []any, modelCol string, f db.UsageFilter,
 ) (string, []any) {
-	where, args = appendDuckUsageCSVFilter(where, args, modelCol, f.Model, true)
-	return appendDuckUsageCSVFilter(where, args, modelCol, f.ExcludeModel, false)
+	b := db.NewQueryBuilder(db.DuckDBQueryDialect(), 0)
+	preds := db.BuildUsageSourceFilter(f, b, modelCol)
+	where = db.AppendUsagePredicates(where, preds, "\t\t\t")
+	return where, append(args, b.Args()...)
 }
 
 func appendDuckUsageSessionFilterClauses(
 	where string, args []any, f db.UsageFilter, sessionID string,
 ) (string, []any) {
-	where, args = appendDuckUsageCSVFilter(where, args, "s.agent", f.Agent, true)
-	where, args = appendDuckUsageValuesFilter(
-		where, args, "s.project", f.ProjectFilterLabels(), true,
-	)
-	where, args = appendDuckUsageCSVFilter(where, args, "s.machine", f.Machine, true)
-	if f.GitBranch != "" {
-		var clause string
-		clause, args = db.BranchPairClauseArgs("s.project", "s.git_branch", f.GitBranch, args)
-		where += "\n\t\t\tAND " + clause
-	}
-	where, args = appendDuckUsageValuesFilter(
-		where, args, "s.project", f.ExcludedProjectFilterLabels(), false,
-	)
-	where, args = appendDuckUsageCSVFilter(where, args, "s.agent", f.ExcludeAgent, false)
-	if sessionID != "" {
-		where += "\n\t\t\tAND s.id = ?"
-		args = append(args, sessionID)
-	}
-	if f.MinUserMessages > 0 {
-		where += "\n\t\t\tAND s.user_message_count >= ?"
-		args = append(args, f.MinUserMessages)
-	}
-	scope := duckNormalizeAutomatedScope(
-		f.AutomatedScope, f.ExcludeAutomated)
-	if f.ExcludeOneShot {
-		if scope == "human" {
-			where += "\n\t\t\tAND s.user_message_count > 1"
-		} else {
-			where += "\n\t\t\tAND (s.user_message_count > 1 OR COALESCE(s.is_automated, FALSE) = TRUE)"
-		}
-	}
-	if pred := duckAutomatedScopePredicate(
-		scope, "COALESCE(s.is_automated, FALSE)"); pred != "" {
-		where += "\n\t\t\tAND " + pred
-	}
-	if f.ActiveSince != "" {
-		where += "\n\t\t\tAND COALESCE(s.ended_at, s.started_at, s.created_at) >= CAST(? AS TIMESTAMP)"
-		args = append(args, f.ActiveSince)
-	}
-	if pred, predArgs := duckUsageTerminationPred(f.Termination); pred != "" {
-		where += "\n\t\t\tAND " + pred
-		args = append(args, predArgs...)
-	}
-	return where, args
-}
-
-func duckUsageTerminationPred(status string) (string, []any) {
-	return duckAnalyticsTerminationPred(
-		status,
-		"COALESCE(s.ended_at, s.started_at, s.created_at)",
-		"s.termination_status",
-	)
+	b := db.NewQueryBuilder(db.DuckDBQueryDialect(), 0)
+	preds := db.BuildUsageSessionFilter(f, b, sessionID)
+	where = db.AppendUsagePredicates(where, preds, "\t\t\t")
+	return where, append(args, b.Args()...)
 }
 
 const duckDailyCursorUsageRowsSQLTemplate = `
@@ -3489,34 +2812,22 @@ func duckCursorUsageRowsSQLForBounds(
 	// must exclude them entirely rather than let them leak into totals.
 	if len(f.ProjectFilterLabels()) > 0 ||
 		len(f.ExcludedProjectFilterLabels()) > 0 ||
-		f.Machine != "" || f.GitBranch != "" || f.MinUserMessages > 0 ||
+		len(db.CSVFilterValues(f.Machine)) > 0 || f.GitBranch != "" || f.MinUserMessages > 0 ||
 		f.ExcludeOneShot || hasTermFilter ||
 		f.ActiveSince != "" {
 		return "", nil, false
 	}
-	if f.Agent != "" {
-		vals := strings.Split(f.Agent, ",")
-		for i := range vals {
-			vals[i] = strings.TrimSpace(vals[i])
-		}
-		if !slices.Contains(vals, "cursor") {
-			return "", nil, false
-		}
+	if vals := db.CSVFilterValues(f.Agent); len(vals) > 0 && !slices.Contains(vals, "cursor") {
+		return "", nil, false
 	}
-	if f.ExcludeAgent != "" {
-		vals := strings.Split(f.ExcludeAgent, ",")
-		for i := range vals {
-			vals[i] = strings.TrimSpace(vals[i])
-		}
-		if slices.Contains(vals, "cursor") {
-			return "", nil, false
-		}
+	if vals := db.CSVFilterValues(f.ExcludeAgent); slices.Contains(vals, "cursor") {
+		return "", nil, false
 	}
 
 	where := "cu.model != ''"
 	var args []any
-	scope := duckNormalizeAutomatedScope(f.AutomatedScope, f.ExcludeAutomated)
-	if pred := duckAutomatedScopePredicate(scope, "cu.is_headless"); pred != "" {
+	scope := db.NormalizeAutomatedScope(f.AutomatedScope, f.ExcludeAutomated)
+	if pred := db.DuckDBQueryDialect().AutomatedScopePredicate(scope, "cu.is_headless"); pred != "" {
 		where += "\n\tAND " + pred
 	}
 	where, args = appendDuckUsageSourceFilterClauses(
@@ -3544,8 +2855,13 @@ func duckDailyUsageRawSQL(f db.UsageFilter) (string, []any) {
 }
 
 func duckUsageLocalDateSQL(f db.UsageFilter) (string, any) {
-	if f.Timezone != "" {
-		return "COALESCE(strftime(timezone(?, timezone('UTC', ts)), '%Y-%m-%d'), '')", f.Timezone
+	name := f.Timezone
+	// The shared default zone converts per timestamp, so dates follow DST.
+	if location := f.Location(); name == "" && location.String() != "Local" {
+		name = location.String()
+	}
+	if name != "" {
+		return "COALESCE(strftime(timezone(?, timezone('UTC', ts)), '%Y-%m-%d'), '')", name
 	}
 	ref := time.Now().UTC()
 	if f.From != "" {
@@ -3553,7 +2869,7 @@ func duckUsageLocalDateSQL(f db.UsageFilter) (string, any) {
 			ref = t
 		}
 	}
-	_, offset := ref.In(time.Local).Zone()
+	_, offset := ref.In(f.Location()).Zone()
 	return "COALESCE(strftime(ts + (? * INTERVAL 1 SECOND), '%Y-%m-%d'), '')", offset
 }
 
@@ -3970,7 +3286,7 @@ func duckUsageAggregateResolvedCost(
 		pricing.RecordResolvedReported(reportedModel, pricedModel, lookup)
 	}
 	if hasComputedUsage {
-		duckRecordComputedUsagePricing(
+		db.RecordComputedUsagePricing(
 			pricing, reportedModel, pricedModel, lookup, requestScoped,
 			billableInput, billableCacheCr, billableCacheRd,
 		)
@@ -4027,22 +3343,6 @@ func duckUsageAggregateResolvedCost(
 		priced = true
 	}
 	return cost, savings, priced, true, nil
-}
-
-func duckRecordComputedUsagePricing(
-	pricing *export.PricingResolver,
-	reportedModel, pricedModel string,
-	lookup export.PricingLookup,
-	requestScoped bool,
-	inputTokens, cacheWriteTokens, cacheReadTokens int,
-) {
-	if requestScoped {
-		pricing.RecordResolvedComputedRequest(
-			reportedModel, pricedModel, lookup,
-			inputTokens, cacheWriteTokens, cacheReadTokens)
-		return
-	}
-	pricing.RecordResolvedComputedAggregate(reportedModel, pricedModel, lookup)
 }
 
 func duckSessionUsageRowCost(
@@ -4220,7 +3520,7 @@ func (s *Store) GetDailyUsage(
 		authoritative *money.Money
 	}
 	sessionCosts := map[string]sessionCost{}
-	useAuthoritativeCost := f.Model == "" && f.ExcludeModel == ""
+	useAuthoritativeCost := !f.HasModelFilter()
 	projectLabels := map[string]bool{}
 	var seenSessions map[string]db.UsageSessionInfo
 	if !f.SkipSessionCounts {
@@ -4389,7 +3689,7 @@ func (s *Store) GetDailyUsage(
 	}
 
 	var result db.DailyUsageResult
-	for _, date := range sortedKeys(days) {
+	for _, date := range db.SortedKeys(days) {
 		day := days[date]
 		if day == nil {
 			continue
@@ -4483,7 +3783,7 @@ func (s *Store) GetDailyUsage(
 			"building pricing block: %w", err)
 	}
 	result.Pricing = &pricingBlock
-	projects, err := s.BuildProjectIdentityMap(ctx, sortedBoolKeys(projectLabels))
+	projects, err := s.BuildProjectIdentityMap(ctx, db.SortedKeys(projectLabels))
 	if err != nil {
 		return db.DailyUsageResult{}, err
 	}
@@ -4525,15 +3825,6 @@ func sortedUsageBucketKeys(m map[string]duckUsageBucket) []string {
 		}
 		return out[i] < out[j]
 	})
-	return out
-}
-
-func sortedBoolKeys(m map[string]bool) []string {
-	out := make([]string, 0, len(m))
-	for k := range m {
-		out = append(out, k)
-	}
-	sort.Strings(out)
 	return out
 }
 
@@ -4720,7 +4011,7 @@ func (s *Store) GetTopSessionsByCost(
 			if priceErr != nil {
 				return fmt.Errorf("summing duckdb top-session cost: %w", priceErr)
 			}
-			if f.Model == "" && f.ExcludeModel == "" && r.authoritativeCostRows > 0 {
+			if !f.HasModelFilter() && r.authoritativeCostRows > 0 {
 				v := money.Money{Microdollars: r.authoritativeCost}
 				a.authoritativeCost = &v
 			}
@@ -4984,8 +4275,8 @@ func (s *Store) GetSessionUsage(
 		TotalOutputTokens: max(sess.TotalOutputTokens-deduplicatedOutputTokens, 0),
 		PeakContextTokens: sess.PeakContextTokens,
 		HasTokenData:      sess.HasTotalOutputTokens || sess.HasPeakContextTokens,
-		Models:            sortedBoolKeys(models),
-		UnpricedModels:    sortedBoolKeys(unpriced),
+		Models:            db.SortedKeys(models),
+		UnpricedModels:    db.SortedKeys(unpriced),
 		BreakdownCount:    breakdownCount,
 		Breakdown:         breakdown,
 	}

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"os"
@@ -9,7 +10,6 @@ import (
 
 	"go.kenn.io/agentsview/internal/config"
 	"go.kenn.io/agentsview/internal/db"
-	"go.kenn.io/agentsview/internal/update"
 )
 
 type serveReplacementAction int
@@ -36,7 +36,7 @@ type serveReplacementDecision struct {
 
 var foregroundServeLaunchLocks sync.Map
 
-func prepareForegroundServeDaemon(
+func prepareForegroundServeDaemon(ctx context.Context,
 	cfg *config.Config, opts serveReplacementOptions,
 ) (bool, func(), error) {
 	noRelease := func() {}
@@ -67,7 +67,7 @@ func prepareForegroundServeDaemon(
 		}
 		return false, noRelease, nil
 	case serveReplacementAuto, serveReplacementExplicit:
-		if err := checkForegroundReplacementDataVersion(
+		if err := checkForegroundReplacementDataVersion(ctx,
 			*cfg, decision,
 		); err != nil {
 			return false, noRelease, err
@@ -80,9 +80,8 @@ func prepareForegroundServeDaemon(
 		ownsStartLock, acquiredStartLock := markDaemonStarting(cfg.DataDir)
 		if !ownsStartLock {
 			releaseReplacementLock()
-			return false, noRelease, fmt.Errorf(
-				"agentsview serve startup is already in progress; " +
-					"wait for it to finish or run `agentsview daemon status`",
+			return false, noRelease, errors.New("agentsview serve startup is already in progress; " +
+				"wait for it to finish or run `agentsview daemon status`",
 			)
 		}
 		fmt.Println("Replacing agentsview daemon")
@@ -92,7 +91,7 @@ func prepareForegroundServeDaemon(
 		if !opts.NoSyncExplicit {
 			adoptDaemonRuntimeLaunchOptions(cfg, decision.Runtime)
 		}
-		if err := stopDaemonRuntimeForUpgrade(*cfg, decision.Runtime); err != nil {
+		if err := stopDaemonRuntimeForUpgrade(ctx, *cfg, decision.Runtime); err != nil {
 			if acquiredStartLock {
 				UnmarkDaemonStarting(cfg.DataDir)
 			}
@@ -116,9 +115,8 @@ func acquireForegroundServeLaunchLock(cfg config.Config) (func(), error) {
 	}
 	lock, ok := acquireBackgroundLaunchLock(cfg.DataDir)
 	if !ok {
-		return nil, fmt.Errorf(
-			"agentsview serve --background is already in progress; " +
-				"wait for it to finish or run `agentsview daemon status`",
+		return nil, errors.New("agentsview serve --background is already in progress; " +
+			"wait for it to finish or run `agentsview daemon status`",
 		)
 	}
 	path := backgroundLaunchLockPath(cfg.DataDir)
@@ -136,7 +134,7 @@ func ownsForegroundServeLaunchLock(dataDir string) bool {
 	return ok
 }
 
-func checkForegroundReplacementDataVersion(
+func checkForegroundReplacementDataVersion(ctx context.Context,
 	cfg config.Config, decision serveReplacementDecision,
 ) error {
 	if cfg.DBPath == "" {
@@ -147,7 +145,7 @@ func checkForegroundReplacementDataVersion(
 	default:
 		return nil
 	}
-	return db.CheckDataVersion(cfg.DBPath)
+	return db.CheckDataVersion(ctx, cfg.DBPath)
 }
 
 func decideServeDaemonReplacement(
@@ -204,14 +202,9 @@ func decideCompatibleServeDaemonReplacement(
 		decision.Reason = "replacement requested with --replace"
 		return decision
 	}
-	if shouldUpgradeDaemonRuntime(rt, version) {
+	if shouldReplaceDaemonRuntime(rt, version) {
 		decision.Action = serveReplacementAuto
-		decision.Reason = serveDaemonOlderReason(rt)
-		return decision
-	}
-	if rt.Record.Version != version {
-		decision.Action = serveReplacementRefuse
-		decision.Reason = serveDaemonRefusalReason(rt, nil)
+		decision.Reason = serveDaemonVersionMismatchReason(rt)
 		return decision
 	}
 	decision.Action = serveReplacementUseExisting
@@ -231,9 +224,9 @@ func decideIncompatibleServeDaemonReplacement(
 		decision.Reason = "replacement requested with --replace"
 		return decision
 	}
-	if shouldUpgradeIncompatibleDaemonRuntime(rt, version) {
+	if shouldReplaceIncompatibleDaemonRuntime(rt, version) {
 		decision.Action = serveReplacementAuto
-		decision.Reason = serveDaemonOlderReason(rt)
+		decision.Reason = serveDaemonVersionMismatchReason(rt)
 		return decision
 	}
 	decision.Action = serveReplacementRefuse
@@ -241,17 +234,17 @@ func decideIncompatibleServeDaemonReplacement(
 	return decision
 }
 
-func serveDaemonOlderReason(rt *DaemonRuntime) string {
+func serveDaemonVersionMismatchReason(rt *DaemonRuntime) string {
 	daemonVersion := serveDaemonVersion(rt)
 	if rt == nil || rt.Record.Version == "" {
 		return fmt.Sprintf(
-			"daemon version is unknown and treated as older than current "+
+			"daemon version is unknown; restarting with current "+
 				"binary version %s",
 			serveCurrentVersion(),
 		)
 	}
 	return fmt.Sprintf(
-		"daemon version %s is older than current binary version %s",
+		"daemon version %s differs from current binary version %s",
 		daemonVersion, serveCurrentVersion(),
 	)
 }
@@ -267,29 +260,9 @@ func serveDaemonRefusalReason(
 			rt.API, rt.Data, daemonAPIVersion, db.CurrentDataVersion(),
 		)
 	}
-	if update.IsDevBuildVersion(version) {
-		return fmt.Sprintf(
-			"current binary version %s is a dev build; dev builds do not "+
-				"replace running daemons automatically",
-			serveCurrentVersion(),
-		)
-	}
-	if rt != nil && update.IsNewer(rt.Record.Version, version) {
-		return fmt.Sprintf(
-			"daemon version %s is newer than current binary version %s",
-			serveDaemonVersion(rt), serveCurrentVersion(),
-		)
-	}
-	if compatErr != nil {
-		return fmt.Sprintf(
-			"current binary version %s is not newer than daemon version %s "+
-				"and cannot automatically replace the incompatible daemon: %v",
-			serveCurrentVersion(), serveDaemonVersion(rt), compatErr,
-		)
-	}
 	return fmt.Sprintf(
-		"current binary version %s is not newer than daemon version %s",
-		serveCurrentVersion(), serveDaemonVersion(rt),
+		"daemon version %s cannot serve current binary version %s: %v",
+		serveDaemonVersion(rt), serveCurrentVersion(), compatErr,
 	)
 }
 
@@ -342,10 +315,10 @@ func serveDaemonDecisionLines(
 	}
 	lines := []string{
 		header,
-		fmt.Sprintf("  url:             %s", urlFromDaemonRuntime(rt)),
+		"  url:             " + urlFromDaemonRuntime(rt),
 		fmt.Sprintf("  pid:             %d", rt.Record.PID),
-		fmt.Sprintf("  daemon version:  %s", serveDaemonVersion(rt)),
-		fmt.Sprintf("  binary version:  %s", serveCurrentVersion()),
+		"  daemon version:  " + serveDaemonVersion(rt),
+		"  binary version:  " + serveCurrentVersion(),
 		fmt.Sprintf(
 			"  API version:     daemon %d, current %d",
 			rt.API, daemonAPIVersion,
@@ -361,7 +334,7 @@ func serveDaemonDecisionLines(
 		)
 	}
 	if decision.Reason != "" {
-		lines = append(lines, fmt.Sprintf("  reason:          %s", decision.Reason))
+		lines = append(lines, "  reason:          "+decision.Reason)
 	}
 	return lines
 }

@@ -1,13 +1,12 @@
 package telemetry
 
 import (
-	"context"
 	"runtime"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	kittelemetry "go.kenn.io/kit/telemetry"
+	kittelemetry "go.kenn.io/kit/telemetry/posthog"
 )
 
 func TestEnabledFromEnvHonorsAgentsViewAndGenericOptOut(t *testing.T) {
@@ -15,7 +14,7 @@ func TestEnabledFromEnvHonorsAgentsViewAndGenericOptOut(t *testing.T) {
 	assert.False(t, EnabledFromEnv())
 
 	t.Setenv(EnabledEnv, "1")
-	if kittelemetry.PostHogTelemetryDisabled() {
+	if kittelemetry.ProcessDisabled() {
 		assert.False(t, EnabledFromEnv())
 		return
 	}
@@ -23,24 +22,6 @@ func TestEnabledFromEnvHonorsAgentsViewAndGenericOptOut(t *testing.T) {
 
 	t.Setenv(GenericEnabledEnv, "0")
 	assert.False(t, EnabledFromEnv())
-}
-
-func TestNewReporterDisabledByEnv(t *testing.T) {
-	t.Setenv(EnabledEnv, "0")
-
-	reporter, err := NewReporter(Options{InstallationID: "anonymous-install-id"})
-	require.NoError(t, err)
-
-	assert.False(t, reporter.Enabled())
-}
-
-func TestGenericTelemetryEnvDisablesReporter(t *testing.T) {
-	t.Setenv(GenericEnabledEnv, "0")
-
-	reporter, err := NewReporter(Options{InstallationID: "anonymous-install-id"})
-	require.NoError(t, err)
-
-	assert.False(t, reporter.Enabled())
 }
 
 func TestNewReporterDisabledDuringTestsDespiteEnabledEnv(t *testing.T) {
@@ -53,20 +34,30 @@ func TestNewReporterDisabledDuringTestsDespiteEnabledEnv(t *testing.T) {
 	assert.False(t, reporter.Enabled())
 }
 
+func TestNewReporterOptedOutKeepsAllowlist(t *testing.T) {
+	t.Setenv(GenericEnabledEnv, "0")
+
+	reporter, err := NewReporter(Options{})
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, reporter.Close()) })
+
+	assert.False(t, reporter.Enabled())
+	assert.True(t, reporter.EventAllowed(EventAppOpened))
+	assert.True(t, reporter.EventAllowed(EventDaemonActive))
+	assert.False(t, reporter.EventAllowed("daemon_started"))
+}
+
 func TestAllowedEventOptionsConfigureDaemonActiveShape(t *testing.T) {
 	t.Setenv(EnabledEnv, "1")
 	t.Setenv(GenericEnabledEnv, "1")
 
-	client, err := newKitReporter(
-		"anonymous-install-id", "v1.2.3", "abc123",
-	)
+	client, err := newKitReporter(Options{
+		InstallationID: "anonymous-install-id", Version: "v1.2.3", Commit: "abc123",
+	})
 	require.NoError(t, err)
 	t.Cleanup(func() { require.NoError(t, client.Close()) })
 
 	reporter := &Reporter{client: client}
-
-	assert.True(t, reporter.EventAllowed(EventDaemonActive))
-	assert.False(t, reporter.EventAllowed("daemon_started"))
 
 	props, err := reporter.SanitizeProperties(EventDaemonActive, map[string]any{
 		"$process_person_profile": true,
@@ -94,31 +85,4 @@ func TestAllowedEventOptionsConfigureDaemonActiveShape(t *testing.T) {
 	assert.NotContains(t, props, "app")
 	assert.NotContains(t, props, "project")
 	assert.NotContains(t, props, "session")
-}
-
-func TestReporterCaptureDaemonActiveNoopsDuringTests(t *testing.T) {
-	t.Setenv(EnabledEnv, "1")
-	t.Setenv(GenericEnabledEnv, "1")
-
-	client, err := newKitReporter(
-		"anonymous-install-id", "v1.2.3", "abc123",
-	)
-	require.NoError(t, err)
-	t.Cleanup(func() { require.NoError(t, client.Close()) })
-
-	reporter := &Reporter{client: client}
-	assert.True(t, reporter.Enabled())
-
-	err = reporter.CaptureDaemonActive(context.Background())
-	require.NoError(t, err)
-}
-
-func TestReporterCaptureDaemonActiveTestBlockerWinsOverCanceledContext(t *testing.T) {
-	client := kittelemetry.DisabledPostHogReporter()
-	reporter := &Reporter{client: client}
-	ctx, cancel := context.WithCancel(context.Background())
-	cancel()
-
-	err := reporter.CaptureDaemonActive(ctx)
-	require.NoError(t, err)
 }

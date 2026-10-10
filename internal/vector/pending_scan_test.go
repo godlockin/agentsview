@@ -2,11 +2,16 @@ package vector
 
 import (
 	"context"
+	"database/sql"
+	"database/sql/driver"
 	"path/filepath"
+	"slices"
 	"strings"
+	"sync"
 	"testing"
 
 	kitvec "go.kenn.io/kit/vector"
+	"go.kenn.io/kit/vector/sqlitevec"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -16,8 +21,9 @@ import (
 // for query.
 func explainVectorPlan(t *testing.T, ix *Index, query string, args ...any) []string {
 	t.Helper()
+
 	rows, err := ix.db.QueryContext(
-		context.Background(), "EXPLAIN QUERY PLAN "+query, args...)
+		t.Context(), "EXPLAIN QUERY PLAN "+query, args...)
 	require.NoError(t, err)
 	defer rows.Close()
 
@@ -48,13 +54,13 @@ func TestMirrorRevisionIndexExists(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			ix, err := OpenSpec(context.Background(),
+			ix, err := OpenSpec(t.Context(),
 				filepath.Join(t.TempDir(), "vectors.db"), tt.spec, false, 4000)
 			require.NoError(t, err)
 			t.Cleanup(func() { require.NoError(t, ix.Close()) })
 
 			var sql string
-			require.NoError(t, ix.db.QueryRow(
+			require.NoError(t, ix.db.QueryRowContext(t.Context(),
 				`SELECT sql FROM sqlite_master WHERE type = 'index' AND name = ?`,
 				tt.index).Scan(&sql))
 			assert.Contains(t, sql, tt.spec.DocsTable)
@@ -69,7 +75,7 @@ func TestMirrorRevisionIndexExists(t *testing.T) {
 // covering index, and content must only be read per pending doc_key.
 func TestPendingContentQueryPlanSkipsStampedDocumentContent(t *testing.T) {
 	ix, gen := builtPendingIndex(t)
-	ordinal, err := ix.ordinalForFingerprint(context.Background(), gen.Fingerprint())
+	ordinal, err := ix.ordinalForFingerprint(t.Context(), gen.Fingerprint())
 	require.NoError(t, err)
 
 	plan := explainVectorPlan(t, ix, ix.pendingContentQuery(), ordinal)
@@ -87,22 +93,86 @@ func TestPendingContentQueryPlanSkipsStampedDocumentContent(t *testing.T) {
 	}
 }
 
-// TestGenerationCoverageQueryPlanUsesRevisionIndex asserts the coverage
-// query's Embedded and Missing anti-joins are answered from the same
-// covering index, so `embeddings status` does not walk the whole mirror
-// either.
-func TestGenerationCoverageQueryPlanUsesRevisionIndex(t *testing.T) {
-	ix, _ := builtPendingIndex(t)
+// recordingConnector opens connections through the vector SQLite driver and
+// records every statement prepared on them, so a test can explain the exact
+// SQL a kit store runs.
+type recordingConnector struct {
+	drv driver.Driver
+	dsn string
 
-	plan := explainVectorPlan(t, ix, ix.generationCoverageQuery())
+	mu         sync.Mutex
+	statements []string
+}
+
+func (c *recordingConnector) Connect(context.Context) (driver.Conn, error) {
+	conn, err := c.drv.Open(c.dsn)
+	if err != nil {
+		return nil, err
+	}
+	return &recordingConn{Conn: conn, connector: c}, nil
+}
+
+func (c *recordingConnector) Driver() driver.Driver { return c.drv }
+
+func (c *recordingConnector) recorded() []string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return slices.Clone(c.statements)
+}
+
+// recordingConn exposes only driver.Conn, so database/sql prepares every
+// statement through Prepare.
+type recordingConn struct {
+	driver.Conn
+	connector *recordingConnector
+}
+
+func (c *recordingConn) Prepare(query string) (driver.Stmt, error) {
+	c.connector.mu.Lock()
+	c.connector.statements = append(c.connector.statements, query)
+	c.connector.mu.Unlock()
+	return c.Conn.Prepare(query)
+}
+
+// TestGenerationCoverageQueryPlanUsesCoverageIndex asserts kit's sqlitevec
+// Coverage, which `embeddings list` and auto-activation run, is answered from
+// the mirror's coverage index rather than every row's content. It records the
+// statement Coverage executes and explains that exact SQL.
+func TestGenerationCoverageQueryPlanUsesCoverageIndex(t *testing.T) {
+	ctx := t.Context()
+	path := filepath.Join(t.TempDir(), "vectors.db")
+	ix, err := Open(ctx, path, false, 4000)
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, ix.Close()) })
+	gen := fakeGeneration("fake-model")
+	_, err = ix.Build(ctx, twoDocSource(), fakeBuildEncoder(), gen, BuildOptions{})
+	require.NoError(t, err)
+
+	connector := &recordingConnector{drv: ix.db.Driver(), dsn: vectorDSN(path, false)}
+	db := sql.OpenDB(connector)
+	t.Cleanup(func() { require.NoError(t, db.Close()) })
+	store, err := sqlitevec.New[string, string](ctx, db, ix.spec.schema())
+	require.NoError(t, err)
+	before := len(connector.recorded())
+	_, err = store.Coverage(ctx, gen.Fingerprint(), "")
+	require.NoError(t, err)
+
+	var coverage []string
+	for _, statement := range connector.recorded()[before:] {
+		if strings.Contains(statement, ix.spec.DocsTable+" d") {
+			coverage = append(coverage, statement)
+		}
+	}
+	require.Len(t, coverage, 1, "Coverage runs one statement over the mirror")
+	ordinal, err := ix.ordinalForFingerprint(ctx, gen.Fingerprint())
+	require.NoError(t, err)
+
+	plan := explainVectorPlan(t, ix, coverage[0], ordinal)
 	joined := strings.Join(plan, "\n")
 
 	assert.Contains(t, joined,
-		"SEARCH d EXISTS USING COVERING INDEX idx_vector_messages_revision",
-		"the Embedded column must probe the covering index:\n%s", joined)
-	assert.Contains(t, joined,
-		"SCAN d USING COVERING INDEX idx_vector_messages_revision",
-		"the Missing column must scan the covering index, not the table:\n%s", joined)
+		"SCAN d USING COVERING INDEX idx_vector_messages_coverage",
+		"coverage must scan the covering index, not the table:\n%s", joined)
 	for _, line := range plan {
 		assert.NotEqual(t, "SCAN d", line,
 			"no coverage step may read every mirror row's content:\n%s", joined)
@@ -113,7 +183,7 @@ func TestGenerationCoverageQueryPlanUsesRevisionIndex(t *testing.T) {
 // denominator against the same stamp anti-join `embeddings status` reports
 // as Missing, across the states a refresh can leave a mirror in.
 func TestCountPendingMatchesCoverageMissing(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	longContent := strings.Repeat("word ", 2000)
 
 	tests := []struct {
@@ -135,6 +205,8 @@ func TestCountPendingMatchesCoverageMissing(t *testing.T) {
 		{
 			name: "StaleRevisionCountsAsPending",
 			mutate: func(t *testing.T, ix *Index) {
+				t.Helper()
+
 				_, err := ix.db.ExecContext(ctx,
 					`UPDATE vector_messages SET content_hash = 'changed'
 					 WHERE doc_key = 'u:s1:u1'`)
@@ -146,6 +218,8 @@ func TestCountPendingMatchesCoverageMissing(t *testing.T) {
 		{
 			name: "UnstampedMultiChunkDocumentCountsEveryChunk",
 			mutate: func(t *testing.T, ix *Index) {
+				t.Helper()
+
 				_, err := ix.db.ExecContext(ctx, `
 INSERT INTO vector_messages
     (doc_key, session_id, source_uuid, ordinal, ordinal_end, content, content_hash)
@@ -153,6 +227,8 @@ VALUES ('u:s1:u3', 's1', 'u3', 9, 9, ?, 'hash-u3')`, longContent)
 				require.NoError(t, err)
 			},
 			wantChunks: func(t *testing.T, ix *Index) int64 {
+				t.Helper()
+
 				chunks := int64(len(kitvec.Split(longContent, ix.split)))
 				require.Greater(t, chunks, int64(1),
 					"content must split into several chunks for this case to be meaningful")
@@ -187,7 +263,7 @@ func builtPendingIndex(t *testing.T) (*Index, kitvec.Generation) {
 	ix := openTestIndex(t)
 	gen := fakeGeneration("fake-model")
 	_, err := ix.Build(
-		context.Background(), twoDocSource(), fakeBuildEncoder(), gen, BuildOptions{})
+		t.Context(), twoDocSource(), fakeBuildEncoder(), gen, BuildOptions{})
 	require.NoError(t, err)
 	return ix, gen
 }

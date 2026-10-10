@@ -20,7 +20,7 @@ func TestSyncStats_RecordSkip(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			var s SyncStats
-			for i := 0; i < tt.skips; i++ {
+			for range tt.skips {
 				s.RecordSkip()
 			}
 			assert.Equal(t, tt.want, s.Skipped)
@@ -468,11 +468,18 @@ func TestSyncStatsCwdUpdatedSurvivesWorkerJSONRoundTrip(t *testing.T) {
 	assert.True(t, restored.shouldEmitSync())
 }
 
-func TestMergeReconciliationSyncStatsCarriesCwdUpdated(t *testing.T) {
-	var dst SyncStats
-	src := SyncStats{CwdUpdated: 3}
-	mergeReconciliationSyncStats(&dst, src)
-	assert.Equal(t, 3, dst.CwdUpdated)
-	assert.True(t, dst.hasSessionChanges(),
-		"a cwd-only reconciliation must still notify session consumers")
+func TestMergeSyncStatsCarriesMetadataChanges(t *testing.T) {
+	for name, merge := range map[string]func(*SyncStats, SyncStats){
+		"reconciliation": mergeReconciliationSyncStats,
+		"rebuild":        mergeSyncStats,
+	} {
+		t.Run(name, func(t *testing.T) {
+			dst := SyncStats{CwdUpdated: 1, LinksUpdated: 2}
+			merge(&dst, SyncStats{CwdUpdated: 3, LinksUpdated: 4})
+			assert.Equal(t, 4, dst.CwdUpdated)
+			assert.Equal(t, 6, dst.LinksUpdated)
+			assert.True(t, dst.hasSessionChanges(),
+				"metadata-only changes must still notify session consumers")
+		})
+	}
 }

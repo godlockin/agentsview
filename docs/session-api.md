@@ -7,11 +7,10 @@ The `agentsview session` command group is a stable, programmatic surface for
 reading and writing session data. It is designed for shell scripts, automation
 agents, and CI jobs that need structured output rather than the web UI.
 
-When an AgentsView daemon is running, the CLI proxies supported operations to it
-over HTTP. On a cold archive, read-only commands open local SQLite directly in
-read-only mode, while commands that need fresh data or need to write start or
-reuse the detached local daemon. This keeps one-off reads fast and keeps SQLite
-writes owned by one process.
+Local session reads use the AgentsView daemon over HTTP and start it when
+needed. This keeps reads and writes under the same archive owner. Explicit
+`--server` and `--pg` options select another backend; raw `session export`
+always runs locally.
 
 ## Quick examples
 
@@ -39,8 +38,9 @@ agentsview session search "regression" --pg --json
 - **Unknown fields are safe to ignore.** Well-behaved consumers tolerate
   forward-compatible additions.
 
-HTTP and CLI share DTOs for bounded responses (same JSON object). The CLI
-`watch` command emits NDJSON whose lines mirror the underlying SSE events.
+HTTP and CLI share response schemas. The CLI adds browser links when it knows
+the server address. The CLI `watch` command emits NDJSON whose lines mirror
+the underlying SSE events.
 
 ## Transport
 
@@ -61,17 +61,17 @@ owner.
 - If both a writable local daemon and a `pg serve` daemon advertise the same
   data directory, the writable one wins so sync/write operations don't
   silently land on a read-only target.
-- If no daemon is running, read-only commands open the local archive directly in
-  read-only mode.
-- If a command requires fresh data or needs to write and no daemon is running,
-  the CLI starts `agentsview serve --background`, waits for readiness, and
-  proxies the operation to that daemon.
+- If no daemon is running, ordinary local session reads and writes start
+  `agentsview serve --background`, wait for readiness, and proxy the
+  operation to that daemon.
 - If `AGENTSVIEW_NO_DAEMON=1` is set, the CLI never auto-starts a daemon. Read
-  commands use direct read-only SQLite. Write commands run directly only after
-  acquiring the per-data-dir write-owner lock.
+  commands require an existing compatible daemon. The
+  [`session usage`](#agentsview-session-usage) refresh path can still run
+  directly after acquiring the write-owner lock; its `--no-sync` path requires
+  a daemon.
 - If a writable daemon is known to own the local archive but is not reachable,
-  write commands refuse instead of opening SQLite as a second writer. Read
-  commands may still fall back to direct read-only SQLite.
+  session commands report the connection or compatibility error instead of
+  opening a second archive handle.
 - `session export` always runs locally regardless of daemon state, and rejects
   `--server`, `--pg`, and `--format`/`--json` because it streams raw source
   bytes.
@@ -88,6 +88,13 @@ does not appear in process arguments.
 automation running away from the UI server, but it is read-only: `session sync`
 and `session export` reject it. If `AGENTSVIEW_PG_URL` or `[pg].url` is
 configured, read commands still use local SQLite unless `--pg` is supplied.
+
+When the CLI reads through HTTP, session list, detail, sync, and search JSON
+include `web_url` links to the selected server's browser view. The links retain
+the server's base path and separate the provider and session ID into URL
+segments, for example `/sessions/codex/<uuid>`. Use the returned link instead of
+constructing one. Direct `--pg` reads omit it because no browser address is
+known.
 
 ## Common flags
 
@@ -212,7 +219,8 @@ ______________________________________________________________________
 
 ### `agentsview session list`
 
-Filtered session list. Response shape matches `GET /api/v1/sessions`.
+Filtered session list. The session fields match `GET /api/v1/sessions`; CLI JSON
+also includes a `machine_labels` catalog.
 
 ```bash
 agentsview session list [flags]
@@ -222,17 +230,60 @@ agentsview session list [flags]
 {
   "sessions": [ ... ],
   "next_cursor": "...",
-  "total": 42
+  "total": 42,
+  "machine_labels": {
+    "machine-key": "Build Host"
+  }
 }
 ```
 
 One-shot and automated sessions are excluded by default. When the first CLI page
 hides any, `session list` writes an advisory to stderr with the hidden count for
 each category and the `--include-one-shot` or `--include-automated` flag that
-reveals it. Human and JSON stdout are unchanged, so redirecting or piping
-structured output remains safe. The JSON `total` continues to describe the
-filtered result, not the excluded sessions. Use the `--include-*` flags to opt
-back in.
+reveals it. Human stdout stays unchanged, and the JSON catalog is additive, so
+redirecting or piping structured output remains safe. The JSON `total` continues
+to describe the filtered result, not the excluded sessions. Use the
+`--include-*` flags to opt back in.
+
+In JSON output, `sessions[].machine` keeps the machine key. Look it up in the
+top-level `machine_labels` map when a display name is needed. A key without a
+stored label is absent from the map, and labels for machines outside the current
+page are omitted. If the catalog cannot be read, the command keeps the session
+result and emits `machine_labels: {}` with a warning on stderr. Human output
+does not read the catalog.
+
+Use `session list --json --include-source` to include each session's recorded
+`file_path`, `file_size`, and `local_modified_at` when the backend stores them.
+Source fields are omitted by default; this option does not add a column to human
+output. HTTP callers use `include_source=true`. PostgreSQL stores the source path
+but does not store file size or archive-row update time.
+
+To compare copies across hosts, fetch their metadata in one request:
+
+```http
+GET /api/v1/sessions?ids=codex:abc,codex:def&include_source=true
+```
+
+The HTTP-only `ids` parameter accepts 1 to 100 comma-separated IDs. Quote an ID
+that contains a comma or line break using RFC 4180 CSV quoting; double any quote
+characters inside it. For example, the decoded query value
+`ids="openclaw:main:part,part"` selects one ID. When none of the IDs contains a
+comma or line break, quote characters are treated literally. Whitespace around
+members is trimmed and duplicate IDs are returned once. Empty members or more
+than 100 members return HTTP 400. A raw ID matches itself and copies whose IDs
+end in `~<raw-id>`; an ID containing `~` matches exactly. Unknown IDs return no
+rows. IDs containing a CRLF sequence cannot be selected through this parameter.
+Direct selection includes child, automated, one-shot, and empty sessions. Deleted
+sessions remain excluded. Other explicit filters intersect the selected rows;
+normal sorting, limits, and cursor pagination still apply. Hosted PostgreSQL
+resolves public IDs first and rejects ambiguous copies through its existing
+identity-conflict response.
+
+Compare `cwd`, `is_truncated`, `message_count`, `file_size`,
+`local_modified_at`, and the session timestamps when choosing a copy. Source
+metadata and timestamps help compare copies; they do not guarantee a complete
+transcript. `local_modified_at` records changes to the archived session row,
+including later metadata edits. It is not the source file's modification time.
 
 Date filters match a session when its activity window overlaps the selected date
 or range. Sessions that start before midnight and remain active after it
@@ -258,7 +309,7 @@ therefore appear on both dates.
 | `--include-one-shot`  | `include_one_shot`  | bool                                                                                                                                                                              |
 | `--include-automated` | `include_automated` | bool                                                                                                                                                                              |
 | `--include-children`  | `include_children`  | bool                                                                                                                                                                              |
-| —                     | `include_source`    | bool; include source file paths, which are hidden by default                                                                                                                      |
+| `--include-source`    | `include_source`    | bool; include available source path, size, and archive-row update time, hidden by default                                                                                                                      |
 | `--outcome`           | `outcome`           | comma-separated                                                                                                                                                                   |
 | `--health-grade`      | `health_grade`      | comma-separated                                                                                                                                                                   |
 | `--min-tool-failures` | `min_tool_failures` | int; `0` is a meaningful filter                                                                                                                                                   |
@@ -346,7 +397,10 @@ emitted, separated from the flattened `content` which still contains inline
 `[Thinking]...[/Thinking]` markers for UI rendering.
 
 Promoted `source_subtype` values on `is_system: true` messages: `continuation`,
-`resume`, `interrupted`, `task_notification`, `stop_hook`, `compact_boundary`.
+`resume`, `interrupted`, `task_notification`, `stop_hook`, `peer_message`,
+`compact_boundary`. `peer_message` is a message another Claude Code session
+sent; its `content` keeps the `<cross-session-message>` wrapper with the
+sender's name.
 
 ______________________________________________________________________
 
@@ -458,7 +512,7 @@ Contract:
 The scheme is registered by the installed desktop app; it is not
 available when only the CLI or server is installed.
 
----
+______________________________________________________________________
 
 ### `agentsview session export`
 
@@ -577,6 +631,8 @@ agentsview session search <pattern> [flags]
     {
       "session_id": "abc-123",
       "project": "myapp",
+      "machine": "workstation",
+      "display_name": "Database investigation",
       "ordinal": 17,
       "ordinal_range": [12, 24],
       "location": "tool_result",
@@ -586,6 +642,11 @@ agentsview session search <pattern> [flags]
   ]
 }
 ```
+
+Each content match includes `machine` and `display_name` in every supported
+search mode and source. `display_name` uses the user title, falls back to the
+provider session name, and is `null` when neither exists. Session search at
+`GET /api/v1/search` also includes `machine` alongside its existing `name`.
 
 One-shot, automated, and subagent sessions are excluded by default; opt back in
 with `--include-one-shot`, `--include-automated`, or `--include-children`.
@@ -675,7 +736,7 @@ request.
   returns from the rollup branch first, so `subagents` has no effect.
 
 ```bash
-agentsview session usage <id> [--format json] [--own-only]
+agentsview session usage <id> [--format json] [--own-only] [--no-sync]
 ```
 
 ```json
@@ -843,9 +904,18 @@ Before querying, the local backend refreshes the session's own transcript and
 the `agent-*.jsonl` files under its `subagents/` directory, so a session that
 just finished reports complete numbers. `--own-only` skips the subagent refresh.
 
+Pass `--no-sync` to read archived usage without refreshing source transcripts.
+This preserves the full subagent rollup and the exit codes above; combine it
+with `--own-only` only when you want to exclude subagents. Local and remote
+HTTP queries skip the sync request, so recent usage appears after the watcher
+or a separate sync has indexed it. PostgreSQL reads already use archived data.
+The local `--no-sync` path requires a compatible daemon and starts one with
+source synchronization disabled if needed. With `AGENTSVIEW_NO_DAEMON=1`,
+it requires an existing compatible daemon.
+
 The command uses a writable local daemon when one is running, or starts a
 detached daemon when fresh local data is needed and no compatible daemon is
-running. With `AGENTSVIEW_NO_DAEMON=1`, it falls back to direct local SQLite
+running. Without `--no-sync`, `AGENTSVIEW_NO_DAEMON=1` selects direct local SQLite
 after acquiring the write-owner lock for any required refresh. Configured
 PostgreSQL does not change this command's default local behavior; pass `--pg` to
 read usage from the shared PostgreSQL store. With `--server`, it calls
@@ -1105,3 +1175,7 @@ When [PostgreSQL sync](/docs/pg-sync/) is enabled, the `secret_findings` table,
 the session-level `secret_leak_count`, and the `--has-secret` filter all mirror
 to the shared database. Substring and regex content search work the same way
 against `pg serve`, with the same masking and `--reveal` constraints.
+
+### Ingest-time image offload
+
+The normalized Markdown endpoint `/api/v1/sessions/{id}/md` carries stored tool-result content, including `agentsview_image` placeholders and `image_ref` asset references. The HTML export keeps its existing contract. A serving host needs the matching `{dataDir}/assets` directory. PostgreSQL and CockroachDB retain the reference text but cannot resolve local assets. The raw `agentsview session export` command streams provider source bytes and retains their original inline payloads.

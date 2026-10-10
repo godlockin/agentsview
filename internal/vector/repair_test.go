@@ -18,13 +18,14 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"go.kenn.io/kit/embedclient"
 	kitvec "go.kenn.io/kit/vector"
 )
 
 func TestBuildRepairInvalidRegeneratesOnlyAffectedDocuments(t *testing.T) {
 	ix := openTestIndex(t)
 	ix.split = kitvec.SplitOptions{MaxRunes: 5}
-	ctx := context.Background()
+	ctx := t.Context()
 	src := &fakeUnitSource{rows: []fakeUnit{
 		{unit: userDoc("s1", "bad", 0, "abcdefghij"), endedAt: "2024-01-01T00:00:00Z"},
 		{unit: userDoc("s1", "good", 1, "short"), endedAt: "2024-01-01T00:00:01Z"},
@@ -110,7 +111,7 @@ SELECT c.vec_rowid, v.embedding
 	assert.NotEqual(t, activeBadRowID, newActiveBadRowID)
 	newActiveBadVector, err := decodeFloat32Blob(newActiveBadBlob)
 	require.NoError(t, err)
-	assert.NoError(t, validateEmbedding(newActiveBadVector, 0))
+	assert.NoError(t, validateStoredEmbeddingBlob(newActiveBadBlob, len(newActiveBadVector)))
 	assert.Equal(t, activeGoodRowID, newActiveGoodRowID)
 	assert.Equal(t, activeGoodBlob, newActiveGoodBlob)
 	assert.Equal(t, oldBadRowID, newOldBadRowID)
@@ -126,7 +127,7 @@ SELECT c.vec_rowid, v.embedding
 	assert.Zero(t, activeInfo.Missing, "repair must preserve complete generation coverage")
 
 	second, err := ix.Build(ctx, src, func(context.Context, []string) ([][]float32, error) {
-		t.Fatal("a clean repair scan must not encode unrelated pending documents")
+		require.FailNow(t, "a clean repair scan must not encode unrelated pending documents")
 		return nil, nil
 	}, activeGen, BuildOptions{RepairInvalid: true})
 	require.NoError(t, err)
@@ -161,7 +162,7 @@ func TestValidateStoredEmbeddingBlobRejectsEveryCorruptionClass(t *testing.T) {
 
 func TestRepairInvalidVectorsQueuesOnlyAffectedDocument(t *testing.T) {
 	ix := openTestIndex(t)
-	ctx := context.Background()
+	ctx := t.Context()
 	src := &fakeUnitSource{rows: []fakeUnit{
 		{unit: userDoc("s1", "bad", 0, "bad"), endedAt: "2024-01-01T00:00:00Z"},
 		{unit: userDoc("s1", "good", 1, "good"), endedAt: "2024-01-01T00:00:01Z"},
@@ -208,7 +209,7 @@ SELECT COUNT(*) FROM message_vectors_chunks
 func TestScanInvalidRepairDocumentsAllocatesContentOncePerDocument(t *testing.T) {
 	ix := openTestIndex(t)
 	ix.split = kitvec.SplitOptions{MaxRunes: 1024}
-	ctx := context.Background()
+	ctx := t.Context()
 	content := strings.Repeat("x", 256*1024)
 	src := &fakeUnitSource{rows: []fakeUnit{
 		{unit: userDoc("s1", "large", 0, content), endedAt: "2024-01-01T00:00:00Z"},
@@ -236,7 +237,7 @@ func TestScanInvalidRepairDocumentsAllocatesContentOncePerDocument(t *testing.T)
 
 func TestBuildRepairInvalidRejectsBackstop(t *testing.T) {
 	ix := openTestIndex(t)
-	ctx := context.Background()
+	ctx := t.Context()
 	gen := fakeGeneration("active-model")
 	require.NoError(t, buildWithoutResult(ix, ctx, twoDocSource(), gen))
 
@@ -250,7 +251,7 @@ func TestBuildRepairInvalidRejectsBackstop(t *testing.T) {
 
 func TestBuildRepairInvalidRegeneratesMissingVectorRow(t *testing.T) {
 	ix := openTestIndex(t)
-	ctx := context.Background()
+	ctx := t.Context()
 	src := &fakeUnitSource{rows: []fakeUnit{
 		{unit: userDoc("s1", "bad", 0, "bad"), endedAt: "2024-01-01T00:00:00Z"},
 	}}
@@ -284,7 +285,7 @@ SELECT COUNT(*)
 
 func TestBuildRepairInvalidResumesAffectedKeysAfterEncodeFailure(t *testing.T) {
 	ix := openTestIndex(t)
-	ctx := context.Background()
+	ctx := t.Context()
 	src := &fakeUnitSource{rows: []fakeUnit{
 		{unit: userDoc("s1", "bad", 0, "bad"), endedAt: "2024-01-01T00:00:00Z"},
 		{unit: userDoc("s1", "good", 1, "good"), endedAt: "2024-01-01T00:00:01Z"},
@@ -321,7 +322,7 @@ SELECT vec_rowid FROM message_vectors_chunks
 	assert.Equal(t, 1, second.Fill.Documents)
 
 	third, err := ix.Build(ctx, src, func(context.Context, []string) ([][]float32, error) {
-		t.Fatal("a completed repair must leave no durable targets")
+		require.FailNow(t, "a completed repair must leave no durable targets")
 		return nil, nil
 	}, gen, BuildOptions{RepairInvalid: true})
 	require.NoError(t, err)
@@ -332,7 +333,7 @@ SELECT vec_rowid FROM message_vectors_chunks
 
 func TestBuildRepairInvalidQueueOwnsTargetAcrossRevisionDrift(t *testing.T) {
 	ix := openTestIndex(t)
-	ctx := context.Background()
+	ctx := t.Context()
 	src := &fakeUnitSource{rows: []fakeUnit{
 		{unit: userDoc("s1", "bad", 0, "old content"), endedAt: "2024-01-01T00:00:00Z"},
 	}}
@@ -377,7 +378,7 @@ UPDATE vector_messages
 
 func TestBuildRepairInvalidCompletesQueuedRevisionThatBecomesEmpty(t *testing.T) {
 	ix := openTestIndex(t)
-	ctx := context.Background()
+	ctx := t.Context()
 	src := &fakeUnitSource{rows: []fakeUnit{
 		{unit: userDoc("s1", "bad", 0, "old content"), endedAt: "2024-01-01T00:00:00Z"},
 	}}
@@ -408,7 +409,7 @@ UPDATE vector_messages
 	assert.Equal(t, 1, first.Fill.Stale)
 
 	second, err := ix.Build(ctx, src, func(context.Context, []string) ([][]float32, error) {
-		t.Fatal("zero-chunk content must complete without calling the encoder")
+		require.FailNow(t, "zero-chunk content must complete without calling the encoder")
 		return nil, nil
 	}, gen, BuildOptions{RepairInvalid: true})
 	require.NoError(t, err)
@@ -430,7 +431,7 @@ SELECT COUNT(*) FROM message_vectors_stamps
 
 func TestOrdinaryBuildClearsCompletedRepairTarget(t *testing.T) {
 	ix := openTestIndex(t)
-	ctx := context.Background()
+	ctx := t.Context()
 	src := &fakeUnitSource{rows: []fakeUnit{
 		{unit: userDoc("s1", "bad", 0, "bad"), endedAt: "2024-01-01T00:00:00Z"},
 	}}
@@ -465,7 +466,7 @@ SELECT COUNT(*) FROM message_vectors_repair_queue
 		"an ordinary successful save for the queued generation must complete the repair target")
 
 	repair, err := ix.Build(ctx, src, func(context.Context, []string) ([][]float32, error) {
-		t.Fatal("repair must not re-embed work completed by an ordinary build")
+		require.FailNow(t, "repair must not re-embed work completed by an ordinary build")
 		return nil, nil
 	}, gen, BuildOptions{RepairInvalid: true})
 	require.NoError(t, err)
@@ -476,7 +477,7 @@ SELECT COUNT(*) FROM message_vectors_repair_queue
 
 func TestOrdinaryBuildStampOnlySkipKeepsRepairTarget(t *testing.T) {
 	ix := openTestIndex(t)
-	ctx := context.Background()
+	ctx := t.Context()
 	src := &fakeUnitSource{rows: []fakeUnit{
 		{unit: userDoc("s1", "bad", 0, "bad"), endedAt: "2024-01-01T00:00:00Z"},
 	}}
@@ -500,7 +501,7 @@ SELECT vec_rowid FROM message_vectors_chunks
 	require.ErrorContains(t, err, "endpoint failed")
 
 	ordinary, err := ix.Build(ctx, src, func(context.Context, []string) ([][]float32, error) {
-		return nil, &HTTPStatusError{Status: http.StatusBadRequest, Body: "input exceeds token limit"}
+		return nil, &embedclient.APIError{StatusCode: http.StatusBadRequest, Reason: embedclient.ReasonInputTooLong}
 	}, gen, BuildOptions{FullRebuild: true})
 	require.NoError(t, err)
 	assert.Equal(t, 1, ordinary.Fill.Skipped)
@@ -519,10 +520,7 @@ SELECT COUNT(*) FROM message_vectors_repair_queue
 }
 
 func TestBuildRepairInvalidKeepsTargetAfterPermanentEncodeFailure(t *testing.T) {
-	assertFailedRepairRemainsQueued(t, &HTTPStatusError{
-		Status: http.StatusBadRequest,
-		Body:   "input exceeds token limit",
-	})
+	assertFailedRepairRemainsQueued(t, &embedclient.APIError{StatusCode: http.StatusBadRequest, Reason: embedclient.ReasonInputTooLong})
 }
 
 func TestBuildRepairInvalidKeepsTargetAfterContextDeadline(t *testing.T) {
@@ -531,7 +529,7 @@ func TestBuildRepairInvalidKeepsTargetAfterContextDeadline(t *testing.T) {
 
 func TestBuildRepairInvalidCountsRemainingTargetsAfterCancellationDuringFill(t *testing.T) {
 	ix := openTestIndex(t)
-	ctx := context.Background()
+	ctx := t.Context()
 	src := &fakeUnitSource{rows: []fakeUnit{
 		{unit: userDoc("s1", "bad", 0, "bad"), endedAt: "2024-01-01T00:00:00Z"},
 	}}
@@ -568,8 +566,9 @@ SELECT COUNT(*) FROM message_vectors_repair_queue
 
 func assertFailedRepairRemainsQueued(t *testing.T, encodeErr error) {
 	t.Helper()
+
 	ix := openTestIndex(t)
-	ctx := context.Background()
+	ctx := t.Context()
 	src := &fakeUnitSource{rows: []fakeUnit{
 		{unit: userDoc("s1", "bad", 0, "bad"), endedAt: "2024-01-01T00:00:00Z"},
 	}}
@@ -616,7 +615,7 @@ SELECT COUNT(*) FROM message_vectors_repair_queue
 
 func TestBuildRepairInvalidContinuesAfterPermanentTargetFailure(t *testing.T) {
 	ix := openTestIndex(t)
-	ctx := context.Background()
+	ctx := t.Context()
 	src := &fakeUnitSource{rows: []fakeUnit{
 		{unit: userDoc("s1", "a-bad", 0, "bad"), endedAt: "2024-01-01T00:00:00Z"},
 		{unit: userDoc("s1", "z-good", 1, "good"), endedAt: "2024-01-01T00:00:01Z"},
@@ -631,10 +630,7 @@ func TestBuildRepairInvalidContinuesAfterPermanentTargetFailure(t *testing.T) {
 
 	result, err := ix.Build(ctx, src, func(_ context.Context, texts []string) ([][]float32, error) {
 		if texts[0] == "bad" {
-			return nil, &HTTPStatusError{
-				Status: http.StatusBadRequest,
-				Body:   "input exceeds token limit",
-			}
+			return nil, &embedclient.APIError{StatusCode: http.StatusBadRequest, Reason: embedclient.ReasonInputTooLong}
 		}
 		return fakeBuildEncoder()(ctx, texts)
 	}, gen, BuildOptions{RepairInvalid: true})
@@ -664,7 +660,7 @@ SELECT COUNT(*) FROM message_vectors_stamps
 
 func TestBuildRepairInvalidUsesConfiguredDocumentConcurrency(t *testing.T) {
 	ix := openTestIndex(t)
-	ctx := context.Background()
+	ctx := t.Context()
 	src := &fakeUnitSource{rows: []fakeUnit{
 		{unit: userDoc("s1", "one", 0, "one"), endedAt: "2024-01-01T00:00:00Z"},
 		{unit: userDoc("s1", "two", 1, "two"), endedAt: "2024-01-01T00:00:01Z"},
@@ -729,7 +725,7 @@ func TestBuildRepairInvalidUsesConfiguredDocumentConcurrency(t *testing.T) {
 func TestBuildRepairInvalidRegeneratesPartiallyMissingChunkMap(t *testing.T) {
 	ix := openTestIndex(t)
 	ix.split = kitvec.SplitOptions{MaxRunes: 5}
-	ctx := context.Background()
+	ctx := t.Context()
 	src := &fakeUnitSource{rows: []fakeUnit{
 		{unit: userDoc("s1", "bad", 0, "abcdefghij"), endedAt: "2024-01-01T00:00:00Z"},
 	}}
@@ -760,7 +756,7 @@ DELETE FROM message_vectors_chunks
 
 func TestBuildRepairInvalidResumesAfterLaterScanBatchFails(t *testing.T) {
 	ix := openTestIndex(t)
-	ctx := context.Background()
+	ctx := t.Context()
 	const documentCount = repairScanDocumentBatch + 1
 	src := &fakeUnitSource{rows: make([]fakeUnit, 0, documentCount)}
 	for i := range documentCount {
@@ -816,7 +812,7 @@ SELECT COUNT(*) FROM message_vectors_repair_queue WHERE ordinal = ?`, ordinal).S
 
 func TestRepairRemainingIgnoresCanceledBuildContext(t *testing.T) {
 	ix := openTestIndex(t)
-	ctx := context.Background()
+	ctx := t.Context()
 	gen := fakeGeneration("active-model")
 	require.NoError(t, buildWithoutResult(ix, ctx, twoDocSource(), gen))
 	ordinal, err := ix.ordinalForFingerprint(ctx, gen.Fingerprint())
@@ -845,7 +841,7 @@ func TestRepairRemainingReturnsFallbackWhenRecountFails(t *testing.T) {
 	require.NoError(t, raw.Close())
 	store := &repairStore{db: raw, ordinal: 1, queueTable: "repair_queue"}
 
-	remaining, known, err := repairRemaining(context.Background(), store, 7)
+	remaining, known, err := repairRemaining(t.Context(), store, 7)
 	require.Error(t, err)
 	assert.Equal(t, 7, remaining)
 	assert.False(t, known)
@@ -853,7 +849,7 @@ func TestRepairRemainingReturnsFallbackWhenRecountFails(t *testing.T) {
 
 func TestBuildRepairInvalidRetriesAfterQueueCleanupFailure(t *testing.T) {
 	ix := openTestIndex(t)
-	ctx := context.Background()
+	ctx := t.Context()
 	src := &fakeUnitSource{rows: []fakeUnit{
 		{unit: userDoc("s1", "saved", 0, "saved"), endedAt: "2024-01-01T00:00:00Z"},
 	}}
@@ -909,7 +905,7 @@ SELECT COUNT(*) FROM message_vectors_repair_queue
 func TestBuildRepairInvalidIgnoresOrdinaryPendingContentChange(t *testing.T) {
 	ix := openTestIndex(t)
 	ix.split = kitvec.SplitOptions{MaxRunes: 5}
-	ctx := context.Background()
+	ctx := t.Context()
 	src := &fakeUnitSource{rows: []fakeUnit{
 		{unit: userDoc("s1", "changed", 0, "short"), endedAt: "2024-01-01T00:00:00Z"},
 	}}
@@ -926,7 +922,7 @@ func TestBuildRepairInvalidIgnoresOrdinaryPendingContentChange(t *testing.T) {
 	require.ErrorContains(t, err, "leave changed document pending")
 
 	result, err := ix.Build(ctx, src, func(context.Context, []string) ([][]float32, error) {
-		t.Fatal("repair must not embed an ordinary pending content change")
+		require.FailNow(t, "repair must not embed an ordinary pending content change")
 		return nil, nil
 	}, gen, BuildOptions{RepairInvalid: true})
 	require.NoError(t, err)
@@ -938,7 +934,7 @@ func TestBuildRepairInvalidIgnoresOrdinaryPendingContentChange(t *testing.T) {
 
 func TestBackstopRemovesRepairQueueEntryForDeletedDocument(t *testing.T) {
 	ix := openTestIndex(t)
-	ctx := context.Background()
+	ctx := t.Context()
 	src := &fakeUnitSource{rows: []fakeUnit{
 		{unit: userDoc("s1", "bad", 0, "bad"), endedAt: "2024-01-01T00:00:00Z"},
 		{unit: userDoc("s1", "good", 1, "good"), endedAt: "2024-01-01T00:00:01Z"},
@@ -980,7 +976,7 @@ SELECT COUNT(*) FROM message_vectors_repair_queue
 
 func TestRepairQueueDocumentCleanupUsesDocumentKeyIndex(t *testing.T) {
 	ix := openTestIndex(t)
-	ctx := context.Background()
+	ctx := t.Context()
 	rows, err := ix.db.QueryContext(ctx, `
 EXPLAIN QUERY PLAN
 DELETE FROM message_vectors_repair_queue WHERE doc_key = ?`, "u:s1:deleted")
@@ -1002,7 +998,7 @@ DELETE FROM message_vectors_repair_queue WHERE doc_key = ?`, "u:s1:deleted")
 
 func TestOrdinaryRepairCompletionUsesQueuePrimaryKey(t *testing.T) {
 	ix := openTestIndex(t)
-	ctx := context.Background()
+	ctx := t.Context()
 	rows, err := ix.db.QueryContext(ctx, `
 EXPLAIN QUERY PLAN
 DELETE FROM message_vectors_repair_queue

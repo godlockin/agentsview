@@ -3,6 +3,7 @@
  */
 import type {
   DeleteApiV1SessionsByIdMessagesByMessageIdPinPathParameters,
+  DeleteApiV1SessionsByIdPinReferencesByMessageKeyPathParameters,
   GetApiV1PinsParams,
   GetApiV1SessionsByIdPinsPathParameters,
   PinMessageResponse,
@@ -80,8 +81,19 @@ export const postApiV1SessionsByIdMessagesByMessageIdPin = async (
   ): Record<string, string | readonly string[]> => {
     if (!h) return {};
     if (h instanceof Headers) return Object.fromEntries(h.entries());
-    if (Array.isArray(h)) return Object.fromEntries(h);
-    return h;
+    if (Symbol.iterator in h) {
+      return Object.fromEntries(
+        Array.from(
+          h as Iterable<Iterable<string>>,
+          (entry) => Array.from(entry) as [string, string],
+        ),
+      );
+    }
+    const headers: Record<string, string | readonly string[]> = {};
+    for (const [name, value] of Object.entries<string | readonly string[] | undefined>(h)) {
+      if (value !== undefined) headers[name] = value;
+    }
+    return headers;
   };
   return orvalFetch<PinMessageResponse>(
     getPostApiV1SessionsByIdMessagesByMessageIdPinUrl({ id, messageId }),
@@ -90,6 +102,29 @@ export const postApiV1SessionsByIdMessagesByMessageIdPin = async (
       method: "POST",
       headers: { "Content-Type": "application/json", ...getHeaders(options?.headers) },
       body: JSON.stringify(pinRequest),
+    },
+  );
+};
+
+export const getDeleteApiV1SessionsByIdPinReferencesByMessageKeyUrl = ({
+  id,
+  messageKey,
+}: DeleteApiV1SessionsByIdPinReferencesByMessageKeyPathParameters) => {
+  return `/api/v1/sessions/${encodeURIComponent(String(id))}/pin-references/${encodeURIComponent(String(messageKey))}`;
+};
+
+/**
+ * @summary Remove retained pin
+ */
+export const deleteApiV1SessionsByIdPinReferencesByMessageKey = async (
+  { id, messageKey }: DeleteApiV1SessionsByIdPinReferencesByMessageKeyPathParameters,
+  options?: Parameters<typeof orvalFetch>[1],
+): Promise<void> => {
+  return orvalFetch<void>(
+    getDeleteApiV1SessionsByIdPinReferencesByMessageKeyUrl({ id, messageKey }),
+    {
+      ...options,
+      method: "DELETE",
     },
   );
 };

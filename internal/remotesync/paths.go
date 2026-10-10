@@ -156,16 +156,16 @@ type forbiddenRootMatcher struct {
 }
 
 func newForbiddenRootMatcher(roots []string) forbiddenRootMatcher {
-	var comparable []string
+	var comparablePath []string
 	for _, root := range roots {
 		// filepath.Abs("") would resolve to the working directory,
 		// silently turning a blank root into a cwd-wide exclusion.
 		if root == "" {
 			continue
 		}
-		comparable = append(comparable, localComparablePath(root))
+		comparablePath = append(comparablePath, localComparablePath(root))
 	}
-	return forbiddenRootMatcher{comparable: comparable}
+	return forbiddenRootMatcher{comparable: comparablePath}
 }
 
 // within reports whether path is a forbidden root or lies beneath one.
@@ -235,8 +235,7 @@ func resolveSymlinksBestEffort(p string) string {
 
 // PathWithinForbiddenRoots reports whether path is a forbidden root or lies
 // beneath one. sep is the path separator of the caller's domain: '/' for
-// remote POSIX paths (see internal/ssh, which builds paths for the resolve
-// script and tar filter), or filepath.Separator for local OS paths. Roots
+// POSIX paths or filepath.Separator for local OS paths. Roots
 // and path are normalized (dot segments resolved, redundant separators
 // collapsed) before comparison, and matching requires a full path-component
 // boundary so sibling names such as .forbidden-provider-backup do not get

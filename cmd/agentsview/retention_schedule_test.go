@@ -71,7 +71,7 @@ func TestRunRetentionTickWetRunPrunesAndTrashes(t *testing.T) {
 	assert.Equal(t, 1, result.Pruned)
 	assert.Equal(t, 1, result.Trashed)
 	assert.NoFileExists(t, src)
-	assert.True(t, d.IsSessionExcluded("ret-2"))
+	assert.True(t, d.IsSessionExcluded(context.Background(), "ret-2"))
 
 	// The state file records the run for the restart-throttle check.
 	state, err := os.ReadFile(filepath.Join(dataDir, "retention-state.json"))

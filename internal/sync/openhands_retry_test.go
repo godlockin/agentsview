@@ -1,11 +1,10 @@
 package sync
 
 import (
-	"context"
 	"os"
 	"path/filepath"
+	"runtime"
 	"testing"
-	"time"
 
 	"github.com/stretchr/testify/require"
 	"go.kenn.io/agentsview/internal/dbtest"
@@ -38,34 +37,42 @@ func TestProcessFileOpenHandsUsesSnapshotMtimeForRetryCache(t *testing.T) {
 	require.NoError(t, err)
 	oldDirMtime := dirInfo.ModTime()
 
-	engine := &Engine{
+	engine := withTestSources(&Engine{
 		db:      dbtest.OpenTestDB(t),
 		machine: "local",
-		agentDirs: map[parser.AgentType][]string{
-			parser.AgentOpenHands: {root},
-		},
-		providerFactories: providerFactoryMap(parser.ProviderFactories()),
 		providerMigrationModes: map[parser.AgentType]parser.ProviderMigrationMode{
 			parser.AgentOpenHands: parser.ProviderMigrationProviderAuthoritative,
 		},
 		skipCache: map[string]int64{sessionDir: oldDirMtime.UnixNano()},
-	}
+	}, &engineSources{
+		agentDirs: map[parser.AgentType][]string{
+			parser.AgentOpenHands: {root},
+		},
+		providerFactories: providerFactoryMap(parser.ProviderFactories()),
+	})
 
-	time.Sleep(10 * time.Millisecond)
-	dbtest.WriteTestFile(t, eventPath, []byte(`{
+	for range 10_000 {
+		dbtest.WriteTestFile(t, eventPath, []byte(`{
 		"id":"e0",
 		"timestamp":"2026-04-02T15:25:41.706887",
 		"source":"user",
 		"llm_message":{"role":"user","content":[{"type":"text","text":"Updated version"}]},
 		"kind":"MessageEvent"
 	}`))
-	require.NoError(t, os.Chtimes(sessionDir, oldDirMtime, oldDirMtime))
+		require.NoError(t, os.Chtimes(sessionDir, oldDirMtime, oldDirMtime))
+		snapshot, err := parser.OpenHandsSnapshot(sessionDir)
+		require.NoError(t, err)
+		if snapshot.Mtime != oldDirMtime.UnixNano() {
+			break
+		}
+		runtime.Gosched()
+	}
 
 	snapshot, err := parser.OpenHandsSnapshot(sessionDir)
 	require.NoError(t, err)
 	require.NotEqual(t, oldDirMtime.UnixNano(), snapshot.Mtime)
 
-	res := engine.processFile(context.Background(), parser.DiscoveredFile{
+	res := engine.processFile(t.Context(), parser.DiscoveredFile{
 		Path:  sessionDir,
 		Agent: parser.AgentOpenHands,
 	})

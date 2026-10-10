@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log"
 	"os"
 	"path/filepath"
@@ -259,17 +260,21 @@ func (c *sharedUnwatchedPollCoordinator) runPollWorker() {
 			if totalRoots == 0 {
 				continue
 			}
-			log.Printf("polling %d unwatched root(s)", totalRoots)
+			log.Printf("polling %d unwatched root(s): %s", totalRoots, formatUnwatchedPollScopes(groups))
+			startedAt := c.now()
 			c.doWork(func() {
 				if c.workerCtx.Err() != nil {
 					return
 				}
 				if err := pollUnwatchedScopesOnce(c.workerCtx, c.engine, groups); err != nil {
-					log.Printf("polling unwatched roots: %v", err)
+					log.Printf("polling unwatched roots failed after %s: %v",
+						c.now().Sub(startedAt).Round(time.Millisecond), err)
 				}
 			})
+			completedAt := c.now()
+			log.Printf("polled %d unwatched root(s) in %s", totalRoots, completedAt.Sub(startedAt).Round(time.Millisecond))
 			c.pollMu.Lock()
-			c.lastCompletion = c.now()
+			c.lastCompletion = completedAt
 			c.pollMu.Unlock()
 		}
 	}
@@ -379,6 +384,25 @@ func countUniqueRoots(groups map[parser.AgentType][]string) int {
 		}
 	}
 	return len(unique)
+}
+
+func formatUnwatchedPollScopes(groups map[parser.AgentType][]string) string {
+	agents := make([]parser.AgentType, 0, len(groups))
+	for agent := range groups {
+		agents = append(agents, agent)
+	}
+	slices.SortFunc(agents, func(a, b parser.AgentType) int {
+		return strings.Compare(string(a), string(b))
+	})
+	parts := make([]string, 0, len(agents))
+	for _, agent := range agents {
+		label := string(agent)
+		if label == "" {
+			label = "unscoped"
+		}
+		parts = append(parts, fmt.Sprintf("%s=%v", label, groups[agent]))
+	}
+	return strings.Join(parts, " ")
 }
 
 func unwatchedPollObligationRoots(obligations map[string]pollingObligation) []string {

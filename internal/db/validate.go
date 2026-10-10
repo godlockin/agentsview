@@ -3,6 +3,8 @@ package db
 import (
 	"context"
 	"time"
+
+	"go.kenn.io/agentsview/internal/stringutil"
 )
 
 // This file is the single centralized validation and sanitization pass
@@ -419,19 +421,8 @@ func ClampModel(p *string) bool {
 	if len(*p) <= MaxModelLen {
 		return false
 	}
-	cut := MaxModelLen
-	// Back up to a rune boundary so we never split a multibyte rune.
-	for cut > 0 && !utf8RuneStart((*p)[cut]) {
-		cut--
-	}
-	*p = (*p)[:cut]
+	*p = stringutil.SafeTruncate(*p, MaxModelLen)
 	return true
-}
-
-// utf8RuneStart reports whether b is the first byte of a UTF-8
-// encoded rune (i.e. not a continuation byte 0b10xxxxxx).
-func utf8RuneStart(b byte) bool {
-	return b&0xC0 != 0x80
 }
 
 // ClampParsedTokens bounds a token count to [0, maxPlausibleTokens] and
@@ -464,7 +455,7 @@ func clampTokens(p *int) bool {
 // BlankImplausibleTimestamp blanks a stored timestamp string in place
 // when it parses to a time outside the plausibility window, returning
 // whether it changed. An empty string is left empty (no change), and an
-// unparseable-but-nonempty value is left as-is: downstream localTime
+// unparseable-but-nonempty value is left as-is: downstream LocalTime
 // already treats both as invalid, so blanking only the parseable-yet-
 // absurd case avoids reformatting otherwise-untouched values.
 func BlankImplausibleTimestamp(p *string) bool {
@@ -497,7 +488,7 @@ func BlankImplausibleTimestampPtr(p *string) (*string, bool) {
 }
 
 // ParseStoredTimestamp parses a timestamp stored in the same formats
-// the read path (db.localTime) accepts.
+// the read path (db.LocalTime) accepts.
 func ParseStoredTimestamp(s string) (time.Time, bool) {
 	if t, err := time.Parse(time.RFC3339Nano, s); err == nil {
 		return t, true

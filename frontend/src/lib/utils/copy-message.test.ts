@@ -1,10 +1,12 @@
 import { describe, it, expect } from "vite-plus/test";
 import { formatMessageForCopy } from "./copy-message.js";
-import type { Message } from "../api/types/core.js";
+import type { DbMessage as Message } from "../api/generated/index.js";
 
 describe("formatMessageForCopy", () => {
   it("includes tool call params", () => {
     const msg: Message = {
+      has_context_tokens: false,
+      has_output_tokens: false,
       id: 1,
       session_id: "s1",
       ordinal: 1,
@@ -41,6 +43,8 @@ describe("formatMessageForCopy", () => {
 
   it("includes Write content", () => {
     const msg: Message = {
+      has_context_tokens: false,
+      has_output_tokens: false,
       id: 2,
       session_id: "s1",
       ordinal: 2,
@@ -74,6 +78,8 @@ describe("formatMessageForCopy", () => {
 
   it("includes kiro-ide Edit with diff key", () => {
     const msg = {
+      has_context_tokens: false,
+      has_output_tokens: false,
       id: 3,
       session_id: "s1",
       ordinal: 3,
@@ -106,10 +112,36 @@ describe("formatMessageForCopy", () => {
     expect(result).toContain("+port: 8080");
   });
 
+  it("includes a raw custom tool input verbatim", () => {
+    const script = '  // setup\ntext(await tools.exec_command({cmd: "echo hello"}));\n';
+    const result = formatMessageForCopy({
+      has_context_tokens: false,
+      has_output_tokens: false,
+      id: 5,
+      session_id: "s1",
+      ordinal: 5,
+      role: "assistant",
+      content: "",
+      timestamp: "",
+      has_thinking: false,
+      thinking_text: "",
+      has_tool_use: true,
+      content_length: 0,
+      model: "",
+      context_tokens: 0,
+      output_tokens: 0,
+      is_system: false,
+      tool_calls: [{ tool_name: "exec", category: "Bash", input_json: script }],
+    });
+    expect(result).toBe(`[exec]\n\n${script}`);
+  });
+
   it("copies the canonical long path in tool metadata", () => {
     const path =
       "/workspace/packages/agentsview/frontend/src/lib/components/content/ToolBlock.svelte";
     const result = formatMessageForCopy({
+      has_context_tokens: false,
+      has_output_tokens: false,
       id: 4,
       session_id: "s1",
       ordinal: 4,

@@ -6,6 +6,7 @@ import (
 	"sort"
 	"time"
 
+	"go.kenn.io/agentsview/internal/config"
 	"go.kenn.io/agentsview/internal/secrets"
 )
 
@@ -104,6 +105,20 @@ func (db *DB) stripStoredToolResultRows(
 	})
 }
 
+func soleProjectedToolResultContent(contents []string) (string, bool) {
+	var sole string
+	for _, content := range contents {
+		if content == "" {
+			continue
+		}
+		if sole != "" {
+			return "", false
+		}
+		sole = content
+	}
+	return sole, sole != ""
+}
+
 // rewriteStoredToolResultRows rewrites both stored tool-result tables in one
 // transaction using the given projection. Direct row updates preserve event
 // coordinates and metadata. The projection is called once per stored content
@@ -150,6 +165,7 @@ func (db *DB) rewriteStoredToolResultRows(
 	if err != nil {
 		return false, fmt.Errorf("reading tool calls: %w", err)
 	}
+	defer callRows.Close()
 	for callRows.Next() {
 		var update contentUpdate
 		if err := callRows.Scan(
@@ -185,6 +201,7 @@ func (db *DB) rewriteStoredToolResultRows(
 	if err != nil {
 		return false, fmt.Errorf("reading tool result events: %w", err)
 	}
+	defer eventRows.Close()
 	events := make([]contentUpdate, 0)
 	for eventRows.Next() {
 		var update contentUpdate
@@ -218,8 +235,8 @@ func (db *DB) rewriteStoredToolResultRows(
 		if calls[i].content == "" {
 			continue
 		}
-		eventsForCall := eventContents[calls[i].key]
-		if len(eventsForCall) == 1 && calls[i].content == eventsForCall[0] {
+		sole, ok := soleProjectedToolResultContent(eventContents[calls[i].key])
+		if ok && calls[i].content == sole {
 			calls[i].length = len(calls[i].content)
 			calls[i].content = ""
 		}
@@ -229,11 +246,11 @@ func (db *DB) rewriteStoredToolResultRows(
 		callIndexes[calls[i].id] = i
 	}
 	for _, call := range allCalls {
-		eventsForCall := eventContents[call.key]
-		if call.content != "" || len(eventsForCall) != 1 {
+		sole, ok := soleProjectedToolResultContent(eventContents[call.key])
+		if call.content != "" || !ok {
 			continue
 		}
-		length := len(eventsForCall[0])
+		length := len(sole)
 		if call.length == length {
 			continue
 		}
@@ -292,7 +309,7 @@ func (db *DB) rewriteStoredToolResultRows(
 	if err := replaceSecretFindingsTx(tx, sessionID, findings, leakCount, secrets.RulesVersion()); err != nil {
 		return false, err
 	}
-	if err := invalidateSessionSignalsTx(tx, sessionID); err != nil {
+	if err := invalidateSessionSignalsTx(ctx, tx, sessionID); err != nil {
 		return false, err
 	}
 	if err := enqueueArtifactExportIfGenerationUnchangedTx(
@@ -451,4 +468,29 @@ func (db *DB) toolImageStats(
 func countStrippable(content string) ToolImageStats {
 	_, stats := StripToolResultImages(content)
 	return stats
+}
+
+// ProjectToolImagesForSessions rewrites copied sessions before replacement publication.
+func (db *DB) ProjectToolImagesForSessions(ctx context.Context, sessionIDs []string) error {
+	if db.ArchiveContent().OmitsToolContent() {
+		return nil
+	}
+	switch db.ToolResultImages() {
+	case config.ToolResultImagesKeep:
+		return nil
+	case config.ToolResultImagesDrop:
+		return db.StripToolImagesForSessions(ctx, sessionIDs)
+	case config.ToolResultImagesOffload:
+		if err := db.requireWritable(); err != nil {
+			return err
+		}
+		for _, id := range sessionIDs {
+			if _, err := db.rewriteStoredToolResultRows(ctx, id, func(content string) (string, error) {
+				return ProjectToolResultImageContent(content, db.ToolResultImages(), db.AssetsDir()), nil
+			}); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
 }

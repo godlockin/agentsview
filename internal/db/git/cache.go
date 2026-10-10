@@ -8,10 +8,9 @@ import (
 	"encoding/json/v2"
 	"errors"
 	"fmt"
-	"strings"
 	"time"
 
-	"github.com/mattn/go-sqlite3"
+	_ "github.com/mattn/go-sqlite3"
 )
 
 // Cache is a small TTL-backed key-value store for git aggregation results.
@@ -78,7 +77,7 @@ func (c *Cache) GetOrCompute(
 ) ([]byte, error) {
 	payload, ok, err := c.lookup(ctx, key, ttl)
 	if err != nil {
-		if !c.write && isMissingCacheTable(err) {
+		if !c.write && c.isMissingCacheTable(ctx) {
 			return compute()
 		}
 		return nil, err
@@ -100,12 +99,12 @@ func (c *Cache) GetOrCompute(
 	return fresh, nil
 }
 
-func isMissingCacheTable(err error) bool {
-	var sqliteErr sqlite3.Error
-	if !errors.As(err, &sqliteErr) || sqliteErr.Code != sqlite3.ErrError {
-		return false
-	}
-	return strings.Contains(err.Error(), "no such table: git_cache")
+func (c *Cache) isMissingCacheTable(ctx context.Context) bool {
+	var exists bool
+	err := c.db.QueryRowContext(ctx,
+		`SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = 'git_cache')`,
+	).Scan(&exists)
+	return err == nil && !exists
 }
 
 // lookup returns (payload, true, nil) when a fresh row exists, (nil, false,
@@ -127,14 +126,12 @@ func (c *Cache) lookup(
 		return nil, false, fmt.Errorf("git_cache lookup: %w", err)
 	}
 	t, parseErr := time.Parse(time.RFC3339Nano, computedAt)
-	if parseErr != nil {
-		// Malformed timestamp: treat as stale so compute runs and overwrites.
-		return nil, false, nil
+	// Only a valid timestamp inside the TTL makes a cache entry fresh.
+	// Malformed timestamps remain cache misses and get overwritten by compute.
+	if parseErr == nil && time.Since(t) <= ttl {
+		return []byte(payload), true, nil
 	}
-	if time.Since(t) > ttl {
-		return nil, false, nil
-	}
-	return []byte(payload), true, nil
+	return nil, false, nil
 }
 
 // tokenIdentity returns a stable hex digest of ghToken suitable for
@@ -162,21 +159,21 @@ func (c *Cache) store(
 	return err
 }
 
-// AggregateLogCached wraps AggregateLog with a TTL-bounded read-through
-// cache. The cache key is derived from ("log", repo, author, since, until).
-// On a cache miss, AggregateLog is invoked; its LogResult is JSON-encoded
-// before being stored. Errors from AggregateLog propagate unchanged.
+// AggregateLogCached caches each checkout's per-commit counts and adds only
+// commits not yet seen in this repository group. The separate cache kind keeps
+// old aggregate-only rows from being read as per-commit data.
 func AggregateLogCached(
 	ctx context.Context,
 	cache *Cache,
 	repo, author, since, until string,
 	ttl time.Duration,
+	seen map[string]struct{},
 ) (LogResult, error) {
-	key := CacheKey("log", repo, author, since, until)
+	key := CacheKey("log-commits", repo, author, since, until)
 	payload, err := cache.GetOrCompute(
-		ctx, key, "log", ttl,
+		ctx, key, "log-commits", ttl,
 		func() ([]byte, error) {
-			res, err := AggregateLog(ctx, repo, author, since, until)
+			res, err := logCommits(ctx, repo, author, since, until)
 			if err != nil {
 				return nil, err
 			}
@@ -186,11 +183,11 @@ func AggregateLogCached(
 	if err != nil {
 		return LogResult{}, err
 	}
-	var out LogResult
+	var out map[string]LogResult
 	if err := json.Unmarshal(payload, &out); err != nil {
 		return LogResult{}, fmt.Errorf("git_cache decode log payload: %w", err)
 	}
-	return out, nil
+	return aggregateCommits(out, seen), nil
 }
 
 // AggregatePRsCached wraps AggregatePRs with a TTL-bounded cache.

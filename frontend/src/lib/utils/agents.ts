@@ -9,6 +9,12 @@ export const KNOWN_AGENTS: readonly AgentMeta[] = [
   { name: "cowork", color: "var(--accent-sky)", label: "Claude Cowork" },
   { name: "codex", color: "var(--accent-green)" },
   { name: "traex", color: "var(--accent-coral)", label: "TraeX" },
+  { name: "augure-code", color: "var(--accent-lime)", label: "Augure Code" },
+  {
+    name: "augure-desktop",
+    color: "var(--accent-violet)",
+    label: "Augure Desktop",
+  },
   { name: "copilot", color: "var(--accent-amber)" },
   { name: "devin", color: "var(--accent-red)", label: "Devin" },
   { name: "evener", color: "var(--accent-teal)", label: "Evener" },
@@ -22,6 +28,7 @@ export const KNOWN_AGENTS: readonly AgentMeta[] = [
   },
   { name: "kilo", color: "var(--accent-purple)", label: "Kilo" },
   { name: "kilo-legacy", color: "var(--accent-purple)", label: "Kilo (legacy)" },
+  { name: "cline", color: "var(--accent-violet)", label: "Cline" },
   { name: "openhands", color: "var(--accent-teal)", label: "OpenHands" },
   { name: "cursor", color: "var(--accent-black)" },
   { name: "cursor-ide", color: "var(--accent-black)", label: "Cursor IDE" },
@@ -39,6 +46,7 @@ export const KNOWN_AGENTS: readonly AgentMeta[] = [
     label: "Visual Studio Copilot",
   },
   { name: "pi", color: "var(--accent-indigo)", label: "Pi" },
+  { name: "stepcode", color: "var(--accent-indigo)", label: "StepCode" },
   { name: "tau", color: "var(--accent-amber)", label: "Tau" },
   {
     name: "prime-agent",
@@ -68,6 +76,7 @@ export const KNOWN_AGENTS: readonly AgentMeta[] = [
     label: "QClaw",
   },
   { name: "iflow", color: "var(--accent-sky)", label: "iFlow" },
+  { name: "junie", color: "var(--accent-lime)", label: "Junie" },
   { name: "kimi", color: "var(--accent-pink)", label: "Kimi" },
   {
     name: "kimi-work",
@@ -80,6 +89,7 @@ export const KNOWN_AGENTS: readonly AgentMeta[] = [
   { name: "kiro-ide", color: "var(--accent-lime)", label: "Kiro IDE" },
   { name: "cortex", color: "var(--accent-cyan)", label: "Cortex Code" },
   { name: "workbuddy", color: "var(--accent-violet)", label: "WorkBuddy" },
+  { name: "codebuddy", color: "var(--accent-blue)", label: "CodeBuddy" },
   { name: "qoder", color: "var(--accent-cyan)", label: "Qoder" },
   { name: "piebald", color: "var(--accent-orange)", label: "Piebald" },
   {
@@ -103,6 +113,11 @@ export const KNOWN_AGENTS: readonly AgentMeta[] = [
   { name: "omnigent", color: "var(--accent-teal)", label: "Omnigent" },
   { name: "codebuff", color: "var(--accent-amber)", label: "Codebuff" },
   { name: "freebuff", color: "var(--accent-sky)", label: "Freebuff" },
+  {
+    name: "crush",
+    color: "var(--accent-coral)",
+    label: "Charm Crush",
+  },
 ];
 
 const agentColorMap = new Map(KNOWN_AGENTS.map((a) => [a.name, a.color]));

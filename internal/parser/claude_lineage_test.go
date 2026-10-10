@@ -1,6 +1,7 @@
 package parser
 
 import (
+	"crypto/sha256"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -343,6 +344,8 @@ func TestClaudeBackgroundForkEqualBgCopiesElectKeeperByStem(t *testing.T) {
 	}
 	for _, stem := range stems {
 		t.Run(stem, func(t *testing.T) {
+			t.Parallel()
+
 			results, excluded, err := claudeParseFile(
 				filepath.Join(dir, stem+".jsonl"), "demo", "local",
 				claudeParseOptions{siblingLineage: true},
@@ -628,6 +631,8 @@ func TestClaudeBackgroundForkEqualReplayCandidatesFailOpen(t *testing.T) {
 
 	for _, kind := range []string{"interactive", "bg"} {
 		t.Run(kind, func(t *testing.T) {
+			t.Parallel()
+
 			dir := t.TempDir()
 			left, right := leftContent, rightContent
 			if kind == "bg" {
@@ -764,7 +769,7 @@ func TestClaudeProviderParseTrimsBackgroundFork(t *testing.T) {
 	sess := outcome.Results[0].Result.Session
 	assert.Equal(t, "orig-1111", sess.ParentSessionID)
 	assert.Equal(t, RelContinuation, sess.RelationshipType)
-	assert.Equal(t, 2, len(outcome.Results[0].Result.Messages))
+	assert.Len(t, outcome.Results[0].Result.Messages, 2)
 }
 
 func TestClaudeBackgroundForkIncrementalAppendContinuesFromTrim(t *testing.T) {
@@ -917,6 +922,35 @@ func TestClaudeLineageSniffCacheInvalidatedBySameSizeRewrite(t *testing.T) {
 	}
 }
 
+// Model a prior observation whose filesystem metadata collides with a newer
+// same-size head. The full parser must validate bytes before using that memo.
+func TestClaudeLineageSniffCacheRejectsStaleHeadWithMatchingMetadata(t *testing.T) {
+	t.Parallel()
+	original := lineageOriginalContent()
+	origPath, forkPath := writeLineageFixture(t, "orig-1111.jsonl", original, "fork-2222.jsonl", lineageForkContent())
+	warm, _, err := claudeParseFile(forkPath, "my_app", "local", claudeParseOptions{siblingLineage: true})
+	require.NoError(t, err)
+	require.Len(t, warm, 1)
+	require.Equal(t, "orig-1111", warm[0].Session.ParentSessionID)
+	// This is the memo a previous z9 head can leave when stat metadata has
+	// coarse resolution. Retain all actual observed cache metadata.
+	prior := strings.ReplaceAll(original, `"u1"`, `"z9"`)
+	require.Len(t, prior, len(original))
+	claudeSniffMu.Lock()
+	cached, ok := claudeSniffCache[origPath]
+	cached.headSHA = sha256.Sum256([]byte(prior))
+	cached.sniff.rootUUID = "z9"
+	claudeSniffCache[origPath] = cached
+	claudeSniffMu.Unlock()
+	require.True(t, ok, "full parse must warm the original's head")
+	results, _, err := claudeParseFile(forkPath, "my_app", "local", claudeParseOptions{siblingLineage: true})
+	require.NoError(t, err)
+	require.Len(t, results, 1)
+	assert.Equal(t, "orig-1111", results[0].Session.ParentSessionID)
+	require.Len(t, results[0].Messages, 2)
+	assert.Equal(t, "continued question", firstMessageContent(results[0].Messages))
+}
+
 func BenchmarkClaudeLineageSniffCacheHit(b *testing.B) {
 	path := filepath.Join(b.TempDir(), "session.jsonl")
 	content := lineageOriginalContent() + strings.Repeat(" ", 64<<10)
@@ -928,7 +962,7 @@ func BenchmarkClaudeLineageSniffCacheHit(b *testing.B) {
 	for b.Loop() {
 		sniff, err := claudeSniffHead(b.Context(), path)
 		if err != nil || !sniff.ok {
-			b.Fatal("sniff cache lost the transcript root", err)
+			require.FailNow(b, fmt.Sprint("sniff cache lost the transcript root", err))
 		}
 	}
 }
@@ -943,7 +977,8 @@ func TestClaudeLineageSniffGivesUpAfterBoundedPreamble(t *testing.T) {
 		preamble = append(preamble,
 			fmt.Sprintf(`{"type":"summary","summary":"noise %d","leafUuid":"leaf-%d"}`, i, i))
 	}
-	forkLines := append(preamble,
+	forkLines := append([]string(nil), preamble...)
+	forkLines = append(forkLines,
 		lineageUserLine("u1", "", "2026-01-01T10:00:00Z", "fork-2222", "bg", "first question"),
 		lineageAssistantLine("a1", "u1", "2026-01-01T10:00:05Z", "fork-2222", "bg", "msg_01", "first answer", 20),
 		lineageUserLine("u2", "a1", "2026-01-01T11:00:00Z", "fork-2222", "bg", "continued question"),

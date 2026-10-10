@@ -17,6 +17,7 @@ import (
 	"go.kenn.io/agentsview/internal/money"
 	"go.kenn.io/agentsview/internal/pricing"
 	"go.kenn.io/agentsview/internal/service"
+	"go.kenn.io/agentsview/internal/storage"
 )
 
 func prepareUsageSchema(
@@ -714,6 +715,17 @@ func TestStoreSessionUsageRollupUsesCopilotReportedSessionCost(t *testing.T) {
 	require.NoError(t, err)
 	require.True(t, rollup.HasCost)
 	assert.Equal(t, money.MustParseDollars("0.05"), rollup.Cost)
+	for _, filter := range []db.UsageFilter{{}, {Model: " , "}, {ExcludeModel: " , "}, {Model: " , ", ExcludeModel: " , "}} {
+		filter.From, filter.To, filter.Timezone = "2026-03-12", "2026-03-12", "UTC"
+		daily, err := store.GetDailyUsage(ctx, filter)
+		require.NoError(t, err)
+		assert.Equal(t, money.MustParseDollars("0.05"), daily.Totals.TotalCost)
+		top, err := store.GetTopSessionsByCost(ctx, filter, 10)
+		require.NoError(t, err)
+		require.Len(t, top, 2)
+		assert.Equal(t, money.MustParseDollars("0.03"), top[0].Cost)
+		assert.Equal(t, money.MustParseDollars("0.02"), top[1].Cost)
+	}
 }
 
 func TestStoreSessionUsageRollupIncludesUntimedRows(t *testing.T) {
@@ -1621,7 +1633,7 @@ func TestPushSyncsModelPricingToPostgres(t *testing.T) {
 		}},
 	}}), "UpsertModelPricing")
 
-	ps, err := New(pgURL, "agentsview", local, "test-machine", true, SyncOptions{})
+	ps, err := New(pgURL, "agentsview", local, "test-machine", true, storage.PusherOptions{})
 	require.NoError(t, err, "New")
 	defer ps.Close()
 
@@ -1731,7 +1743,7 @@ func TestPushRetiresOpenRouterPricingRows(t *testing.T) {
 			Value: `["minimax/minimax-m3"]`,
 		},
 	))
-	ps, err := New(pgURL, "agentsview", local, "test-machine", true, SyncOptions{})
+	ps, err := New(pgURL, "agentsview", local, "test-machine", true, storage.PusherOptions{})
 	require.NoError(t, err, "New")
 	defer ps.Close()
 	_, err = ps.Push(context.Background(), false, nil)
@@ -1788,7 +1800,7 @@ func TestPushFallsBackToBuiltinPricingWhenLocalTableEmpty(t *testing.T) {
 	t.Cleanup(func() { cleanPGSchema(t, pgURL) })
 
 	local := testDB(t)
-	ps, err := New(pgURL, "agentsview", local, "test-machine", true, SyncOptions{})
+	ps, err := New(pgURL, "agentsview", local, "test-machine", true, storage.PusherOptions{})
 	require.NoError(t, err, "New")
 	defer ps.Close()
 

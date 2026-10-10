@@ -15,8 +15,9 @@
     SquareTerminalIcon,
     TriangleAlertIcon,
   } from "../../icons.js";
-  import { onDestroy, onMount } from "svelte";
+  import { onDestroy, onMount, untrack } from "svelte";
   import type { Session } from "../../api/types.js";
+  import type { SessionToolSequencesResponse } from "../../api/generated/index.js";
   import {
     OpenersService,
     SessionsService,
@@ -25,7 +26,7 @@
     type ResumeResponse,
   } from "../../api/generated/index";
   import {
-    callGenerated,
+    ApiError,
     isAbortError,
   } from "../../api/runtime.js";
   import { copyToClipboard } from "../../utils/clipboard.js";
@@ -40,6 +41,7 @@
   import { normalizeMessagePreview } from "../../utils/messages.js";
   import { getGradeStyle, getGradeLabel } from "../../utils/grade.js";
   import SignalPanel from "../content/SignalPanel.svelte";
+  import ToolSequencesPanel from "../content/ToolSequencesPanel.svelte";
   import SessionFilterControl from "../filters/SessionFilterControl.svelte";
   import SidebarToggleButton from "./SidebarToggleButton.svelte";
   import { sessions } from "../../stores/sessions.svelte.js";
@@ -56,6 +58,7 @@
 
   import { inSessionSearch } from "../../stores/inSessionSearch.svelte.js";
   import { messages as messagesStore } from "../../stores/messages.svelte.js";
+  import { sessionTiming } from "../../stores/sessionTiming.svelte.js";
   import { formatModelEffort } from "../../utils/model.js";
   import { ui } from "../../stores/ui.svelte.js";
   import { m } from "../../i18n/index.js";
@@ -79,10 +82,25 @@
   let openFeedbackKind = $state<"success" | "error">("success");
   let feedbackTimer: ReturnType<typeof setTimeout> | undefined;
   let sessionDir = $state<string | null>(null);
+  let toolSequencesData = $state<SessionToolSequencesResponse | null>(null);
+  let toolSequencesLoading = $state(false);
+  let toolSequencesFailed = $state(false);
+  let toolSequencesUnavailable = $state(false);
+  let toolSequencesRetry = $state(0);
+  // The session, loaded message revision, end state and retry count the current or last read was for.
+  let toolSequencesIdentity = "";
+  let toolSequencesTimer: ReturnType<typeof setTimeout> | undefined;
+  // The session the read clock and conflict count below belong to.
+  let toolSequencesSessionId = "";
+  // When the last read for that session began; 0 before the first read.
+  let toolSequencesStartedAt = 0;
+  // Reads in a row that a sync interrupted with a 409.
+  let toolSequencesConflicts = 0;
   const openersRead = new LatestRead();
   const directoryRead = new LatestRead();
   const costRead = new LatestRead();
   const breakdownRead = new LatestRead();
+  const toolSequencesRead = new LatestRead();
 
   interface SessionDirectoryResponse {
     path: string;
@@ -105,7 +123,7 @@
 
   onMount(() => {
     const signal = openersRead.begin();
-    callGenerated((options) => OpenersService.getApiV1Openers(options), signal)
+    OpenersService.getApiV1Openers({ signal })
       .then((res) => {
         if (!openersRead.isCurrent(signal)) return;
         openers = res.openers;
@@ -132,10 +150,7 @@
     const signal = directoryRead.begin();
     pendingSessionDirId = id;
     sessionDir = null;
-    callGenerated(
-      (options) => SessionsService.getApiV1SessionsByIdDirectory({ id }, options),
-      signal,
-    )
+    SessionsService.getApiV1SessionsByIdDirectory({ id }, { signal })
       .then(({ path }) => {
         if (session?.id === id && directoryRead.isCurrent(signal)) {
           sessionDir = (path as SessionDirectoryResponse["path"]) || null;
@@ -242,10 +257,7 @@
     if (key === costFetchKey) return;
     const signal = costRead.begin();
     costSessionId = id;
-    callGenerated(
-      (options) => SessionsService.getApiV1SessionsByIdUsage({ id }, { rollup: true }, options),
-      signal,
-    )
+    SessionsService.getApiV1SessionsByIdUsage({ id }, { rollup: true }, { signal })
       .then((res) => {
         if (!costRead.isCurrent(signal)) return;
         costFetchKey = key;
@@ -282,11 +294,7 @@
     if (key === breakdownFetchKey) return;
     const signal = breakdownRead.begin();
     usageBreakdownLoading = true;
-    callGenerated(
-      (options) =>
-        SessionsService.getApiV1SessionsByIdUsage({ id }, { breakdown: true }, options),
-      signal,
-    )
+    SessionsService.getApiV1SessionsByIdUsage({ id }, { breakdown: true }, { signal })
       .then((res) => {
         if (!breakdownRead.isCurrent(signal)) return;
         breakdownFetchKey = key;
@@ -307,6 +315,7 @@
     directoryRead.cancel();
     costRead.cancel();
     breakdownRead.cancel();
+    stopToolSequences();
   });
 
   let sessionCostLabel = $derived(
@@ -369,6 +378,100 @@
     }
   });
 
+  // Every new message changes the transcript revision, and each read loads the whole session, so a busy session reads at most this often.
+  const TOOL_SEQUENCES_MIN_INTERVAL_MS = 5_000;
+  const TOOL_SEQUENCES_MAX_CONFLICTS = 3;
+
+  function stopToolSequences() {
+    toolSequencesRead.cancel();
+    clearTimeout(toolSequencesTimer);
+    toolSequencesTimer = undefined;
+  }
+
+  $effect(() => {
+    const id = session?.id;
+    const termination = session?.termination_status ?? "";
+    const visible = ui.signalPanelOpen;
+    const retry = toolSequencesRetry;
+    if (!visible || !id) {
+      stopToolSequences();
+      toolSequencesData = null;
+      toolSequencesLoading = false;
+      toolSequencesFailed = false;
+      toolSequencesUnavailable = false;
+      toolSequencesIdentity = "";
+      toolSequencesSessionId = "";
+      return;
+    }
+
+    if (untrack(() => toolSequencesData?.session_id !== id)) toolSequencesData = null;
+    if (toolSequencesSessionId !== id) {
+      toolSequencesSessionId = id;
+      toolSequencesStartedAt = 0;
+      toolSequencesConflicts = 0;
+    }
+    const loadedRevision = messagesStore.sessionId === id ? messagesStore.loadedRevision : null;
+    if (loadedRevision === null && messagesStore.loading) {
+      // The message list is replacing its rows; read once they land so the sequences match them.
+      stopToolSequences();
+      toolSequencesIdentity = "";
+      toolSequencesLoading = true;
+      toolSequencesFailed = false;
+      toolSequencesUnavailable = false;
+      return;
+    }
+    // A failed read keeps its identity, so only a new revision, end state or retry reads again.
+    const identity = [id, loadedRevision ?? "", termination, retry].join("\n");
+    if (identity === toolSequencesIdentity) return;
+    toolSequencesIdentity = identity;
+    stopToolSequences();
+    toolSequencesLoading = true;
+    toolSequencesFailed = false;
+    toolSequencesUnavailable = false;
+    const wait = toolSequencesStartedAt + TOOL_SEQUENCES_MIN_INTERVAL_MS - Date.now();
+    if (toolSequencesStartedAt > 0 && wait > 0) {
+      toolSequencesTimer = setTimeout(() => readToolSequences(id), wait);
+    } else {
+      readToolSequences(id);
+    }
+  });
+
+  // Someone asked for the retry, so it skips the interval that paces automatic reads.
+  function retryToolSequences() {
+    toolSequencesStartedAt = 0;
+    toolSequencesRetry++;
+  }
+
+  function readToolSequences(id: string) {
+    toolSequencesTimer = undefined;
+    toolSequencesStartedAt = Date.now();
+    const signal = toolSequencesRead.begin();
+    SessionsService.getApiV1SessionsByIdToolSequences({ id }, { signal })
+      .then((response) => {
+        if (!toolSequencesRead.finish(signal)) return;
+        toolSequencesConflicts = 0;
+        toolSequencesLoading = false;
+        toolSequencesData = response;
+      })
+      .catch((error) => {
+        if (isAbortError(error) || !toolSequencesRead.finish(signal)) return;
+        const conflict = error instanceof ApiError && error.status === 409;
+        if (conflict && ++toolSequencesConflicts < TOOL_SEQUENCES_MAX_CONFLICTS) {
+          // A sync landed during the read; keep what is shown and read again after the interval.
+          toolSequencesRetry++;
+          return;
+        }
+        toolSequencesConflicts = 0;
+        toolSequencesLoading = false;
+        toolSequencesData = null;
+        if (error instanceof ApiError && error.status === 501) {
+          toolSequencesUnavailable = true;
+        } else {
+          toolSequencesFailed = true;
+        }
+      });
+  }
+
   function sessionDisplayId(id: string): string {
     const idx = id.indexOf(":");
     return idx >= 0 ? id.slice(idx + 1) : id;
@@ -409,7 +512,6 @@
       if (copiedSessionId === sessionId) copiedSessionId = "";
     }, 1500);
   }
-
 
   let copiedLinkId = $state("");
   let copiedLinkTimer: ReturnType<typeof setTimeout> | undefined;
@@ -647,7 +749,7 @@
     !session?.id.includes("~"),
   );
 
-  const canResume = $derived(
+  const canLaunch = $derived(
     session
       ? supportsResume(session.agent) && isLocal
       : false,
@@ -662,6 +764,7 @@
       ? claudeCodeLink(sessionDir)
       : null,
   );
+  const canCopyCommand = $derived(session ? supportsResume(session.agent) : false);
 
   const terminalOpeners = $derived(
     openers.filter((o) => o.kind === "terminal"),
@@ -682,7 +785,7 @@
   );
 
   const showDropdown = $derived(
-    canResume ||
+    canCopyCommand ||
     codexLink !== null ||
     (isLocal && (
       editorOpeners.length > 0 ||
@@ -738,7 +841,6 @@
   onkeydown={handleKeydown}
   onclick={handleClickOutside}
 />
-
 
 <div class="session-breadcrumb">
   {#if !ui.isMobileViewport && !ui.sidebarOpen}
@@ -832,7 +934,8 @@
         style:color={gradeStyle.text}
         style:border-color={gradeStyle.border}
         onclick={() => ui.toggleSignalPanel()}
-        title={m.session_breadcrumb_session_health()}
+        title={m.session_breadcrumb_session_health_and_tool_sequences()}
+        aria-expanded={ui.signalPanelOpen}
       >
         {getGradeLabel(session.health_grade)}
       </button>
@@ -843,10 +946,10 @@
             class:has-feedback-success={openFeedback !== "" && openFeedbackKind === "success"}
             class:has-feedback-error={openFeedback !== "" && openFeedbackKind === "error"}
             onclick={(e) => { e.stopPropagation(); showOpenMenu = !showOpenMenu; }}
-            title={canResume
+            title={canLaunch
               ? m.session_breadcrumb_resume_session_in_terminal()
               : m.session_breadcrumb_session_actions()}
-            aria-label={canResume
+            aria-label={canLaunch
               ? m.session_breadcrumb_resume_session()
               : m.session_breadcrumb_session_actions()}
           >
@@ -858,7 +961,7 @@
               {/if}
               {openFeedback}
             {:else}
-              {canResume
+              {canLaunch
                 ? m.session_breadcrumb_resume()
                 : m.session_breadcrumb_open()}
               <ChevronDownIcon size="8" strokeWidth="2.6" aria-hidden="true" />
@@ -866,7 +969,7 @@
           </button>
           {#if showOpenMenu}
             <div class="open-menu">
-              {#if canResume}
+              {#if canLaunch}
                 {#each terminalOpeners as opener, i (opener.id)}
                   <button
                     class="open-menu-item"
@@ -910,7 +1013,9 @@
                     <span class="open-menu-name">{m.session_breadcrumb_open_in_claude_code()}</span>
                   </a>
                 {/if}
-                <div class="open-menu-divider"></div>
+              {/if}
+              {#if canCopyCommand}
+                {#if canLaunch}<div class="open-menu-divider"></div>{/if}
                 <button class="open-menu-item" onclick={handleCopyResumeCommand}>
                   <span class="open-menu-num">
                     <CopyIcon size="10" strokeWidth="2" aria-hidden="true" />
@@ -952,7 +1057,7 @@
                 {/each}
               {/if}
               {/if}
-              {#if canResume && claudeDesktopOpener}
+              {#if canLaunch && claudeDesktopOpener}
                 <div class="open-menu-divider"></div>
                 <button
                   class="open-menu-item"
@@ -1131,6 +1236,15 @@
 
 {#if ui.signalPanelOpen && session}
   <SignalPanel {session} />
+  <ToolSequencesPanel
+    data={toolSequencesData?.session_id === session.id ? toolSequencesData : null}
+    timing={sessionTiming.timing?.session_id === session.id ? sessionTiming.timing : null}
+    sessionId={session.id}
+    loading={toolSequencesLoading}
+    failed={toolSequencesFailed}
+    unavailable={toolSequencesUnavailable}
+    onretry={retryToolSequences}
+  />
 {/if}
 
 <style>
@@ -1390,7 +1504,6 @@
     text-transform: uppercase;
     letter-spacing: 0.04em;
   }
-
 
   .session-id {
     font-size: 10px;

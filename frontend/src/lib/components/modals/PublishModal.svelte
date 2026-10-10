@@ -10,12 +10,12 @@
     SessionsService,
   } from "../../api/generated/index";
   import {
-    callGenerated,
     isAbortError,
   } from "../../api/runtime.js";
-  import type { PublishResponse } from "../../api/types.js";
+  import type { PublishResponse } from "../../api/generated/index.js";
   import { copyToClipboard } from "../../utils/clipboard.js";
   import { LatestRead } from "../../utils/latest-read.js";
+  import { reportTelemetry } from "../../utils/telemetry.js";
 
   type View = "setup" | "progress" | "success" | "error";
 
@@ -44,10 +44,7 @@
   async function init() {
     const signal = configRead.begin();
     try {
-      const config = await callGenerated(
-        (options) => ConfigService.getApiV1ConfigGithub(options),
-        signal,
-      );
+      const config = await ConfigService.getApiV1ConfigGithub({ signal });
       if (isClosed() || !configRead.isCurrent(signal)) return;
       if (config.configured) {
         await doPublish();
@@ -86,6 +83,7 @@
       view = "error";
       return;
     }
+    reportTelemetry("export_run", { format: target.kind === "insight" ? "insight_gist" : "gist" });
 
     if (target.kind === "insight") {
       view = "progress";

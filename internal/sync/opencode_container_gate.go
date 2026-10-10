@@ -126,7 +126,7 @@ func (e *Engine) captureSQLiteContainerStates(
 	for _, rawPath := range changedPaths {
 		path := filepath.Clean(rawPath)
 		for _, agent := range openCodeFamilySQLiteAgents {
-			for _, dir := range e.agentDirs[agent] {
+			for _, dir := range e.sources().agentDirs[agent] {
 				if dir == "" || strings.HasPrefix(dir, "s3://") {
 					continue
 				}
@@ -182,7 +182,7 @@ func (e *Engine) captureAgentSQLiteContainerStates(
 	roots []string,
 	states map[string]parser.SQLiteContainerState,
 ) {
-	for _, dir := range e.agentDirs[agent] {
+	for _, dir := range e.sources().agentDirs[agent] {
 		if dir == "" || strings.HasPrefix(dir, "s3://") {
 			continue
 		}
@@ -280,7 +280,7 @@ func openCodeContainerPathForChangedPathEvent(
 // contract is documented in docs/internal/session-format-sources.md and
 // pinned by TestOpenCodeWatcherPassDefersChildOnlyEditToFullDiscovery.
 func (e *Engine) storedMemberFreshnessPager(
-	container string,
+	container, idPrefix string,
 ) parser.StoredMemberFreshnessPager {
 	current := db.CurrentDataVersion()
 	return func(
@@ -295,12 +295,19 @@ func (e *Engine) storedMemberFreshnessPager(
 		// member past the first all-stale page.
 		for {
 			page, done, err := e.db.ListVirtualContainerMemberFreshnessPage(
-				ctx, container, afterPath, limit,
+				ctx, container, idPrefix, afterPath, limit,
 			)
 			if err != nil {
 				return nil, false, err
 			}
 			for _, row := range page {
+				// Trashed and excluded members are never rewritten, so their version and hash stay stale.
+				if row.Trashed || row.Excluded {
+					rows = append(rows, parser.StoredMemberFreshness{
+						Path: row.Path, Suppressed: true,
+					})
+					continue
+				}
 				if row.DataVersion < current {
 					continue
 				}
@@ -309,6 +316,7 @@ func (e *Engine) storedMemberFreshnessPager(
 					CoveredThroughNS: storedSessionRowWatermarkNS(
 						row.VirtualContainerMemberFreshness,
 					),
+					FingerprintHash: row.Hash,
 				})
 			}
 			if done || len(rows) > 0 {
@@ -614,7 +622,7 @@ func (e *Engine) finishStreamingSQLiteContainerDiscovery() {
 // check covers hybrid roots, where the discoverable row set can grow (a
 // removed storage JSON stops shadowing its same-ID row) without the
 // container state changing; such a row was never verified and must parse.
-func (e *Engine) sqliteContainerSourceFresh(file parser.DiscoveredFile) bool {
+func (e *Engine) sqliteContainerSourceFresh(ctx context.Context, file parser.DiscoveredFile) bool {
 	if e.forceParseRequested(file) {
 		return false
 	}
@@ -654,8 +662,8 @@ func (e *Engine) sqliteContainerSourceFresh(file parser.DiscoveredFile) bool {
 		return false
 	}
 	fullID := applyIDPrefixToID(e.idPrefix, string(file.Agent)+":"+sessionID)
-	return e.db.GetSessionDataVersion(fullID) >= db.CurrentDataVersion() &&
-		e.db.GetSessionFilePath(fullID) == e.effectiveSourcePath(file.Path)
+	return e.db.GetSessionDataVersion(ctx, fullID) >= db.CurrentDataVersion() &&
+		e.db.GetSessionFilePath(ctx, fullID) == e.effectiveSourcePath(file.Path)
 }
 
 // watermarkOnlySQLiteSourceFresh reports whether a shared-container session
@@ -671,7 +679,7 @@ func (e *Engine) sqliteContainerSourceFresh(file parser.DiscoveredFile) bool {
 // digest still catches it (see storedMemberFreshnessPager for the full
 // contract). That keeps per-event work bounded by the changed batch instead
 // of the archive.
-func (e *Engine) watermarkOnlySQLiteSourceFresh(
+func (e *Engine) watermarkOnlySQLiteSourceFresh(ctx context.Context,
 	source parser.SourceRef,
 	file parser.DiscoveredFile,
 ) (int64, bool) {
@@ -699,12 +707,12 @@ func (e *Engine) watermarkOnlySQLiteSourceFresh(
 	if e.pathRewriter != nil {
 		lookupPath = e.pathRewriter(lookupPath)
 	}
-	_, storedMtime, found := e.db.GetFileInfoByPath(lookupPath)
+	_, storedMtime, found := e.db.GetFileInfoByPath(ctx, lookupPath)
 	if !found {
 		return 0, false
 	}
 	limit := storedMtime
-	if hash, ok := e.db.GetFileHashByPath(lookupPath); ok {
+	if hash, ok := e.db.GetFileHashByPath(ctx, lookupPath); ok {
 		if metadata, parsed := parser.OpenCodeChildDigestMetadataWatermarkNS(
 			hash,
 		); parsed {
@@ -714,7 +722,7 @@ func (e *Engine) watermarkOnlySQLiteSourceFresh(
 	if limit < watermark {
 		return 0, false
 	}
-	if e.db.GetDataVersionByPath(lookupPath) < db.CurrentDataVersion() {
+	if e.db.GetDataVersionByPath(ctx, lookupPath) < db.CurrentDataVersion() {
 		return 0, false
 	}
 	return storedMtime, true
@@ -885,8 +893,7 @@ func (e *Engine) finishSQLiteContainerPass(incomplete, fullDiscovery bool) {
 			continue
 		}
 		if e.trustedSQLiteContainers == nil {
-			e.trustedSQLiteContainers =
-				make(map[string]trustedSQLiteContainer)
+			e.trustedSQLiteContainers = make(map[string]trustedSQLiteContainer)
 		}
 		e.trustedSQLiteContainers[dbPath] = trustedSQLiteContainer{
 			state: state,

@@ -5,7 +5,8 @@ import (
 	"crypto/sha256"
 	"database/sql"
 	"encoding/hex"
-	"encoding/json"
+	"encoding/json/jsontext"
+	"encoding/json/v2"
 	"errors"
 	"fmt"
 	"io"
@@ -15,6 +16,9 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
+
+	"github.com/cenkalti/backoff/v7"
+	"go.kenn.io/kit/atomicfile"
 )
 
 const (
@@ -360,7 +364,7 @@ func (db *DB) Compact(ctx context.Context, options CompactOptions) (result Compa
 		}
 		return result, primary
 	}
-	if err := db.installCompactCandidate(op); err != nil {
+	if err := db.installCompactCandidate(ctx, op); err != nil {
 		return result, err
 	}
 	if compactTestHookAfterInstall != nil {
@@ -371,12 +375,12 @@ func (db *DB) Compact(ctx context.Context, options CompactOptions) (result Compa
 	// the caller (an HTTP request, a Ctrl-C'd CLI) has gone away.
 	opCtx := context.WithoutCancel(ctx)
 	if err := db.verifyReopenedArchive(opCtx, op.verification); err != nil {
-		return result, db.rollbackCompactInstall(
+		return result, db.rollbackCompactInstall(ctx,
 			fmt.Errorf("verify reopened archive: %w", err), op)
 	}
 	op.manifest.Phase = compactPhaseCommitted
 	if err := writeCompactManifest(op.manifestPath, op.manifest); err != nil {
-		return result, db.rollbackCompactInstall(
+		return result, db.rollbackCompactInstall(ctx,
 			fmt.Errorf("record committed archive compaction: %w", err), op)
 	}
 	// Commit point: the compacted archive is authoritative from here on.
@@ -600,40 +604,37 @@ func (db *DB) vacuumIntoCandidate(ctx context.Context, candidatePath string) err
 // checkpointWALTruncateConn retries a truncate checkpoint on conn so
 // short-lived readers can release their pinned pages.
 func checkpointWALTruncateConn(ctx context.Context, conn *sql.DB) error {
-	var lastErr error
-	for i := range walCheckpointAttempts {
+	_, err := backoff.Retry(ctx, func() (struct{}, error) {
 		var busy, logPages, checkpointedPages int
 		err := conn.QueryRowContext(
 			ctx, "PRAGMA wal_checkpoint(TRUNCATE)",
 		).Scan(&busy, &logPages, &checkpointedPages)
 		if err != nil {
-			return err
+			return struct{}{}, backoff.Permanent(err)
 		}
-		if busy == 0 {
-			return nil
+		if busy != 0 {
+			return struct{}{}, ErrWALCheckpointBusy
 		}
-		lastErr = ErrWALCheckpointBusy
-		if i == walCheckpointAttempts-1 {
-			break
-		}
-		timer := time.NewTimer(walCheckpointRetryDelay)
-		select {
-		case <-ctx.Done():
-			timer.Stop()
-			return ctx.Err()
-		case <-timer.C:
-		}
+		return struct{}{}, nil
+	}, backoff.WithBackOff(backoff.NewConstantBackOff(walCheckpointRetryDelay)),
+		backoff.WithMaxTries(walCheckpointAttempts), backoff.WithMaxElapsedTime(0))
+	if err == nil {
+		return nil
 	}
-	return lastErr
+	retryErr := backoff.AsRetryError(err)
+	if errors.Is(retryErr.Cause, backoff.ErrPermanent) || errors.Is(retryErr.Cause, backoff.ErrExhausted) {
+		return retryErr.LastErr
+	}
+	return ctx.Err()
 }
 
 // installCompactCandidate performs the short exclusive swap: close and drain
 // every pool, rename the staged copy over the archive, and reopen with the
 // write barrier still up. On failure the unchanged (or restored) original is
 // serving again before the error returns.
-func (db *DB) installCompactCandidate(op *compactOperation) error {
+func (db *DB) installCompactCandidate(ctx context.Context, op *compactOperation) error {
 	db.mu.Lock()
-	if err := db.closeConnectionsLocked(); err != nil {
+	if err := db.closeConnectionsLocked(ctx); err != nil {
 		return db.reopenUnchangedAfterSwapFailureLocked(
 			fmt.Errorf("close archive connections: %w", err), op)
 	}
@@ -728,9 +729,9 @@ func (db *DB) restoreOriginalAfterSwapFailureLocked(primary error, op *compactOp
 // rollbackCompactInstall undoes an installed but not yet committed
 // replacement. Writes have been barred since before the backup was taken, so
 // restoring the backup is lossless.
-func (db *DB) rollbackCompactInstall(primary error, op *compactOperation) error {
+func (db *DB) rollbackCompactInstall(ctx context.Context, primary error, op *compactOperation) error {
 	db.mu.Lock()
-	if err := db.closeConnectionsLocked(); err != nil {
+	if err := db.closeConnectionsLocked(ctx); err != nil {
 		// The installed candidate keeps serving reads; the barrier stays up
 		// and the prepared manifest lets startup recovery finish the decision.
 		reopenErr := db.reopenLockedWithBarrier(true)
@@ -1157,7 +1158,7 @@ func compactManifestPath(databasePath string) string {
 }
 
 func writeCompactManifest(path string, manifest compactManifest) error {
-	data, err := json.MarshalIndent(manifest, "", "  ")
+	data, err := json.Marshal(manifest, jsontext.WithIndent("  "))
 	if err != nil {
 		return err
 	}
@@ -1180,7 +1181,7 @@ func writeCompactManifest(path string, manifest compactManifest) error {
 	if err := f.Close(); err != nil {
 		return err
 	}
-	if err := os.Rename(tmp, path); err != nil {
+	if err := atomicfile.Replace(tmp, path); err != nil {
 		return err
 	}
 	return syncDirectory(filepath.Dir(path))
@@ -1357,7 +1358,7 @@ func reinstateSidelinedOriginal(databasePath, expectedHash string) (bool, error)
 	if err := removeIfExists(databasePath); err != nil {
 		return false, err
 	}
-	if err := os.Rename(databasePath+".failed", databasePath); err != nil {
+	if err := atomicfile.Replace(databasePath+".failed", databasePath); err != nil {
 		return false, fmt.Errorf("reinstate sidelined archive: %w", err)
 	}
 	return true, syncDirectory(filepath.Dir(databasePath))
@@ -1382,7 +1383,7 @@ func compactRecoveryFileState(
 		return false, nil
 	}
 	if err := verifyArchiveFile(context.Background(), path, expected); err != nil {
-		return false, nil
+		return false, nil //nolint:nilerr // A candidate that fails integrity verification is ineligible for recovery.
 	}
 	return true, nil
 }

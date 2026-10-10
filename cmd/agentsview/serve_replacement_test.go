@@ -30,7 +30,7 @@ func TestServeDaemonReplacementDecisionAutoReplacesOlderRelease(t *testing.T) {
 
 	require.NotNil(t, decision.Runtime)
 	assert.Equal(t, serveReplacementAuto, decision.Action)
-	assert.Contains(t, decision.Reason, "older")
+	assert.Contains(t, decision.Reason, "differs")
 }
 
 func TestPrepareForegroundServeDaemonAutoReplacesOlderDaemon(t *testing.T) {
@@ -40,10 +40,10 @@ func TestPrepareForegroundServeDaemonAutoReplacesOlderDaemon(t *testing.T) {
 	writeRuntimeRecordFixture(t, dir, daemonRuntimeRecord(
 		host, port, withRuntimeVersion("1.0.0"),
 	))
-	setTestVersion(t, "1.1.0")
+	setTestVersion(t, "v1.1.0-3-gabcdef")
 
 	var stoppedPID int
-	stubStopDaemonRuntimeForUpgrade(t, func(
+	stubStopDaemonRuntimeForUpgrade(t, func(ctx context.Context,
 		_ config.Config, rt *DaemonRuntime,
 	) error {
 		stoppedPID = rt.Record.PID
@@ -52,7 +52,7 @@ func TestPrepareForegroundServeDaemonAutoReplacesOlderDaemon(t *testing.T) {
 	})
 
 	out := captureStdout(t, func() {
-		cont, release, err := prepareForegroundServeDaemon(
+		cont, release, err := prepareForegroundServeDaemon(t.Context(),
 			&config.Config{DataDir: dir}, serveReplacementOptions{},
 		)
 		t.Cleanup(release)
@@ -73,13 +73,13 @@ func TestPrepareForegroundServeDaemonPreservesNoSyncWhenReplacingOlderDaemon(
 	t.Cleanup(func() { UnmarkDaemonStarting(dir) })
 	host, port := testPingServer(t)
 	_, err := WriteDaemonRuntimeWithAuthAndNoSync(
-		dir, host, port, "1.0.0", false, false, true,
+		dir, host, port, "1.0.0", "", false, false, true, nil,
 	)
 	require.NoError(t, err)
 	t.Cleanup(func() { RemoveDaemonRuntime(dir) })
 	setTestVersion(t, "1.1.0")
 
-	stubStopDaemonRuntimeForUpgrade(t, func(
+	stubStopDaemonRuntimeForUpgrade(t, func(ctx context.Context,
 		_ config.Config, rt *DaemonRuntime,
 	) error {
 		assert.True(t, rt.NoSync)
@@ -88,7 +88,7 @@ func TestPrepareForegroundServeDaemonPreservesNoSyncWhenReplacingOlderDaemon(
 	})
 
 	cfg := config.Config{DataDir: dir}
-	cont, release, err := prepareForegroundServeDaemon(
+	cont, release, err := prepareForegroundServeDaemon(t.Context(),
 		&cfg, serveReplacementOptions{},
 	)
 	t.Cleanup(release)
@@ -105,13 +105,13 @@ func TestPrepareForegroundServeDaemonExplicitNoSyncOverridesRuntime(
 	t.Cleanup(func() { UnmarkDaemonStarting(dir) })
 	host, port := testPingServer(t)
 	_, err := WriteDaemonRuntimeWithAuthAndNoSync(
-		dir, host, port, "1.0.0", false, false, true,
+		dir, host, port, "1.0.0", "", false, false, true, nil,
 	)
 	require.NoError(t, err)
 	t.Cleanup(func() { RemoveDaemonRuntime(dir) })
 	setTestVersion(t, "1.1.0")
 
-	stubStopDaemonRuntimeForUpgrade(t, func(
+	stubStopDaemonRuntimeForUpgrade(t, func(ctx context.Context,
 		cfg config.Config, rt *DaemonRuntime,
 	) error {
 		assert.False(t, cfg.NoSync)
@@ -121,7 +121,7 @@ func TestPrepareForegroundServeDaemonExplicitNoSyncOverridesRuntime(
 	})
 
 	cfg := config.Config{DataDir: dir, NoSync: false}
-	cont, release, err := prepareForegroundServeDaemon(
+	cont, release, err := prepareForegroundServeDaemon(t.Context(),
 		&cfg,
 		serveReplacementOptions{NoSyncExplicit: true},
 	)
@@ -141,7 +141,7 @@ func TestPrepareForegroundServeDaemonMarksStartingBeforeStopping(t *testing.T) {
 	setTestVersion(t, "1.1.0")
 
 	var sawStarting bool
-	stubStopDaemonRuntimeForUpgrade(t, func(
+	stubStopDaemonRuntimeForUpgrade(t, func(ctx context.Context,
 		_ config.Config, rt *DaemonRuntime,
 	) error {
 		sawStarting = IsDaemonStarting(dir)
@@ -149,7 +149,7 @@ func TestPrepareForegroundServeDaemonMarksStartingBeforeStopping(t *testing.T) {
 		return nil
 	})
 
-	cont, release, err := prepareForegroundServeDaemon(
+	cont, release, err := prepareForegroundServeDaemon(t.Context(),
 		&config.Config{DataDir: dir}, serveReplacementOptions{},
 	)
 	t.Cleanup(release)
@@ -177,7 +177,7 @@ func TestPrepareForegroundServeDaemonRefusesReplacementWhenStartLockHeld(
 	forbidStopDaemonRuntimeForUpgrade(t,
 		"foreground replacement must not stop without owning start lock")
 
-	cont, release, err := prepareForegroundServeDaemon(
+	cont, release, err := prepareForegroundServeDaemon(t.Context(),
 		&config.Config{DataDir: dir}, serveReplacementOptions{},
 	)
 	t.Cleanup(release)
@@ -204,7 +204,7 @@ func TestPrepareForegroundServeDaemonRefusesReplacementWhenBackgroundLaunchHeld(
 	forbidStopDaemonRuntimeForUpgrade(t,
 		"foreground replacement must not stop during background launch")
 
-	cont, release, err := prepareForegroundServeDaemon(
+	cont, release, err := prepareForegroundServeDaemon(t.Context(),
 		&config.Config{DataDir: dir}, serveReplacementOptions{},
 	)
 	t.Cleanup(release)
@@ -223,7 +223,7 @@ func TestPrepareForegroundServeDaemonRefusesFreshStartWhenBackgroundLaunchHeld(
 	require.True(t, ok)
 	t.Cleanup(func() { require.NoError(t, launchLock.Unlock()) })
 
-	cont, release, err := prepareForegroundServeDaemon(
+	cont, release, err := prepareForegroundServeDaemon(t.Context(),
 		&config.Config{DataDir: dir}, serveReplacementOptions{},
 	)
 	t.Cleanup(release)
@@ -239,7 +239,7 @@ func TestPrepareForegroundServeDaemonKeepsLaunchLockForFreshStart(
 ) {
 	dir := runtimeTestDir(t)
 
-	cont, release, err := prepareForegroundServeDaemon(
+	cont, release, err := prepareForegroundServeDaemon(t.Context(),
 		&config.Config{DataDir: dir}, serveReplacementOptions{},
 	)
 	t.Cleanup(release)
@@ -268,7 +268,7 @@ func TestPrepareForegroundServeDaemonBackgroundChildUsesParentLaunchLock(
 	t.Cleanup(func() { require.NoError(t, launchLock.Unlock()) })
 	t.Setenv(backgroundChildEnvVar, "1")
 
-	cont, release, err := prepareForegroundServeDaemon(
+	cont, release, err := prepareForegroundServeDaemon(t.Context(),
 		&config.Config{DataDir: dir}, serveReplacementOptions{},
 	)
 	t.Cleanup(release)
@@ -288,7 +288,7 @@ func TestPrepareForegroundServeDaemonStopsUnderBackgroundLaunchLock(
 	))
 	setTestVersion(t, "1.1.0")
 
-	stubStopDaemonRuntimeForUpgrade(t, func(
+	stubStopDaemonRuntimeForUpgrade(t, func(ctx context.Context,
 		_ config.Config, rt *DaemonRuntime,
 	) error {
 		launchLock, ok := acquireBackgroundLaunchLock(dir)
@@ -301,7 +301,7 @@ func TestPrepareForegroundServeDaemonStopsUnderBackgroundLaunchLock(
 		return nil
 	})
 
-	cont, release, err := prepareForegroundServeDaemon(
+	cont, release, err := prepareForegroundServeDaemon(t.Context(),
 		&config.Config{DataDir: dir}, serveReplacementOptions{},
 	)
 	t.Cleanup(release)
@@ -322,14 +322,14 @@ func TestPrepareForegroundServeDaemonKeepsLaunchLockThroughDBOpen(
 	))
 	setTestVersion(t, "1.1.0")
 
-	stubStopDaemonRuntimeForUpgrade(t, func(
+	stubStopDaemonRuntimeForUpgrade(t, func(ctx context.Context,
 		_ config.Config, rt *DaemonRuntime,
 	) error {
 		RemoveDaemonRuntime(dir)
 		return nil
 	})
 
-	cont, release, err := prepareForegroundServeDaemon(
+	cont, release, err := prepareForegroundServeDaemon(t.Context(),
 		&config.Config{DataDir: dir, DBPath: dbPath},
 		serveReplacementOptions{},
 	)
@@ -345,7 +345,7 @@ func TestPrepareForegroundServeDaemonKeepsLaunchLockThroughDBOpen(
 		"foreground replacement must keep launch lock until startup handoff")
 
 	database, writeLock, err := openWriteDB(
-		context.Background(),
+		t.Context(),
 		config.Config{DataDir: dir, DBPath: dbPath},
 	)
 	require.NoError(t, err)
@@ -368,7 +368,7 @@ func TestPrepareForegroundServeDaemonUsesExistingCompatibleDaemon(t *testing.T) 
 	forbidStopDaemonRuntimeForUpgrade(t, "same-version daemon must be reused")
 
 	out := captureStdout(t, func() {
-		cont, release, err := prepareForegroundServeDaemon(
+		cont, release, err := prepareForegroundServeDaemon(t.Context(),
 			&config.Config{DataDir: dir}, serveReplacementOptions{},
 		)
 		t.Cleanup(release)
@@ -380,87 +380,40 @@ func TestPrepareForegroundServeDaemonUsesExistingCompatibleDaemon(t *testing.T) 
 	assert.Contains(t, out, "http://")
 }
 
-func TestServeDaemonReplacementDecisionRefusesCompatibleDowngrade(t *testing.T) {
+func TestServeDaemonReplacementDecisionReplacesDifferentVersions(t *testing.T) {
+	for _, tt := range []struct{ name, client, daemon string }{
+		{"git describe", "v1.1.0-3-gabcdef", "v1.1.0-2-g123456"},
+		{"non semver daemon", "1.1.0", "local-build"},
+		{"development CLI", "dev", "1.0.0"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			dir := runtimeTestDir(t)
+			host, port := testPingServer(t)
+			writeRuntimeRecordFixture(t, dir, daemonRuntimeRecord(
+				host, port, withRuntimeVersion(tt.daemon),
+			))
+			setTestVersion(t, tt.client)
+			decision := decideServeDaemonReplacement(
+				config.Config{DataDir: dir}, serveReplacementOptions{},
+			)
+			require.NotNil(t, decision.Runtime)
+			assert.Equal(t, serveReplacementAuto, decision.Action)
+			assert.Contains(t, decision.Reason, "differs")
+		})
+	}
+}
+
+func TestServeDaemonReplacementDoesNotDowngradeRelease(t *testing.T) {
 	dir := runtimeTestDir(t)
 	host, port := testPingServer(t)
 	writeRuntimeRecordFixture(t, dir, daemonRuntimeRecord(
 		host, port, withRuntimeVersion("1.1.0"),
 	))
 	setTestVersion(t, "1.0.0")
-	forbidStopDaemonRuntimeForUpgrade(t, "downgrade needs --replace")
-
-	decision := decideServeDaemonReplacement(
-		config.Config{DataDir: dir}, serveReplacementOptions{},
-	)
-
-	require.NotNil(t, decision.Runtime)
-	assert.Equal(t, serveReplacementRefuse, decision.Action)
-	assert.Contains(t, decision.Reason, "newer")
-	assert.Contains(t, strings.Join(serveDaemonConflictLines(decision), "\n"),
-		"--replace")
-}
-
-func TestServeDaemonReplacementDecisionRefusesGitDescribeDevBuild(
-	t *testing.T,
-) {
-	dir := runtimeTestDir(t)
-	host, port := testPingServer(t)
-	writeRuntimeRecordFixture(t, dir, daemonRuntimeRecord(
-		host, port, withRuntimeVersion("1.0.0"),
-	))
-	setTestVersion(t, "v1.1.0-2-gabcdef")
-	forbidStopDaemonRuntimeForUpgrade(t,
-		"git-describe dev build needs --replace")
-
-	decision := decideServeDaemonReplacement(
-		config.Config{DataDir: dir}, serveReplacementOptions{},
-	)
-
-	require.NotNil(t, decision.Runtime)
-	assert.Equal(t, serveReplacementRefuse, decision.Action)
-	assert.Contains(t, decision.Reason, "dev build")
-	assert.Contains(t, strings.Join(serveDaemonConflictLines(decision), "\n"),
-		"--replace")
-}
-
-func TestServeDaemonReplacementDecisionRefusesCompatibleNonSemver(t *testing.T) {
-	dir := runtimeTestDir(t)
-	host, port := testPingServer(t)
-	writeRuntimeRecordFixture(t, dir, daemonRuntimeRecord(
-		host, port, withRuntimeVersion("local-build"),
-	))
-	setTestVersion(t, "1.1.0")
-	forbidStopDaemonRuntimeForUpgrade(t, "non-semver daemon needs --replace")
-
-	decision := decideServeDaemonReplacement(
-		config.Config{DataDir: dir}, serveReplacementOptions{},
-	)
-
-	require.NotNil(t, decision.Runtime)
-	assert.Equal(t, serveReplacementRefuse, decision.Action)
-	assert.Contains(t, decision.Reason, "not newer")
-	assert.Contains(t, strings.Join(serveDaemonConflictLines(decision), "\n"),
-		"--replace")
-}
-
-func TestPrepareForegroundServeDaemonRefusesDevWithoutReplace(t *testing.T) {
-	dir := runtimeTestDir(t)
-	host, port := testPingServer(t)
-	writeRuntimeRecordFixture(t, dir, daemonRuntimeRecord(
-		host, port, withRuntimeVersion("1.0.0"),
-	))
-	setTestVersion(t, "dev")
-	forbidStopDaemonRuntimeForUpgrade(t, "dev build needs --replace")
-
-	cont, release, err := prepareForegroundServeDaemon(
-		&config.Config{DataDir: dir}, serveReplacementOptions{},
-	)
-	t.Cleanup(release)
-
-	assert.False(t, cont)
-	require.Error(t, err)
-	assert.Contains(t, err.Error(), "dev builds")
-	assert.Contains(t, err.Error(), "--replace")
+	decision := decideServeDaemonReplacement(config.Config{DataDir: dir}, serveReplacementOptions{})
+	assert.Equal(t, serveReplacementUseExisting, decision.Action)
+	decision = decideServeDaemonReplacement(config.Config{DataDir: dir}, serveReplacementOptions{Replace: true})
+	assert.Equal(t, serveReplacementExplicit, decision.Action)
 }
 
 func TestPrepareForegroundServeDaemonReplaceStopsWritableDevConflict(t *testing.T) {
@@ -473,7 +426,7 @@ func TestPrepareForegroundServeDaemonReplaceStopsWritableDevConflict(t *testing.
 	setTestVersion(t, "dev")
 
 	var stopped bool
-	stubStopDaemonRuntimeForUpgrade(t, func(
+	stubStopDaemonRuntimeForUpgrade(t, func(ctx context.Context,
 		_ config.Config, rt *DaemonRuntime,
 	) error {
 		stopped = true
@@ -482,7 +435,7 @@ func TestPrepareForegroundServeDaemonReplaceStopsWritableDevConflict(t *testing.
 	})
 
 	out := captureStdout(t, func() {
-		cont, release, err := prepareForegroundServeDaemon(
+		cont, release, err := prepareForegroundServeDaemon(t.Context(),
 			&config.Config{DataDir: dir},
 			serveReplacementOptions{Replace: true},
 		)
@@ -510,7 +463,7 @@ func TestPrepareForegroundServeDaemonReplaceStopsConfirmedUnreachableDaemon(
 		"precondition: runtime record must be live but unprobeable")
 
 	var stopped bool
-	stubStopDaemonRuntimeForUpgrade(t, func(
+	stubStopDaemonRuntimeForUpgrade(t, func(ctx context.Context,
 		_ config.Config, rt *DaemonRuntime,
 	) error {
 		stopped = true
@@ -520,7 +473,7 @@ func TestPrepareForegroundServeDaemonReplaceStopsConfirmedUnreachableDaemon(
 		return nil
 	})
 
-	cont, release, err := prepareForegroundServeDaemon(
+	cont, release, err := prepareForegroundServeDaemon(t.Context(),
 		&config.Config{DataDir: dir},
 		serveReplacementOptions{Replace: true},
 	)
@@ -549,7 +502,7 @@ func TestPrepareForegroundServeDaemonBackstopRefusesSecondWritableDaemon(t *test
 	require.NoError(t, err)
 	setTestVersion(t, "1.1.0")
 
-	stubStopDaemonRuntimeForUpgrade(t, func(
+	stubStopDaemonRuntimeForUpgrade(t, func(ctx context.Context,
 		_ config.Config, rt *DaemonRuntime,
 	) error {
 		assert.Equal(t, os.Getpid(), rt.Record.PID)
@@ -559,7 +512,7 @@ func TestPrepareForegroundServeDaemonBackstopRefusesSecondWritableDaemon(t *test
 		return nil
 	})
 
-	cont, release, err := prepareForegroundServeDaemon(
+	cont, release, err := prepareForegroundServeDaemon(t.Context(),
 		&config.Config{DataDir: dir, DBPath: dbPath},
 		serveReplacementOptions{},
 	)
@@ -569,7 +522,7 @@ func TestPrepareForegroundServeDaemonBackstopRefusesSecondWritableDaemon(t *test
 	require.NoError(t, err)
 	assert.True(t, cont)
 	database, lock, err := openWriteDB(
-		context.Background(),
+		t.Context(),
 		config.Config{DataDir: dir, DBPath: dbPath},
 	)
 	require.Error(t, err)
@@ -581,14 +534,14 @@ func TestPrepareForegroundServeDaemonBackstopRefusesSecondWritableDaemon(t *test
 func TestPrepareForegroundServeDaemonReplaceChecksTooNewDatabaseBeforeStop(t *testing.T) {
 	dir := runtimeTestDir(t)
 	dbPath := filepath.Join(dir, "sessions.db")
-	database, err := db.Open(dbPath)
+	database, err := db.Open(t.Context(), dbPath)
 	require.NoError(t, err)
 	require.NoError(t, database.Close())
 
 	futureVersion := db.CurrentDataVersion() + 10
 	conn, err := sql.Open("sqlite3", dbPath)
 	require.NoError(t, err)
-	_, err = conn.Exec(fmt.Sprintf("PRAGMA user_version = %d", futureVersion))
+	_, err = conn.ExecContext(t.Context(), fmt.Sprintf("PRAGMA user_version = %d", futureVersion))
 	require.NoError(t, err)
 	require.NoError(t, conn.Close())
 
@@ -602,7 +555,7 @@ func TestPrepareForegroundServeDaemonReplaceChecksTooNewDatabaseBeforeStop(t *te
 	forbidStopDaemonRuntimeForUpgrade(t,
 		"too-new database must be rejected before stop")
 
-	cont, release, err := prepareForegroundServeDaemon(
+	cont, release, err := prepareForegroundServeDaemon(t.Context(),
 		&config.Config{DataDir: dir, DBPath: dbPath},
 		serveReplacementOptions{Replace: true},
 	)
@@ -621,14 +574,14 @@ func TestPrepareForegroundServeDaemonReplaceChecksTooNewDatabaseBeforeStop(t *te
 func TestPrepareForegroundServeDaemonReplaceChecksDatabaseEvenWithCurrentRuntimeData(t *testing.T) {
 	dir := runtimeTestDir(t)
 	dbPath := filepath.Join(dir, "sessions.db")
-	database, err := db.Open(dbPath)
+	database, err := db.Open(t.Context(), dbPath)
 	require.NoError(t, err)
 	require.NoError(t, database.Close())
 
 	futureVersion := db.CurrentDataVersion() + 10
 	conn, err := sql.Open("sqlite3", dbPath)
 	require.NoError(t, err)
-	_, err = conn.Exec(fmt.Sprintf("PRAGMA user_version = %d", futureVersion))
+	_, err = conn.ExecContext(t.Context(), fmt.Sprintf("PRAGMA user_version = %d", futureVersion))
 	require.NoError(t, err)
 	require.NoError(t, conn.Close())
 
@@ -641,7 +594,7 @@ func TestPrepareForegroundServeDaemonReplaceChecksDatabaseEvenWithCurrentRuntime
 	forbidStopDaemonRuntimeForUpgrade(t,
 		"too-new database must be rejected before stop")
 
-	cont, release, err := prepareForegroundServeDaemon(
+	cont, release, err := prepareForegroundServeDaemon(t.Context(),
 		&config.Config{DataDir: dir, DBPath: dbPath},
 		serveReplacementOptions{Replace: true},
 	)
@@ -657,14 +610,14 @@ func TestPrepareForegroundServeDaemonReplaceChecksDatabaseEvenWithCurrentRuntime
 func TestPrepareForegroundServeDaemonAutoReplaceChecksTooNewDatabaseBeforeStop(t *testing.T) {
 	dir := runtimeTestDir(t)
 	dbPath := filepath.Join(dir, "sessions.db")
-	database, err := db.Open(dbPath)
+	database, err := db.Open(t.Context(), dbPath)
 	require.NoError(t, err)
 	require.NoError(t, database.Close())
 
 	futureVersion := db.CurrentDataVersion() + 10
 	conn, err := sql.Open("sqlite3", dbPath)
 	require.NoError(t, err)
-	_, err = conn.Exec(fmt.Sprintf("PRAGMA user_version = %d", futureVersion))
+	_, err = conn.ExecContext(t.Context(), fmt.Sprintf("PRAGMA user_version = %d", futureVersion))
 	require.NoError(t, err)
 	require.NoError(t, conn.Close())
 
@@ -677,7 +630,7 @@ func TestPrepareForegroundServeDaemonAutoReplaceChecksTooNewDatabaseBeforeStop(t
 	forbidStopDaemonRuntimeForUpgrade(t,
 		"too-new database must be rejected before auto replacement stop")
 
-	cont, release, err := prepareForegroundServeDaemon(
+	cont, release, err := prepareForegroundServeDaemon(t.Context(),
 		&config.Config{DataDir: dir, DBPath: dbPath},
 		serveReplacementOptions{},
 	)
@@ -700,7 +653,7 @@ func TestPrepareForegroundServeDaemonReplaceLeavesReadOnlyDaemon(t *testing.T) {
 	))
 	forbidStopDaemonRuntimeForUpgrade(t, "read-only daemon must not be stopped")
 
-	cont, release, err := prepareForegroundServeDaemon(
+	cont, release, err := prepareForegroundServeDaemon(t.Context(),
 		&config.Config{DataDir: dir},
 		serveReplacementOptions{Replace: true},
 	)
@@ -711,25 +664,6 @@ func TestPrepareForegroundServeDaemonReplaceLeavesReadOnlyDaemon(t *testing.T) {
 	rt, compatErr := FindIncompatibleDaemonRuntime(dir)
 	require.NotNil(t, rt)
 	require.Error(t, compatErr)
-}
-
-func TestServeDaemonReplacementDecisionRefusesDevBuild(t *testing.T) {
-	dir := runtimeTestDir(t)
-	host, port := testPingServer(t)
-	writeRuntimeRecordFixture(t, dir, daemonRuntimeRecord(
-		host, port, withRuntimeVersion("1.0.0"),
-	))
-	setTestVersion(t, "dev")
-
-	decision := decideServeDaemonReplacement(
-		config.Config{DataDir: dir}, serveReplacementOptions{},
-	)
-
-	require.NotNil(t, decision.Runtime)
-	assert.Equal(t, serveReplacementRefuse, decision.Action)
-	assert.Contains(t, decision.Reason, "dev builds")
-	assert.Contains(t, strings.Join(serveDaemonConflictLines(decision), "\n"),
-		"--replace")
 }
 
 func TestServeDaemonReplacementDecisionReplaceOverridesForwardData(t *testing.T) {

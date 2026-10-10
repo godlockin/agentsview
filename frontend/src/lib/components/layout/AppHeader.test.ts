@@ -5,7 +5,10 @@ const mocks = vi.hoisted(() => ({
   downloadExport: vi.fn().mockResolvedValue(undefined),
   getMarkdownExportUrl: vi.fn().mockReturnValue("/api/v1/sessions/sess-123/md"),
   copyToClipboard: vi.fn().mockResolvedValue(true),
+  reportTelemetry: vi.fn(),
 }));
+
+vi.mock("../../utils/telemetry.js", () => ({ reportTelemetry: mocks.reportTelemetry }));
 
 vi.mock("../../api/client.js", () => ({
   downloadExport: mocks.downloadExport,
@@ -29,6 +32,19 @@ import AppHeader from "./AppHeader.svelte";
 
 function testSession(overrides: Partial<Session> = {}): Session {
   return {
+    compaction_count: 0,
+    consecutive_failure_max: 0,
+    edit_churn_count: 0,
+    ended_with_role: "",
+    final_failure_streak: 0,
+    has_peak_context_tokens: false,
+    has_total_output_tokens: false,
+    mid_task_compaction_count: 0,
+    outcome: "",
+    outcome_confidence: "",
+    secret_leak_count: 0,
+    tool_failure_signal_count: 0,
+    tool_retry_count: 0,
     id: "sess-123",
     project: "agentsview",
     machine: "test-machine",
@@ -101,6 +117,9 @@ describe("AppHeader export actions", () => {
     expect(mocks.getMarkdownExportUrl).toHaveBeenCalledWith("sess-123");
     expect(mocks.copyToClipboard).toHaveBeenCalledWith(
       "http://localhost:3000/api/v1/sessions/sess-123/md",
+    );
+    await vi.waitFor(() =>
+      expect(mocks.reportTelemetry).toHaveBeenCalledWith("export_run", { format: "markdown_link" }),
     );
   });
 
@@ -259,6 +278,10 @@ describe("AppHeader export actions", () => {
 
   it("labels read-only global refresh with the refresh action", async () => {
     sync.serverVersion = {
+      api_version: 1,
+      data_version: 1,
+      session_stats_available: false,
+      insight_generation_available: false,
       version: "dev",
       commit: "unknown",
       build_date: "",
@@ -280,6 +303,10 @@ describe("AppHeader export actions", () => {
 
   it("keeps Recall available when settings report a read-only backend", async () => {
     sync.serverVersion = {
+      api_version: 1,
+      data_version: 1,
+      session_stats_available: false,
+      insight_generation_available: false,
       version: "dev",
       commit: "unknown",
       build_date: "",

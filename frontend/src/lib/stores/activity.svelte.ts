@@ -1,13 +1,17 @@
-import type { AgentInfo, ProjectInfo } from "../api/types.js";
+import type { QueryStep } from "../utils/refresh.js";
+import { LiveQuery } from "../utils/liveQuery.svelte.js";
+import type {
+  DbAgentInfo as AgentInfo,
+  DbProjectInfo as ProjectInfo,
+} from "../api/generated/index.js";
 import type { Report } from "../api/types/activity.js";
 import { m } from "../i18n/index.js";
 import { MetadataService } from "../api/generated/index";
-import { callGenerated, isAbortError } from "../api/runtime.js";
+import { ApiError, isAbortError } from "../api/runtime.js";
 import {
   fetchActivityReport,
   fetchActivitySessions,
   type ActivityReportProgress,
-  type ActivityReportQuery,
   type ActivityBucketRange,
   type ActivitySessionPageOptions,
   type ActivitySessionSort,
@@ -49,7 +53,66 @@ function customToInstant(to: string): string {
   return end.toISOString();
 }
 
-export type ActivityQueryParams = ActivityReportQuery;
+export type ActivityQueryParams = import("../api/generated/index.js").GetApiV1ActivityReportParams;
+
+// Step names for the report stream's phases; "done" only closes the
+// previous phase.
+const REPORT_PHASE_STEPS: Record<ActivityReportProgress["phase"], string | null> = {
+  loading_sessions: "sessions",
+  loading_usage: "usage",
+  scanning_activity: "scan",
+  finalizing: "finalize",
+  done: null,
+};
+
+/**
+ * Splits a report fetch into per-phase steps from the timestamps of its
+ * progress events. Request latency before the first event counts toward
+ * the first phase; a fetch that reports no phases is a single "report"
+ * step. Each phase is also reported to `live` as it starts and ends.
+ */
+class ReportPhaseTimer {
+  private readonly steps: QueryStep[] = [];
+  private current: string | null = null;
+  private currentStartedAt: number;
+  private liveStep = 0;
+
+  constructor(
+    private readonly startedAt: number,
+    private readonly live: LiveQuery,
+  ) {
+    this.currentStartedAt = startedAt;
+  }
+
+  observe(phase: ActivityReportProgress["phase"], at: number): void {
+    const step = REPORT_PHASE_STEPS[phase];
+    if (step === this.current) return;
+    this.close(at);
+    this.current = step;
+    // Request latency before the first event belongs to the first phase.
+    this.currentStartedAt = this.steps.length === 0 ? this.startedAt : at;
+    if (step !== null) this.liveStep = this.live.start(step, this.currentStartedAt);
+  }
+
+  finish(at: number): QueryStep[] {
+    this.close(at);
+    return this.steps.length > 0
+      ? this.steps
+      : [{ name: "report", startMs: 0, durationMs: at - this.startedAt }];
+  }
+
+  private close(at: number): void {
+    if (this.current === null) return;
+    const step: QueryStep = {
+      name: this.current,
+      startMs: this.currentStartedAt - this.startedAt,
+      durationMs: at - this.currentStartedAt,
+    };
+    this.steps.push(step);
+    this.live.settle(this.liveStep, step);
+    this.current = null;
+  }
+}
 
 class ActivityStore {
   preset = $state<Preset>("day");
@@ -75,9 +138,21 @@ class ActivityStore {
   sessionsSort: ActivitySessionSort = $state("agent_minutes");
   sessionsDirection: "asc" | "desc" = $state("desc");
   sessionsBucketRange: ActivityBucketRange | null = $state(null);
+  // Bumped whenever report.by_session is replaced by a first page instead of
+  // extended by a cursor page, so the sessions table can scroll back to top.
+  sessionsListVersion = $state(0);
   // Epoch ms of the last successful report fetch, powering the "Updated Xm ago"
   // refresh label. null until the first load completes.
   lastUpdatedAt: number | null = $state(null);
+  // Wall-clock ms of the most recent report fetch, request start to data
+  // applied, shown next to the refresh label. null until the first load.
+  lastQueryDurationMs: number | null = $state(null);
+  // How that time split across the report's server-side phases, measured
+  // between the progress events the report stream emits. A plain JSON
+  // response (no stream) yields a single "report" step.
+  lastQuerySteps: QueryStep[] = $state([]);
+  // The report fetch running now, drawn live by the refresh control.
+  readonly liveQuery = new LiveQuery();
   // Set when an SSE event arrives after the first load, signalling that newer
   // data exists. Mirrors the analytics/usage stores: marking is cheap, and the
   // actual refetch is left to the manual refresh button and the periodic
@@ -163,6 +238,7 @@ class ActivityStore {
 
   async load({ background = false }: { background?: boolean } = {}): Promise<boolean> {
     const v = ++this.loadVersion;
+    const startedAt = performance.now();
     const signal = this.reportRead.begin();
     if (this.materializeRollingWindow()) {
       this.writeUrl();
@@ -178,9 +254,14 @@ class ActivityStore {
     this.loading = true;
     this.progress = null;
     this.error = null;
+    const live = this.liveQuery.begin(startedAt);
+    const phases = new ReportPhaseTimer(startedAt, this.liveQuery);
     try {
       const res = await fetchActivityReport(this.queryParams(), signal, (progress) => {
+        // A superseded load's result is discarded, and its phases must not
+        // reach the live query that now belongs to its replacement.
         if (v === this.loadVersion && this.reportRead.isCurrent(signal)) {
+          phases.observe(progress.phase, performance.now());
           this.progress = progress;
         }
       });
@@ -193,7 +274,11 @@ class ActivityStore {
       this.sessionsBucketRange = null;
       this.report = res;
       this.reportGeneration++;
+      this.sessionsListVersion++;
       this.lastUpdatedAt = Date.now();
+      const finishedAt = performance.now();
+      this.lastQueryDurationMs = finishedAt - startedAt;
+      this.lastQuerySteps = phases.finish(finishedAt);
       this.hasNewData = false;
       return true;
     } catch (e) {
@@ -208,9 +293,10 @@ class ActivityStore {
       // changes are always foreground and clear on error.
       if (background && this.report !== null) return false;
       this.report = null;
-      this.error = e instanceof Error ? e.message : "Failed to load activity report";
+      this.error = e instanceof Error ? e.message : m.activity_report_load_failed();
       return false;
     } finally {
+      this.liveQuery.end(live);
       if (this.reportRead.finish(signal)) {
         this.loading = false;
         this.progress = null;
@@ -221,6 +307,8 @@ class ActivityStore {
   async loadSessionPage(options: ActivitySessionPageOptions = {}): Promise<boolean> {
     const report = this.report;
     if (!report?.report_id) return false;
+    const reportVersion = this.loadVersion;
+    const startedAt = performance.now();
     const signal = this.sessionsRead.begin();
     const sort = options.sort ?? this.sessionsSort;
     const direction = options.direction ?? this.sessionsDirection;
@@ -248,26 +336,45 @@ class ActivityStore {
       if (page.refresh_required && page.report) {
         this.report = page.report;
         this.reportGeneration++;
+        this.sessionsListVersion++;
         this.sessionsSort = "agent_minutes";
         this.sessionsDirection = "desc";
         this.sessionsBucketRange = null;
         this.lastUpdatedAt = Date.now();
+        const durationMs = performance.now() - startedAt;
+        this.lastQueryDurationMs = durationMs;
+        this.lastQuerySteps = [{ name: "report", startMs: 0, durationMs }];
         this.hasNewData = false;
         return true;
       }
       this.sessionsSort = sort;
       this.sessionsDirection = direction;
       this.sessionsBucketRange = bucketRange ? { ...bucketRange } : null;
+      // A cursor continues the loaded list; anything else starts a new one.
+      if (!options.cursor) this.sessionsListVersion++;
       this.report = {
         ...report,
         report_id: page.report_id,
-        by_session: page.sessions,
+        by_session: options.cursor ? [...report.by_session, ...page.sessions] : page.sessions,
         sessions_next_cursor: page.next_cursor,
         sessions_total: page.total,
       };
       return true;
     } catch (e) {
-      if (isAbortError(e) || !this.sessionsRead.isCurrent(signal)) return false;
+      if (
+        isAbortError(e) ||
+        !this.sessionsRead.isCurrent(signal) ||
+        this.loadVersion !== reportVersion
+      )
+        return false;
+      if (
+        e instanceof ApiError &&
+        e.status === 400 &&
+        (e.message === "invalid activity report ID" ||
+          e.message === "invalid activity session cursor")
+      ) {
+        return await this.load();
+      }
       this.sessionsError = e instanceof Error ? e.message : m.activity_sessions_load_failed();
       return false;
     } finally {
@@ -304,10 +411,7 @@ class ActivityStore {
     request = (async () => {
       let ok = true;
       try {
-        const res = await callGenerated(
-          (options) => MetadataService.getApiV1Projects(opts, options),
-          signal,
-        );
+        const res = await MetadataService.getApiV1Projects(opts, { signal });
         if (ver === this.#filterOptionsVersion && this.filterOptionsRead.isCurrent(signal))
           this.projects = res.projects;
       } catch (e) {
@@ -315,10 +419,7 @@ class ActivityStore {
         ok = false; // keep the current list; retry on the next call
       }
       try {
-        const res = await callGenerated(
-          (options) => MetadataService.getApiV1Agents(opts, options),
-          signal,
-        );
+        const res = await MetadataService.getApiV1Agents(opts, { signal });
         if (ver === this.#filterOptionsVersion && this.filterOptionsRead.isCurrent(signal))
           this.agents = res.agents;
       } catch (e) {
@@ -326,10 +427,7 @@ class ActivityStore {
         ok = false;
       }
       try {
-        const res = await callGenerated(
-          (options) => MetadataService.getApiV1Machines(opts, options),
-          signal,
-        );
+        const res = await MetadataService.getApiV1Machines(opts, { signal });
         if (ver === this.#filterOptionsVersion && this.filterOptionsRead.isCurrent(signal))
           this.machines = res.machines;
       } catch (e) {

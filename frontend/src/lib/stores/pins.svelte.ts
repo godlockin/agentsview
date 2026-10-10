@@ -1,6 +1,6 @@
-import type { PinnedMessage } from "../api/types.js";
+import type { DbPinnedMessage as PinnedMessage } from "../api/generated/index.js";
 import { PinsService } from "../api/generated/index";
-import { callGenerated, isAbortError } from "../api/runtime.js";
+import { isAbortError } from "../api/runtime.js";
 import { LatestRead } from "../utils/latest-read.js";
 
 class PinsStore {
@@ -35,10 +35,7 @@ class PinsStore {
     const signal = this.#allPinsRead.begin();
     const mutVer = this.#mutationVersion;
     try {
-      const res = await callGenerated(
-        (options) => PinsService.getApiV1Pins({ project }, options),
-        signal,
-      );
+      const res = await PinsService.getApiV1Pins({ project }, { signal });
       // Apply only if this is the latest load AND no mutation
       // occurred since the request started (which would make
       // this response stale relative to the optimistic state).
@@ -72,16 +69,15 @@ class PinsStore {
       this.sessionPinIds = new Set();
     }
     try {
-      const res = await callGenerated(
-        (options) => PinsService.getApiV1SessionsByIdPins({ id: sessionId }, options),
-        signal,
-      );
+      const res = await PinsService.getApiV1SessionsByIdPins({ id: sessionId }, { signal });
       if (
         this.#sessionPinsRead.isCurrent(signal) &&
         this.#loadVersion === loadVer &&
         this.#mutationVersion === mutVer
       ) {
-        this.sessionPinIds = new Set(res.pins.map((p) => p.message_id));
+        this.sessionPinIds = new Set(
+          res.pins.filter((p) => !p.unresolved).map((p) => p.message_id),
+        );
       }
     } catch (e) {
       if (isAbortError(e) || !this.#sessionPinsRead.isCurrent(signal)) return;
@@ -116,6 +112,25 @@ class PinsStore {
   #refetchAfterMutation() {
     if (this.#inflight.size === 0 && this.#currentSessionId) {
       this.loadForSession(this.#currentSessionId);
+    }
+  }
+
+  async removeReference(pin: PinnedMessage) {
+    if (!pin.message_key) return;
+    this.#mutationVersion++;
+    try {
+      await PinsService.deleteApiV1SessionsByIdPinReferencesByMessageKey({
+        id: pin.session_id,
+        messageKey: pin.message_key,
+      });
+      this.pins = this.pins.filter(
+        (p) => !(p.session_id === pin.session_id && p.message_key === pin.message_key),
+      );
+    } catch {
+      // Reload below reconciles failed removal without losing the retained card.
+    } finally {
+      this.loadAll(this.#loadedProject);
+      if (this.#currentSessionId) this.loadForSession(this.#currentSessionId);
     }
   }
 

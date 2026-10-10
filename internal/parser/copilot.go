@@ -475,7 +475,7 @@ func (b *copilotSessionBuilder) markUsageCoveredAt(occurredAt time.Time) {
 
 // loadCopilotStoreUsage reads the CLI's observed per-request token data when
 // available. Billing semantics for this undocumented store are not assumed.
-func loadCopilotStoreUsage(
+func loadCopilotStoreUsage(ctx context.Context,
 	storePath, rawSessionID string,
 ) ([]ParsedUsageEvent, error) {
 	if storePath == "" || rawSessionID == "" {
@@ -487,16 +487,13 @@ func loadCopilotStoreUsage(
 		}
 		return nil, fmt.Errorf("stat copilot session store %s: %w", storePath, err)
 	}
-	store, err := sql.Open(
-		"sqlite3",
-		"file:"+sqliteURIPath(storePath)+"?mode=ro&_busy_timeout=3000",
-	)
+	store, err := openSQLiteReadOnly(storePath, sqliteReadOptions{busyTimeoutMS: 3000})
 	if err != nil {
 		return nil, fmt.Errorf("opening copilot session store %s: %w", storePath, err)
 	}
 	defer store.Close()
 
-	rows, err := store.Query(`
+	rows, err := store.QueryContext(ctx, `
 		SELECT id, model, input_tokens, output_tokens, cache_read_tokens,
 		       cache_write_tokens, reasoning_tokens, created_at
 		FROM assistant_usage_events
@@ -507,7 +504,7 @@ func loadCopilotStoreUsage(
 		// Older stores need not contain usage data. Confirm a missing schema
 		// before falling back; operational read failures must remain retryable.
 		if sqliteErr, ok := errors.AsType[sqlite3.Error](err); ok && sqliteErr.Code == sqlite3.ErrError {
-			hasUsage, schemaErr := copilotStoreHasUsageSchema(context.Background(), store.QueryRowContext)
+			hasUsage, schemaErr := copilotStoreHasUsageSchema(ctx, store.QueryRowContext)
 			if schemaErr == nil && !hasUsage {
 				return nil, nil
 			}
@@ -582,9 +579,10 @@ func normalizeCopilotModel(model string) string {
 }
 
 // readCopilotWorkspaceName reads the session name from the
-// workspace.yaml sibling file in a directory-format session.
-// Returns an empty string for flat .jsonl sessions or when
-// no name is present.
+// workspace.yaml sibling file in a directory-format session. The one
+// name field holds both names the user chose (--name or /rename) and
+// names Copilot generated. Returns an empty string for flat .jsonl
+// sessions or when no name is present.
 func readCopilotWorkspaceName(eventsPath string) string {
 	if filepath.Base(eventsPath) != "events.jsonl" {
 		return ""
@@ -601,11 +599,8 @@ func readCopilotWorkspaceName(eventsPath string) string {
 		if !ok {
 			continue
 		}
-		name := strings.TrimSpace(after)
-		if name != "" {
-			return truncate(
-				strings.ReplaceAll(name, "\n", " "), 300,
-			)
+		if name := strings.TrimSpace(after); name != "" {
+			return truncate(name, 300)
 		}
 	}
 	return ""
@@ -616,13 +611,13 @@ func readCopilotWorkspaceName(eventsPath string) string {
 // file doesn't exist or contains no user/assistant messages. This is the
 // provider-owned parse entrypoint; the package-level free function was folded
 // onto the provider.
-func (p *copilotProvider) parseSession(
+func (p *copilotProvider) parseSession(ctx context.Context,
 	path, machine string,
 ) (*ParsedSession, []ParsedMessage, []ParsedUsageEvent, error) {
-	return p.parseSessionWithStore(path, machine, "")
+	return p.parseSessionWithStore(ctx, path, machine, "")
 }
 
-func (p *copilotProvider) parseSessionWithStore(
+func (p *copilotProvider) parseSessionWithStore(ctx context.Context,
 	path, machine, storePath string,
 ) (*ParsedSession, []ParsedMessage, []ParsedUsageEvent, error) {
 	info, err := os.Stat(path)
@@ -676,7 +671,7 @@ func (p *copilotProvider) parseSessionWithStore(
 	}
 	usesStoreUsage := false
 	if !b.startedAt.Before(copilotUsageBasedPricingStartedAt) {
-		storeUsage, err := loadCopilotStoreUsage(storePath, rawSessionID)
+		storeUsage, err := loadCopilotStoreUsage(ctx, storePath, rawSessionID)
 		if err != nil {
 			return nil, nil, nil, err
 		}
@@ -710,12 +705,12 @@ func (p *copilotProvider) parseSessionWithStore(
 
 	sessionID := "copilot:" + rawSessionID
 
-	// Prefer the workspace.yaml name (LLM-generated or user-set
-	// title) over the raw first user message. Falls back to the
-	// first user message when no name is present.
+	// The workspace.yaml name is the session name. It stands in for the
+	// first message only when the session has no user message.
+	sessionName := readCopilotWorkspaceName(path)
 	firstMessage := b.firstMessage
-	if wsName := readCopilotWorkspaceName(path); wsName != "" {
-		firstMessage = wsName
+	if firstMessage == "" {
+		firstMessage = sessionName
 	}
 
 	userCount := 0
@@ -731,6 +726,7 @@ func (p *copilotProvider) parseSessionWithStore(
 		Machine:          machine,
 		Agent:            AgentCopilot,
 		FirstMessage:     firstMessage,
+		SessionName:      sessionName,
 		StartedAt:        b.startedAt,
 		EndedAt:          b.endedAt,
 		MessageCount:     len(b.messages),

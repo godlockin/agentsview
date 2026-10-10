@@ -11,6 +11,7 @@ type Phase string
 
 const (
 	PhaseIdle             Phase = "idle"
+	PhaseOpeningDatabase  Phase = "opening_database"
 	PhaseDiscovering      Phase = "discovering"
 	PhasePreparingResync  Phase = "preparing_resync"
 	PhaseSyncing          Phase = "syncing"
@@ -84,6 +85,14 @@ type SyncStats struct {
 	// serialized because worker-process passes marshal SyncStats back to the
 	// daemon, which must still emit "sessions" for cwd-only changes.
 	CwdUpdated int `json:"cwd_updated,omitempty"`
+	// LinksUpdated counts global, scoped, and queued parent-link repairs.
+	// A pending retry can update parent_session_id while the poll's
+	// sync stats and tombstone count stay zero. Workers carry the count back
+	// to the daemon so it can notify clients about link-only repairs.
+	LinksUpdated int `json:"links_updated,omitempty"`
+	// LinksPending is the worker's terminal snapshot of unfinished linking.
+	// The daemon retains it for its next poll when the worker exits.
+	LinksPending bool `json:"links_pending,omitempty"`
 
 	// Anomalies aggregates per-run parser/sanitizer anomaly signals
 	// surfaced in the CLI sync summary. These are live per-run counters
@@ -128,13 +137,13 @@ type SyncStats struct {
 	cwdFilteredFiles int
 }
 
-func (s SyncStats) shouldEmitSync() bool {
-	return s.Tombstoned > 0 ||
-		(!s.Aborted && (s.Synced > 0 || s.CwdUpdated > 0 || s.ArchiveRebuilt))
+func (s *SyncStats) shouldEmitSync() bool {
+	return s.Tombstoned > 0 || s.LinksUpdated > 0 ||
+		(!s.Aborted && (s.hasSessionChanges() || s.ArchiveRebuilt))
 }
 
-func (s SyncStats) hasSessionChanges() bool {
-	return s.Synced > 0 || s.CwdUpdated > 0 || s.Tombstoned > 0
+func (s *SyncStats) hasSessionChanges() bool {
+	return s.Synced > 0 || s.CwdUpdated > 0 || s.Tombstoned > 0 || s.LinksUpdated > 0
 }
 
 // AnomalyStats aggregates parser-output anomaly signals observed during a
@@ -203,7 +212,7 @@ func (s SanitizeStats) IsZero() bool {
 
 // IsZero reports whether the run observed no anomalies at all, so the CLI
 // summary can omit the anomaly section entirely on clean runs.
-func (a AnomalyStats) IsZero() bool {
+func (a *AnomalyStats) IsZero() bool {
 	return a.UnsupportedSourceLayoutsTotal == 0 &&
 		a.MalformedLinesTotal == 0 &&
 		a.UnknownSchemaSessionsTotal == 0 &&
@@ -410,6 +419,14 @@ func (s *SyncStats) RecordSynced(n int) {
 // RecordCwdUpdated records a durable source workspace reconciliation.
 func (s *SyncStats) RecordCwdUpdated(n int) {
 	s.CwdUpdated += n
+}
+
+// RecordLinksUpdated records parent-link rows repaired without an ordinary
+// session write. Zero and negative counts are ignored.
+func (s *SyncStats) RecordLinksUpdated(n int) {
+	if n > 0 {
+		s.LinksUpdated += n
+	}
 }
 
 // RecordFailed increments the hard-failure counter.

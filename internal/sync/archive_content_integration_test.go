@@ -93,13 +93,13 @@ func TestUsageOnlyStoragePreservesUsageWithoutTranscriptContent(t *testing.T) {
 		parser.AgentCodex:  {codexRoot},
 	}
 	fullDB := dbtest.OpenTestDB(t)
-	fullEngine := sync.NewEngine(fullDB, sync.EngineConfig{
+	fullEngine := sync.NewEngine(t.Context(), fullDB, sync.EngineConfig{
 		AgentDirs: agentDirs,
 		Machine:   "local",
 	})
 	t.Cleanup(fullEngine.Close)
 	usageDB := dbtest.OpenTestDB(t)
-	usageEngine := sync.NewEngine(usageDB, sync.EngineConfig{
+	usageEngine := sync.NewEngine(t.Context(), usageDB, sync.EngineConfig{
 		AgentDirs:      agentDirs,
 		Machine:        "local",
 		ArchiveContent: config.ArchiveContentUsage,
@@ -136,10 +136,10 @@ func TestUsageOnlyStoragePreservesUsageWithoutTranscriptContent(t *testing.T) {
 			From: "2026-08-31", To: "2026-08-31",
 			Agent: agent, Timezone: "UTC", Breakdowns: true,
 		}
-		fullUsage, err := fullDB.GetDailyUsage(context.Background(), filter)
+		fullUsage, err := fullDB.GetDailyUsage(t.Context(), filter)
 		require.NoError(t, err)
 		usageOnlyUsage, err := usageDB.GetDailyUsage(
-			context.Background(), filter,
+			t.Context(), filter,
 		)
 		require.NoError(t, err)
 		assert.Equal(t, fullUsage.Totals, usageOnlyUsage.Totals)
@@ -147,11 +147,11 @@ func TestUsageOnlyStoragePreservesUsageWithoutTranscriptContent(t *testing.T) {
 		assert.Equal(t, fullUsage.SessionCounts, usageOnlyUsage.SessionCounts)
 
 		fullMatching, err := fullDB.GetUsageMatchingSessionCount(
-			context.Background(), filter,
+			t.Context(), filter,
 		)
 		require.NoError(t, err)
 		usageOnlyMatching, err := usageDB.GetUsageMatchingSessionCount(
-			context.Background(), filter,
+			t.Context(), filter,
 		)
 		require.NoError(t, err)
 		assert.Equal(t, fullMatching, usageOnlyMatching)
@@ -159,17 +159,17 @@ func TestUsageOnlyStoragePreservesUsageWithoutTranscriptContent(t *testing.T) {
 		automatedFilter := filter
 		automatedFilter.AutomatedScope = "automated"
 		fullAutomated, err := fullDB.GetDailyUsage(
-			context.Background(), automatedFilter,
+			t.Context(), automatedFilter,
 		)
 		require.NoError(t, err)
 		usageOnlyAutomated, err := usageDB.GetDailyUsage(
-			context.Background(), automatedFilter,
+			t.Context(), automatedFilter,
 		)
 		require.NoError(t, err)
 		assert.Equal(t, fullAutomated, usageOnlyAutomated)
 	}
 
-	messages, err := usageDB.GetAllMessages(context.Background(), "codex:"+sessionID)
+	messages, err := usageDB.GetAllMessages(t.Context(), "codex:"+sessionID)
 	require.NoError(t, err)
 	require.NotEmpty(t, messages)
 	for _, message := range messages {
@@ -180,7 +180,7 @@ func TestUsageOnlyStoragePreservesUsageWithoutTranscriptContent(t *testing.T) {
 	}
 
 	session, err := usageDB.GetSessionFull(
-		context.Background(), "codex:"+sessionID,
+		t.Context(), "codex:"+sessionID,
 	)
 	require.NoError(t, err)
 	require.NotNil(t, session)
@@ -190,7 +190,7 @@ func TestUsageOnlyStoragePreservesUsageWithoutTranscriptContent(t *testing.T) {
 	assert.Equal(t, 0, session.SecretLeakCount)
 
 	fullClaudeMessages, err := fullDB.GetAllMessages(
-		context.Background(), claudeSessionID,
+		t.Context(), claudeSessionID,
 	)
 	require.NoError(t, err)
 	require.NotEmpty(t, fullClaudeMessages)
@@ -202,22 +202,102 @@ func TestUsageOnlyStoragePreservesUsageWithoutTranscriptContent(t *testing.T) {
 	assert.Contains(t, fullClaudeText.String(), "incrementally appended")
 
 	usageClaudeMessages, err := usageDB.GetAllMessages(
-		context.Background(), claudeSessionID,
+		t.Context(), claudeSessionID,
 	)
 	require.NoError(t, err)
 	require.Less(t, len(usageClaudeMessages), len(fullClaudeMessages),
 		"usage-only storage must omit rows unrelated to accounting")
 	for _, message := range usageClaudeMessages {
-		assert.True(t,
-			(message.TokenUsage != nil && message.Model != "" &&
-				message.Model != "<synthetic>") ||
-				(message.Role == "assistant" && message.Model != "<synthetic>"),
+		assert.True(t, (message.TokenUsage != nil && message.Model != "" &&
+			message.Model != "<synthetic>") ||
+			(message.Role == "assistant" && message.Model != "<synthetic>"),
 			"stored message %d is unrelated to usage accounting", message.Ordinal,
 		)
 		assert.Empty(t, message.Content)
 		assert.Empty(t, message.ThinkingText)
 		assert.Empty(t, message.ToolCalls)
 		assert.Empty(t, message.ToolResults)
+	}
+}
+
+func TestUsageOnlyStorageClaudeContextFirstWorker(t *testing.T) {
+	for _, policy := range []config.ArchiveContent{config.ArchiveContentFull, config.ArchiveContentUsage} {
+		for _, tc := range []struct {
+			name, origin, relationship string
+		}{
+			{"sdk", "sdk", "subagent"},
+			{"human", "human", ""},
+		} {
+			t.Run(string(policy)+"/"+tc.name, func(t *testing.T) {
+				root := t.TempDir()
+				path := filepath.Join(root, "project", "context-first.jsonl")
+				require.NoError(t, os.MkdirAll(filepath.Dir(path), 0o700))
+				content := `{"type":"agent-setting","entrypoint":"sdk-cli"}` + "\n" +
+					`{"type":"user","uuid":"context","timestamp":"2026-10-01T10:00:00Z","message":{"content":"<ide_opened_file>The user opened a file.</ide_opened_file>"}}` + "\n"
+				require.NoError(t, os.WriteFile(path, []byte(content), 0o600))
+				database := dbtest.OpenTestDB(t)
+				engine := sync.NewEngine(t.Context(), database, sync.EngineConfig{
+					AgentDirs: map[parser.AgentType][]string{parser.AgentClaude: {root}},
+					Machine:   "local", ArchiveContent: policy,
+				})
+				t.Cleanup(engine.Close)
+				require.Equal(t, 1, engine.SyncAll(t.Context(), nil).Synced)
+				stored, err := database.GetSessionFull(t.Context(), "context-first")
+				require.NoError(t, err)
+				require.NotNil(t, stored)
+				require.Zero(t, stored.UserMessageCount)
+				appends := []string{
+					`{"type":"assistant","uuid":"a1","parentUuid":"context","timestamp":"2026-10-01T10:01:00Z","message":{"id":"msg-1","model":"claude-sonnet-4-5","content":[{"type":"text","text":"Reading "}],"usage":{"input_tokens":10,"output_tokens":1}}}` + "\n",
+					`{"type":"assistant","uuid":"a1-cont","parentUuid":"a1","timestamp":"2026-10-01T10:01:01Z","message":{"id":"msg-1","model":"claude-sonnet-4-5","content":[{"type":"text","text":"context."},{"type":"tool_use","id":"call-1","name":"Read","input":{"file_path":"src/main.go"}}],"usage":{"input_tokens":10,"output_tokens":7}}}` + "\n" +
+						fmt.Sprintf(`{"type":"user","uuid":"u1","parentUuid":"a1-cont","turnOrigin":"%s","timestamp":"2026-10-01T10:02:00Z","message":{"content":"Explain this function."}}`, tc.origin) + "\n",
+					testjsonl.NewSessionBuilder().AddClaudeAssistantWithUUID("2026-10-01T10:03:00Z", "The explanation.", "a2", "u1").String(),
+					fmt.Sprintf(`{"type":"user","uuid":"u2","parentUuid":"a2","turnOrigin":"%s","timestamp":"2026-10-01T10:04:00Z","message":{"content":"Explain the next function."}}`, tc.origin) + "\n",
+				}
+				for stage, appendText := range appends {
+					content += appendText
+					require.NoError(t, os.WriteFile(path, []byte(content), 0o600))
+					engine.SyncPathsContext(t.Context(), []string{path})
+					stored, err = database.GetSessionFull(t.Context(), "context-first")
+					require.NoError(t, err)
+					require.NotNil(t, stored)
+					if stage != 1 {
+						assert.True(t, stored.LastWriteIncremental)
+					}
+					if stage > 0 {
+						assert.Equal(t, tc.relationship, stored.RelationshipType)
+						wantCount := 1
+						if stage == 3 {
+							wantCount = 2
+						}
+						assert.Equal(t, wantCount, stored.UserMessageCount)
+					}
+					if stage == 1 {
+						assert.Equal(t, 7, stored.TotalOutputTokens)
+						messages, err := database.GetMessages(t.Context(), "context-first", 0, 10, true)
+						require.NoError(t, err)
+						var assistants []db.Message
+						for _, message := range messages {
+							if message.Role == "assistant" {
+								assistants = append(assistants, message)
+							}
+						}
+						require.Len(t, assistants, 1)
+						assert.Equal(t, 7, assistants[0].OutputTokens)
+						if policy == config.ArchiveContentFull {
+							require.Len(t, messages, 3)
+							assert.Equal(t, "Reading \ncontext.\n[Read: src/main.go]", assistants[0].Content)
+							require.Len(t, assistants[0].ToolCalls, 1)
+							assert.Equal(t, "call-1", assistants[0].ToolCalls[0].ToolUseID)
+						} else {
+							assert.Len(t, messages, 1)
+						}
+					}
+					if policy == config.ArchiveContentUsage {
+						assert.Nil(t, stored.FirstMessage)
+					}
+				}
+			})
+		}
 	}
 }
 
@@ -241,7 +321,7 @@ func TestUsageOnlyStorageClaudeUserAppendStaysIncremental(t *testing.T) {
 	require.NoError(t, os.WriteFile(path, []byte(initial.String()), 0o600))
 
 	database := dbtest.OpenTestDB(t)
-	engine := sync.NewEngine(database, sync.EngineConfig{
+	engine := sync.NewEngine(t.Context(), database, sync.EngineConfig{
 		AgentDirs: map[parser.AgentType][]string{
 			parser.AgentClaude: {claudeRoot},
 		},
@@ -270,20 +350,78 @@ func TestUsageOnlyStorageClaudeUserAppendStaysIncremental(t *testing.T) {
 	assert.Nil(t, stored.FirstMessage)
 }
 
+func TestUsageOnlyStorageClaudeAITitleAppendStaysIncremental(t *testing.T) {
+	claudeRoot := t.TempDir()
+	sessionID := "usage-only-ai-title"
+	path := filepath.Join(claudeRoot, "project", sessionID+".jsonl")
+	require.NoError(t, os.MkdirAll(filepath.Dir(path), 0o755))
+	initial := testjsonl.NewSessionBuilder().
+		AddClaudeUserWithSessionID(
+			"2026-08-31T10:00:00Z", "private initial prompt",
+			sessionID, "/workspace/project",
+		).
+		AddClaudeAssistantUsage(
+			"2026-08-31T10:00:01Z", "private response",
+			testjsonl.ClaudeAssistantUsage{
+				MessageID: "msg-initial", RequestID: "req-initial",
+				Model: "claude-sonnet-4-6", InputTokens: 100, OutputTokens: 10,
+			},
+		)
+	require.NoError(t, os.WriteFile(path, []byte(initial.String()), 0o600))
+
+	database := dbtest.OpenTestDB(t)
+	database.SetArchiveContent(config.ArchiveContentUsage)
+	engine := sync.NewEngine(t.Context(), database, sync.EngineConfig{
+		AgentDirs: map[parser.AgentType][]string{
+			parser.AgentClaude: {claudeRoot},
+		},
+		Machine: "local", ArchiveContent: config.ArchiveContentUsage,
+	})
+	t.Cleanup(engine.Close)
+	require.Equal(t, 1, engine.SyncAll(t.Context(), nil).Synced)
+
+	appendFile, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0o600)
+	require.NoError(t, err)
+	_, err = appendFile.WriteString(
+		`{"type":"ai-title","aiTitle":"Generated title"}` + "\n",
+	)
+	require.NoError(t, err)
+	require.NoError(t, appendFile.Close())
+	engine.SyncPathsContext(t.Context(), []string{path})
+
+	stored, err := database.GetSessionFull(t.Context(), sessionID)
+	require.NoError(t, err)
+	require.NotNil(t, stored)
+	assert.True(t, stored.LastWriteIncremental)
+	assert.Nil(t, stored.SessionName)
+	assert.Nil(t, stored.FirstMessage)
+	assert.True(t, stored.HasTotalOutputTokens)
+	assert.Equal(t, 10, stored.TotalOutputTokens)
+	messages := fetchMessages(t, database, sessionID)
+	require.NotEmpty(t, messages)
+	for _, message := range messages {
+		assert.Empty(t, message.Content)
+		assert.Empty(t, message.ThinkingText)
+		assert.Empty(t, message.ToolCalls)
+		assert.Empty(t, message.ToolResults)
+	}
+	t.Logf("LastWriteIncremental=%t SessionName=nil FirstMessage=nil TotalOutputTokens=%d transcript_content=%q", stored.LastWriteIncremental, stored.TotalOutputTokens, messages[0].Content)
+}
+
 func TestUsageOnlyStorageSettlesLegacySignalBackfillOnce(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "legacy-usage.db")
-	seedDatabase, err := db.Open(path)
+	seedDatabase, err := db.Open(t.Context(), path)
 	require.NoError(t, err)
 	startedAt := "2026-08-31T10:00:00Z"
-	require.NoError(t, seedDatabase.UpsertSession(db.Session{
+	require.NoError(t, seedDatabase.UpsertSession(t.Context(), db.Session{
 		ID: "legacy-signals", Project: "project", Agent: "claude",
 		Machine: "local", StartedAt: &startedAt, MessageCount: 1,
 	}))
-	require.NoError(t, seedDatabase.InsertMessages([]db.Message{{
+	require.NoError(t, seedDatabase.InsertMessages(t.Context(), []db.Message{{
 		SessionID: "legacy-signals", Ordinal: 0, Role: "assistant",
 		Model: "model-a", TokenUsage: []byte(`{"input_tokens":10,"output_tokens":2}`),
 	}}))
-	require.NoError(t, seedDatabase.UpdateSessionSignals(
+	require.NoError(t, seedDatabase.UpdateSessionSignals(t.Context(),
 		"legacy-signals", db.SessionSignalUpdate{
 			ToolFailureSignalCount: 3,
 			Outcome:                "failure",
@@ -293,16 +431,16 @@ func TestUsageOnlyStorageSettlesLegacySignalBackfillOnce(t *testing.T) {
 			},
 		},
 	))
-	require.NoError(t, seedDatabase.ReplaceSessionSecretFindings(
+	require.NoError(t, seedDatabase.ReplaceSessionSecretFindings(t.Context(),
 		"legacy-signals", nil, 2, "legacy-rules",
 	))
 	require.NoError(t, seedDatabase.Close())
 
-	database, err := db.OpenWithArchiveContent(path, config.ArchiveContentUsage)
+	database, err := db.OpenWithArchiveContent(t.Context(), path, config.ArchiveContentUsage)
 	require.NoError(t, err)
 	t.Cleanup(func() { require.NoError(t, database.Close()) })
 
-	engine := sync.NewEngine(database, sync.EngineConfig{ArchiveContent: config.ArchiveContentUsage})
+	engine := sync.NewEngine(t.Context(), database, sync.EngineConfig{ArchiveContent: config.ArchiveContentUsage})
 	t.Cleanup(engine.Close)
 	compute := engine.BackfillSignalComputer()
 	calls := 0
@@ -383,6 +521,7 @@ func TestUsageOnlyStoragePreservesNestedToolLinkedSubagentUsage(
 
 func seedUsageOnlySubagentUsage(t *testing.T, database *db.DB) {
 	t.Helper()
+
 	require.NoError(t, database.UpsertModelPricing([]db.ModelPricing{{
 		ModelPattern:  "test-model",
 		InputPerMTok:  money.MustParseDollars("2"),
@@ -400,7 +539,7 @@ func seedUsageOnlySubagentUsage(t *testing.T, database *db.DB) {
 		{id: "child", input: 2_000, output: 200, child: "grandchild"},
 		{id: "grandchild", input: 3_000, output: 300},
 	} {
-		require.NoError(t, database.UpsertSession(db.Session{
+		require.NoError(t, database.UpsertSession(t.Context(), db.Session{
 			ID: fixture.id, Project: "project", Agent: "claude", Machine: "local",
 			StartedAt: &startedAt, EndedAt: &startedAt, MessageCount: 1,
 			TotalOutputTokens: fixture.output, HasTotalOutputTokens: true,
@@ -433,7 +572,7 @@ func seedUsageOnlySubagentUsage(t *testing.T, database *db.DB) {
 				}},
 			}}
 		}
-		require.NoError(t, database.InsertMessages([]db.Message{message}))
+		require.NoError(t, database.InsertMessages(t.Context(), []db.Message{message}))
 	}
 }
 
@@ -495,7 +634,7 @@ func TestTranscriptsArchiveContentSyncKeepsTranscriptWithoutToolPayloads(
 	writeTranscriptsFixture(t, claudeRoot, sessionID)
 
 	database := dbtest.OpenTestDB(t)
-	engine := sync.NewEngine(database, sync.EngineConfig{
+	engine := sync.NewEngine(t.Context(), database, sync.EngineConfig{
 		AgentDirs: map[parser.AgentType][]string{
 			parser.AgentClaude: {claudeRoot},
 		},
@@ -558,9 +697,9 @@ func TestResyncProjectsArchivedSessionsOntoArchiveContent(t *testing.T) {
 			}
 
 			dbPath := filepath.Join(t.TempDir(), "sessions.db")
-			full, err := db.Open(dbPath)
+			full, err := db.Open(t.Context(), dbPath)
 			require.NoError(t, err)
-			fullEngine := sync.NewEngine(full, sync.EngineConfig{
+			fullEngine := sync.NewEngine(t.Context(), full, sync.EngineConfig{
 				AgentDirs: agentDirs, Machine: "local",
 			})
 			require.Equal(t, 2, fullEngine.SyncAll(t.Context(), nil).Synced)
@@ -568,10 +707,10 @@ func TestResyncProjectsArchivedSessionsOntoArchiveContent(t *testing.T) {
 			require.NoError(t, full.Close())
 			require.NoError(t, os.Remove(sourcePath))
 
-			database, err := db.OpenWithArchiveContent(dbPath, policy)
+			database, err := db.OpenWithArchiveContent(t.Context(), dbPath, policy)
 			require.NoError(t, err)
 			t.Cleanup(func() { require.NoError(t, database.Close()) })
-			engine := sync.NewEngine(database, sync.EngineConfig{
+			engine := sync.NewEngine(t.Context(), database, sync.EngineConfig{
 				AgentDirs: agentDirs, Machine: "local", ArchiveContent: policy,
 			})
 			t.Cleanup(engine.Close)
@@ -588,6 +727,8 @@ func TestResyncProjectsArchivedSessionsOntoArchiveContent(t *testing.T) {
 			calls := toolCallsOf(messages)
 
 			switch policy {
+			case config.ArchiveContentFull:
+				require.FailNow(t, "full archive policy is outside this stripped-content fixture")
 			case config.ArchiveContentTranscripts:
 				require.NotNil(t, stored.FirstMessage)
 				assert.Contains(t, joinedContent(messages), "the build tool is missing")
@@ -632,19 +773,19 @@ func TestResyncCopiesDerivedTextOnlyOutsideUsagePolicy(t *testing.T) {
 			}
 
 			dbPath := filepath.Join(t.TempDir(), "sessions.db")
-			full, err := db.Open(dbPath)
+			full, err := db.Open(t.Context(), dbPath)
 			require.NoError(t, err)
-			fullEngine := sync.NewEngine(full, sync.EngineConfig{
+			fullEngine := sync.NewEngine(t.Context(), full, sync.EngineConfig{
 				AgentDirs: agentDirs, Machine: "local",
 			})
 			require.Equal(t, 1, fullEngine.SyncAll(t.Context(), nil).Synced)
 			fullEngine.Close()
-			_, err = full.InsertInsight(db.Insight{
+			_, err = full.InsertInsight(t.Context(), db.Insight{
 				Type: "daily", DateFrom: "2026-08-31", DateTo: "2026-08-31",
 				Agent: "claude", Content: "summary quoting private transcript text",
 			})
 			require.NoError(t, err)
-			_, err = full.InsertRecallEntry(db.RecallEntry{
+			_, err = full.InsertRecallEntry(t.Context(), db.RecallEntry{
 				ID: "entry-1", Type: "fact", Scope: "project", Status: "accepted",
 				Title: "build tool", Body: "the build tool is missing",
 				Project: "project", Agent: "claude", SourceSessionID: sessionID,
@@ -652,10 +793,10 @@ func TestResyncCopiesDerivedTextOnlyOutsideUsagePolicy(t *testing.T) {
 			require.NoError(t, err)
 			require.NoError(t, full.Close())
 
-			database, err := db.OpenWithArchiveContent(dbPath, tc.policy)
+			database, err := db.OpenWithArchiveContent(t.Context(), dbPath, tc.policy)
 			require.NoError(t, err)
 			t.Cleanup(func() { require.NoError(t, database.Close()) })
-			engine := sync.NewEngine(database, sync.EngineConfig{
+			engine := sync.NewEngine(t.Context(), database, sync.EngineConfig{
 				AgentDirs: agentDirs, Machine: "local", ArchiveContent: tc.policy,
 			})
 			t.Cleanup(engine.Close)
@@ -690,7 +831,7 @@ func TestArchivePolicyOrphanToolResultsDoNotChangeAutomation(t *testing.T) {
 	for _, policy := range []config.ArchiveContent{config.ArchiveContentFull, config.ArchiveContentTranscripts, config.ArchiveContentUsage} {
 		t.Run(string(policy), func(t *testing.T) {
 			database := dbtest.OpenTestDB(t)
-			engine := sync.NewEngine(database, sync.EngineConfig{
+			engine := sync.NewEngine(t.Context(), database, sync.EngineConfig{
 				AgentDirs: map[parser.AgentType][]string{parser.AgentCodex: {root}},
 				Machine:   "local", ArchiveContent: policy,
 			})
@@ -731,7 +872,7 @@ func TestArchivePolicyCortexToolResultsDoNotChangeAutomation(t *testing.T) {
 			for _, policy := range []config.ArchiveContent{config.ArchiveContentFull, config.ArchiveContentTranscripts, config.ArchiveContentUsage} {
 				t.Run(string(policy), func(t *testing.T) {
 					database := dbtest.OpenTestDB(t)
-					engine := sync.NewEngine(database, sync.EngineConfig{
+					engine := sync.NewEngine(t.Context(), database, sync.EngineConfig{
 						AgentDirs: map[parser.AgentType][]string{parser.AgentCortex: {root}},
 						Machine:   "local", ArchiveContent: policy,
 					})

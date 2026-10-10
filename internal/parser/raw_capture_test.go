@@ -137,7 +137,8 @@ func canonicalRawCaptureTestPath(t *testing.T, path string) string {
 
 func TestResolveRawCapturePlanLeavesUnsupportedProviderUntouched(t *testing.T) {
 	provider := &rawCaptureTestProvider{
-		Def: AgentDef{Type: AgentClaude}}
+		Def: AgentDef{Type: AgentClaude},
+	}
 
 	plan, ok, err := ResolveRawCapturePlan(t.Context(), provider, SourceRef{
 		Provider: AgentClaude,
@@ -153,7 +154,8 @@ func TestResolveRawCapturePlanLeavesUnsupportedProviderUntouched(t *testing.T) {
 func TestResolveRawCapturePlanRequiresDeclaredInterface(t *testing.T) {
 	provider := &rawCaptureUndeclaredProvider{
 		Def:  AgentDef{Type: AgentClaude},
-		Caps: rawCaptureTestCapabilities()}
+		Caps: rawCaptureTestCapabilities(),
+	}
 
 	_, ok, err := ResolveRawCapturePlan(t.Context(), provider, SourceRef{
 		Provider: AgentClaude,
@@ -447,10 +449,12 @@ func TestCodexProviderPlansForkWithReplayParent(t *testing.T) {
 	root := filepath.Join(t.TempDir(), "sessions")
 	const childID = "22222222-2222-4222-8222-222222222222"
 	const parentID = "11111111-1111-4111-8111-111111111111"
-	parentPath := writeCodexProviderSession(t, root, parentID, "parent task")
-	childPath := writeCodexProviderSessionContent(t, root, childID,
-		`{"type":"session_meta","payload":{"id":"`+childID+`","forked_from_id":"`+parentID+`"}}`+"\n",
-	)
+	parentPath := canonicalRawCaptureTestPath(t,
+		writeCodexProviderSession(t, root, parentID, "parent task"))
+	_ = canonicalRawCaptureTestPath(t,
+		writeCodexProviderSessionContent(t, root, childID,
+			`{"type":"session_meta","payload":{"id":"`+childID+`","forked_from_id":"`+parentID+`"}}`+"\n",
+		))
 	provider, ok := NewProvider(AgentCodex, ProviderConfig{Roots: []string{root}})
 	require.True(t, ok)
 	child := requireCodexProviderSource(t, provider, childID)
@@ -459,7 +463,7 @@ func TestCodexProviderPlansForkWithReplayParent(t *testing.T) {
 	// discovery layer reports the resolved path, so compare resolved forms.
 	resolvedParent, err := filepath.EvalSymlinks(parentPath)
 	require.NoError(t, err)
-	resolvedChild, err := filepath.EvalSymlinks(childPath)
+	resolvedChild, err := filepath.EvalSymlinks(child.DisplayPath)
 	require.NoError(t, err)
 
 	plan, supported, err := ResolveRawCapturePlan(t.Context(), provider, child)
@@ -484,9 +488,10 @@ func TestCodexProviderPlansForkCaptureWithoutReplayParent(t *testing.T) {
 	root := filepath.Join(t.TempDir(), "sessions")
 	const childID = "22222222-2222-4222-8222-222222222222"
 	const parentID = "11111111-1111-4111-8111-111111111111"
-	writeCodexProviderSessionContent(t, root, childID,
-		`{"type":"session_meta","payload":{"id":"`+childID+`","forked_from_id":"`+parentID+`"}}`+"\n",
-	)
+	_ = canonicalRawCaptureTestPath(t,
+		writeCodexProviderSessionContent(t, root, childID,
+			`{"type":"session_meta","payload":{"id":"`+childID+`","forked_from_id":"`+parentID+`"}}`+"\n",
+		))
 	provider, ok := NewProvider(AgentCodex, ProviderConfig{Roots: []string{root}})
 	require.True(t, ok)
 	child := requireCodexProviderSource(t, provider, childID)

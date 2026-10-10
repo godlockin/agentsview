@@ -64,7 +64,7 @@ func (e *Engine) PlanChangedPathsContext(
 
 func normalizeChangedPhysicalPath(path string) (string, error) {
 	if path == "" || strings.IndexByte(path, 0) >= 0 || !filepath.IsAbs(path) {
-		return "", fmt.Errorf("changed path is not a trusted absolute physical path")
+		return "", errors.New("changed path is not a trusted absolute physical path")
 	}
 	return filepath.Clean(path), nil
 }
@@ -77,11 +77,11 @@ func (e *Engine) planOneChangedPath(
 	claimed := false
 	agents := e.sortedAuthoritativeProviderAgents()
 	for _, agent := range agents {
-		roots := e.agentDirs[agent]
+		roots := e.sources().agentDirs[agent]
 		if len(roots) == 0 {
 			continue
 		}
-		factory := e.providerFactories[agent]
+		factory := e.sources().providerFactories[agent]
 		if factory == nil {
 			continue
 		}
@@ -92,7 +92,7 @@ func (e *Engine) planOneChangedPath(
 		}
 		provider := factory.NewProvider(parser.ProviderConfig{
 			Roots: roots, Machine: e.machine,
-			SourceMachines: e.sourceMachines[agent], PathRewriter: e.pathRewriter,
+			SourceMachines: e.sources().sourceMachines[agent], PathRewriter: e.pathRewriter,
 		})
 		watchRoots, err := e.providerChangedPathWatchRoots(ctx, agent, provider, roots)
 		if err != nil {
@@ -116,7 +116,7 @@ func (e *Engine) planOneChangedPath(
 			// classifier so title-only changes select only changed sessions and
 			// preserve the live/archive copy already tracked by the archive.
 			attribution.files = append(
-				attribution.files, e.classifyCodexIndexPath(path)...,
+				attribution.files, e.classifyCodexIndexPath(ctx, path)...,
 			)
 			continue
 		}
@@ -228,7 +228,7 @@ func (e *Engine) resolveClaudeDuplicateAttribution(
 		return err
 	}
 	expanded = dedupeDiscoveredFiles(expanded)
-	preferredFiles := e.dedupeClaudeDiscoveredFiles(expanded)
+	preferredFiles := e.dedupeClaudeDiscoveredFiles(ctx, expanded)
 	preferredBySession := make(map[string]parser.DiscoveredFile)
 	for _, file := range preferredFiles {
 		if !isClaudeFormatTranscriptFile(file) {
@@ -272,14 +272,14 @@ func (e *Engine) expandAffectedClaudeDuplicateCandidates(
 ) ([]parser.DiscoveredFile, error) {
 	providers := make(map[parser.AgentType]parser.Provider)
 	for _, agent := range []parser.AgentType{parser.AgentClaude, parser.AgentIcodemate} {
-		factory := e.providerFactories[agent]
-		roots := e.agentDirs[agent]
+		factory := e.sources().providerFactories[agent]
+		roots := e.sources().agentDirs[agent]
 		if factory == nil || len(roots) == 0 {
 			continue
 		}
 		providers[agent] = factory.NewProvider(parser.ProviderConfig{
 			Roots: roots, Machine: e.machine,
-			SourceMachines: e.sourceMachines[agent],
+			SourceMachines: e.sources().sourceMachines[agent],
 			PathRewriter:   e.pathRewriter,
 		})
 	}
@@ -320,7 +320,7 @@ func (e *Engine) expandAffectedClaudeDuplicateCandidates(
 		}
 		seenSessions[sessionKey] = struct{}{}
 
-		storedPath := e.db.GetSessionFilePath(fullID)
+		storedPath := e.db.GetSessionFilePath(ctx, fullID)
 		if storedPath == "" {
 			continue
 		}
@@ -365,8 +365,8 @@ func (e *Engine) expandAffectedClaudeDuplicateCandidates(
 }
 
 func (e *Engine) sortedAuthoritativeProviderAgents() []parser.AgentType {
-	agents := make([]parser.AgentType, 0, len(e.providerFactories))
-	for agent := range e.providerFactories {
+	agents := make([]parser.AgentType, 0, len(e.sources().providerFactories))
+	for agent := range e.sources().providerFactories {
 		if e.providerMigrationModes[agent] == parser.ProviderMigrationProviderAuthoritative {
 			agents = append(agents, agent)
 		}
@@ -508,7 +508,7 @@ func changedPathSourceKey(file parser.DiscoveredFile) string {
 }
 
 // PruneScope projects only armed input attribution into invalidation work.
-func (plan ChangedPathPlan) PruneScope(
+func (plan *ChangedPathPlan) PruneScope(
 	armedPhysicalPaths map[string]struct{},
 ) ChangedPathPruneScope {
 	armedPhysicalPaths = normalizeChangedPathSet(armedPhysicalPaths)
@@ -530,7 +530,7 @@ func (plan ChangedPathPlan) PruneScope(
 
 // CountCachedSuppressedInputs maps cached source results back to distinct
 // disarmed pending inputs without exposing their paths.
-func (plan ChangedPathPlan) CountCachedSuppressedInputs(
+func (plan *ChangedPathPlan) CountCachedSuppressedInputs(
 	armedPhysicalPaths map[string]struct{},
 	cachedSourceKeys map[string]struct{},
 	cachedFallbackProviders map[parser.AgentType]int,
@@ -594,14 +594,14 @@ func (e *Engine) discoverChangedPathFallbackProviders(
 		if e.providerMigrationModes[agent] != parser.ProviderMigrationProviderAuthoritative {
 			return nil, nil, fmt.Errorf("fallback provider %s is not authoritative", agent)
 		}
-		factory := e.providerFactories[agent]
-		roots := e.agentDirs[agent]
+		factory := e.sources().providerFactories[agent]
+		roots := e.sources().agentDirs[agent]
 		if factory == nil || len(roots) == 0 {
 			return nil, nil, fmt.Errorf("fallback provider %s is not configured", agent)
 		}
 		provider := factory.NewProvider(parser.ProviderConfig{
 			Roots: roots, Machine: e.machine, PathRewriter: e.pathRewriter,
-			SourceMachines: e.sourceMachines[agent],
+			SourceMachines: e.sources().sourceMachines[agent],
 		})
 		sources, err := provider.Discover(ctx)
 		if err != nil {
@@ -614,7 +614,7 @@ func (e *Engine) discoverChangedPathFallbackProviders(
 			}
 		}
 		providerFiles = sortAndDedupeChangedPathFiles(providerFiles)
-		providerFiles = e.dedupeClaudeDiscoveredFiles(providerFiles)
+		providerFiles = e.dedupeClaudeDiscoveredFiles(ctx, providerFiles)
 		providerFiles = sortAndDedupeChangedPathFiles(providerFiles)
 		counts[agent] = len(providerFiles)
 		files = append(files, providerFiles...)

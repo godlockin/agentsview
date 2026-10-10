@@ -38,7 +38,7 @@ func startRetention(
 	ctx context.Context,
 	cfg config.Config,
 	database *db.DB,
-	runner pricingRefreshExclusiveRunner,
+	runner remoteSyncExclusiveRunner,
 ) {
 	rc := cfg.Retention
 	if !rc.Enabled {
@@ -67,7 +67,7 @@ func retentionRunOnce(
 	ctx context.Context,
 	cfg config.Config,
 	database *db.DB,
-	runner pricingRefreshExclusiveRunner,
+	runner remoteSyncExclusiveRunner,
 ) {
 	statePath := filepath.Join(cfg.DataDir, "retention-state.json")
 	if last, ok := readRetentionState(statePath); ok {
@@ -92,7 +92,7 @@ func runRetentionTick(
 	ctx context.Context,
 	cfg config.Config,
 	database *db.DB,
-	runner pricingRefreshExclusiveRunner,
+	runner remoteSyncExclusiveRunner,
 	now time.Time,
 	out io.Writer,
 ) (retentionResult, error) {
@@ -103,7 +103,7 @@ func runRetentionTick(
 	}
 	before := now.AddDate(0, 0, -days).Format("2006-01-02")
 
-	candidates, err := database.FindPruneCandidates(db.PruneFilter{
+	candidates, err := database.FindPruneCandidates(ctx, db.PruneFilter{
 		Before: before,
 	})
 	if err != nil {
@@ -133,7 +133,7 @@ func runRetentionTick(
 			ids[i] = s.ID
 		}
 		if len(ids) > 0 {
-			pruned, err := database.DeleteSessions(ids)
+			pruned, err := database.DeleteSessions(ctx, ids)
 			if err != nil {
 				return fmt.Errorf("deleting sessions: %w", err)
 			}

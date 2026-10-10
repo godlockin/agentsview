@@ -1,7 +1,6 @@
 package parser
 
 import (
-	"context"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -37,7 +36,7 @@ func parseCopilotTestSession(
 	t *testing.T, path, machine string,
 ) (*ParsedSession, []ParsedMessage, []ParsedUsageEvent, error) {
 	t.Helper()
-	return newCopilotTestProvider(t).parseSession(path, machine)
+	return newCopilotTestProvider(t).parseSession(t.Context(), path, machine)
 }
 
 // discoverCopilotTestSessions discovers Copilot sessions under root through the
@@ -46,7 +45,7 @@ func parseCopilotTestSession(
 func discoverCopilotTestSessions(t *testing.T, root string) []DiscoveredFile {
 	t.Helper()
 	provider := newCopilotTestProvider(t, root)
-	sources, err := provider.Discover(context.Background())
+	sources, err := provider.Discover(t.Context())
 	require.NoError(t, err)
 	if len(sources) == 0 {
 		return nil
@@ -86,6 +85,7 @@ func writeCopilotJSONL(
 // parseAndValidateHelper parses the session and fails the test on basic errors.
 func parseAndValidateHelper(t *testing.T, path string, machine string, wantMsgs int) (*ParsedSession, []ParsedMessage) {
 	t.Helper()
+
 	sess, msgs, _, err := parseCopilotTestSession(t, path, machine)
 	require.NoError(t, err)
 	require.NotNil(t, sess, "expected non-nil session")
@@ -266,6 +266,7 @@ func writeDirSession(
 	workspaceYAML string,
 ) string {
 	t.Helper()
+
 	dir := t.TempDir()
 	sessDir := filepath.Join(dir, sessID)
 	require.NoError(t, os.MkdirAll(sessDir, 0o755))
@@ -295,8 +296,10 @@ func TestParseCopilotSession_WorkspaceName(t *testing.T) {
 	path := writeDirSession(t, "ws-name", events, yaml)
 	sess, _ := parseAndValidateHelper(t, path, "m", 2)
 
-	// workspace.yaml name takes precedence over first user message.
-	assertEqual(t, "Fix Login Authentication Bug", sess.FirstMessage, "FirstMessage")
+	// A generated name is the session name; the first message stays
+	// the user's prompt.
+	assert.Equal(t, "Fix Login Authentication Bug", sess.SessionName)
+	assert.Equal(t, "Fix the login bug", sess.FirstMessage)
 }
 
 func TestParseCopilotSession_WorkspaceNameUserNamed(t *testing.T) {
@@ -310,8 +313,9 @@ func TestParseCopilotSession_WorkspaceNameUserNamed(t *testing.T) {
 	path := writeDirSession(t, "ws-user-named", events, yaml)
 	sess, _ := parseAndValidateHelper(t, path, "m", 2)
 
-	// user_named: true sessions also use name as FirstMessage.
-	assertEqual(t, "My Custom Session Name", sess.FirstMessage, "FirstMessage")
+	// A name the user chose is the session name.
+	assert.Equal(t, "My Custom Session Name", sess.SessionName)
+	assert.Equal(t, "Original prompt", sess.FirstMessage)
 }
 
 func TestParseCopilotSession_WorkspaceNameMissing(t *testing.T) {

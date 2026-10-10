@@ -11,15 +11,18 @@ import (
 	"os"
 	"os/signal"
 	"sort"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
 
 	"github.com/spf13/cobra"
 	"go.kenn.io/agentsview/internal/config"
+	"go.kenn.io/agentsview/internal/db"
 	duckdbsync "go.kenn.io/agentsview/internal/duckdb"
 	"go.kenn.io/agentsview/internal/pathutil"
 	"go.kenn.io/agentsview/internal/server"
+	"go.kenn.io/agentsview/internal/storage"
 	syncpkg "go.kenn.io/agentsview/internal/sync"
 )
 
@@ -35,7 +38,7 @@ type DuckDBPushConfig struct {
 	// incremental push blocked by read-only serve handles defers instead
 	// of rebuilding the whole archive on every changed batch, and
 	// archive-scale diagnostics are skipped (see
-	// duckdbsync.SyncOptions.Automatic). Explicit `duckdb push` runs leave
+	// storage.MirrorPushOptions.Automatic). Explicit `duckdb push` runs leave
 	// it false and do neither.
 	Automatic bool
 }
@@ -51,7 +54,7 @@ type duckDBPusher struct {
 		func() error,
 	) error
 	ensurePricing func(context.Context) error
-	mirrorPush    func(context.Context, bool) (duckdbsync.PushResult, error)
+	mirrorPush    func(context.Context, bool) (storage.MirrorPushResult, error)
 }
 
 func (p *duckDBPusher) push(
@@ -126,7 +129,7 @@ func runDuckDBPush(cfg DuckDBPushConfig) {
 	if err != nil {
 		fatal("duckdb push: %v", err)
 	}
-	if err := duckdbsync.ValidatePushTarget(duckCfg); err != nil {
+	if err := mirrorBackend.ValidatePushTarget(duckCfg); err != nil {
 		fatal("duckdb push: %v", err)
 	}
 	writeDuckDBPushPlan(os.Stdout, duckCfg, cfg, projects, excludeProjects)
@@ -136,7 +139,11 @@ func runDuckDBPush(cfg DuckDBPushConfig) {
 	)
 	defer stop()
 
-	backend, cleanup, err := resolveArchiveWriteBackend(ctx, appCfg)
+	intent := transportIntentArchiveWrite
+	if cfg.Watch {
+		intent = transportIntentLongLived
+	}
+	backend, cleanup, err := resolveArchiveWriteBackend(ctx, appCfg, intent)
 	if err != nil {
 		fatal("opening writer: %v", err)
 	}
@@ -209,7 +216,7 @@ func writeDuckDBPushPlan(
 // (missing file, schema drift, a live serve holding the mirror locked, ...)
 // silently print nothing here, leaving only the generic "Pushed N
 // sessions..." summary with no indication a full rebuild had just run.
-func writeDuckDBPushDiagnostics(w io.Writer, result duckdbsync.PushResult) {
+func writeDuckDBPushDiagnostics(w io.Writer, result storage.MirrorPushResult) {
 	if result.Diagnostics.Deferred {
 		reason := result.Diagnostics.DeferredReason
 		if reason == "" {
@@ -251,9 +258,9 @@ func writeDuckDBPushDiagnostics(w io.Writer, result duckdbsync.PushResult) {
 // formatDuckDBPushSource renders an incremental push's source counters.
 // The "local N" figure is omitted when LocalSessionCount is 0: automatic
 // pushes skip the archive-scale scope count entirely (see
-// duckdbsync.SyncOptions.Automatic), so 0 means "not counted", not an
+// storage.MirrorPushOptions.Automatic), so 0 means "not counted", not an
 // empty archive.
-func formatDuckDBPushSource(d duckdbsync.PushDiagnostics) string {
+func formatDuckDBPushSource(d storage.MirrorPushDiagnostics) string {
 	source := ""
 	if d.LocalSessionCount > 0 {
 		source = fmt.Sprintf("local %d; ", d.LocalSessionCount)
@@ -277,9 +284,9 @@ func formatDuckDBPushFilters(projects []string, excludeProjects []string) string
 	}
 }
 
-func formatDuckDBPushSessionCounts(counts duckdbsync.PushSessionCounts) string {
+func formatDuckDBPushSessionCounts(counts storage.MirrorSessionCounts) string {
 	if len(counts.ByAgent) == 0 {
-		return fmt.Sprintf("%d", counts.Total)
+		return strconv.Itoa(counts.Total)
 	}
 	agents := make([]string, 0, len(counts.ByAgent))
 	for agent := range counts.ByAgent {
@@ -335,7 +342,7 @@ func runDuckDBStatus() {
 		scope = "all projects"
 	}
 	fmt.Printf("Machine:         %s\n", machine)
-	fmt.Printf("Last push:       %s\n", valueOrNever(status.LastPushAt))
+	fmt.Printf("Last push:       %s\n", db.ValueOrNever(status.LastPushAt))
 	fmt.Printf("Schema version:  %d\n", status.SchemaVersion)
 	fmt.Printf("Data version:    %d\n", status.DataVersion)
 	fmt.Printf("Scope:           %s\n", scope)
@@ -348,7 +355,7 @@ func loadDuckDBServeConfig(cmd *cobra.Command) (config.Config, string, error) {
 	if err != nil {
 		return config.Config{}, "", fmt.Errorf("reading base-path: %w", err)
 	}
-	cfg, err := config.LoadDuckDBServePFlags(cmd.Flags())
+	cfg, err := config.LoadRemoteServePFlags(cmd.Flags())
 	if err != nil {
 		return config.Config{}, "", fmt.Errorf("loading config: %w", err)
 	}
@@ -387,9 +394,10 @@ func runDuckDBServe(appCfg config.Config, basePath string) {
 
 	rtOpts := serveRuntimeOptions{
 		Mode:          "duckdb-serve",
+		BasePath:      basePath,
 		RequestedPort: appCfg.Port,
 	}
-	appCfg, err = prepareServeRuntimeConfig(appCfg, rtOpts)
+	appCfg, err = prepareServeRuntimeConfig(ctx, appCfg, rtOpts)
 	if err != nil {
 		fatal("duckdb serve: %v", err)
 	}
@@ -404,7 +412,7 @@ func runDuckDBServe(appCfg config.Config, basePath string) {
 		server.WithBaseContext(ctx),
 	}
 	if basePath != "" {
-		opts = append(opts, server.WithBasePath(basePath))
+		opts = append(opts, server.WithBasePath(rtOpts.BasePath))
 	}
 	srv := server.New(appCfg, store, nil, opts...)
 	rt, err := startServerWithOptionalCaddy(ctx, appCfg, srv, rtOpts)
@@ -415,7 +423,7 @@ func runDuckDBServe(appCfg config.Config, basePath string) {
 		fatal("duckdb serve: %v", err)
 	}
 	if _, sfErr := writeDaemonRuntimeWithAuth(
-		rt.Cfg.DataDir, rt.Cfg.Host, rt.Cfg.Port, version, true,
+		rt.Cfg.DataDir, rt.Cfg.Host, rt.Cfg.Port, version, rt.PublicURL, true,
 		rt.Cfg.RequireAuth,
 		rt.Caddy.Pid(),
 	); sfErr != nil {
@@ -473,7 +481,7 @@ func openDuckDBServeStore(
 	}
 
 	applyClassifierConfig(appCfg)
-	store, err := duckdbsync.NewStoreFromConfig(duckCfg)
+	store, err := duckdbsync.NewStoreFromConfig(ctx, duckCfg)
 	if err != nil {
 		fatal("duckdb serve: %v", err)
 	}
@@ -684,7 +692,7 @@ func serveQuackOnce(
 		return quackServeSession{}, fmt.Errorf("statting duckdb mirror: %w", err)
 	}
 	duckdbsync.PrimeFileIdentity(info)
-	conn, err := duckdbsync.OpenReadOnly(duckCfg.Path)
+	conn, err := duckdbsync.OpenReadOnly(ctx, duckCfg.Path)
 	if err != nil {
 		return quackServeSession{}, err
 	}
@@ -811,9 +819,7 @@ func resolveQuackServeToken(
 	if configuredToken != "" {
 		return configuredToken, nil
 	}
-	return "", fmt.Errorf(
-		"token is required; set --token, AGENTSVIEW_DUCKDB_TOKEN, or [duckdb].token",
-	)
+	return "", errors.New("token is required; set --token, AGENTSVIEW_DUCKDB_TOKEN, or [duckdb].token")
 }
 
 func identifyQuackNode(ctx context.Context, conn *sql.DB, machine string) {
@@ -864,15 +870,11 @@ func resolveDuckDBPushProjects(
 	duckCfg config.DuckDBConfig, cfg DuckDBPushConfig,
 ) (projects, exclude []string, err error) {
 	if cfg.ProjectsFlag != "" && cfg.ExcludeProjects != "" {
-		return nil, nil, fmt.Errorf(
-			"--projects and --exclude-projects are mutually exclusive",
-		)
+		return nil, nil, errors.New("--projects and --exclude-projects are mutually exclusive")
 	}
 	if cfg.AllProjects &&
 		(cfg.ProjectsFlag != "" || cfg.ExcludeProjects != "") {
-		return nil, nil, fmt.Errorf(
-			"--all-projects cannot be combined with --projects or --exclude-projects",
-		)
+		return nil, nil, errors.New("--all-projects cannot be combined with --projects or --exclude-projects")
 	}
 	projects = duckCfg.Projects
 	exclude = duckCfg.ExcludeProjects
@@ -889,9 +891,7 @@ func resolveDuckDBPushProjects(
 		projects = nil
 	}
 	if len(projects) > 0 && len(exclude) > 0 {
-		return nil, nil, fmt.Errorf(
-			"projects and exclude_projects are mutually exclusive",
-		)
+		return nil, nil, errors.New("projects and exclude_projects are mutually exclusive")
 	}
 	return projects, exclude, nil
 }

@@ -13,18 +13,19 @@ import (
 	"os"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
-	"unicode/utf8"
 
 	"go.kenn.io/agentsview/internal/config"
 	"go.kenn.io/agentsview/internal/db"
-	"go.kenn.io/agentsview/internal/secrets"
 )
 
 // Compile-time check: *Store satisfies db.Store.
 var _ db.Store = (*Store)(nil)
+
+func (s *Store) MemoryBackendName() string { return "duckdb" }
 
 // Store wraps a DuckDB connection for read-mostly serve mode. path and
 // handleMu support live reopening after a mirror rebuild swaps in a new
@@ -73,13 +74,13 @@ type Store struct {
 // the connection serves the old generation while fileInfo describes the
 // new one, so the watcher never sees a change and the Store serves stale
 // data until the next rebuild.
-func NewStore(path string) (*Store, error) {
+func NewStore(ctx context.Context, path string) (*Store, error) {
 	info, err := os.Stat(path)
 	if err != nil {
 		return nil, fmt.Errorf("statting duckdb mirror %s: %w", path, err)
 	}
 	PrimeFileIdentity(info)
-	conn, err := OpenReadOnly(path)
+	conn, err := OpenReadOnly(ctx, path)
 	if err != nil {
 		return nil, err
 	}
@@ -141,7 +142,8 @@ func (s *Store) queryContext(
 ) (*sql.Rows, error) {
 	s.handleMu.RLock()
 	defer s.handleMu.RUnlock()
-	return queryDuckDBContext(ctx, s.duck, s.connectionKind, s.quack, query, args...)
+	rows, err := queryDuckDBContext(ctx, s.duck, s.connectionKind, s.quack, query, args...)
+	return rows, err
 }
 
 // queryRowContext holds the read lock across the query start for the same
@@ -242,6 +244,12 @@ func (s *Store) GetRecallEntry(
 	return nil, db.ErrReadOnly
 }
 
+func (s *Store) ReviewRecallEntry(
+	_ context.Context, _ string, _ db.RecallReviewAction,
+) (db.RecallEntry, error) {
+	return db.RecallEntry{}, db.ErrReadOnly
+}
+
 func (s *Store) QueryRecallEntries(
 	_ context.Context, _ db.RecallQuery,
 ) (db.RecallPage, error) {
@@ -254,7 +262,7 @@ func (s *Store) RecordRecallQueryEvent(
 	return "", db.ErrReadOnly
 }
 
-func (s *Store) InsertRecallEntry(_ db.RecallEntry) (string, error) {
+func (s *Store) InsertRecallEntry(ctx context.Context, _ db.RecallEntry) (string, error) {
 	return "", db.ErrReadOnly
 }
 
@@ -276,7 +284,7 @@ func (s *Store) IngestEvalTrajectory(
 	return db.EvalTrajectoryIngestResult{}, db.ErrReadOnly
 }
 
-const duckSessionCols = `id, project, machine, agent,
+const duckSessionCols = `id, project, project_assigned, machine, agent,
 	agent_label, entrypoint, session_kind,
 	first_message, COALESCE(display_name, session_name) AS display_name, created_at, started_at,
 	ended_at, message_count, user_message_count,
@@ -310,10 +318,10 @@ func scanSessionWithSource(
 	rs interface{ Scan(...any) error }, includeSource bool,
 ) (db.Session, error) {
 	var s db.Session
-	var createdAt any
+	var createdAt, localModifiedAt any
 	var startedAt, endedAt, deletedAt any
 	targets := []any{
-		&s.ID, &s.Project, &s.Machine, &s.Agent,
+		&s.ID, &s.Project, &s.ProjectAssigned, &s.Machine, &s.Agent,
 		&s.AgentLabel, &s.Entrypoint, &s.SessionKind,
 		&s.FirstMessage, &s.DisplayName,
 		&createdAt, &startedAt, &endedAt,
@@ -343,13 +351,16 @@ func scanSessionWithSource(
 		&deletedAt, &s.DeletionCause, &s.TerminationStatus, &s.TranscriptRevision,
 	}
 	if includeSource {
-		targets = append(targets, &s.FilePath)
+		targets = append(targets, &s.FilePath, &s.FileSize, &localModifiedAt)
 	}
 	err := rs.Scan(targets...)
 	if err != nil {
 		return s, err
 	}
 	s.CreatedAt = formatDBTime(createdAt)
+	if v := formatDBTime(localModifiedAt); v != "" {
+		s.LocalModifiedAt = &v
+	}
 	if v := formatDBTime(startedAt); v != "" {
 		s.StartedAt = &v
 	}
@@ -414,6 +425,52 @@ func (s *Store) FindSessionIDsByPartial(
 	return ids, rows.Err()
 }
 
+// FindSessionIDsByRawSuffix returns IDs that equal raw or end with a
+// literal colon/tilde delimiter followed by raw.
+func (s *Store) FindSessionIDsByRawSuffix(
+	ctx context.Context, raw string, limit int,
+) ([]string, error) {
+	if raw == "" {
+		return nil, nil
+	}
+	if limit <= 0 {
+		limit = 5
+	}
+	rows, err := s.queryContext(ctx,
+		`SELECT id FROM sessions
+		 WHERE (id = ?
+		        OR RIGHT(id, LENGTH(?) + 1) IN (':' || ?, '~' || ?))
+		   AND deleted_at IS NULL
+		 ORDER BY (id = ?) DESC,
+		          COALESCE(ended_at, started_at, created_at) DESC
+		 LIMIT ?`,
+		raw, raw, raw, raw, raw, limit,
+	)
+	if err != nil {
+		return nil, fmt.Errorf(
+			"finding duckdb sessions by raw suffix %q: %w",
+			raw, err,
+		)
+	}
+	defer rows.Close()
+	ids := []string{}
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, fmt.Errorf(
+				"scanning duckdb session id: %w", err,
+			)
+		}
+		ids = append(ids, id)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf(
+			"iterating duckdb raw suffix session ids: %w", err,
+		)
+	}
+	return ids, nil
+}
+
 func formatDBTime(v any) string {
 	switch t := v.(type) {
 	case nil:
@@ -446,11 +503,11 @@ func (s *Store) DecodeCursor(raw string) (db.SessionCursor, error) {
 	if len(parts) == 1 {
 		data, err := base64.RawURLEncoding.DecodeString(parts[0])
 		if err != nil {
-			return db.SessionCursor{}, fmt.Errorf("%w: %v", db.ErrInvalidCursor, err)
+			return db.SessionCursor{}, fmt.Errorf("%w: %w", db.ErrInvalidCursor, err)
 		}
 		var c db.SessionCursor
 		if err := json.Unmarshal(data, &c); err != nil {
-			return db.SessionCursor{}, fmt.Errorf("%w: %v", db.ErrInvalidCursor, err)
+			return db.SessionCursor{}, fmt.Errorf("%w: %w", db.ErrInvalidCursor, err)
 		}
 		c.Total = 0
 		return c, nil
@@ -460,11 +517,11 @@ func (s *Store) DecodeCursor(raw string) (db.SessionCursor, error) {
 	}
 	data, err := base64.RawURLEncoding.DecodeString(parts[0])
 	if err != nil {
-		return db.SessionCursor{}, fmt.Errorf("%w: invalid payload: %v", db.ErrInvalidCursor, err)
+		return db.SessionCursor{}, fmt.Errorf("%w: invalid payload: %w", db.ErrInvalidCursor, err)
 	}
 	sig, err := base64.RawURLEncoding.DecodeString(parts[1])
 	if err != nil {
-		return db.SessionCursor{}, fmt.Errorf("%w: invalid signature: %v", db.ErrInvalidCursor, err)
+		return db.SessionCursor{}, fmt.Errorf("%w: invalid signature: %w", db.ErrInvalidCursor, err)
 	}
 	s.cursorMu.RLock()
 	secret := append([]byte(nil), s.cursorSecret...)
@@ -476,15 +533,13 @@ func (s *Store) DecodeCursor(raw string) (db.SessionCursor, error) {
 	}
 	var c db.SessionCursor
 	if err := json.Unmarshal(data, &c); err != nil {
-		return db.SessionCursor{}, fmt.Errorf("%w: invalid json: %v", db.ErrInvalidCursor, err)
+		return db.SessionCursor{}, fmt.Errorf("%w: invalid json: %w", db.ErrInvalidCursor, err)
 	}
 	return c, nil
 }
 
 func (s *Store) ListSessions(ctx context.Context, f db.SessionFilter) (db.SessionPage, error) {
-	if f.Limit <= 0 || f.Limit > db.MaxSessionLimit {
-		f.Limit = db.DefaultSessionLimit
-	}
+	f.Limit = db.NormalizeSessionLimit(f.Limit)
 	where, args := db.BuildSessionFilterSQL(f, db.DuckDBQueryDialect())
 	rs := db.ResolveSort(f)
 	total := 0
@@ -517,7 +572,7 @@ func (s *Store) ListSessions(ctx context.Context, f db.SessionFilter) (db.Sessio
 	}
 	columns := duckSessionCols
 	if f.IncludeSource {
-		columns += ", file_path"
+		columns += ", file_path, file_size, local_modified_at"
 	}
 	query := "SELECT " + columns +
 		" FROM sessions WHERE " + cursorWhere + " " +
@@ -533,13 +588,7 @@ func (s *Store) ListSessions(ctx context.Context, f db.SessionFilter) (db.Sessio
 	if err != nil {
 		return db.SessionPage{}, err
 	}
-	page := db.SessionPage{Sessions: sessions, Total: total}
-	if len(sessions) > f.Limit {
-		page.Sessions = sessions[:f.Limit]
-		last := page.Sessions[f.Limit-1]
-		page.NextCursor = s.EncodeCursor(db.NextSessionCursor(&last, rs, total, f))
-	}
-	return page, nil
+	return db.BuildSessionPage(sessions, total, f, rs, s.EncodeCursor), nil
 }
 
 func (s *Store) GetSidebarSessionIndex(ctx context.Context, f db.SessionFilter) (db.SidebarSessionIndex, error) {
@@ -572,6 +621,7 @@ func (s *Store) GetSidebarSessionIndex(ctx context.Context, f db.SessionFilter) 
 			parent_session_id,
 			relationship_type,
 			project,
+			project_assigned,
 			machine,
 			agent,
 			agent_label,
@@ -612,6 +662,7 @@ func (s *Store) GetSidebarSessionIndex(ctx context.Context, f db.SessionFilter) 
 			&row.ParentSessionID,
 			&row.RelationshipType,
 			&row.Project,
+			&row.ProjectAssigned,
 			&row.Machine,
 			&row.Agent,
 			&row.AgentLabel,
@@ -707,12 +758,12 @@ func (s *Store) GetChildSessions(ctx context.Context, parentID string) ([]db.Ses
 	return scanSessionRows(rows)
 }
 
-func (s *Store) GetSessionVersion(id string) (int, int64, bool) {
+func (s *Store) GetSessionVersion(ctx context.Context, id string) (int, int64, bool) {
 	var count int
 	var fileMtime sql.NullInt64
 	var fileHash sql.NullString
 	var updated any
-	err := s.queryRowContext(context.Background(),
+	err := s.queryRowContext(ctx,
 		`SELECT message_count, file_mtime, file_hash,
 		        COALESCE(local_modified_at, ended_at, started_at, created_at)
 		 FROM sessions WHERE id = ?`,
@@ -723,7 +774,7 @@ func (s *Store) GetSessionVersion(id string) (int, int64, bool) {
 	}
 	fileMtimePart := ""
 	if fileMtime.Valid {
-		fileMtimePart = fmt.Sprintf("%d", fileMtime.Int64)
+		fileMtimePart = strconv.FormatInt(fileMtime.Int64, 10)
 	}
 	fileHashPart := ""
 	if fileHash.Valid {
@@ -738,16 +789,7 @@ func (s *Store) GetSessionVersion(id string) (int, int64, bool) {
 
 func (s *Store) GetStats(ctx context.Context, excludeOneShot, excludeAutomated bool) (db.Stats, error) {
 	filter := rootSessionWhere(excludeOneShot, excludeAutomated)
-	query := fmt.Sprintf(`
-		SELECT
-			COUNT(*),
-			COALESCE(SUM(message_count), 0),
-			COUNT(DISTINCT project),
-			COUNT(DISTINCT machine),
-			MIN(COALESCE(started_at, created_at))
-		FROM sessions
-		WHERE %s`,
-		filter)
+	query := "\n\t\tSELECT\n\t\t\tCOUNT(*),\n\t\t\tCOALESCE(SUM(message_count), 0),\n\t\t\tCOUNT(DISTINCT project),\n\t\t\tCOUNT(DISTINCT machine),\n\t\t\tMIN(COALESCE(started_at, created_at))\n\t\tFROM sessions\n\t\tWHERE " + filter
 	var stats db.Stats
 	var earliest any
 	if err := s.queryRowContext(ctx, query).Scan(
@@ -886,7 +928,7 @@ func rootSessionWhere(excludeOneShot, excludeAutomated bool) string {
 	return filter
 }
 
-func (s *Store) HasFTS() bool { return true }
+func (s *Store) HasFTS(ctx context.Context) bool { return true }
 
 // HasSemantic returns false: the DuckDB store has no VectorSearcher seam
 // yet, so SearchContent rejects "semantic"/"hybrid" modes up front with
@@ -937,10 +979,14 @@ func (s *Store) Search(ctx context.Context, f db.SearchFilter) (db.SearchPage, e
 		nameProject = "AND s.project = ?"
 	}
 	dateBuilder := db.NewQueryBuilder(db.DuckDBQueryDialect(), 0)
+	var nameProjectSb988 strings.Builder
+	var projectSb988 strings.Builder
 	for _, pred := range dateBuilder.SessionDateRangePredicates(f.DateFrom, f.DateTo, "", func(col string) string { return "s." + col }) {
-		project += " AND " + pred
-		nameProject += " AND " + pred
+		projectSb988.WriteString(" AND " + pred)
+		nameProjectSb988.WriteString(" AND " + pred)
 	}
+	nameProject += nameProjectSb988.String()
+	project += projectSb988.String()
 	args = append(args, dateBuilder.Args()...)
 	args = append(args, namePattern, namePattern, namePattern, namePattern)
 	if f.Project != "" {
@@ -954,7 +1000,7 @@ func (s *Store) Search(ctx context.Context, f db.SearchFilter) (db.SearchPage, e
 	args = append(args, f.Limit+1, f.Cursor)
 	rows, err := s.queryContext(ctx, `
 		WITH msg_ranked AS (
-			SELECT m.session_id, s.project, s.agent,
+			SELECT m.session_id, s.project, s.agent, s.machine,
 				COALESCE(s.display_name, s.session_name, s.first_message, '') AS name,
 				COALESCE(s.ended_at, s.started_at, s.created_at) AS session_ended_at,
 				m.ordinal, SUBSTRING(m.content, 1, 200) AS snippet,
@@ -974,13 +1020,13 @@ func (s *Store) Search(ctx context.Context, f db.SearchFilter) (db.SearchPage, e
 				`+project+`
 		),
 		msg_matches AS (
-			SELECT session_id, project, agent, name, session_ended_at,
+			SELECT session_id, project, agent, machine, name, session_ended_at,
 				ordinal, snippet, rank, match_priority, match_pos
 			FROM msg_ranked
 			WHERE rn = 1
 		),
 		name_matches AS (
-			SELECT s.id AS session_id, s.project, s.agent,
+			SELECT s.id AS session_id, s.project, s.agent, s.machine,
 				COALESCE(s.display_name, s.session_name, s.first_message, '') AS name,
 				COALESCE(s.ended_at, s.started_at, s.created_at) AS session_ended_at,
 				-1 AS ordinal,
@@ -1005,7 +1051,7 @@ func (s *Store) Search(ctx context.Context, f db.SearchFilter) (db.SearchPage, e
 				AND s.id NOT IN (SELECT session_id FROM msg_matches)
 				`+nameProject+`
 		)
-		SELECT session_id, project, agent, name,
+		SELECT session_id, project, agent, machine, name,
 			session_ended_at, ordinal, snippet, rank
 		FROM (
 			SELECT * FROM msg_matches
@@ -1024,7 +1070,7 @@ func (s *Store) Search(ctx context.Context, f db.SearchFilter) (db.SearchPage, e
 	for rows.Next() {
 		var r db.SearchResult
 		var ended any
-		if err := rows.Scan(&r.SessionID, &r.Project, &r.Agent, &r.Name,
+		if err := rows.Scan(&r.SessionID, &r.Project, &r.Agent, &r.Machine, &r.Name,
 			&ended, &r.Ordinal, &r.Snippet, &r.Rank); err != nil {
 			return db.SearchPage{}, err
 		}
@@ -1132,11 +1178,7 @@ func (s *Store) SearchContent(ctx context.Context, f db.ContentSearchFilter) (db
 	if err != nil {
 		return db.ContentSearchPage{}, err
 	}
-	page := db.ContentSearchPage{Matches: matches}
-	if len(matches) > f.Limit {
-		page.Matches = matches[:f.Limit]
-		page.NextCursor = f.Cursor + f.Limit
-	}
+	page := f.Page(matches)
 	// Post-truncation derivation, O(page): every lexical match gets its
 	// conversation-unit OrdinalRange and lineage fields via the shared
 	// batched pass, matching the SQLite and PG backends.
@@ -1150,7 +1192,7 @@ func (s *Store) collectContentMatches(ctx context.Context, f db.ContentSearchFil
 	if f.Mode != "regex" {
 		return s.collectContentSubstringMatches(ctx, f)
 	}
-	scopeWhere, scopeArgs := db.BuildSessionFilterSQL(contentSessionFilter(f), db.DuckDBQueryDialect())
+	scopeWhere, scopeArgs := db.BuildContentScopeSQL(f, db.DuckDBQueryDialect())
 	scopeWhere, scopeArgs = db.AppendExcludeSessionIDs(
 		scopeWhere, scopeArgs, "id", f.ExcludeSessionIDs)
 	pattern := ""
@@ -1174,7 +1216,7 @@ func (s *Store) collectContentMatches(ctx context.Context, f db.ContentSearchFil
 		for _, m := range all {
 			loc := re.FindStringIndex(m.body)
 			if loc != nil {
-				m.match.Snippet = duckContentSnippet(f, m.body, loc[0], loc[1])
+				m.match.Snippet = f.BuildSnippet(m.body, loc[0], loc[1])
 				filtered = append(filtered, m)
 			}
 		}
@@ -1196,7 +1238,7 @@ func (s *Store) collectContentMatches(ctx context.Context, f db.ContentSearchFil
 func (s *Store) collectContentSubstringMatches(
 	ctx context.Context, f db.ContentSearchFilter,
 ) ([]db.ContentMatch, error) {
-	scopeWhere, scopeArgs := db.BuildSessionFilterSQL(contentSessionFilter(f), db.DuckDBQueryDialect())
+	scopeWhere, scopeArgs := db.BuildContentScopeSQL(f, db.DuckDBQueryDialect())
 	scopeWhere, scopeArgs = db.AppendExcludeSessionIDs(
 		scopeWhere, scopeArgs, "id", f.ExcludeSessionIDs)
 	var branches []string
@@ -1294,10 +1336,10 @@ func (s *Store) collectContentSubstringMatches(
 	return s.scanContentMatches(ctx, query, args, func(body string) string {
 		if f.Mode == "fts" {
 			start, end := db.FTSSnippetRange(f.Pattern, body)
-			return duckContentSnippet(f, body, start, end)
+			return f.BuildSnippet(body, start, end)
 		}
 		start, end, _ := db.CaseInsensitiveSpan(body, f.Pattern)
-		return duckContentSnippet(f, body, start, end)
+		return f.BuildSnippet(body, start, end)
 	})
 }
 
@@ -1322,26 +1364,6 @@ func duckContentSearchPredicate(
 		return "FALSE"
 	}
 	return strings.Join(clauses, " AND ")
-}
-
-func duckContentSnippet(f db.ContentSearchFilter, body string, start, end int) string {
-	lo, hi := duckSnippetBounds(body, start, end, 60)
-	if f.RevealSecrets {
-		return body[lo:hi]
-	}
-	return secrets.RedactWindow(body, lo, hi)
-}
-
-func duckSnippetBounds(text string, start, end, radius int) (int, int) {
-	lo := max(start-radius, 0)
-	hi := min(end+radius, len(text))
-	for lo < start && !utf8.RuneStart(text[lo]) {
-		lo++
-	}
-	for hi > end && hi < len(text) && !utf8.RuneStart(text[hi]) {
-		hi--
-	}
-	return lo, hi
 }
 
 type duckContentCandidate struct {
@@ -1413,19 +1435,6 @@ func contentCandidateMatches(candidates []duckContentCandidate) []db.ContentMatc
 		out[i] = candidate.match
 	}
 	return out
-}
-
-func contentSessionFilter(f db.ContentSearchFilter) db.SessionFilter {
-	return db.SessionFilter{
-		Project: f.Project, ExcludeProject: f.ExcludeProject,
-		Machine: f.Machine, GitBranch: f.GitBranch, Agent: f.Agent,
-		Date: f.Date, DateFrom: f.DateFrom, DateTo: f.DateTo,
-		Timezone:         f.Timezone,
-		ActiveSince:      f.ActiveSince,
-		ExcludeOneShot:   !f.IncludeOneShot,
-		ExcludeAutomated: !f.IncludeAutomated,
-		IncludeChildren:  f.IncludeChildren,
-	}
 }
 
 func (s *Store) collectContentSource(

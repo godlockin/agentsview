@@ -1,6 +1,7 @@
 package parser
 
 import (
+	"context"
 	"database/sql"
 	"encoding/json/v2"
 	"fmt"
@@ -109,9 +110,9 @@ func (s *OpenCodeSeeder) executor() openCodeSeedExecer {
 	return s.db
 }
 
-func (s *OpenCodeSeeder) InTransaction(seed func(*OpenCodeSeeder)) {
+func (s *OpenCodeSeeder) InTransaction(ctx context.Context, seed func(*OpenCodeSeeder)) {
 	s.t.Helper()
-	tx, err := s.db.Begin()
+	tx, err := s.db.BeginTx(ctx, nil)
 	require.NoError(s.t, err, "begin seed transaction")
 	defer func() { _ = tx.Rollback() }()
 
@@ -203,23 +204,23 @@ func newTestDB(t *testing.T) (string, *OpenCodeSeeder, *sql.DB) {
 var (
 	openCodeSchemaTemplateOnce  sync.Once
 	openCodeSchemaTemplateBytes []byte
-	openCodeSchemaTemplateErr   error
+	errOpenCodeSchemaTemplate   error
 )
 
 func copyOpenCodeSchemaTemplate(t *testing.T, dbPath string) {
 	t.Helper()
+
 	openCodeSchemaTemplateOnce.Do(func() {
-		openCodeSchemaTemplateBytes, openCodeSchemaTemplateErr =
-			buildOpenCodeSchemaTemplate()
+		openCodeSchemaTemplateBytes, errOpenCodeSchemaTemplate = buildOpenCodeSchemaTemplate(t.Context())
 	})
-	require.NoError(t, openCodeSchemaTemplateErr)
+	require.NoError(t, errOpenCodeSchemaTemplate)
 	require.NoError(t, os.MkdirAll(filepath.Dir(dbPath), 0o755),
 		"mkdir opencode test db dir")
 	require.NoError(t, os.WriteFile(dbPath, openCodeSchemaTemplateBytes, 0o644),
 		"copy opencode schema template")
 }
 
-func buildOpenCodeSchemaTemplate() ([]byte, error) {
+func buildOpenCodeSchemaTemplate(ctx context.Context) ([]byte, error) {
 	dir, err := os.MkdirTemp("", "agentsview-opencode-schema-*")
 	if err != nil {
 		return nil, fmt.Errorf("create opencode schema template dir: %w", err)
@@ -231,7 +232,7 @@ func buildOpenCodeSchemaTemplate() ([]byte, error) {
 	if err != nil {
 		return nil, fmt.Errorf("open opencode schema template: %w", err)
 	}
-	if _, err = db.Exec(openCodeSchema); err != nil {
+	if _, err = db.ExecContext(ctx, openCodeSchema); err != nil {
 		_ = db.Close()
 		return nil, fmt.Errorf("create opencode schema template: %w", err)
 	}
@@ -252,17 +253,18 @@ func buildOpenCodeSchemaTemplate() ([]byte, error) {
 // required.
 func seedHybridSQLiteDB(t *testing.T, dbPath, sessionID string) {
 	t.Helper()
+
 	copyOpenCodeSchemaTemplate(t, dbPath)
 	db, err := sql.Open("sqlite3", dbPath)
 	require.NoError(t, err, "open hybrid db")
 	t.Cleanup(func() { db.Close() })
-	_, err = db.Exec(
+	_, err = db.ExecContext(t.Context(),
 		`INSERT INTO project (id, worktree)
 		 VALUES (?, ?)`,
 		"prj_seed", "/tmp/seed",
 	)
 	require.NoError(t, err, "seed project")
-	_, err = db.Exec(
+	_, err = db.ExecContext(t.Context(),
 		`INSERT INTO session
 			(id, project_id, time_created, time_updated)
 		 VALUES (?, ?, ?, ?)`,
@@ -287,6 +289,7 @@ func writeOpenCodeStorageFile(
 	t *testing.T, path string, data any,
 ) {
 	t.Helper()
+
 	require.NoError(t, os.MkdirAll(filepath.Dir(path), 0o755),
 		"mkdir %s", filepath.Dir(path))
 	raw, err := json.Marshal(data)
@@ -303,10 +306,10 @@ func BenchmarkOpenCodeStorageSessionFingerprint(b *testing.B) {
 			)
 			writeFile := func(path string, data []byte) {
 				if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-					b.Fatal(err)
+					require.FailNow(b, fmt.Sprint(err))
 				}
 				if err := os.WriteFile(path, data, 0o644); err != nil {
-					b.Fatal(err)
+					require.FailNow(b, fmt.Sprint(err))
 				}
 			}
 			writeFile(sessionPath, []byte(`{"id":"ses_benchmark","directory":"/work/benchmark","title":"Benchmark","time":{"created":1700000000000,"updated":1700000060000}}`))
@@ -341,12 +344,12 @@ func BenchmarkOpenCodeStorageSessionFingerprint(b *testing.B) {
 			b.ReportAllocs()
 			b.ResetTimer()
 			for range b.N {
-				hash, err := openCodeStorageSessionFingerprint(sessionPath)
+				hash, err := openCodeStorageSessionFingerprint(b.Context(), sessionPath)
 				if err != nil {
-					b.Fatal(err)
+					require.FailNow(b, fmt.Sprint(err))
 				}
 				if hash == "" {
-					b.Fatal("expected fingerprint")
+					require.FailNow(b, "expected fingerprint")
 				}
 			}
 		})
@@ -370,7 +373,8 @@ func TestParseOpenCodeDB_StandardSession(t *testing.T) {
 	assertEq(t, "Project", s.Session.Project, "myapp")
 	assertEq(t, "Cwd", s.Session.Cwd, "/home/user/code/myapp")
 	assertEq(t, "MessageCount", s.Session.MessageCount, 2)
-	assertEq(t, "FirstMessage", s.Session.FirstMessage, "Test Session")
+	assertEq(t, "SessionName", s.Session.SessionName, "Test Session")
+	assertEq(t, "FirstMessage", s.Session.FirstMessage, "Hello, help me with Go")
 
 	wantPath := dbPath + "#ses_abc"
 	assertEq(t, "File.Path", s.Session.File.Path, wantPath)
@@ -391,11 +395,11 @@ func TestOpenOpenCodeDBDoesNotForceWALMode(t *testing.T) {
 	reader, err := openOpenCodeDB(dbPath)
 	require.NoError(t, err)
 	defer reader.Close()
-	_, err = reader.Exec("CREATE TABLE must_stay_read_only (id INTEGER)")
+	_, err = reader.ExecContext(t.Context(), "CREATE TABLE must_stay_read_only (id INTEGER)")
 	require.Error(t, err, "OpenCode source databases must stay read-only")
 
 	var journalMode string
-	require.NoError(t, reader.QueryRow("PRAGMA journal_mode").Scan(&journalMode))
+	require.NoError(t, reader.QueryRowContext(t.Context(), "PRAGMA journal_mode").Scan(&journalMode))
 	assert.Equal(t, "delete", journalMode)
 	assert.NoFileExists(t, dbPath+"-wal")
 	assert.NoFileExists(t, dbPath+"-shm")
@@ -499,12 +503,13 @@ func TestParseOpenCodeFile_StorageSession(t *testing.T) {
 	assertEq(t, "Cwd", sess.Cwd, "/home/user/code/myapp")
 	assertEq(t, "Machine", sess.Machine, "testmachine")
 	assertEq(t, "MessageCount", sess.MessageCount, 2)
-	assertEq(t, "FirstMessage", sess.FirstMessage, "Storage Session")
+	assertEq(t, "SessionName", sess.SessionName, "Storage Session")
+	assertEq(t, "FirstMessage", sess.FirstMessage, "Hello from storage")
 	assertEq(t, "File.Path", sess.File.Path, sessionPath)
 	assertEq(t, "File.Mtime", sess.File.Mtime > 0, true)
 
 	assertEq(t, "messages len", len(msgs), 2)
-	fingerprint, err := openCodeStorageSessionFingerprint(sessionPath)
+	fingerprint, err := openCodeStorageSessionFingerprint(t.Context(), sessionPath)
 	require.NoError(t, err)
 	assert.Equal(t, sess.File.Hash, fingerprint,
 		"fingerprinting and parsing must stamp the same raw storage identity")
@@ -543,7 +548,7 @@ func TestOpenCodeStorageEmptySessionKeepsSkipAndFingerprint(t *testing.T) {
 	assert.Nil(t, sess)
 	assert.Empty(t, messages)
 
-	fingerprint, err := openCodeStorageSessionFingerprint(sessionPath)
+	fingerprint, err := openCodeStorageSessionFingerprint(t.Context(), sessionPath)
 	require.NoError(t, err)
 	assert.Empty(t, fingerprint)
 
@@ -557,7 +562,7 @@ func TestOpenCodeStorageEmptySessionKeepsSkipAndFingerprint(t *testing.T) {
 	require.NoError(t, err)
 	assert.Nil(t, sess)
 	assert.Empty(t, messages)
-	fingerprint, err = openCodeStorageSessionFingerprint(sessionPath)
+	fingerprint, err = openCodeStorageSessionFingerprint(t.Context(), sessionPath)
 	require.NoError(t, err)
 	assert.Empty(t, fingerprint)
 
@@ -571,7 +576,7 @@ func TestOpenCodeStorageEmptySessionKeepsSkipAndFingerprint(t *testing.T) {
 	require.NoError(t, err)
 	assert.Nil(t, sess)
 	assert.Empty(t, messages)
-	fingerprint, err = openCodeStorageSessionFingerprint(sessionPath)
+	fingerprint, err = openCodeStorageSessionFingerprint(t.Context(), sessionPath)
 	require.NoError(t, err)
 	assert.Empty(t, fingerprint)
 }
@@ -607,21 +612,21 @@ func TestOpenCodeStorageFingerprintAvoidsNormalizedParseAllocations(
 	)
 
 	fingerprintAllocs := testing.AllocsPerRun(5, func() {
-		hash, err := openCodeStorageSessionFingerprint(sessionPath)
+		hash, err := openCodeStorageSessionFingerprint(t.Context(), sessionPath)
 		if err != nil {
-			t.Fatalf("fingerprint: %v", err)
+			require.FailNowf(t, "test failed", "fingerprint: %v", err)
 		}
 		if hash == "" {
-			t.Fatal("expected fingerprint")
+			require.FailNow(t, "expected fingerprint")
 		}
 	})
 	parseAllocs := testing.AllocsPerRun(5, func() {
 		sess, _, err := parseOpenCodeStorageFile(sessionPath, "testmachine")
 		if err != nil {
-			t.Fatalf("parse: %v", err)
+			require.FailNowf(t, "test failed", "parse: %v", err)
 		}
 		if sess == nil {
-			t.Fatal("expected parsed session")
+			require.FailNow(t, "expected parsed session")
 		}
 	})
 
@@ -709,7 +714,7 @@ func TestOpenCodeStorageFingerprintTracksRawRows(t *testing.T) {
 		"time": map[string]any{"created": int64(1700000000000)},
 	})
 
-	baseline, err := openCodeStorageSessionFingerprint(sessionPath)
+	baseline, err := openCodeStorageSessionFingerprint(t.Context(), sessionPath)
 	require.NoError(t, err)
 	require.NotEmpty(t, baseline)
 	sess, _, err := parseOpenCodeStorageFile(sessionPath, "testmachine")
@@ -766,7 +771,7 @@ func TestOpenCodeStorageFingerprintTracksRawRows(t *testing.T) {
 				require.NoError(t, os.WriteFile(tc.path, original, 0o644))
 			})
 			writeOpenCodeStorageFile(t, tc.path, tc.data)
-			changed, err := openCodeStorageSessionFingerprint(sessionPath)
+			changed, err := openCodeStorageSessionFingerprint(t.Context(), sessionPath)
 			require.NoError(t, err)
 			assert.NotEqual(t, baseline, changed)
 		})
@@ -880,11 +885,11 @@ func TestParseOpenCodeFile_LegacySessionMalformedProjectReturnsScopedError(
 	))
 
 	sess, msgs, err := parseOpenCodeStorageFile(sessionPath, "machine")
-	assert.Error(t, err)
+	require.Error(t, err)
 	assert.Nil(t, sess)
 	assert.Nil(t, msgs)
-	_, fingerprintErr := openCodeStorageSessionFingerprint(sessionPath)
-	assert.Error(t, fingerprintErr)
+	_, fingerprintErr := openCodeStorageSessionFingerprint(t.Context(), sessionPath)
+	require.Error(t, fingerprintErr)
 	assert.Contains(t, fingerprintErr.Error(), "decoding opencode project file")
 }
 
@@ -917,12 +922,12 @@ func TestParseOpenCodeFile_LegacySessionUnreadableProjectReturnsScopedError(
 	require.NoError(t, os.MkdirAll(projectPath, 0o755))
 
 	sess, msgs, err := parseOpenCodeStorageFile(sessionPath, "machine")
-	assert.Error(t, err)
+	require.Error(t, err)
 	assert.Nil(t, sess)
 	assert.Nil(t, msgs)
 	assert.Contains(t, err.Error(), "reading opencode project file")
-	_, fingerprintErr := openCodeStorageSessionFingerprint(sessionPath)
-	assert.Error(t, fingerprintErr)
+	_, fingerprintErr := openCodeStorageSessionFingerprint(t.Context(), sessionPath)
+	require.Error(t, fingerprintErr)
 	assert.Contains(t, fingerprintErr.Error(), "reading opencode project file")
 }
 
@@ -935,13 +940,13 @@ func TestOpenCodeStorageMtimeUsesProjectOnlyForFallback(t *testing.T) {
 	writeOpenCodeStorageFile(t, concreteProjectPath, map[string]any{
 		"id": "global", "worktree": "/work/unused",
 	})
-	concreteBefore, err := OpenCodeSourceMtime(concretePath)
+	concreteBefore, err := OpenCodeSourceMtime(t.Context(), concretePath)
 	require.NoError(t, err)
 	future := time.Unix(1810000000, 123456789)
 	require.NoError(t, os.Chtimes(
 		concreteProjectPath, future, future,
 	))
-	concreteAfter, err := OpenCodeSourceMtime(concretePath)
+	concreteAfter, err := OpenCodeSourceMtime(t.Context(), concretePath)
 	require.NoError(t, err)
 	assert.Equal(t, concreteBefore, concreteAfter,
 		"unused project metadata must not refresh a session with a concrete directory")
@@ -958,13 +963,13 @@ func TestOpenCodeStorageMtimeUsesProjectOnlyForFallback(t *testing.T) {
 	writeOpenCodeStorageFile(t, fallbackProjectPath, map[string]any{
 		"id": "global", "worktree": "/work/fallback",
 	})
-	fallbackBefore, err := OpenCodeSourceMtime(fallbackPath)
+	fallbackBefore, err := OpenCodeSourceMtime(t.Context(), fallbackPath)
 	require.NoError(t, err)
 	future = time.Unix(1810000100, 123456789)
 	require.NoError(t, os.Chtimes(
 		fallbackProjectPath, future, future,
 	))
-	fallbackAfter, err := OpenCodeSourceMtime(fallbackPath)
+	fallbackAfter, err := OpenCodeSourceMtime(t.Context(), fallbackPath)
 	require.NoError(t, err)
 	assert.Greater(t, fallbackAfter, fallbackBefore,
 		"project metadata must refresh a legacy session without a directory")
@@ -1067,8 +1072,8 @@ func TestParseOpenCodeFile_StorageSessionInvalidChildFails(
 	require.Error(t, err, "expected parseOpenCodeStorageFile error")
 	assert.Nil(t, sess, "session, want nil")
 	assert.Nil(t, msgs, "msgs, want nil")
-	_, fingerprintErr := openCodeStorageSessionFingerprint(sessionPath)
-	assert.Error(t, fingerprintErr)
+	_, fingerprintErr := openCodeStorageSessionFingerprint(t.Context(), sessionPath)
+	require.Error(t, fingerprintErr)
 	assert.Contains(t, fingerprintErr.Error(), "decoding opencode message file")
 }
 
@@ -1136,8 +1141,8 @@ func TestParseOpenCodeFile_StorageMessageMissingIDFails(t *testing.T) {
 	require.Error(t, err, "expected parseOpenCodeStorageFile error")
 	assert.Nil(t, sess, "session, want nil")
 	assert.Nil(t, msgs, "msgs, want nil")
-	_, fingerprintErr := openCodeStorageSessionFingerprint(sessionPath)
-	assert.Error(t, fingerprintErr)
+	_, fingerprintErr := openCodeStorageSessionFingerprint(t.Context(), sessionPath)
+	require.Error(t, fingerprintErr)
 	assert.Contains(t, fingerprintErr.Error(), "missing id")
 }
 
@@ -1182,8 +1187,8 @@ func TestParseOpenCodeFile_StoragePartMissingIDFails(t *testing.T) {
 	require.Error(t, err, "expected parseOpenCodeStorageFile error")
 	assert.Nil(t, sess, "session, want nil")
 	assert.Nil(t, msgs, "msgs, want nil")
-	_, fingerprintErr := openCodeStorageSessionFingerprint(sessionPath)
-	assert.Error(t, fingerprintErr)
+	_, fingerprintErr := openCodeStorageSessionFingerprint(t.Context(), sessionPath)
+	require.Error(t, fingerprintErr)
 	assert.Contains(t, fingerprintErr.Error(), "missing id")
 }
 
@@ -1421,6 +1426,8 @@ func TestParseOpenCodeDB_TitleFallback(t *testing.T) {
 			assertEq(t, "placeholder title fallback",
 				s.Session.FirstMessage,
 				"Refactor the auth module")
+			assertEq(t, "placeholder is not a session name",
+				s.Session.SessionName, "")
 		}
 	}
 }
@@ -1458,6 +1465,119 @@ func TestParseOpenCodeDB_ToolParts(t *testing.T) {
 		ToolUseID: "call_1",
 		InputJSON: `{"file_path":"main.go"}`,
 	}})
+}
+
+func TestParseOpenCodeDB_DispatchTiming(t *testing.T) {
+	dbPath, seeder, db := newTestDB(t)
+	defer db.Close()
+
+	const (
+		projectID = "prj_timing"
+		sessionID = "ses_timing"
+		base      = int64(1700000000000)
+	)
+	seeder.AddProject(projectID, "/tmp/proj")
+	seeder.AddSession(sessionID, projectID, "", "", base, base+1000)
+	seeder.AddMessage("msg_user", sessionID, base, base, `{"role":"user"}`)
+	seeder.AddPart("prt_user", "msg_user", sessionID, base, base,
+		`{"type":"text","text":"run the tools"}`)
+	seeder.AddMessage("msg_assistant", sessionID, base+1, base+1,
+		`{"role":"assistant"}`)
+
+	cases := []struct {
+		name, tool, state  string
+		wantEvents         int
+		wantStatus         string
+		wantStart, wantEnd int64
+	}{
+		{
+			name:       "completed",
+			tool:       "read",
+			state:      `{"status":"completed","input":{"path":"a"},"time":{"start":1000,"end":32000}}`,
+			wantEvents: 2, wantStatus: "completed", wantStart: 1000, wantEnd: 32000,
+		},
+		{
+			name:       "errored",
+			tool:       "read",
+			state:      `{"status":"error","input":{"path":"b"},"time":{"start":40000,"end":40000}}`,
+			wantEvents: 2, wantStatus: "errored", wantStart: 40000, wantEnd: 40000,
+		},
+		{
+			name:       "interrupted-equal-bounds",
+			tool:       "read",
+			state:      `{"status":"error","input":{"path":"b-aborted"},"error":"interrupted","metadata":{"interrupted":true},"time":{"start":45000,"end":45000}}`,
+			wantEvents: 0,
+		},
+		{
+			name:       "completed-equal-bounds",
+			tool:       "read",
+			state:      `{"status":"completed","input":{"path":"instant"},"time":{"start":45000,"end":45000}}`,
+			wantEvents: 2, wantStatus: "completed", wantStart: 45000, wantEnd: 45000,
+		},
+		{
+			name:       "bash-nonzero-exit",
+			tool:       "bash",
+			state:      `{"status":"completed","input":{"command":"false"},"metadata":{"exit":1},"time":{"start":46000,"end":47000}}`,
+			wantEvents: 2, wantStatus: "errored", wantStart: 46000, wantEnd: 47000,
+		},
+		{
+			name:       "invalid-tool",
+			tool:       "invalid",
+			state:      `{"status":"completed","input":{},"time":{"start":48000,"end":49000}}`,
+			wantEvents: 2, wantStatus: "errored", wantStart: 48000, wantEnd: 49000,
+		},
+		{
+			name:       "pending",
+			tool:       "read",
+			state:      `{"status":"pending","input":{"path":"pending"},"time":{"start":50000,"end":51000}}`,
+			wantEvents: 0,
+		},
+		{
+			name:       "missing-start",
+			tool:       "read",
+			state:      `{"status":"completed","input":{"path":"c"},"time":{"end":50000}}`,
+			wantEvents: 0,
+		},
+		{
+			name:       "reversed",
+			tool:       "read",
+			state:      `{"status":"completed","input":{"path":"d"},"time":{"start":70000,"end":60000}}`,
+			wantEvents: 0,
+		},
+		{
+			name:       "running",
+			tool:       "read",
+			state:      `{"status":"running","input":{"path":"e"},"time":{"start":80000}}`,
+			wantEvents: 0,
+		},
+	}
+	for i, tc := range cases {
+		callID := fmt.Sprintf("call_timing_%d", i)
+		partID := fmt.Sprintf("prt_timing_%d", i)
+		seeder.AddPart(partID, "msg_assistant", sessionID, base+2+int64(i), base+2+int64(i),
+			fmt.Sprintf(`{"type":"tool","tool":%q,"callID":%q,"state":%s}`, tc.tool, callID, tc.state))
+	}
+
+	sessions, err := parseOpenCodeAll(dbPath, "m")
+	require.NoError(t, err, "ParseOpenCodeDB")
+	require.Len(t, sessions, 1)
+	tools := sessions[0].Messages[1].ToolCalls
+	require.Len(t, tools, len(cases))
+	for i, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			call := tools[i]
+			require.Len(t, call.ResultEvents, tc.wantEvents)
+			if tc.wantEvents == 0 {
+				return
+			}
+			assert.Equal(t, "tool_execution", call.ResultEvents[0].Source)
+			assert.Equal(t, "started", call.ResultEvents[0].Status)
+			assert.Equal(t, time.UnixMilli(tc.wantStart), call.ResultEvents[0].Timestamp)
+			assert.Equal(t, "tool_execution", call.ResultEvents[1].Source)
+			assert.Equal(t, tc.wantStatus, call.ResultEvents[1].Status)
+			assert.Equal(t, time.UnixMilli(tc.wantEnd), call.ResultEvents[1].Timestamp)
+		})
+	}
 }
 
 // TestParseOpenCodeDB_SkillTool verifies that a "skill" tool part
@@ -1979,7 +2099,7 @@ func newLegacyOpenCodeTestDB(t *testing.T) (string, *OpenCodeSeeder, *sql.DB) {
 	dbPath := filepath.Join(t.TempDir(), "opencode-legacy.db")
 	db, err := sql.Open("sqlite3", dbPath)
 	require.NoError(t, err, "open legacy test db")
-	_, err = db.Exec(openCodeSchemaLegacy)
+	_, err = db.ExecContext(t.Context(), openCodeSchemaLegacy)
 	require.NoError(t, err, "create legacy schema")
 	return dbPath, &OpenCodeSeeder{db: db, t: t}, db
 }
@@ -2003,7 +2123,7 @@ func TestParseOpenCodeDB_LegacySchemaWithoutDirectoryUsesProjectWorktree(t *test
 
 	// Confirm the column is actually absent so the test would fail closed
 	// if the modern SELECT path were used.
-	hasDir, err := openCodeTableHasColumn(db, "session", "directory")
+	hasDir, err := openCodeTableHasColumn(t.Context(), db, "session", "directory")
 	require.NoError(t, err)
 	require.False(t, hasDir, "legacy fixture must omit session.directory")
 
@@ -2021,7 +2141,7 @@ func TestParseOpenCodeDB_ModernSchemaDirectoryColumnDetected(t *testing.T) {
 	defer db.Close()
 	seedStandardSession(t, seeder)
 
-	hasDir, err := openCodeSessionHasDirectoryCached(db, dbPath, "session")
+	hasDir, err := openCodeSessionHasDirectoryCached(t.Context(), db, dbPath, "session")
 	require.NoError(t, err)
 	assert.True(t, hasDir, "modern fixture must include session.directory")
 
@@ -2162,7 +2282,7 @@ func TestListOpenCodeSessionWatermarkMeta(t *testing.T) {
 	)
 	// Project row above the session row: the watermark is MAX(session,
 	// project). Child rows sit above both and must NOT be reflected.
-	_, err := db.Exec(
+	_, err := db.ExecContext(t.Context(),
 		"UPDATE project SET time_updated = ? WHERE id = ?",
 		1700000070000, "prj_1",
 	)
@@ -2311,7 +2431,8 @@ func TestParseOpenCodeDB_TokenUsage(t *testing.T) {
 	require.NotNil(t, asst2, "missing claude-sonnet assistant message")
 
 	checkUsage := func(name string, m *ParsedMessage,
-		wantIn, wantOut, wantCacheRead, wantCacheCreate int) {
+		wantIn, wantOut, wantCacheRead, wantCacheCreate int,
+	) {
 		t.Helper()
 		require.NotEmpty(t, m.TokenUsage, "%s: TokenUsage empty", name)
 		var got map[string]int

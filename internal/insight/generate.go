@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json/jsontext"
 	"encoding/json/v2"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -12,6 +13,9 @@ import (
 	"regexp"
 	"sort"
 	"strings"
+
+	"go.kenn.io/agentsview/internal/config"
+	"go.kenn.io/agentsview/internal/stringutil"
 )
 
 // geminiInsightModel is the model passed to the gemini CLI
@@ -30,15 +34,17 @@ type Result struct {
 	Model   string
 }
 
-// ValidAgentNames lists the supported insight agent names in display
-// order. ValidAgents is a lookup set derived from it.
-var ValidAgentNames = []string{
-	"claude",
-	"codex",
-	"copilot",
-	"gemini",
-	"kiro",
+// ValidTypes lists the insight types the generate route accepts.
+var ValidTypes = map[string]bool{
+	"daily_activity": true,
+	"agent_analysis": true,
+	CannedType:       true,
 }
+
+// ValidAgentNames lists the supported insight agent names in display
+// order. ValidAgents is a lookup set derived from it. The names live in
+// internal/config so configuration validation accepts exactly this set.
+var ValidAgentNames = config.InsightAgentNames()
 
 // ValidAgents is the set of supported insight agent names.
 var ValidAgents = func() map[string]bool {
@@ -163,10 +169,11 @@ func truncateLogLine(line string, maxBytes int) string {
 	if maxBytes <= 0 || len(line) <= maxBytes {
 		return line
 	}
-	omitted := len(line) - maxBytes
+	prefix := stringutil.SafeTruncate(line, maxBytes)
+	omitted := len(line) - len(prefix)
 	return fmt.Sprintf(
 		"%s... [truncated %d bytes]",
-		line[:maxBytes], omitted,
+		prefix, omitted,
 	)
 }
 
@@ -383,7 +390,7 @@ func generateCodex(
 	if waitErr := cmd.Wait(); waitErr != nil {
 		if parseErr != nil {
 			return Result{}, fmt.Errorf(
-				"codex failed: %w (parse: %v)\nstderr: %s",
+				"codex failed: %w (parse: %w)\nstderr: %s",
 				waitErr, parseErr, stderrText,
 			)
 		}
@@ -546,9 +553,7 @@ func generateCopilot(
 
 	content := strings.TrimSpace(string(stdoutBytes))
 	if content == "" {
-		return Result{}, fmt.Errorf(
-			"copilot returned empty result",
-		)
+		return Result{}, errors.New("copilot returned empty result")
 	}
 
 	return Result{
@@ -564,9 +569,7 @@ func generateGemini(
 	cfg AgentConfig,
 ) (Result, error) {
 	if strings.TrimSpace(cfg.Sandbox) == "" && !cfg.AllowUnsafe {
-		return Result{}, fmt.Errorf(
-			"gemini insights require an explicit sandbox or unsafe opt-in; set [agent.gemini].sandbox to a Gemini sandbox provider or [agent.gemini].allow_unsafe = true",
-		)
+		return Result{}, errors.New("gemini insights require an explicit sandbox or unsafe opt-in; set [agent.gemini].sandbox to a Gemini sandbox provider or [agent.gemini].allow_unsafe = true")
 	}
 	cmd := exec.CommandContext(
 		ctx, path,
@@ -612,7 +615,7 @@ func generateGemini(
 	if waitErr := cmd.Wait(); waitErr != nil {
 		if parseErr != nil {
 			return Result{}, fmt.Errorf(
-				"gemini failed: %w (parse: %v)\nstderr: %s",
+				"gemini failed: %w (parse: %w)\nstderr: %s",
 				waitErr, parseErr, stderrText,
 			)
 		}
@@ -802,7 +805,7 @@ func generateKiro(
 	}
 	content := strings.TrimSpace(strings.Join(lines, "\n"))
 	if content == "" {
-		return Result{}, fmt.Errorf("kiro returned empty result")
+		return Result{}, errors.New("kiro returned empty result")
 	}
 
 	return Result{

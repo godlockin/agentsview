@@ -5,7 +5,6 @@ package main
 import (
 	"archive/zip"
 	"bytes"
-	"context"
 	"database/sql"
 	"encoding/json/jsontext"
 	"encoding/json/v2"
@@ -18,6 +17,7 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"go.kenn.io/agentsview/internal/config"
 	"go.kenn.io/agentsview/internal/dbtest"
 	"go.kenn.io/agentsview/internal/importer"
 	"go.kenn.io/agentsview/internal/parser"
@@ -33,7 +33,7 @@ func TestGeminiAppsImportDispatchesDirectAndZipSources(t *testing.T) {
 	require.NoError(t, os.WriteFile(direct, []byte(geminiAppsCLIHTML), 0o644))
 
 	stats, err := runImportDispatch(
-		context.Background(), database, "gemini-apps", direct, t.TempDir(), "test-machine",
+		t.Context(), database, "gemini-apps", direct, t.TempDir(), "test-machine",
 	)
 	require.NoError(t, err)
 	assert.Equal(t, 1, stats.Imported)
@@ -54,16 +54,16 @@ func TestGeminiAppsImportDispatchesDirectAndZipSources(t *testing.T) {
 	require.NotNil(t, cleanup)
 	defer cleanup()
 	stats, err = runImportDispatch(
-		context.Background(), database, "gemini-apps", source, t.TempDir(), "test-machine",
+		t.Context(), database, "gemini-apps", source, t.TempDir(), "test-machine",
 	)
 	require.NoError(t, err)
 	assert.Equal(t, 1, stats.Skipped)
 
 	_, err = runImportDispatch(
-		context.Background(), database, "gemini-apps",
+		t.Context(), database, "gemini-apps",
 		filepath.Join(t.TempDir(), "missing.html"), t.TempDir(), "test-machine",
 	)
-	assert.ErrorContains(t, err, "stat import source")
+	require.ErrorContains(t, err, "stat import source")
 
 	nonPrompt := filepath.Join(t.TempDir(), "non-prompt.html")
 	require.NoError(t, os.WriteFile(
@@ -72,17 +72,61 @@ func TestGeminiAppsImportDispatchesDirectAndZipSources(t *testing.T) {
 		0o644,
 	))
 	stats, err = runImportDispatch(
-		context.Background(), database, "gemini-apps", nonPrompt, t.TempDir(), "test-machine",
+		t.Context(), database, "gemini-apps", nonPrompt, t.TempDir(), "test-machine",
 	)
-	assert.ErrorContains(t, err, "no admissible Prompted records")
+	require.ErrorContains(t, err, "no admissible Prompted records")
 	assert.Equal(t, 1, stats.Skipped)
 	assert.Equal(t, "\rDone: 1 processed (1 skipped)\n", formatImportFailureSummary(stats))
 	assert.Empty(t, formatImportFailureSummary(importer.ImportStats{}))
 }
 
-// isolateParseDiffEnv points the data dir, HOME, and every per-agent
-// directory override at empty temp dirs so end-to-end runs never
-// discover the developer machine's real session files.
+// claudeAIExportFile writes a one-conversation Claude.ai export with n messages.
+func claudeAIExportFile(t *testing.T, n int) string {
+	t.Helper()
+	msgs := make([]string, n)
+	for i := range msgs {
+		msgs[i] = fmt.Sprintf(`{"uuid":"m%d","text":"turn %d","sender":"human","content":[{"type":"text","text":"turn %d"}],"created_at":"2026-03-01T10:0%d:00.000000Z"}`, i, i, i, i)
+	}
+	path := filepath.Join(t.TempDir(), "conversations.json")
+	require.NoError(t, os.WriteFile(path, []byte(`[{"uuid":"replace-001","name":"Replace",`+
+		`"created_at":"2026-03-01T10:00:00.000000Z","updated_at":"2026-03-01T10:05:00.000000Z",`+
+		`"chat_messages":[`+strings.Join(msgs, ",")+`]}]`), 0o644))
+	return path
+}
+
+func TestImportSessionsReplace(t *testing.T) {
+	testDataDir(t)
+	require.NoError(t, importSessions(ImportConfig{Type: "claude-ai", Path: claudeAIExportFile(t, 2)}))
+	require.NoError(t, importSessions(ImportConfig{
+		Type: "claude-ai", Path: claudeAIExportFile(t, 1), Replace: []string{"claude-ai:replace-001"},
+	}))
+
+	cfg, err := config.LoadMinimal()
+	require.NoError(t, err)
+	database, err := openDB(t.Context(), cfg)
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, database.Close()) })
+	msgs, err := database.GetAllMessages(t.Context(), "claude-ai:replace-001")
+	require.NoError(t, err)
+	assert.Len(t, msgs, 1)
+	trashed, err := database.ListTrashedSessions(t.Context())
+	require.NoError(t, err)
+	require.Len(t, trashed, 1)
+	assert.True(t, strings.HasPrefix(trashed[0].ID, "claude-ai:replace-001:replaced:"), trashed[0].ID)
+}
+
+func TestImportSessionsRejectsReplaceForGeminiApps(t *testing.T) {
+	dataDir := testDataDir(t)
+	err := importSessions(ImportConfig{
+		Type: "gemini-apps", Path: filepath.Join(t.TempDir(), "missing.html"),
+		Replace: []string{"x"},
+	})
+	require.ErrorContains(t, err, "--replace is not supported for gemini-apps imports")
+	entries, err := os.ReadDir(dataDir)
+	require.NoError(t, err)
+	assert.Empty(t, entries, "the rejection must not create a database")
+}
+
 func isolateParseDiffEnv(t *testing.T) {
 	t.Helper()
 	testDataDir(t)
@@ -321,7 +365,7 @@ func TestDoParseDiff_FailOnChangeFalseOnEmptyArchive(t *testing.T) {
 	isolateParseDiffEnv(t)
 
 	var buf bytes.Buffer
-	failed := doParseDiff(ParseDiffConfig{
+	failed := doParseDiff(t.Context(), ParseDiffConfig{
 		FailOnChange: true,
 		Stdout:       &buf,
 		Stderr:       &buf,
@@ -951,16 +995,16 @@ func TestDoParseDiff_FailOnChangeDirections(t *testing.T) {
 	require.NoError(t, os.WriteFile(srcPath, []byte(content), 0o644))
 
 	d := dbtest.OpenTestDBAt(t, filepath.Join(dataDir, "sessions.db"))
-	engine := sync.NewEngine(d, sync.EngineConfig{
+	engine := sync.NewEngine(t.Context(), d, sync.EngineConfig{
 		AgentDirs: map[parser.AgentType][]string{
 			parser.AgentClaude: {claudeDir},
 		},
 		Machine: "local",
 	})
-	stats := engine.SyncAll(context.Background(), nil)
+	stats := engine.SyncAll(t.Context(), nil)
 	require.Equal(t, 1, stats.Synced, "one session synced")
-	require.NoError(t, d.Update(func(tx *sql.Tx) error {
-		_, err := tx.Exec(
+	require.NoError(t, d.Update(t.Context(), func(tx *sql.Tx) error {
+		_, err := tx.ExecContext(t.Context(),
 			"UPDATE sessions SET first_message = ? WHERE id = ?",
 			"drifted first message", "real-session",
 		)
@@ -970,7 +1014,7 @@ func TestDoParseDiff_FailOnChangeDirections(t *testing.T) {
 	require.NoError(t, d.Close())
 
 	var failBuf bytes.Buffer
-	failed := doParseDiff(ParseDiffConfig{
+	failed := doParseDiff(t.Context(), ParseDiffConfig{
 		FailOnChange: true, Stdout: &failBuf, Stderr: &failBuf,
 	})
 	assert.True(t, failed,
@@ -978,7 +1022,7 @@ func TestDoParseDiff_FailOnChangeDirections(t *testing.T) {
 	assert.Contains(t, failBuf.String(), "sessions changed")
 
 	var cleanBuf bytes.Buffer
-	notFailed := doParseDiff(ParseDiffConfig{
+	notFailed := doParseDiff(t.Context(), ParseDiffConfig{
 		FailOnChange: false, Stdout: &cleanBuf, Stderr: &cleanBuf,
 	})
 	assert.False(t, notFailed,
@@ -1014,18 +1058,18 @@ func TestDoParseDiff_RacedSessionDoesNotFail(t *testing.T) {
 
 	dbPath := filepath.Join(dataDir, "sessions.db")
 	d := dbtest.OpenTestDBAt(t, dbPath)
-	engine := sync.NewEngine(d, sync.EngineConfig{
+	engine := sync.NewEngine(t.Context(), d, sync.EngineConfig{
 		AgentDirs: map[parser.AgentType][]string{
 			parser.AgentClaude: {claudeDir},
 		},
 		Machine: "local",
 	})
-	stats := engine.SyncAll(context.Background(), nil)
+	stats := engine.SyncAll(t.Context(), nil)
 	require.Equal(t, 1, stats.Synced, "one session synced")
 
 	// Find the synced session id so the drift targets the real row.
 	rows, err := d.ListSessionsModifiedBetween(
-		context.Background(), "", "", nil, nil,
+		t.Context(), "", "", nil, nil,
 	)
 	require.NoError(t, err)
 	require.Len(t, rows, 1, "exactly one stored session")
@@ -1033,8 +1077,8 @@ func TestDoParseDiff_RacedSessionDoesNotFail(t *testing.T) {
 
 	// Drift the stored row so a fresh parse reports a real change, then
 	// push the source mtime past the recorded snapshot file_mtime.
-	require.NoError(t, d.Update(func(tx *sql.Tx) error {
-		_, uerr := tx.Exec(
+	require.NoError(t, d.Update(t.Context(), func(tx *sql.Tx) error {
+		_, uerr := tx.ExecContext(t.Context(),
 			"UPDATE sessions SET first_message = ? WHERE id = ?",
 			"drifted first message", sessionID,
 		)
@@ -1047,7 +1091,7 @@ func TestDoParseDiff_RacedSessionDoesNotFail(t *testing.T) {
 		"advance source mtime past the snapshot")
 
 	var racedBuf bytes.Buffer
-	racedFailed := doParseDiff(ParseDiffConfig{
+	racedFailed := doParseDiff(t.Context(), ParseDiffConfig{
 		FailOnChange: true, Stdout: &racedBuf, Stderr: &racedBuf,
 	})
 	assert.False(t, racedFailed,
@@ -1082,24 +1126,24 @@ func TestDoParseDiff_UntouchedDriftStillFails(t *testing.T) {
 
 	dbPath := filepath.Join(dataDir, "sessions.db")
 	d := dbtest.OpenTestDBAt(t, dbPath)
-	engine := sync.NewEngine(d, sync.EngineConfig{
+	engine := sync.NewEngine(t.Context(), d, sync.EngineConfig{
 		AgentDirs: map[parser.AgentType][]string{
 			parser.AgentClaude: {claudeDir},
 		},
 		Machine: "local",
 	})
-	stats := engine.SyncAll(context.Background(), nil)
+	stats := engine.SyncAll(t.Context(), nil)
 	require.Equal(t, 1, stats.Synced, "one session synced")
 
 	rows, err := d.ListSessionsModifiedBetween(
-		context.Background(), "", "", nil, nil,
+		t.Context(), "", "", nil, nil,
 	)
 	require.NoError(t, err)
 	require.Len(t, rows, 1)
 	sessionID := rows[0].ID
 
-	require.NoError(t, d.Update(func(tx *sql.Tx) error {
-		_, uerr := tx.Exec(
+	require.NoError(t, d.Update(t.Context(), func(tx *sql.Tx) error {
+		_, uerr := tx.ExecContext(t.Context(),
 			"UPDATE sessions SET first_message = ? WHERE id = ?",
 			"drifted first message", sessionID,
 		)
@@ -1109,7 +1153,7 @@ func TestDoParseDiff_UntouchedDriftStillFails(t *testing.T) {
 
 	// Source mtime is left untouched: the change is genuine drift.
 	var buf bytes.Buffer
-	failed := doParseDiff(ParseDiffConfig{
+	failed := doParseDiff(t.Context(), ParseDiffConfig{
 		FailOnChange: true, Stdout: &buf, Stderr: &buf,
 	})
 	assert.True(t, failed,

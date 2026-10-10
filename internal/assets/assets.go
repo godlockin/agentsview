@@ -2,11 +2,14 @@ package assets
 
 import (
 	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"io"
 	"os"
 	"path/filepath"
 	"strings"
+
+	"go.kenn.io/kit/atomicfile"
 )
 
 // allowedImageExts is the set of passive image formats safe to serve inline.
@@ -35,23 +38,34 @@ func ExtForMediaType(mediaType string) (string, bool) {
 	return ext, ok
 }
 
+// Reference returns the content-addressed asset:// reference for body.
+// mediaType must name a passive image format.
+func Reference(mediaType string, body []byte) (string, error) {
+	ext, ok := mediaTypeToExt[mediaType]
+	if !ok {
+		return "", fmt.Errorf("unsupported asset type: %s", mediaType)
+	}
+
+	sum := sha256.Sum256(body)
+	hash := hex.EncodeToString(sum[:])
+	return "asset://" + hash + ext, nil
+}
+
 // Put writes body to the assets directory under its SHA-256 hash and returns
 // the asset:// reference. created is false when a complete object already
 // existed; repairing a partial one reports true. mediaType must name a passive
 // image format.
 func Put(assetsDir, mediaType string, body []byte) (ref string, created bool, err error) {
-	ext, ok := mediaTypeToExt[mediaType]
-	if !ok {
-		return "", false, fmt.Errorf("unsupported asset type: %s", mediaType)
+	ref, err = Reference(mediaType, body)
+	if err != nil {
+		return "", false, err
 	}
 
-	sum := sha256.Sum256(body)
-	hash := fmt.Sprintf("%x", sum[:])
-	filename := hash + ext
+	filename := strings.TrimPrefix(ref, "asset://")
 	destPath := filepath.Join(assetsDir, filename)
 
-	if isCompleteObject(destPath, int64(len(body)), hash) {
-		return "asset://" + filename, false, nil
+	if isCompleteObject(destPath, int64(len(body)), strings.TrimSuffix(filename, filepath.Ext(filename))) {
+		return ref, false, nil
 	}
 
 	if err := writeObject(assetsDir, destPath, func(out *os.File) error {
@@ -61,7 +75,7 @@ func Put(assetsDir, mediaType string, body []byte) (ref string, created bool, er
 		return "", false, err
 	}
 
-	return "asset://" + filename, true, nil
+	return ref, true, nil
 }
 
 // isCompleteObject reports whether the content-addressed path already holds a
@@ -82,7 +96,7 @@ func isCompleteObject(destPath string, size int64, expectedHash string) bool {
 	if copyErr != nil || closeErr != nil || actualSize != size {
 		return false
 	}
-	return fmt.Sprintf("%x", h.Sum(nil)) == expectedHash
+	return hex.EncodeToString(h.Sum(nil)) == expectedHash
 }
 
 // writeObject fills a temp file in assetsDir and renames it onto destPath, so
@@ -115,7 +129,7 @@ func writeObject(assetsDir, destPath string, fill func(*os.File) error) error {
 	if err := os.Chmod(tmpPath, 0o644); err != nil {
 		return fmt.Errorf("setting asset mode: %w", err)
 	}
-	if err := os.Rename(tmpPath, destPath); err != nil {
+	if err := atomicfile.Replace(tmpPath, destPath); err != nil {
 		return fmt.Errorf("publishing asset: %w", err)
 	}
 	return nil
@@ -149,7 +163,7 @@ func CopyAsset(srcPath, assetsDir string) (string, error) {
 		return "", fmt.Errorf("hashing asset: %w", err)
 	}
 
-	hash := fmt.Sprintf("%x", h.Sum(nil))
+	hash := hex.EncodeToString(h.Sum(nil))
 	filename := hash + ext // ext is already normalized to .jpg for .jpeg sources
 	destPath := filepath.Join(assetsDir, filename)
 

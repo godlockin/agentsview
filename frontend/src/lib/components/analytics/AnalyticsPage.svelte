@@ -14,6 +14,7 @@
   import HourOfWeekHeatmap from "./HourOfWeekHeatmap.svelte";
   import SessionShape from "./SessionShape.svelte";
   import VelocityMetrics from "./VelocityMetrics.svelte";
+  import OutcomeTotals from "./OutcomeTotals.svelte";
   import ToolUsage from "./ToolUsage.svelte";
   import TopSkills from "./TopSkills.svelte";
   import SkillTrend from "./SkillTrend.svelte";
@@ -28,6 +29,8 @@
     analytics,
     ANALYTICS_DEFAULT_WINDOW_DAYS,
   } from "../../stores/analytics.svelte.js";
+  import { outcomeTotals } from "../../stores/outcomeTotals.svelte.js";
+  import { settings } from "../../stores/settings.svelte.js";
   import { analyticsPageDates } from "../../stores/analyticsPageDates.js";
   import {
     sessions,
@@ -46,7 +49,7 @@
     sessionParamsToPanelDate,
     type PanelDateState,
   } from "../../stores/yokedDates.svelte.js";
-  import { rollingRange } from "../../utils/dates.js";
+  import { parseLocalDate, rollingRange } from "../../utils/dates.js";
   import { exportAnalyticsCSV } from "../../utils/csv-export.js";
   import RefreshControl from "../shared/RefreshControl.svelte";
   import { m } from "../../i18n/index.js";
@@ -242,16 +245,20 @@
     });
   }
 
-  function refreshAnalytics(): Promise<void> {
+  async function refreshAnalytics(): Promise<void> {
     cancelInitialLoad();
     const refresh = analytics.fetchAll();
-    if (router.isRootPath || suppressSessionDateRefresh) return refresh;
-    const state = currentAnalyticsPanelDate();
-    if (state && !analyticsDateYokeIsClear()) {
-      yokedDates.updateFromPanel(state);
-      writeSessionDateParams(state);
+    const outcomes = outcomeWindow && !outcomeFiltersUnsupported
+      ? outcomeTotals.load(outcomeWindow)
+      : undefined;
+    if (!router.isRootPath && !suppressSessionDateRefresh) {
+      const state = currentAnalyticsPanelDate();
+      if (state && !analyticsDateYokeIsClear()) {
+        yokedDates.updateFromPanel(state);
+        writeSessionDateParams(state);
+      }
     }
-    return refresh;
+    await Promise.all([refresh, outcomes]);
   }
 
   function handleActivityRangeSelect(from: string, to: string) {
@@ -347,6 +354,45 @@
   }
 
   analytics.setFetchStartHandler(cancelInitialLoad);
+
+  // The outcome totals are read on their own, not through analytics.fetchAll,
+  // because the GitHub half of the aggregation shells out once per repository
+  // and must never be pulled into the page's normal refresh.
+  const outcomeFiltersUnsupported = $derived(Boolean(
+    analytics.machine || analytics.model || analytics.termination ||
+    analytics.minUserMessages > 0 || analytics.recentlyActive ||
+    analytics.selectedDow !== null || analytics.selectedHour !== null,
+  ));
+
+  const outcomeWindow = $derived.by(() => {
+    if (sync.serverVersion?.session_stats_available !== true) return null;
+    const from = analytics.selectedDate ?? analytics.selectedActivityRange?.from ?? analytics.from;
+    const to = analytics.selectedDate ?? analytics.selectedActivityRange?.to ?? analytics.to;
+    const start = parseLocalDate(from);
+    const end = parseLocalDate(to);
+    if (!start || !end) return null;
+    // Dashboard dates include the last day; stats bounds exclude the end.
+    // Advance by a local calendar day so DST changes keep midnight aligned.
+    end.setDate(end.getDate() + 1);
+    return {
+      since: start.toISOString(),
+      until: end.toISOString(),
+      timezone: analytics.timezone,
+      agent: analytics.agent || undefined,
+      includeProject: analytics.project ? [analytics.project] : undefined,
+      includeOneShot: analytics.includeOneShot,
+      includeAutomated: analytics.includeAutomated,
+    };
+  });
+
+  $effect(() => {
+    const window = outcomeWindow;
+    const unsupported = outcomeFiltersUnsupported;
+    untrack(() => {
+      if (!window || unsupported) outcomeTotals.reset();
+      else void outcomeTotals.load(window);
+    });
+  });
 
   $effect(() => {
     if (initialLoadDeferred && !sessions.loading) {
@@ -579,6 +625,7 @@
     cancelInitialLoad();
     analytics.setFetchStartHandler(undefined);
     analytics.cancelInFlightReads();
+    outcomeTotals.reset();
     const state = currentAnalyticsPanelDate();
     if (state) {
       analyticsPageDates.retain(
@@ -615,6 +662,9 @@
     />
     <RefreshControl
       lastUpdatedAt={analytics.lastUpdatedAt}
+      queryDurationMs={analytics.lastQueryDurationMs}
+      querySteps={analytics.lastQuerySteps}
+      liveQuery={analytics.liveQuery}
       busy={analytics.isQuerying}
       onRefresh={refreshAnalytics}
       label={m.analytics_refresh()}
@@ -698,6 +748,21 @@
 
       <Card level="default" padding="none" class="chart-panel wide">
         <AgentComparison />
+      </Card>
+
+      <Card level="default" padding="none" class="chart-panel wide">
+        <OutcomeTotals
+          stats={outcomeTotals.stats}
+          loading={outcomeTotals.loading}
+          unavailable={outcomeFiltersUnsupported}
+          backendAvailable={sync.serverVersion?.session_stats_available}
+          githubConfigured={settings.githubConfigured}
+          error={outcomeTotals.error}
+          includePullRequests={outcomeTotals.includePullRequests}
+          onIncludePullRequests={() => {
+            if (outcomeWindow) void outcomeTotals.loadWithPullRequests(outcomeWindow);
+          }}
+        />
       </Card>
     </div>
 

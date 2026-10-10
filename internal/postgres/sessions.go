@@ -7,6 +7,7 @@ import (
 	"database/sql"
 	"encoding/base64"
 	"encoding/json/v2"
+	"errors"
 	"fmt"
 	"strings"
 	"sync"
@@ -19,9 +20,10 @@ import (
 // Store wraps a PostgreSQL connection for read-only session
 // queries.
 type Store struct {
-	pg           *sql.DB
-	cursorMu     sync.RWMutex
-	cursorSecret []byte
+	hostedRelations bool
+	pg              *sql.DB
+	cursorMu        sync.RWMutex
+	cursorSecret    []byte
 
 	insightCapabilityMu        sync.RWMutex
 	insightGenerationAvailable bool
@@ -44,7 +46,7 @@ type Store struct {
 
 // pgSessionBaseCols is the column list for PG session queries that do not
 // expose source paths.
-const pgSessionBaseCols = `id, project, machine, agent,
+const pgSessionBaseCols = `id, project, project_assigned, machine, agent,
 	agent_label, entrypoint, session_kind,
 	first_message, COALESCE(display_name, session_name) AS display_name, created_at, started_at,
 	ended_at, message_count, user_message_count,
@@ -90,44 +92,6 @@ func (pb *paramBuilder) add(v any) string {
 	return fmt.Sprintf("$%d", pb.n)
 }
 
-func normalizePGAutomatedScope(
-	scope string,
-	excludeAutomated bool,
-) string {
-	switch strings.TrimSpace(scope) {
-	case "human", "all", "automated":
-		return strings.TrimSpace(scope)
-	}
-	if excludeAutomated {
-		return "human"
-	}
-	return "all"
-}
-
-func pgAutomatedScopePredicate(scope, col string) string {
-	switch scope {
-	case "human":
-		return col + " = FALSE"
-	case "automated":
-		return col + " = TRUE"
-	default:
-		return ""
-	}
-}
-
-// pgActivityWindows holds the cutoff durations used by
-// pgTerminationPred. Kept in sync with the SQLite-side constants
-// in internal/db/sessions.go so both stores classify a session
-// the same way at the same wall-clock time.
-const (
-	pgActiveWindow = 10 * time.Minute
-	pgStaleWindow  = 60 * time.Minute
-)
-
-// pgActivityExpr returns the COALESCEd activity timestamp
-// expression used to compute a session's effective recency.
-const pgActivityExpr = "COALESCE(ended_at, started_at, created_at)"
-
 const pgSidebarActivityExprS = "COALESCE(s.ended_at, s.started_at, s.created_at)"
 
 func pgSidebarStarredRootCTE(enabled bool) string {
@@ -149,56 +113,6 @@ func pgSidebarStarredRootJoin(enabled bool) string {
 	return "JOIN eligible_roots e ON e.id = t.root_id"
 }
 
-// pgTerminationPred returns a WHERE fragment for the multi-state
-// termination filter (active / stale / unclean). The status value
-// may be comma-separated to OR multiple states. Returns "" when
-// status is empty or "all".
-//
-// Stale and unclean both require a parser red flag — sessions with
-// termination_status NULL or 'clean' never appear under those
-// filters, so a short-lived agent that completes normally never
-// generates a yellow false-positive once it ages past 10 minutes.
-func pgTerminationPred(status string, pb *paramBuilder) string {
-	if status == "" || status == "all" {
-		return ""
-	}
-	now := time.Now().UTC()
-	activeCutoff := now.Add(-pgActiveWindow)
-	staleCutoff := now.Add(-pgStaleWindow)
-	const flagged = "termination_status IN ('tool_call_pending', 'truncated')"
-
-	parts := strings.Split(status, ",")
-	preds := make([]string, 0, len(parts))
-	for _, p := range parts {
-		switch strings.TrimSpace(p) {
-		case "active":
-			preds = append(preds,
-				pgActivityExpr+" > "+pb.add(activeCutoff))
-		case "stale":
-			preds = append(preds, "("+
-				pgActivityExpr+" > "+pb.add(staleCutoff)+
-				" AND "+pgActivityExpr+" <= "+pb.add(activeCutoff)+
-				" AND "+flagged+")")
-		case "unclean":
-			preds = append(preds, "("+
-				pgActivityExpr+" <= "+pb.add(staleCutoff)+
-				" AND "+flagged+")")
-		case "clean":
-			preds = append(preds, "termination_status = 'clean'")
-		case "awaiting_user":
-			preds = append(preds,
-				"termination_status = 'awaiting_user'")
-		}
-	}
-	if len(preds) == 0 {
-		return ""
-	}
-	if len(preds) == 1 {
-		return preds[0]
-	}
-	return "(" + strings.Join(preds, " OR ") + ")"
-}
-
 // scanPGSession scans a row with pgSessionCols into a
 // db.Session, converting TIMESTAMPTZ columns to string.
 func scanPGSession(
@@ -214,7 +128,7 @@ func scanPGSessionWithSource(
 	var createdAt *time.Time
 	var startedAt, endedAt, deletedAt *time.Time
 	targets := []any{
-		&s.ID, &s.Project, &s.Machine, &s.Agent,
+		&s.ID, &s.Project, &s.ProjectAssigned, &s.Machine, &s.Agent,
 		&s.AgentLabel, &s.Entrypoint, &s.SessionKind,
 		&s.FirstMessage, &s.DisplayName,
 		&createdAt, &startedAt, &endedAt,
@@ -374,13 +288,13 @@ func (s *Store) DecodeCursor(
 		)
 		if err != nil {
 			return db.SessionCursor{},
-				fmt.Errorf("%w: %v",
+				fmt.Errorf("%w: %w",
 					db.ErrInvalidCursor, err)
 		}
 		var c db.SessionCursor
 		if err := json.Unmarshal(data, &c); err != nil {
 			return db.SessionCursor{},
-				fmt.Errorf("%w: %v",
+				fmt.Errorf("%w: %w",
 					db.ErrInvalidCursor, err)
 		}
 		c.Total = 0
@@ -397,7 +311,7 @@ func (s *Store) DecodeCursor(
 	data, err := base64.RawURLEncoding.DecodeString(payload)
 	if err != nil {
 		return db.SessionCursor{},
-			fmt.Errorf("%w: invalid payload: %v",
+			fmt.Errorf("%w: invalid payload: %w",
 				db.ErrInvalidCursor, err)
 	}
 
@@ -405,7 +319,7 @@ func (s *Store) DecodeCursor(
 	if err != nil {
 		return db.SessionCursor{},
 			fmt.Errorf(
-				"%w: invalid signature encoding: %v",
+				"%w: invalid signature encoding: %w",
 				db.ErrInvalidCursor, err)
 	}
 
@@ -427,7 +341,7 @@ func (s *Store) DecodeCursor(
 	var c db.SessionCursor
 	if err := json.Unmarshal(data, &c); err != nil {
 		return db.SessionCursor{},
-			fmt.Errorf("%w: invalid json: %v",
+			fmt.Errorf("%w: invalid json: %w",
 				db.ErrInvalidCursor, err)
 	}
 	return c, nil
@@ -437,11 +351,9 @@ func (s *Store) DecodeCursor(
 func (s *Store) ListSessions(
 	ctx context.Context, f db.SessionFilter,
 ) (db.SessionPage, error) {
-	if f.Limit <= 0 || f.Limit > db.MaxSessionLimit {
-		f.Limit = db.DefaultSessionLimit
-	}
+	f.Limit = db.NormalizeSessionLimit(f.Limit)
 
-	where, args := buildPGSessionFilter(f)
+	where, args := db.BuildSessionFilterSQL(f, s.sessionDialect())
 
 	dialect := db.PostgresQueryDialect()
 	rs := db.ResolveSort(f)
@@ -505,18 +417,7 @@ func (s *Store) ListSessions(
 		return db.SessionPage{}, err
 	}
 
-	page := db.SessionPage{
-		Sessions: sessions, Total: total,
-	}
-	if len(sessions) > f.Limit {
-		page.Sessions = sessions[:f.Limit]
-		last := page.Sessions[f.Limit-1]
-		page.NextCursor = s.EncodeCursor(
-			db.NextSessionCursor(&last, rs, total, f),
-		)
-	}
-
-	return page, nil
+	return db.BuildSessionPage(sessions, total, f, rs, s.EncodeCursor), nil
 }
 
 // GetSidebarSessionIndex returns the skinny session rows needed by
@@ -537,7 +438,7 @@ func (s *Store) GetSidebarSessionIndex(
 	rootFilter.IncludeChildren = false
 	rootWhere, rootArgs := buildPGSessionBaseFilter(rootFilter)
 	canonicalRootWhere := db.BuildCanonicalRootWhere(
-		db.PostgresQueryDialect(), "sessions", f.IncludeOrphans,
+		s.sessionDialect(), "sessions", f.IncludeOrphans,
 	)
 	var total int
 	countQuery := "SELECT COUNT(*) FROM sessions WHERE " +
@@ -549,13 +450,14 @@ func (s *Store) GetSidebarSessionIndex(
 			fmt.Errorf("counting sidebar roots: %w", err)
 	}
 
-	where, args := buildPGSessionFilter(f)
+	where, args := db.BuildSessionFilterSQL(f, s.sessionDialect())
 	query := `
 		SELECT
 			id,
 			parent_session_id,
 			relationship_type,
 			project,
+			project_assigned,
 			machine,
 			agent,
 			agent_label,
@@ -599,18 +501,16 @@ func (s *Store) GetSidebarSessionIndex(
 func (s *Store) getSidebarSessionIndexPage(
 	ctx context.Context, f db.SessionFilter,
 ) (db.SidebarSessionIndex, error) {
-	if f.Limit <= 0 || f.Limit > db.MaxSessionLimit {
-		f.Limit = db.DefaultSessionLimit
-	}
+	f.Limit = db.NormalizeSessionLimit(f.Limit)
 
 	rootFilter := f
 	rootFilter.IncludeChildren = false
 	rootFilter.Cursor = ""
 	rootFilter.Starred = false
 	rootWhere, rootArgs := buildPGSessionBaseFilter(rootFilter)
-	canonicalRootWhere := db.BuildCanonicalRootWhere(db.PostgresQueryDialect(), "sessions", f.IncludeOrphans)
-	childAutomationPred := pgAutomatedScopePredicate(
-		normalizePGAutomatedScope(f.AutomatedScope, f.ExcludeAutomated),
+	canonicalRootWhere := db.BuildCanonicalRootWhere(s.sessionDialect(), "sessions", f.IncludeOrphans)
+	childAutomationPred := db.PostgresQueryDialect().AutomatedScopePredicate(
+		db.NormalizeAutomatedScope(f.AutomatedScope, f.ExcludeAutomated),
 		"s.is_automated",
 	)
 	childAutomationWhere := ""
@@ -642,7 +542,7 @@ func (s *Store) getSidebarSessionIndexPage(
 					UNION
 					SELECT t.root_id, s.id
 					FROM sessions s
-					JOIN tree t ON s.parent_session_id = t.id
+					JOIN tree t ON ` + s.sessionDialect().ParentRelation("s", "t") + `
 					WHERE s.message_count > 0
 					  AND s.deleted_at IS NULL
 					  ` + childAutomationWhere + `
@@ -692,7 +592,7 @@ func (s *Store) getSidebarSessionIndexPage(
 			UNION
 			SELECT t.root_id, s.id
 			FROM sessions s
-			JOIN tree t ON s.parent_session_id = t.id
+			JOIN tree t ON ` + s.sessionDialect().ParentRelation("s", "t") + `
 			WHERE s.message_count > 0
 			  AND s.deleted_at IS NULL
 			  ` + childAutomationWhere + `
@@ -781,7 +681,7 @@ func (s *Store) getSidebarSessionIndexPage(
 			UNION
 			SELECT s.id, t.ord
 			FROM sessions s
-			JOIN tree t ON s.parent_session_id = t.id
+			JOIN tree t ON ` + s.sessionDialect().ParentRelation("s", "t") + `
 			WHERE s.message_count > 0
 			  AND s.deleted_at IS NULL
 			  ` + childAutomationWhere + `
@@ -796,6 +696,7 @@ func (s *Store) getSidebarSessionIndexPage(
 			s.parent_session_id,
 			s.relationship_type,
 			s.project,
+			s.project_assigned,
 			s.machine,
 			s.agent,
 			s.agent_label,
@@ -844,6 +745,7 @@ func scanPGSidebarSessionIndexRows(
 			&row.ParentSessionID,
 			&row.RelationshipType,
 			&row.Project,
+			&row.ProjectAssigned,
 			&row.Machine,
 			&row.Agent,
 			&row.AgentLabel,
@@ -897,7 +799,7 @@ func (s *Store) GetSession(
 		id,
 	)
 	sess, err := scanPGSession(row)
-	if err == sql.ErrNoRows {
+	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
 	}
 	if err != nil {
@@ -910,7 +812,7 @@ func (s *Store) GetSession(
 
 // FindSessionIDsByRawSuffix returns up to limit session IDs whose
 // stored id is either the exact raw input or the raw input preceded
-// by an agent prefix. The suffix comparison is literal and results
+// by an agent or host prefix. The suffix comparison is literal and results
 // match SQLite ordering: exact match first, then most recent session.
 func (s *Store) FindSessionIDsByRawSuffix(
 	ctx context.Context, raw string, limit int,
@@ -924,7 +826,7 @@ func (s *Store) FindSessionIDsByRawSuffix(
 	rows, err := s.pg.QueryContext(ctx,
 		`SELECT id FROM sessions
 		 WHERE (id = $1
-		        OR RIGHT(id, LENGTH($1) + 1) = ':' || $1)
+		        OR RIGHT(id, LENGTH($1) + 1) IN (':' || $1, '~' || $1))
 		   AND deleted_at IS NULL
 		 ORDER BY (id = $1) DESC,
 		          COALESCE(ended_at, started_at, created_at) DESC
@@ -968,7 +870,7 @@ func (s *Store) GetSessionFull(
 		id,
 	)
 	sess, err := scanPGSession(row)
-	if err == sql.ErrNoRows {
+	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
 	}
 	if err != nil {

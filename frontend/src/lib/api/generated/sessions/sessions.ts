@@ -24,6 +24,7 @@ import type {
   GetApiV1SessionsByIdSearchPathParameters,
   GetApiV1SessionsByIdTimingPathParameters,
   GetApiV1SessionsByIdToolCallsPathParameters,
+  GetApiV1SessionsByIdToolSequencesPathParameters,
   GetApiV1SessionsByIdUsageParams,
   GetApiV1SessionsByIdUsagePathParameters,
   GetApiV1SessionsByIdWatchPathParameters,
@@ -52,12 +53,14 @@ import type {
   ServiceSessionList,
   ServiceToolCallList,
   SessionDirectoryResponse,
+  SessionToolSequencesResponse,
   SessionUsageResponse,
   TrashResponse,
   TrashSourceOutputBody,
   UploadSessionResponse,
 } from "../models";
 
+import { orvalRequest } from "../../runtime.ts";
 import { orvalFetch } from "../../runtime.ts";
 
 export const getGetApiV1EventsUrl = () => {
@@ -68,9 +71,9 @@ export const getGetApiV1EventsUrl = () => {
  * @summary Watch server events
  */
 export const getApiV1Events = async (
-  options?: Parameters<typeof orvalFetch>[1],
-): Promise<string> => {
-  return orvalFetch<string>(getGetApiV1EventsUrl(), {
+  options?: Parameters<typeof orvalRequest>[1],
+): Promise<Response> => {
+  return orvalRequest<Response>(getGetApiV1EventsUrl(), {
     ...options,
     method: "GET",
   });
@@ -150,8 +153,19 @@ export const postApiV1SessionsBatchDelete = async (
   ): Record<string, string | readonly string[]> => {
     if (!h) return {};
     if (h instanceof Headers) return Object.fromEntries(h.entries());
-    if (Array.isArray(h)) return Object.fromEntries(h);
-    return h;
+    if (Symbol.iterator in h) {
+      return Object.fromEntries(
+        Array.from(
+          h as Iterable<Iterable<string>>,
+          (entry) => Array.from(entry) as [string, string],
+        ),
+      );
+    }
+    const headers: Record<string, string | readonly string[]> = {};
+    for (const [name, value] of Object.entries<string | readonly string[] | undefined>(h)) {
+      if (value !== undefined) headers[name] = value;
+    }
+    return headers;
   };
   return orvalFetch<void>(getPostApiV1SessionsBatchDeleteUrl(), {
     ...options,
@@ -328,9 +342,9 @@ export const getGetApiV1SessionsByIdExportUrl = ({
  */
 export const getApiV1SessionsByIdExport = async (
   { id }: GetApiV1SessionsByIdExportPathParameters,
-  options?: Parameters<typeof orvalFetch>[1],
-): Promise<string> => {
-  return orvalFetch<string>(getGetApiV1SessionsByIdExportUrl({ id }), {
+  options?: Parameters<typeof orvalRequest>[1],
+): Promise<Response> => {
+  return orvalRequest<Response>(getGetApiV1SessionsByIdExportUrl({ id }), {
     ...options,
     method: "GET",
   });
@@ -361,9 +375,9 @@ export const getGetApiV1SessionsByIdMdUrl = (
 export const getApiV1SessionsByIdMd = async (
   { id }: GetApiV1SessionsByIdMdPathParameters,
   params?: GetApiV1SessionsByIdMdParams,
-  options?: Parameters<typeof orvalFetch>[1],
-): Promise<string> => {
-  return orvalFetch<string>(getGetApiV1SessionsByIdMdUrl({ id }, params), {
+  options?: Parameters<typeof orvalRequest>[1],
+): Promise<Response> => {
+  return orvalRequest<Response>(getGetApiV1SessionsByIdMdUrl({ id }, params), {
     ...options,
     method: "GET",
   });
@@ -421,8 +435,19 @@ export const postApiV1SessionsByIdOpen = async (
   ): Record<string, string | readonly string[]> => {
     if (!h) return {};
     if (h instanceof Headers) return Object.fromEntries(h.entries());
-    if (Array.isArray(h)) return Object.fromEntries(h);
-    return h;
+    if (Symbol.iterator in h) {
+      return Object.fromEntries(
+        Array.from(
+          h as Iterable<Iterable<string>>,
+          (entry) => Array.from(entry) as [string, string],
+        ),
+      );
+    }
+    const headers: Record<string, string | readonly string[]> = {};
+    for (const [name, value] of Object.entries<string | readonly string[] | undefined>(h)) {
+      if (value !== undefined) headers[name] = value;
+    }
+    return headers;
   };
   return orvalFetch<OpenSessionResponse>(getPostApiV1SessionsByIdOpenUrl({ id }), {
     ...options,
@@ -517,8 +542,19 @@ export const patchApiV1SessionsByIdRename = async (
   ): Record<string, string | readonly string[]> => {
     if (!h) return {};
     if (h instanceof Headers) return Object.fromEntries(h.entries());
-    if (Array.isArray(h)) return Object.fromEntries(h);
-    return h;
+    if (Symbol.iterator in h) {
+      return Object.fromEntries(
+        Array.from(
+          h as Iterable<Iterable<string>>,
+          (entry) => Array.from(entry) as [string, string],
+        ),
+      );
+    }
+    const headers: Record<string, string | readonly string[]> = {};
+    for (const [name, value] of Object.entries<string | readonly string[] | undefined>(h)) {
+      if (value !== undefined) headers[name] = value;
+    }
+    return headers;
   };
   return orvalFetch<DbSession>(getPatchApiV1SessionsByIdRenameUrl({ id }, params), {
     ...options,
@@ -566,8 +602,19 @@ export const postApiV1SessionsByIdResume = async (
   ): Record<string, string | readonly string[]> => {
     if (!h) return {};
     if (h instanceof Headers) return Object.fromEntries(h.entries());
-    if (Array.isArray(h)) return Object.fromEntries(h);
-    return h;
+    if (Symbol.iterator in h) {
+      return Object.fromEntries(
+        Array.from(
+          h as Iterable<Iterable<string>>,
+          (entry) => Array.from(entry) as [string, string],
+        ),
+      );
+    }
+    const headers: Record<string, string | readonly string[]> = {};
+    for (const [name, value] of Object.entries<string | readonly string[] | undefined>(h)) {
+      if (value !== undefined) headers[name] = value;
+    }
+    return headers;
   };
   return orvalFetch<ResumeResponse>(getPostApiV1SessionsByIdResumeUrl({ id }), {
     ...options,
@@ -667,6 +714,25 @@ export const postApiV1SessionsByIdTrashSource = async (
   });
 };
 
+export const getGetApiV1SessionsByIdToolSequencesUrl = ({
+  id,
+}: GetApiV1SessionsByIdToolSequencesPathParameters) => {
+  return `/api/v1/sessions/${encodeURIComponent(String(id))}/tool-sequences`;
+};
+
+/**
+ * @summary Get session tool sequences
+ */
+export const getApiV1SessionsByIdToolSequences = async (
+  { id }: GetApiV1SessionsByIdToolSequencesPathParameters,
+  options?: Parameters<typeof orvalFetch>[1],
+): Promise<SessionToolSequencesResponse> => {
+  return orvalFetch<SessionToolSequencesResponse>(getGetApiV1SessionsByIdToolSequencesUrl({ id }), {
+    ...options,
+    method: "GET",
+  });
+};
+
 export const getGetApiV1SessionsByIdUsageUrl = (
   { id }: GetApiV1SessionsByIdUsagePathParameters,
   params?: GetApiV1SessionsByIdUsageParams,
@@ -711,9 +777,9 @@ export const getGetApiV1SessionsByIdWatchUrl = ({
  */
 export const getApiV1SessionsByIdWatch = async (
   { id }: GetApiV1SessionsByIdWatchPathParameters,
-  options?: Parameters<typeof orvalFetch>[1],
-): Promise<string> => {
-  return orvalFetch<string>(getGetApiV1SessionsByIdWatchUrl({ id }), {
+  options?: Parameters<typeof orvalRequest>[1],
+): Promise<Response> => {
+  return orvalRequest<Response>(getGetApiV1SessionsByIdWatchUrl({ id }), {
     ...options,
     method: "GET",
   });

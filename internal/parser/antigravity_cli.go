@@ -4,7 +4,7 @@ import (
 	"bufio"
 	"context"
 	"crypto/sha256"
-	"database/sql"
+	"encoding/hex"
 	"encoding/json/jsontext"
 	"encoding/json/v2"
 	"fmt"
@@ -122,7 +122,7 @@ func (p *antigravityCLIProvider) parseSessionWithStatus(
 	// is available, so SourceVersion is never fabricated.
 	var sourceVersion string
 	if ext == ".db" {
-		dbResult, dbErr := loadAntigravityCLIDBSteps(path)
+		dbResult, dbErr := loadAntigravityCLIDBSteps(ctx, path)
 		sourceVersion = dbResult.sourceVersion
 		hasGenMetadata = dbResult.hasGenMetadata
 		// gen_metadata token usage describes the session's actual
@@ -380,11 +380,10 @@ func normalizeAntigravityCLIWorkspace(workspace string) string {
 	return ""
 }
 
-func loadAntigravityCLIDBSteps(
+func loadAntigravityCLIDBSteps(ctx context.Context,
 	path string,
 ) (antigravityStepLoadResult, error) {
-	dsn := "file:" + sqliteURIPath(path) + "?mode=ro&immutable=0"
-	db, err := sql.Open("sqlite3", dsn)
+	db, err := openSQLiteReadOnly(path, sqliteReadOptions{})
 	if err != nil {
 		return antigravityStepLoadResult{}, fmt.Errorf(
 			"open antigravity cli db %s: %w", path, err,
@@ -397,8 +396,8 @@ func loadAntigravityCLIDBSteps(
 	// agy-schema marker even when the step query fails and the parser falls
 	// back to the trajectory sidecar (antigravitySourceVersion returns "" when
 	// the schema itself is unreadable, so an undecodable .db is never labeled).
-	sourceVersion := antigravitySourceVersion(db)
-	result, err := loadAntigravityStepsWithRawCount(db)
+	sourceVersion := antigravitySourceVersion(ctx, db)
+	result, err := loadAntigravityStepsWithRawCount(ctx, db)
 	result.sourceVersion = sourceVersion
 	if err != nil {
 		return result, err
@@ -800,7 +799,7 @@ func decryptAntigravityCLITranscript(
 
 // AntigravityCLIFileInfo returns a fake os.FileInfo whose size and
 // mtime combine the session file with everything else the parser
-// renders: SQLite WAL/SHM siblings, the .trajectory.json sidecar,
+// renders: the SQLite WAL sibling, the .trajectory.json sidecar,
 // history.jsonl, cache/last_conversations.json, and the brain/<id> artifacts.
 // History and the workspace cache stay here while legacy sync skip checks use
 // this effective file info; provider hashes additionally scope tagged history
@@ -827,11 +826,12 @@ func antigravityCLICompanionPaths(path string) []string {
 	if base, ok := strings.CutSuffix(path, ".db"); ok {
 		// The trajectory sidecar is a transcript source for .db sessions
 		// too, so an agy-reader sync must change the fingerprint even when
-		// the database files themselves are untouched.
+		// the database files themselves are untouched. The -shm index is
+		// left out because the parse's own read-only open rewrites it; see
+		// sqliteDBJournalSuffixes.
 		companions := []string{
 			historyPath,
 			path + "-wal",
-			path + "-shm",
 			base + ".trajectory.json",
 		}
 		return append(companions, antigravityBrainCompanions(
@@ -880,7 +880,7 @@ func antigravityCLICombinedFileInfo(
 	mtime := base.ModTime().UnixNano()
 	for _, p := range companions {
 		info, err := os.Stat(p)
-		if err != nil {
+		if err != nil || !antigravityCompanionCounts(p, info) {
 			continue
 		}
 		size += info.Size()
@@ -893,6 +893,12 @@ func antigravityCLICombinedFileInfo(
 		size:  size,
 		mtime: mtime,
 	}
+}
+
+// antigravityCompanionCounts drops a frame-less WAL companion: reading the
+// database creates and deletes one, which must not look like a change.
+func antigravityCompanionCounts(path string, info os.FileInfo) bool {
+	return !strings.HasSuffix(path, "-wal") || sqliteWALInfoHasFrames(info)
 }
 
 func antigravityCompositeHash(path string, companions ...string) (string, error) {
@@ -925,7 +931,8 @@ func antigravityCompositeHashWithExtra(
 		}
 		prev = companion
 		info, err := os.Stat(companion)
-		if err != nil || info.IsDir() {
+		if err != nil || info.IsDir() ||
+			!antigravityCompanionCounts(companion, info) {
 			continue
 		}
 		if err := addAntigravityFingerprintPart(
@@ -942,7 +949,7 @@ func antigravityCompositeHashWithExtra(
 			return "", err
 		}
 	}
-	return fmt.Sprintf("%x", h.Sum(nil)), nil
+	return hex.EncodeToString(h.Sum(nil)), nil
 }
 
 func antigravityCLICompositeHash(path, id, workspace string) (string, error) {
@@ -1154,7 +1161,7 @@ func (c *agyTokenCount) UnmarshalJSON(data []byte) error {
 	if err != nil || n < 0 {
 		// Negative counts are garbage too: emitting them would
 		// subtract from session and daily usage totals.
-		return nil
+		return nil //nolint:nilerr // Malformed optional token counts do not invalidate the transcript.
 	}
 	*c = agyTokenCount(n)
 	return nil
@@ -1624,7 +1631,7 @@ func parseAntigravityCLITrajectory(
 				}
 			case "CORTEX_STEP_TYPE_LIST_DIRECTORY":
 				if step.ListDirectory != nil {
-					resultText = fmt.Sprintf("List directory: %s", step.ListDirectory.DirectoryPathURI)
+					resultText = "List directory: " + step.ListDirectory.DirectoryPathURI
 				}
 			case "CORTEX_STEP_TYPE_ERROR_MESSAGE":
 				if step.ErrorMessage != nil {
@@ -1672,7 +1679,7 @@ func parseAntigravityCLITrajectory(
 			cp := step.Checkpoint
 			var parts []string
 			if len(cp.UserRequests) > 0 {
-				parts = append(parts, fmt.Sprintf("User Requests: %s", strings.Join(cp.UserRequests, ", ")))
+				parts = append(parts, "User Requests: "+strings.Join(cp.UserRequests, ", "))
 			}
 			if cp.SessionSummary != "" {
 				parts = append(parts, cp.SessionSummary)

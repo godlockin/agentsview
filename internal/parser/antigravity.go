@@ -1,6 +1,7 @@
 package parser
 
 import (
+	"context"
 	"database/sql"
 	"encoding/binary"
 	"fmt"
@@ -32,12 +33,13 @@ var antigravityUUIDLikeRE = regexp.MustCompile(
 )
 
 // AntigravityFileInfo returns the effective file info for an IDE
-// session .db, combining the main file with its -wal/-shm sidecars,
+// session .db, combining the main file with its -wal sidecar,
 // the annotations/<id>.pbtxt sidecar, and the brain/<id> artifacts
 // the parse renders as messages. WAL-only commits and annotation or
 // brain updates do not touch the main file, so skip checks and
 // persisted file metadata must use this composite or live sessions
-// never reparse.
+// never reparse. The -shm index is left out; see
+// sqliteDBJournalSuffixes.
 func AntigravityFileInfo(path string) (os.FileInfo, error) {
 	info, err := os.Stat(path)
 	if err != nil {
@@ -50,17 +52,28 @@ func AntigravityFileInfo(path string) (os.FileInfo, error) {
 }
 
 func antigravityIDECompanionPaths(path string) []string {
+	if _, _, ok := antigravityBrainTranscriptConversation(path); ok {
+		// A brain transcript standing as its own session has no companions:
+		// it is the whole of what that session is parsed from.
+		return nil
+	}
 	id := strings.TrimSuffix(filepath.Base(path), ".db")
 	root := filepath.Dir(filepath.Dir(path))
 	companions := []string{
+		// No "-shm": the parse's own read-only open rewrites that index,
+		// so including it made every parse schedule the next one.
+		// Committed writes land in the main file or the -wal.
 		path + "-wal",
-		path + "-shm",
 		filepath.Join(root, "annotations", id+".pbtxt"),
 		// The agy-reader trajectory sidecar is a transcript source for
 		// IDE sessions too (see parseSession), so a sidecar write must
 		// change the fingerprint even when the database files themselves
 		// are untouched.
 		strings.TrimSuffix(path, ".db") + ".trajectory.json",
+		// The brain transcript is folded into this session's messages (see
+		// parseSession), so a transcript write must reparse the session even
+		// when the database files are untouched.
+		antigravityBrainTranscriptPath(root, id),
 	}
 	return append(companions, antigravityBrainCompanions(
 		filepath.Join(root, "brain", id),
@@ -70,9 +83,17 @@ func antigravityIDECompanionPaths(path string) []string {
 // parseSession parses one IDE session DB. It is owned by the
 // antigravityProvider; the package-level ParseAntigravitySession
 // entrypoint was folded onto the provider.
-func (p *antigravityProvider) parseSession(
+func (p *antigravityProvider) parseSession(ctx context.Context,
 	path, project, machine string,
 ) (*ParsedSession, []ParsedMessage, []ParsedUsageEvent, error) {
+	if _, id, ok := antigravityBrainTranscriptConversation(path); ok {
+		// A conversation with no database of its own: the brain's
+		// plaintext transcript is the session. It carries no token usage.
+		sess, msgs, err := parseAntigravityBrainTranscriptSession(
+			path, id, project, machine,
+		)
+		return sess, msgs, nil, err
+	}
 	info, err := os.Stat(path)
 	if err != nil {
 		return nil, nil, nil, fmt.Errorf("stat %s: %w", path, err)
@@ -87,8 +108,7 @@ func (p *antigravityProvider) parseSession(
 
 	// Open read-only; SQLite session files have WAL/SHM
 	// sidecars that the driver expects in the same dir.
-	dsn := "file:" + sqliteURIPath(path) + "?mode=ro&immutable=0"
-	db, err := sql.Open("sqlite3", dsn)
+	db, err := openSQLiteReadOnly(path, sqliteReadOptions{})
 	if err != nil {
 		return nil, nil, nil, fmt.Errorf(
 			"open antigravity db %s: %w", path, err,
@@ -99,9 +119,9 @@ func (p *antigravityProvider) parseSession(
 	// Schema-fingerprint label for the producing agy build. Computed from
 	// the open DB so IDE and CLI classify identically; empty when the
 	// schema cannot be read.
-	sourceVersion := antigravitySourceVersion(db)
+	sourceVersion := antigravitySourceVersion(ctx, db)
 
-	dbResult, err := loadAntigravityStepsWithRawCount(db)
+	dbResult, err := loadAntigravityStepsWithRawCount(ctx, db)
 	if err != nil {
 		// Fail closed on an unreadable steps table, deliberately: a
 		// covering sidecar cannot rescue an unreadable DB because
@@ -165,6 +185,16 @@ func (p *antigravityProvider) parseSession(
 			filepath.Join(root, "brain", id),
 		)...,
 	)
+	// The brain's own transcript of this conversation, when it wrote one. It is
+	// folded in here rather than stored as a second session so one conversation
+	// stays one session.
+	brainMessages, err := collectAntigravityBrainTranscriptMessages(
+		antigravityBrainTranscriptPath(root, id),
+	)
+	if err != nil && !os.IsNotExist(err) {
+		return nil, nil, nil, err
+	}
+	messages = append(messages, brainMessages...)
 
 	sort.SliceStable(messages, func(i, j int) bool {
 		return messages[i].Timestamp.Before(messages[j].Timestamp)
@@ -354,17 +384,17 @@ func roleForAntigravityStepKind(kind antigravityStepKind) RoleType {
 	}
 }
 
-func loadAntigravityStepsWithRawCount(
+func loadAntigravityStepsWithRawCount(ctx context.Context,
 	db *sql.DB,
 ) (antigravityStepLoadResult, error) {
-	generations := loadAntigravityGenerationMetadata(db)
-	executors := loadAntigravityExecutorMetadata(db)
+	generations := loadAntigravityGenerationMetadata(ctx, db)
+	executors := loadAntigravityExecutorMetadata(ctx, db)
 	result := antigravityStepLoadResult{
 		executors:      executors,
 		hasGenMetadata: len(generations) > 0,
 	}
-	rows, err := db.Query(
-		`SELECT idx, step_type, step_payload FROM steps ` +
+	rows, err := db.QueryContext(ctx,
+		`SELECT idx, step_type, step_payload FROM steps `+
 			`ORDER BY idx`,
 	)
 	if err != nil {
@@ -466,10 +496,10 @@ type antigravityExecutorMetadata struct {
 	modelName     string
 }
 
-func loadAntigravityGenerationMetadata(
+func loadAntigravityGenerationMetadata(ctx context.Context,
 	db *sql.DB,
 ) []antigravityGenerationMetadata {
-	rows, err := db.Query("SELECT idx, data FROM gen_metadata ORDER BY idx")
+	rows, err := db.QueryContext(ctx, "SELECT idx, data FROM gen_metadata ORDER BY idx")
 	if err != nil {
 		return nil
 	}
@@ -483,17 +513,19 @@ func loadAntigravityGenerationMetadata(
 		}
 		generation.stepIndices,
 			generation.hasStepIndices,
-			generation.stepIndicesValid =
-			extractAntigravityStepIndices(generation.data)
+			generation.stepIndicesValid = extractAntigravityStepIndices(generation.data)
 		generations = append(generations, generation)
+	}
+	if rows.Err() != nil {
+		return nil
 	}
 	return generations
 }
 
-func loadAntigravityExecutorMetadata(
+func loadAntigravityExecutorMetadata(ctx context.Context,
 	db *sql.DB,
 ) []antigravityExecutorMetadata {
-	rows, err := db.Query("SELECT data FROM executor_metadata ORDER BY idx")
+	rows, err := db.QueryContext(ctx, "SELECT data FROM executor_metadata ORDER BY idx")
 	if err != nil {
 		return nil
 	}
@@ -509,6 +541,9 @@ func loadAntigravityExecutorMetadata(
 		if ok {
 			executors = append(executors, executor)
 		}
+	}
+	if rows.Err() != nil {
+		return nil
 	}
 	sort.SliceStable(executors, func(i, j int) bool {
 		return executors[i].lastStepIndex < executors[j].lastStepIndex
@@ -938,8 +973,7 @@ func extractModelNameFromFields(
 func resolveAntigravityGenerationModel(
 	data []byte, executorModel string,
 ) string {
-	generationModel, hasDisplayLabel :=
-		extractAntigravityGenerationModel(data)
+	generationModel, hasDisplayLabel := extractAntigravityGenerationModel(data)
 	return resolveAntigravityModelName(
 		generationModel, executorModel, hasDisplayLabel,
 	)

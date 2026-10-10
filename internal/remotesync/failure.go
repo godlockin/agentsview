@@ -51,10 +51,7 @@ func FailureSummary(err error) string {
 				"incompatible remote-sync protocol versions; upgrade agentsview " +
 				"on both hosts"
 		default:
-			return fmt.Sprintf(
-				"HTTP remote sync failed: remote daemon returned %s",
-				statusLabel(statusErr.Code),
-			)
+			return "HTTP remote sync failed: remote daemon returned " + statusLabel(statusErr.Code)
 		}
 	}
 
@@ -76,9 +73,9 @@ func FailureSummary(err error) string {
 			"host name; check the url in this [[remote_hosts]] entry"
 	}
 
-	var netErr net.Error
+	netErr, hasNetErr := errors.AsType[net.Error](err)
 	if errors.Is(err, context.DeadlineExceeded) ||
-		(errors.As(err, &netErr) && netErr.Timeout()) {
+		(hasNetErr && netErr.Timeout()) {
 		return "HTTP remote sync failed: connection timed out; check " +
 			"that the remote host is reachable and the url is correct"
 	}
@@ -97,9 +94,16 @@ func IsHostUnavailable(err error) bool {
 	if _, ok := errors.AsType[*PendingCleanupError](err); ok {
 		return false
 	}
-	var cleanup cleanupRetrier
-	if errors.As(err, &cleanup) {
+	if _, ok := errors.AsType[interface {
+		error
+		cleanupRetrier
+	}](err); ok {
 		return false
+	}
+	// Private-network names may stop resolving while the network is offline.
+	// Treat this like an unreachable host so other sources can still sync.
+	if _, ok := errors.AsType[*net.DNSError](err); ok {
+		return true
 	}
 	if errors.Is(err, context.DeadlineExceeded) ||
 		errors.Is(err, syscall.ECONNREFUSED) ||
@@ -124,8 +128,8 @@ func IsHostUnavailable(err error) bool {
 			return true
 		}
 	}
-	var netErr net.Error
-	if !errors.As(err, &netErr) || netErr == nil {
+	netErr, hasNetErr := errors.AsType[net.Error](err)
+	if !hasNetErr || netErr == nil {
 		return false
 	}
 	return netErr.Timeout()

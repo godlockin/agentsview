@@ -107,6 +107,19 @@ func (c *Capturer) Capture(
 	provider parser.Provider,
 	source parser.SourceRef,
 ) (result Result, resultErr error) {
+	return c.capture(ctx, provider, source, "")
+}
+
+// CaptureForBackfill uses the ordinary capture pipeline and binds membership at
+// publication. Already-bound sources keep their exact generation after appends.
+func (c *Capturer) CaptureForBackfill(ctx context.Context, provider parser.Provider, source parser.SourceRef, runID string) (Result, error) {
+	if runID == "" {
+		return Result{}, rawcheckpoint.ErrBackfillConflict
+	}
+	return c.capture(ctx, provider, source, runID)
+}
+
+func (c *Capturer) capture(ctx context.Context, provider parser.Provider, source parser.SourceRef, runID string) (result Result, resultErr error) {
 	if err := ctx.Err(); err != nil {
 		return Result{}, err
 	}
@@ -127,6 +140,18 @@ func (c *Capturer) Capture(
 		Provider:         source.Provider,
 		ConfiguredRootID: root.ID,
 		SourceKey:        plan.SourceKey,
+	}
+	if runID != "" {
+		member, found, err := c.store.BackfillSource(ctx, runID, identity)
+		if err != nil {
+			return Result{}, err
+		}
+		if found {
+			if member.Status == "invalidated" {
+				return Result{}, rawcheckpoint.ErrBackfillIncomplete
+			}
+			return Result{Status: StatusUnchanged, CaptureID: member.CaptureID, Source: identity}, nil
+		}
 	}
 	var reservation rawcheckpoint.Reservation
 	committed := false
@@ -299,13 +324,21 @@ func (c *Capturer) Capture(
 				return Result{}, err
 			}
 		}
-		if err := c.store.CompleteUnchangedCapture(
-			ctx, reservation.ID, identity, base.CaptureID, base.ObservationRevision,
-		); err != nil {
-			return Result{}, err
+		var publishErr error
+		if runID == "" {
+			publishErr = c.store.CompleteUnchangedCapture(ctx, reservation.ID, identity, base.CaptureID, base.ObservationRevision)
+		} else {
+			publishErr = c.store.CompleteUnchangedCaptureForBackfill(ctx, reservation.ID, identity, base.CaptureID, base.ObservationRevision, runID)
+		}
+		if publishErr != nil {
+			return Result{}, publishErr
 		}
 		committed = true
-		return Result{Status: StatusUnchanged, Source: identity}, nil
+		unchanged := Result{Status: StatusUnchanged, Source: identity}
+		if runID != "" {
+			unchanged.CaptureID = base.CaptureID
+		}
+		return unchanged, nil
 	}
 	if base.PermanentlyRejected {
 		assessment = c.fullAssessment(observed, sourceBytes)
@@ -405,8 +438,14 @@ func (c *Capturer) Capture(
 		Kind:                 rawsync.ManifestSnapshot,
 		Entries:              entries,
 	}
-	if err := c.store.CommitCapture(ctx, reservation.ID, generation); err != nil {
-		return Result{}, err
+	var publishErr error
+	if runID == "" {
+		publishErr = c.store.CommitCapture(ctx, reservation.ID, generation)
+	} else {
+		publishErr = c.store.CommitCaptureForBackfill(ctx, reservation.ID, generation, runID)
+	}
+	if publishErr != nil {
+		return Result{}, publishErr
 	}
 	committed = true
 	finishPublication()
@@ -506,7 +545,7 @@ func (c *Capturer) observePlan(
 		pathInfo, err := c.files.stat(entry.planned.LocalPath)
 		if err != nil {
 			closeObservedEntries(observed)
-			if sourcePathChangedError(err) {
+			if errors.Is(err, os.ErrNotExist) {
 				return nil, 0, ErrSourceChanged
 			}
 			return nil, 0, fmt.Errorf(
@@ -518,10 +557,13 @@ func (c *Capturer) observePlan(
 			closeObservedEntries(observed)
 			return nil, 0, ErrSourceChanged
 		}
-		file, err := entry.root.Open(entry.relative)
+		file, err := c.files.openRoot(entry.root, entry.relative)
 		if err != nil {
 			closeObservedEntries(observed)
-			if sourcePathChangedError(err) {
+			// A path can be replaced between the rooted check and open. Check
+			// its identity again instead of classifying an upstream error by text.
+			currentInfo, statErr := entry.root.Lstat(entry.relative)
+			if errors.Is(err, os.ErrNotExist) || statErr != nil || !os.SameFile(rootedInfo, currentInfo) {
 				return nil, 0, ErrSourceChanged
 			}
 			return nil, 0, fmt.Errorf(
@@ -555,15 +597,11 @@ func (c *Capturer) observePlan(
 		sourceBytes += info.Size()
 		observed = append(observed, observedCaptureEntry{
 			planned: entry.planned, root: entry.root, relative: entry.relative,
-			file: file, info: info, identity: identity, checkpointIdentity: identity,
+			file: file, info: info, identity: identity,
+			checkpointIdentity: checkpointFileIdentity(file, info),
 		})
 	}
 	return observed, sourceBytes, nil
-}
-
-func sourcePathChangedError(err error) bool {
-	return errors.Is(err, os.ErrNotExist) ||
-		sanitizeFilesystemError(err).Error() == "path escapes from parent"
 }
 
 func (c *Capturer) assessCapture(

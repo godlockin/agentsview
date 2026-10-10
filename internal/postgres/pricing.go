@@ -23,165 +23,16 @@ type pricingLoad struct {
 	err     error
 }
 
-func fallbackPricingRows() []db.ModelPricing {
-	src := pricing.FallbackPricing()
-	out := make([]db.ModelPricing, len(src))
-	for i, p := range src {
-		bands := make([]db.PricingBand, len(p.Bands))
-		for j, band := range p.Bands {
-			bands[j] = db.PricingBand{
-				AboveInputTokens:       band.AboveInputTokens,
-				InputPerMTok:           band.InputPerMTok,
-				OutputPerMTok:          band.OutputPerMTok,
-				CacheCreationPerMTok:   band.CacheCreationPerMTok,
-				CacheCreation1hPerMTok: band.CacheCreation1hPerMTok,
-				CacheReadPerMTok:       band.CacheReadPerMTok,
-			}
-		}
-		out[i] = db.ModelPricing{
-			ModelPattern:           p.ModelPattern,
-			InputPerMTok:           p.InputPerMTok,
-			OutputPerMTok:          p.OutputPerMTok,
-			CacheCreationPerMTok:   p.CacheCreationPerMTok,
-			CacheCreation1hPerMTok: p.CacheCreation1hPerMTok,
-			CacheReadPerMTok:       p.CacheReadPerMTok,
-			Bands:                  bands,
-		}
-	}
-	return out
-}
-
 func pricingRowsToMap(prices []db.ModelPricing) map[string]export.ModelRates {
-	fallback := pgFallbackRateMap()
+	fallback := db.FallbackRateMap()
 	out := make(map[string]export.ModelRates, len(prices))
 	for _, p := range prices {
 		if strings.HasPrefix(p.ModelPattern, "_") {
 			continue
 		}
-		rates := pgModelPricingRates(p)
-		rates.Source = pgModelPricingSource(p, fallback)
+		rates := db.ModelPricingRates(p)
+		rates.Source = db.ModelPricingSource(p.ModelPattern, rates, fallback)
 		out[p.ModelPattern] = rates
-	}
-	return out
-}
-
-func pgFallbackRateMap() map[string]export.ModelRates {
-	src := pricing.FallbackPricing()
-	out := make(map[string]export.ModelRates, len(src))
-	for _, p := range src {
-		out[p.ModelPattern] = export.ModelRates{
-			InputPerMTok:        p.InputPerMTok,
-			OutputPerMTok:       p.OutputPerMTok,
-			CacheWritePerMTok:   p.CacheCreationPerMTok,
-			CacheWrite1hPerMTok: p.CacheCreation1hPerMTok,
-			CacheReadPerMTok:    p.CacheReadPerMTok,
-			Source:              export.PricingRowSourceEmbedded,
-			Bands:               pgCatalogPricingBands(p.Bands),
-		}
-	}
-	return out
-}
-
-func pgModelPricingRates(p db.ModelPricing) export.ModelRates {
-	var updatedAt *time.Time
-	if p.UpdatedAt != "" {
-		if parsed, err := time.Parse(time.RFC3339Nano, p.UpdatedAt); err == nil {
-			t := parsed.UTC()
-			updatedAt = &t
-		}
-	}
-	return export.ModelRates{
-		InputPerMTok:        p.InputPerMTok,
-		OutputPerMTok:       p.OutputPerMTok,
-		CacheWritePerMTok:   p.CacheCreationPerMTok,
-		CacheWrite1hPerMTok: p.CacheCreation1hPerMTok,
-		CacheReadPerMTok:    p.CacheReadPerMTok,
-		UpdatedAt:           updatedAt,
-		Bands:               pgStoredPricingBands(p.Bands),
-	}
-}
-
-func pgCatalogPricingBands(bands []pricing.PricingBand) []export.PricingBand {
-	out := make([]export.PricingBand, len(bands))
-	for i, band := range bands {
-		out[i] = export.PricingBand{
-			AboveInputTokens:    band.AboveInputTokens,
-			InputPerMTok:        band.InputPerMTok,
-			OutputPerMTok:       band.OutputPerMTok,
-			CacheWritePerMTok:   band.CacheCreationPerMTok,
-			CacheWrite1hPerMTok: band.CacheCreation1hPerMTok,
-			CacheReadPerMTok:    band.CacheReadPerMTok,
-		}
-	}
-	return out
-}
-
-func pgStoredPricingBands(bands []db.PricingBand) []export.PricingBand {
-	out := make([]export.PricingBand, len(bands))
-	for i, band := range bands {
-		var updatedAt *time.Time
-		if parsed, err := time.Parse(time.RFC3339Nano, band.UpdatedAt); err == nil {
-			t := parsed.UTC()
-			updatedAt = &t
-		}
-		out[i] = export.PricingBand{
-			AboveInputTokens:    band.AboveInputTokens,
-			InputPerMTok:        band.InputPerMTok,
-			OutputPerMTok:       band.OutputPerMTok,
-			CacheWritePerMTok:   band.CacheCreationPerMTok,
-			CacheWrite1hPerMTok: band.CacheCreation1hPerMTok,
-			CacheReadPerMTok:    band.CacheReadPerMTok,
-			UpdatedAt:           updatedAt,
-		}
-	}
-	return out
-}
-
-func pgModelPricingSource(
-	p db.ModelPricing, fallback map[string]export.ModelRates,
-) export.PricingRowSource {
-	if rates, ok := fallback[p.ModelPattern]; ok &&
-		rates.InputPerMTok == p.InputPerMTok &&
-		rates.OutputPerMTok == p.OutputPerMTok &&
-		rates.CacheWritePerMTok == p.CacheCreationPerMTok &&
-		rates.CacheWrite1hPerMTok == p.CacheCreation1hPerMTok &&
-		rates.CacheReadPerMTok == p.CacheReadPerMTok &&
-		pgPricingBandsEqual(rates.Bands, pgStoredPricingBands(p.Bands)) {
-		return export.PricingRowSourceEmbedded
-	}
-	return export.PricingRowSourceFetched
-}
-
-func pgPricingBandsEqual(a, b []export.PricingBand) bool {
-	if len(a) != len(b) {
-		return false
-	}
-	for i := range a {
-		if a[i].AboveInputTokens != b[i].AboveInputTokens ||
-			a[i].InputPerMTok != b[i].InputPerMTok ||
-			a[i].OutputPerMTok != b[i].OutputPerMTok ||
-			a[i].CacheWritePerMTok != b[i].CacheWritePerMTok ||
-			a[i].CacheWrite1hPerMTok != b[i].CacheWrite1hPerMTok ||
-			a[i].CacheReadPerMTok != b[i].CacheReadPerMTok {
-			return false
-		}
-	}
-	return true
-}
-
-func fallbackPricingMap() map[string]export.ModelRates {
-	return pricingRowsToMap(fallbackPricingRows())
-}
-
-func pricingMapRows(
-	in map[string]export.ModelRates,
-) []export.EffectivePricingRow {
-	out := make([]export.EffectivePricingRow, 0, len(in))
-	for pattern, rates := range in {
-		out = append(out, export.EffectivePricingRow{
-			ModelPattern: pattern,
-			Rates:        rates,
-		})
 	}
 	return out
 }
@@ -199,14 +50,6 @@ func clonePricingRows(
 
 type pgGenAIPricingQuerier interface {
 	QueryRowContext(context.Context, string, ...any) *sql.Row
-}
-
-func embeddedPGGenAIPricingDocument() db.GenAIPricingDocument {
-	embedded := pricing.EmbeddedGenAIDocument()
-	return db.GenAIPricingDocument{
-		Version: embedded.Version, SourceRef: embedded.SourceRef,
-		Source: db.GenAIPricingSourceEmbedded, Data: embedded.RawJSON(),
-	}
 }
 
 func loadPGGenAIPricing(
@@ -307,14 +150,14 @@ func (s *Store) runPricingLoad(ctx context.Context, load *pricingLoad) {
 	out := map[string]export.ModelRates{}
 	dbRows, err := s.mergeDBPricing(ctx, out)
 	if err == nil && dbRows == 0 {
-		out = fallbackPricingMap()
+		out = db.FallbackPricingMap()
 	}
 	var prices []export.EffectivePricingRow
 	if err == nil {
 		s.pricingMu.Lock()
 		s.applyCustomPricing(out)
 		s.pricingMu.Unlock()
-		prices = pricingMapRows(out)
+		prices = db.PricingMapRows(out)
 		var document *db.GenAIPricingDocument
 		document, err = loadPGGenAIPricing(ctx, s.pg)
 		if err == nil {
@@ -379,14 +222,14 @@ func (s *Store) mergeDBPricing(
 	if err != nil {
 		return 0, err
 	}
-	fallback := pgFallbackRateMap()
+	fallback := db.FallbackRateMap()
 	usableRows := 0
 	for _, p := range prices {
 		if strings.HasPrefix(p.ModelPattern, "_") {
 			continue
 		}
-		rates := pgModelPricingRates(p)
-		rates.Source = pgModelPricingSource(p, fallback)
+		rates := db.ModelPricingRates(p)
+		rates.Source = db.ModelPricingSource(p.ModelPattern, rates, fallback)
 		out[p.ModelPattern] = rates
 		usableRows++
 	}
@@ -416,13 +259,9 @@ func (s *Store) applyCustomPricing(out map[string]export.ModelRates) {
 				Microdollars: cp.CacheReadMicrodollarsPerMTok,
 			},
 		}
-		rates.Source = pgCustomPricingSource()
+		rates.Source = export.PricingRowSourceCustom
 		out[model] = rates
 	}
-}
-
-func pgCustomPricingSource() export.PricingRowSource {
-	return export.PricingRowSourceCustom
 }
 
 const pricingUpsertBatch = 100
@@ -777,34 +616,41 @@ func upsertPGModelPricing(
 	defaultUpdatedAt := time.Now().UTC().Format(time.RFC3339Nano)
 	baseChanged := make(map[string]struct{}, len(prices))
 	for i := 0; i < len(prices); i += pricingUpsertBatch {
-		end := min(i+pricingUpsertBatch, len(prices))
-		query, args := pgPricingUpsertStatement(
-			prices[i:end], defaultUpdatedAt,
-		)
-		rows, err := tx.QueryContext(ctx, query, args...)
-		if err != nil {
-			return fmt.Errorf(
-				"upserting pg pricing batch starting at %d: %w",
-				i, err,
+		if err := func() error {
+			end := min(i+pricingUpsertBatch, len(prices))
+			query, args := pgPricingUpsertStatement(
+				prices[i:end], defaultUpdatedAt,
 			)
-		}
-		for rows.Next() {
-			var modelPattern string
-			if err := rows.Scan(&modelPattern); err != nil {
+			rows, err := tx.QueryContext(ctx, query, args...)
+			if err != nil {
+				return fmt.Errorf(
+					"upserting pg pricing batch starting at %d: %w",
+					i, err,
+				)
+			}
+			defer rows.Close()
+			for rows.Next() {
+				var modelPattern string
+				if err := rows.Scan(&modelPattern); err != nil {
+					rows.Close()
+					return fmt.Errorf(
+						"scanning changed pg pricing at batch %d: %w", i, err)
+				}
+				baseChanged[modelPattern] = struct{}{}
+			}
+			if err := rows.Err(); err != nil {
 				rows.Close()
 				return fmt.Errorf(
-					"scanning changed pg pricing at batch %d: %w", i, err)
+					"iterating changed pg pricing at batch %d: %w", i, err)
 			}
-			baseChanged[modelPattern] = struct{}{}
-		}
-		if err := rows.Err(); err != nil {
-			rows.Close()
-			return fmt.Errorf(
-				"iterating changed pg pricing at batch %d: %w", i, err)
-		}
-		if err := rows.Close(); err != nil {
-			return fmt.Errorf(
-				"closing changed pg pricing at batch %d: %w", i, err)
+			if err := rows.Close(); err != nil {
+				return fmt.Errorf(
+					"closing changed pg pricing at batch %d: %w", i, err)
+			}
+
+			return nil
+		}(); err != nil {
+			return err
 		}
 	}
 	bandOnlyPrices := make([]db.ModelPricing, 0, len(prices))
@@ -856,28 +702,6 @@ func upsertPGModelPricing(
 // for the life of its transaction.
 const pricingSyncLockKey = "model_pricing_sync_lock"
 
-// lockPGModelPricing serializes concurrent pricing syncs by locking a
-// dedicated sync_metadata row until tx ends. A row lock is used instead
-// of pg_advisory_xact_lock because supported CockroachDB versions do not
-// implement advisory locks, and sync_metadata lives in the target
-// schema, so the lock is schema-scoped on both engines.
-func lockPGModelPricing(ctx context.Context, tx *sql.Tx) error {
-	if _, err := tx.ExecContext(ctx,
-		`INSERT INTO sync_metadata (key, value) VALUES ($1, '')
-		 ON CONFLICT (key) DO NOTHING`,
-		pricingSyncLockKey,
-	); err != nil {
-		return fmt.Errorf("creating pg model pricing lock row: %w", err)
-	}
-	if _, err := tx.ExecContext(ctx,
-		`SELECT value FROM sync_metadata WHERE key = $1 FOR UPDATE`,
-		pricingSyncLockKey,
-	); err != nil {
-		return fmt.Errorf("locking pg model pricing: %w", err)
-	}
-	return nil
-}
-
 func upsertPGGenAIPricing(
 	ctx context.Context, tx *sql.Tx, document db.GenAIPricingDocument,
 ) error {
@@ -906,14 +730,14 @@ func (s *Sync) syncModelPricing(ctx context.Context) error {
 		return fmt.Errorf("listing local model pricing: %w", err)
 	}
 	if len(prices) == 0 {
-		prices = fallbackPricingRows()
+		prices = db.FallbackMirrorPricingRows("")
 	}
 	localGenAI, err := s.local.GetGenAIPricing(ctx)
 	if err != nil {
 		return fmt.Errorf("reading local GenAI pricing document: %w", err)
 	}
 	if localGenAI == nil {
-		embedded := embeddedPGGenAIPricingDocument()
+		embedded := db.EmbeddedGenAIPricingDocument()
 		localGenAI = &embedded
 	}
 	tx, err := s.pg.BeginTx(ctx, nil)
@@ -925,8 +749,8 @@ func (s *Sync) syncModelPricing(ctx context.Context) error {
 	// each write a merged copy, so read, plan, and write are serialized
 	// under one lock; otherwise a slower push could overwrite ownership a
 	// faster one recorded and leave its rows untracked.
-	if err := lockPGModelPricing(ctx, tx); err != nil {
-		return err
+	if err := lockSyncMetadataRow(ctx, tx, pricingSyncLockKey); err != nil {
+		return fmt.Errorf("locking pg model pricing: %w", err)
 	}
 	existing, err := listPGModelPricing(ctx, tx)
 	if err != nil {

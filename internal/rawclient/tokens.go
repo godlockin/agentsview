@@ -2,22 +2,19 @@ package rawclient
 
 import (
 	"context"
-	"fmt"
-	"net/http"
+	"errors"
 	"sync"
 	"time"
+
+	"go.kenn.io/agentsview/internal/apiclient"
 )
 
-// tokenScopes is the exact scope set the transport needs; the status scope
-// has no server route yet and is not requested.
-var tokenScopes = []string{"negotiate", "upload", "commit"}
-
-type tokenResponse struct {
-	Token     string    `json:"token"`
-	DeviceID  string    `json:"device_id"`
-	Scopes    []string  `json:"scopes"`
-	ExpiresAt time.Time `json:"expires_at"`
-}
+var (
+	// tokenScopes covers NewClient's upload operations. NewStatusClient requests
+	// only status through the token endpoint.
+	tokenScopes       = []string{"negotiate", "upload", "commit"}
+	statusTokenScopes = []string{"status"}
+)
 
 // tokenProvider caches one live device token and refreshes it with
 // single-flight semantics before the server-side expiry margin.
@@ -26,6 +23,7 @@ type tokenProvider struct {
 	deviceID   string
 	credential string
 	margin     time.Duration
+	scopes     []string
 
 	mu      sync.Mutex
 	current string
@@ -37,10 +35,11 @@ func newTokenProvider(
 	client *Client,
 	deviceID, credential string,
 	margin time.Duration,
+	scopes []string,
 ) *tokenProvider {
 	return &tokenProvider{
 		client: client, deviceID: deviceID, credential: credential,
-		margin: margin, refresh: make(chan struct{}, 1),
+		margin: margin, scopes: scopes, refresh: make(chan struct{}, 1),
 	}
 }
 
@@ -87,27 +86,21 @@ func (p *tokenProvider) cached() (string, bool) {
 }
 
 // exchange trades the device credential for a fresh scoped token and caches
-// it. It goes through rawRequest, never do: do prefetches an avdt token and
+// it. It goes through request, never do: do prefetches an avdt token and
 // would recurse into this provider.
 func (p *tokenProvider) exchange(ctx context.Context) (string, error) {
-	body := struct {
-		Scopes []string `json:"scopes"`
-	}{Scopes: tokenScopes}
-	resp, err := p.client.rawRequest(ctx, http.MethodPost, "/api/v1/raw-sync/tokens",
-		http.Header{
-			"Authorization":          []string{"Bearer " + p.credential},
-			"X-AgentsView-Device-ID": []string{p.deviceID},
-		}, body)
+	response, err := p.client.request(func(api *apiclient.Client) (*apiclient.PostAPIV1RawSyncTokensResp, error) {
+		return api.PostAPIV1RawSyncTokensWithResponse(ctx, &apiclient.PostAPIV1RawSyncTokensRequestOptions{
+			Body:   &apiclient.RawSyncTokenInputBody{Scopes: p.scopes},
+			Header: &apiclient.PostAPIV1RawSyncTokensHeaders{Authorization: new("Bearer " + p.credential), XAgentsViewDeviceID: new(p.deviceID)},
+		})
+	}, "")
 	if err != nil {
 		return "", err
 	}
-	defer resp.Body.Close()
-	var issued tokenResponse
-	if err := jsonDecode(resp.Body, &issued); err != nil {
-		return "", fmt.Errorf("rawclient: decode token response: %w", err)
-	}
+	issued := response.JSON200
 	if issued.Token == "" || issued.DeviceID != p.deviceID {
-		return "", fmt.Errorf("rawclient: token response identity mismatch")
+		return "", errors.New("rawclient: token response identity mismatch")
 	}
 	p.mu.Lock()
 	p.current = issued.Token

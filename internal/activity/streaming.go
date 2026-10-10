@@ -237,7 +237,7 @@ func BuildCandidateArtifactsFromSource(
 	usage []UsageRow,
 ) (CandidateArtifacts, error) {
 	return buildCandidateArtifactsFromSource(
-		ctx, p, sessions, source, usage, false,
+		ctx, p, sessions, source, usage, false, nil,
 	)
 }
 
@@ -253,7 +253,7 @@ func BuildCandidateArtifactsFromSourceWithSurvivorUsage(
 	usage []UsageRow,
 ) (CandidateArtifacts, error) {
 	return buildCandidateArtifactsFromSource(
-		ctx, p, sessions, source, usage, true,
+		ctx, p, sessions, source, usage, true, nil,
 	)
 }
 
@@ -264,6 +264,7 @@ func buildCandidateArtifactsFromSource(
 	source CandidateSource,
 	usage []UsageRow,
 	usageIsSurvivorSet bool,
+	joint *jointActivityAccumulator,
 ) (CandidateArtifacts, error) {
 	windows := rangeWindows(p)
 	membershipWindows := secondPrecisionWindows(windows)
@@ -316,6 +317,9 @@ func buildCandidateArtifactsFromSource(
 			&report, windows, membershipWindows, aggregates, membership, words,
 			kindBy, iv,
 		)
+		if joint != nil {
+			joint.add(iv)
+		}
 		return nil
 	})
 	if err != nil {
@@ -384,14 +388,15 @@ type activeCandidateEnd struct {
 
 type activeCandidateHeap []activeCandidateEnd
 
-func (h activeCandidateHeap) Len() int { return len(h) }
-func (h activeCandidateHeap) Less(i, j int) bool {
-	return h[i].end.Before(h[j].end)
+func (h *activeCandidateHeap) Len() int { return len(*h) }
+func (h *activeCandidateHeap) Less(i, j int) bool {
+	return (*h)[i].end.Before((*h)[j].end)
 }
-func (h activeCandidateHeap) Swap(i, j int) { h[i], h[j] = h[j], h[i] }
+func (h *activeCandidateHeap) Swap(i, j int) { (*h)[i], (*h)[j] = (*h)[j], (*h)[i] }
 func (h *activeCandidateHeap) Push(value any) {
 	*h = append(*h, value.(activeCandidateEnd))
 }
+
 func (h *activeCandidateHeap) Pop() any {
 	old := *h
 	value := old[len(old)-1]

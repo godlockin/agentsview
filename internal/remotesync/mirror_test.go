@@ -1,7 +1,6 @@
 package remotesync
 
 import (
-	"context"
 	"os"
 	"path/filepath"
 	"strings"
@@ -22,6 +21,7 @@ func TestMirrorDirDisambiguatesSanitizedCollisions(t *testing.T) {
 
 func writeMirrorFile(t *testing.T, root, remotePath, content string, mtime time.Time) string {
 	t.Helper()
+
 	local, err := safeRemappedRemotePath(root, remotePath)
 	require.NoError(t, err)
 	require.NoError(t, os.MkdirAll(filepath.Dir(local), 0o755))
@@ -115,48 +115,39 @@ func TestApplyMirrorDeletionsPrunesEmptyDirs(t *testing.T) {
 }
 
 func TestAcquireMirrorLockIsExclusive(t *testing.T) {
-	root := filepath.Join(t.TempDir(), "mirror")
-	lock, err := AcquireMirrorLock(context.Background(), root)
-	require.NoError(t, err)
-	t.Cleanup(func() { _ = lock.Close() })
-
-	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
-	defer cancel()
-	_, err = AcquireMirrorLock(ctx, root)
-	require.Error(t, err)
-
-	require.NoError(t, lock.Close())
-	second, err := AcquireMirrorLock(context.Background(), root)
-	require.NoError(t, err)
-	require.NoError(t, second.Close())
-}
-
-func TestAcquireMirrorLockCanonicalizesSymlinkedParent(t *testing.T) {
-	base := t.TempDir()
-	realParent := filepath.Join(base, "real")
-	require.NoError(t, os.MkdirAll(realParent, 0o755))
-	linkParent := filepath.Join(base, "link")
-	if err := os.Symlink(realParent, linkParent); err != nil {
-		t.Skipf("symlinks unavailable: %v", err)
+	tests := map[string]func(t *testing.T, base string) (root, contender string){
+		"same path": func(_ *testing.T, base string) (string, string) {
+			root := filepath.Join(base, "mirror")
+			return root, root
+		},
+		// Symlink aliases must contend on one canonical lock.
+		"symlinked parent": func(t *testing.T, base string) (string, string) {
+			t.Helper()
+			realParent := filepath.Join(base, "real")
+			require.NoError(t, os.MkdirAll(realParent, 0o755))
+			linkParent := filepath.Join(base, "link")
+			if err := os.Symlink(realParent, linkParent); err != nil {
+				t.Skipf("symlinks unavailable: %v", err)
+			}
+			return filepath.Join(realParent, "data", "remote-mirrors", "shared"),
+				filepath.Join(linkParent, "data", "remote-mirrors", "shared")
+		},
 	}
-	realRoot := filepath.Join(realParent, "data", "remote-mirrors", "shared")
-	aliasRoot := filepath.Join(linkParent, "data", "remote-mirrors", "shared")
-	lock, err := AcquireMirrorLock(context.Background(), realRoot)
-	require.NoError(t, err)
-	t.Cleanup(func() { _ = lock.Close() })
+	for name, paths := range tests {
+		t.Run(name, func(t *testing.T) {
+			root, contender := paths(t, t.TempDir())
+			lock, err := AcquireMirrorLock(t.Context(), root)
+			require.NoError(t, err)
+			t.Cleanup(func() { _ = lock.Close() })
 
-	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
-	aliasLock, err := AcquireMirrorLock(ctx, aliasRoot)
-	cancel()
-	if aliasLock != nil {
-		require.NoError(t, aliasLock.Close())
+			assertMirrorLocked(t, contender)
+
+			require.NoError(t, lock.Close())
+			second, err := AcquireMirrorLock(t.Context(), contender)
+			require.NoError(t, err)
+			require.NoError(t, second.Close())
+		})
 	}
-	assert.Error(t, err, "symlink aliases must contend on one canonical lock")
-
-	require.NoError(t, lock.Close())
-	aliasLock, err = AcquireMirrorLock(context.Background(), aliasRoot)
-	require.NoError(t, err)
-	require.NoError(t, aliasLock.Close())
 }
 
 func TestRemoveMirrorTypeConflictsRemovesDirAtFetchPath(t *testing.T) {

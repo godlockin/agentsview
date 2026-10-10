@@ -2,6 +2,7 @@ package db
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sort"
 
@@ -64,7 +65,7 @@ func (db *DB) assembleDailyUsageFacts(
 	accum := make(map[usageCostAllocationKey]*usageDailyFactsBucket)
 	sessionCosts := make(map[string]usageDailyFactsSessionCost)
 	projectLabels := make(map[string]struct{})
-	useAuthoritative := filter.Model == "" && filter.ExcludeModel == ""
+	useAuthoritative := !filter.HasModelFilter()
 	var totalSavings money.Money
 
 	for _, group := range facts.Groups {
@@ -129,8 +130,7 @@ func (db *DB) assembleDailyUsageFacts(
 		for key, cost := range costs {
 			bucket := accum[key]
 			if bucket == nil {
-				return DailyUsageResult{}, fmt.Errorf(
-					"daily usage cost has no token bucket")
+				return DailyUsageResult{}, errors.New("daily usage cost has no token bucket")
 			}
 			var addErr error
 			bucket.cost, addErr = money.Add(bucket.cost, cost)
@@ -154,7 +154,7 @@ func (db *DB) assembleDailyUsageFacts(
 	if !filter.SkipSessionCounts {
 		sessionCounts = NewUsageSessionCounts(facts.MatchingSessions)
 	}
-	projects, err := db.BuildProjectIdentityMap(ctx, sortedSetKeys(projectLabels))
+	projects, err := db.BuildProjectIdentityMap(ctx, SortedKeys(projectLabels))
 	if err != nil {
 		return DailyUsageResult{}, err
 	}
@@ -176,7 +176,6 @@ func (db *DB) assembleDailyUsageFacts(
 
 func recordUsageFactsPricing(
 	resolver *export.PricingResolver, group usageFactsGroup,
-
 ) error {
 	timestamp := usagePricingTimestamp(group.PricingTimestamp)
 	_, baseLookup := resolver.ResolveAt(

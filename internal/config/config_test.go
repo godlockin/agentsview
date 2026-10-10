@@ -2,7 +2,6 @@ package config
 
 import (
 	"bytes"
-	"context"
 	"flag"
 	"log"
 	"os"
@@ -23,6 +22,32 @@ import (
 )
 
 const configFileName = "config.toml"
+
+func TestCodeBuddyDefaultAndOverride(t *testing.T) {
+	home := canonicalTempDir(t)
+	setTestHome(t, home)
+	for _, appData := range []string{"", "relative", canonicalTempDir(t)} {
+		t.Run(appData, func(t *testing.T) {
+			t.Setenv("LOCALAPPDATA", appData)
+			t.Setenv("CODEBUDDY_DIR", "")
+			cfg, err := Default()
+			require.NoError(t, err)
+			dirs := cfg.ResolveDirs(parser.AgentCodeBuddy)
+			require.Len(t, dirs, 3)
+			expected := filepath.Join(home, "AppData", "Local", "CodeBuddyExtension", "Data")
+			if runtime.GOOS == "windows" && filepath.IsAbs(appData) {
+				expected = filepath.Join(appData, "CodeBuddyExtension", "Data")
+			}
+			assert.Equal(t, expected, dirs[0])
+			assert.Equal(t, filepath.Join(home, "Library", "Application Support", "CodeBuddyExtension", "Data"), dirs[1])
+			assert.Equal(t, filepath.Join(home, ".config", "CodeBuddyExtension", "Data"), dirs[2])
+			custom := canonicalTempDir(t)
+			t.Setenv("CODEBUDDY_DIR", custom)
+			cfg.loadEnv()
+			assert.Equal(t, []string{custom}, cfg.ResolveDirs(parser.AgentCodeBuddy))
+		})
+	}
+}
 
 func skipIfNotUnix(t *testing.T) {
 	t.Helper()
@@ -166,6 +191,7 @@ func TestToolResultImagesConfig(t *testing.T) {
 	}{
 		{name: "missing defaults to keep", want: ToolResultImagesKeep},
 		{name: "keep trims and folds", toml: `tool_result_images = " KEEP "`, want: ToolResultImagesKeep},
+		{name: "offload", toml: `tool_result_images = "offload"`, want: ToolResultImagesOffload},
 		{name: "drop trims and folds", toml: `tool_result_images = " Drop "`, want: ToolResultImagesDrop},
 	}
 	for _, tt := range tests {
@@ -180,17 +206,17 @@ func TestToolResultImagesConfig(t *testing.T) {
 	cfg, err := Default()
 	require.NoError(t, err)
 	require.EqualError(t, cfg.applyConfigTOML(`tool_result_images = "discard"`),
-		`tool_result_images must be "keep" or "drop" (got "discard")`)
+		`tool_result_images must be "keep", "drop", or "offload" (got "discard")`)
 
 	dir := setupTestEnv(t)
 	cfg.DataDir = dir
 	require.NoError(t, cfg.SaveSettings(map[string]any{
-		"tool_result_images": ToolResultImagesDrop,
+		"tool_result_images": ToolResultImagesOffload,
 	}))
-	assert.Equal(t, ToolResultImagesDrop, cfg.ToolResultImages)
+	assert.Equal(t, ToolResultImagesOffload, cfg.ToolResultImages)
 	loaded, err := LoadMinimal()
 	require.NoError(t, err)
-	assert.Equal(t, ToolResultImagesDrop, loaded.ToolResultImages)
+	assert.Equal(t, ToolResultImagesOffload, loaded.ToolResultImages)
 }
 
 func setTestHome(t *testing.T, home string) {
@@ -484,6 +510,7 @@ func TestDefault_IncludesHermesProfilesRoot(t *testing.T) {
 
 	assert.Contains(t, dirs, filepath.Join(home, ".hermes", "sessions"))
 	assert.Contains(t, dirs, filepath.Join(home, ".hermes", "profiles"))
+	assert.Contains(t, dirs, filepath.Join(home, "AppData", "Local", "hermes", "sessions"))
 }
 
 func TestDefault_HermesNoProfilesDirIsSafe(t *testing.T) {
@@ -510,6 +537,18 @@ func TestDefault_HermesEnvReplacesDefaultAndProfilesRoots(t *testing.T) {
 	assert.Equal(t, []string{custom}, cfg.ResolveDirs(parser.AgentHermes))
 }
 
+func TestLoad_HermesConfigDirsReplaceAllDefaultRoots(t *testing.T) {
+	t.Setenv("HERMES_SESSIONS_DIR", "")
+	custom := filepath.Join(canonicalTempDir(t), "hermes-sessions")
+
+	cfg := loadMinimalWithConfig(t, map[string]any{
+		"hermes_sessions_dirs": []string{custom},
+	})
+
+	assert.Equal(t, []string{custom}, cfg.ResolveDirs(parser.AgentHermes))
+	assert.True(t, cfg.IsUserConfigured(parser.AgentHermes))
+}
+
 func TestLoadEnv_GoosePathRootUsesProducerLayout(t *testing.T) {
 	for _, basename := range []string{"data", "sessions"} {
 		t.Run(basename, func(t *testing.T) {
@@ -525,7 +564,7 @@ func TestLoadEnv_GoosePathRootUsesProducerLayout(t *testing.T) {
 			})
 			require.True(t, ok)
 
-			plan, err := provider.WatchPlan(context.Background())
+			plan, err := provider.WatchPlan(t.Context())
 			require.NoError(t, err)
 			require.Len(t, plan.Roots, 1)
 			assert.Equal(t,
@@ -631,6 +670,73 @@ func TestLoadPFlags_AppliesExplicitFlags(t *testing.T) {
 
 	assert.Equal(t, "0.0.0.0", cfg.Host)
 	assert.Equal(t, 9090, cfg.Port)
+}
+
+func TestPortExplicitProvenance(t *testing.T) {
+	t.Run("standard flag marks explicit default", func(t *testing.T) {
+		cfg, err := loadConfigFromFlags(t, "-port", "8080")
+		require.NoError(t, err)
+		assert.Equal(t, 8080, cfg.Port)
+		assert.True(t, cfg.PortExplicit)
+	})
+
+	t.Run("pflag marks explicit default", func(t *testing.T) {
+		cfg, err := loadConfigFromPFlags(t, "--port", "8080")
+		require.NoError(t, err)
+		assert.Equal(t, 8080, cfg.Port)
+		assert.True(t, cfg.PortExplicit)
+	})
+
+	t.Run("explicit zero remains explicit", func(t *testing.T) {
+		cfg, err := loadConfigFromPFlags(t, "--port", "0")
+		require.NoError(t, err)
+		assert.Zero(t, cfg.Port)
+		assert.True(t, cfg.PortExplicit)
+	})
+
+	t.Run("omitted port stays implicit", func(t *testing.T) {
+		standard, err := loadConfigFromFlags(t)
+		require.NoError(t, err)
+		pflagConfig, err := loadConfigFromPFlags(t)
+		require.NoError(t, err)
+		assert.Equal(t, 8080, standard.Port)
+		assert.False(t, standard.PortExplicit)
+		assert.Equal(t, 8080, pflagConfig.Port)
+		assert.False(t, pflagConfig.PortExplicit)
+	})
+
+	t.Run("persisted port stays implicit", func(t *testing.T) {
+		dir := setupTestEnv(t)
+		writeConfig(t, dir, map[string]any{"port": 7357})
+		fs := pflag.NewFlagSet("test", pflag.ContinueOnError)
+		RegisterServePFlags(fs)
+		cfg, err := LoadPFlags(fs)
+		require.NoError(t, err)
+		assert.Equal(t, 7357, cfg.Port)
+		assert.False(t, cfg.PortExplicit)
+	})
+
+	t.Run("pg and duckdb loaders mark explicit ports", func(t *testing.T) {
+		for _, load := range []struct {
+			name string
+			fn   func(*pflag.FlagSet) (Config, error)
+		}{
+			{name: "pg", fn: LoadRemoteServePFlags},
+			{name: "duckdb", fn: LoadRemoteServePFlags},
+			{name: "clickhouse", fn: LoadRemoteServePFlags},
+		} {
+			t.Run(load.name, func(t *testing.T) {
+				setupTestEnv(t)
+				fs := pflag.NewFlagSet("test", pflag.ContinueOnError)
+				RegisterServePFlags(fs)
+				require.NoError(t, fs.Parse([]string{"--port", "8080"}))
+				cfg, err := load.fn(fs)
+				require.NoError(t, err)
+				assert.Equal(t, 8080, cfg.Port)
+				assert.True(t, cfg.PortExplicit)
+			})
+		}
+	})
 }
 
 func TestLoad_NilFlagSet(t *testing.T) {
@@ -984,6 +1090,13 @@ func TestAgentDirsExplicitEmptyArrayOverridesDefaults(t *testing.T) {
 	assert.True(t, cfg.IsUserConfigured(parser.AgentGrok))
 	assert.Empty(t, cfg.ResolveDirs(parser.AgentCopilot))
 	assert.True(t, cfg.IsUserConfigured(parser.AgentCopilot))
+}
+
+func TestDefaultWatchExcludesTransientLockFiles(t *testing.T) {
+	cfg, err := Default()
+	require.NoError(t, err)
+
+	assert.Contains(t, cfg.WatchExcludePatterns, "*.lock*")
 }
 
 func TestAgentDirsEnvBeatsExplicitEmptyArray(t *testing.T) {
@@ -1439,6 +1552,33 @@ func TestResolveDirs_DeepSeekHarnessPrecedence(t *testing.T) {
 		assert.Equal(t, []string{absoluteTestPath(t, "/from/env")},
 			cfg.ResolveDirs(parser.AgentDeepSeekHarness))
 		assert.True(t, cfg.IsUserConfigured(parser.AgentDeepSeekHarness))
+	})
+}
+
+func TestResolveDirs_JunieHomeAndExplicitOverride(t *testing.T) {
+	t.Run("JUNIE_HOME re-roots implicit sessions directory", func(t *testing.T) {
+		dir := setupTestEnv(t)
+		root := canonicalTempDir(t)
+		t.Setenv("JUNIE_HOME", root)
+		writeConfig(t, dir, map[string]any{})
+
+		cfg, err := LoadMinimal()
+		require.NoError(t, err)
+		assert.Equal(t, []string{filepath.Join(root, "sessions")}, cfg.ResolveDirs(parser.AgentJunie))
+		assert.False(t, cfg.IsUserConfigured(parser.AgentJunie))
+	})
+
+	t.Run("JUNIE_DIR beats JUNIE_HOME", func(t *testing.T) {
+		dir := setupTestEnv(t)
+		t.Setenv("JUNIE_HOME", canonicalTempDir(t))
+		explicit := absoluteTestPath(t, "/from/env/junie-sessions")
+		t.Setenv("JUNIE_DIR", explicit)
+		writeConfig(t, dir, map[string]any{})
+
+		cfg, err := LoadMinimal()
+		require.NoError(t, err)
+		assert.Equal(t, []string{explicit}, cfg.ResolveDirs(parser.AgentJunie))
+		assert.True(t, cfg.IsUserConfigured(parser.AgentJunie))
 	})
 }
 
@@ -2418,7 +2558,7 @@ func TestLoadFile_CustomModelPricing(t *testing.T) {
 			for model, wantRate := range tt.want {
 				got, ok := cfg.CustomModelPricing[model]
 				if !ok {
-					t.Errorf("missing model %q", model)
+					assert.Failf(t, "test failed", "missing model %q", model)
 					continue
 				}
 				assert.Equal(t, wantRate, got, "model %q", model)
@@ -2484,22 +2624,25 @@ func TestLoadFile_RemoteHosts(t *testing.T) {
 	f := newConfigFixture(t)
 	f.WriteConfigText(t, `[[remote_hosts]]
 host = "devbox1"
-user = "jesse"
-port = 22
+url = "https://devbox1.example.test"
+token = "remote-token"
 interval = "5m"
 
 [[remote_hosts]]
 host = "  laptop2  "
+url = " https://laptop2.example.test "
+token = " remote-token "
 `)
 
 	cfg := f.LoadMinimal(t)
 
 	require.Len(t, cfg.RemoteHosts, 2)
-	assert.Equal(t, RemoteHost{Host: "devbox1", User: "jesse", Port: 22, Interval: 5 * time.Minute}, cfg.RemoteHosts[0])
+	assert.Equal(t, RemoteHost{Host: "devbox1", URL: "https://devbox1.example.test", Token: "remote-token", Interval: 5 * time.Minute}, cfg.RemoteHosts[0])
 	assert.Equal(t, 5*time.Minute, cfg.RemoteHosts[0].Interval)
 	assert.Equal(t, time.Duration(0), cfg.RemoteHosts[1].Interval)
-	// host is trimmed at load so validation and SSH see the same value
-	assert.Equal(t, RemoteHost{Host: "laptop2"}, cfg.RemoteHosts[1])
+	// Remote values are trimmed before validation and sync.
+	assert.Equal(t, RemoteHost{Host: "laptop2", URL: "https://laptop2.example.test", Token: "remote-token"}, cfg.RemoteHosts[1])
+	require.NoError(t, cfg.ValidateRemoteHosts())
 }
 
 func TestLoadFile_RemoteHostsHTTP(t *testing.T) {
@@ -2546,28 +2689,23 @@ func TestLoadFile_RemoteHostsAbsentIsNil(t *testing.T) {
 }
 
 func TestValidateRemoteHosts(t *testing.T) {
+	t.Parallel()
 	tests := []struct {
 		name    string
 		hosts   []RemoteHost
 		wantErr []string // substrings expected in error; empty => no error
 	}{
-		{"valid", []RemoteHost{{Host: "a"}, {Host: "b", Port: 22}, {Host: "c", Port: 0}}, nil},
+		{"omitted transport uses http", []RemoteHost{{Host: "a", URL: "https://a.example.test", Token: "token"}}, nil},
+		{"omitted transport requires credentials", []RemoteHost{{Host: "a"}}, []string{"url is required", "token is required"}},
 		{"empty host", []RemoteHost{{Host: ""}}, []string{"host is required"}},
-		{"negative port", []RemoteHost{{Host: "a", Port: -1}}, []string{"invalid port"}},
-		{"port too large", []RemoteHost{{Host: "a", Port: 70000}}, []string{"invalid port"}},
-		{"aggregates both", []RemoteHost{{Host: ""}, {Host: "b", Port: 99999}}, []string{"host is required", "invalid port"}},
+		{"aggregates entries", []RemoteHost{{Host: ""}, {Host: "b", Interval: -1}}, []string{"entry 1: host is required", "entry 2 (\"b\"): invalid interval"}},
 		{"duplicate host", []RemoteHost{{Host: "a"}, {Host: "a"}}, []string{"duplicate host"}},
-		{"duplicate host different user or port", []RemoteHost{{Host: "box", User: "alice"}, {Host: "box", User: "bob", Port: 2222}}, []string{"duplicate host"}},
-		{"option shaped host", []RemoteHost{{Host: "-oProxyCommand=sh"}}, []string{"host must not begin with '-'"}},
-		{"option shaped user", []RemoteHost{{Host: "box", User: "-lroot"}}, []string{"user must not begin with '-'"}},
 		{"none configured", nil, nil},
 		{"negative interval", []RemoteHost{{Host: "a", Interval: -1}}, []string{"invalid interval"}},
-		{"zero interval ok", []RemoteHost{{Host: "a", Interval: 0}}, nil},
+		{"zero interval ok", []RemoteHost{{Host: "a", URL: "https://a.example.test", Token: "token", Interval: 0}}, nil},
 		{"http valid", []RemoteHost{{Host: "a", Transport: RemoteTransportHTTP, URL: "https://a.example.test", Token: "token"}}, nil},
 		{"http requires url", []RemoteHost{{Host: "a", Transport: RemoteTransportHTTP}}, []string{"url is required"}},
 		{"http requires token", []RemoteHost{{Host: "a", Transport: RemoteTransportHTTP, URL: "https://a.example.test"}}, []string{"token is required"}},
-		{"http rejects user", []RemoteHost{{Host: "a", Transport: RemoteTransportHTTP, URL: "https://a.example.test", User: "alice"}}, []string{"user is only valid for ssh"}},
-		{"http rejects port", []RemoteHost{{Host: "a", Transport: RemoteTransportHTTP, URL: "https://a.example.test", Port: 443}}, []string{"port is only valid for ssh"}},
 		{"http rejects bad scheme", []RemoteHost{{Host: "a", Transport: RemoteTransportHTTP, URL: "ftp://a.example.test"}}, []string{"url must use http or https"}},
 		{"http rejects empty hostname with port", []RemoteHost{{Host: "a", Transport: RemoteTransportHTTP, URL: "http://:8080"}}, []string{"url must include a host"}},
 		{"http rejects query", []RemoteHost{{Host: "a", Transport: RemoteTransportHTTP, URL: "https://a.example.test?token=x"}}, []string{"url must not include query"}},
@@ -2575,12 +2713,12 @@ func TestValidateRemoteHosts(t *testing.T) {
 		{"http rejects fragment", []RemoteHost{{Host: "a", Transport: RemoteTransportHTTP, URL: "https://a.example.test/#remote"}}, []string{"url must not include fragment"}},
 		{"http rejects empty fragment delimiter", []RemoteHost{{Host: "a", Transport: RemoteTransportHTTP, URL: "https://a.example.test#", Token: "token"}}, []string{"url must not include fragment"}},
 		{"http rejects userinfo", []RemoteHost{{Host: "a", Transport: RemoteTransportHTTP, URL: "https://alice@a.example.test"}}, []string{"url must not include userinfo"}},
-		{"ssh rejects url", []RemoteHost{{Host: "a", Transport: RemoteTransportSSH, URL: "https://a.example.test"}}, []string{"url is only valid for http"}},
-		{"ssh rejects token", []RemoteHost{{Host: "a", Transport: RemoteTransportSSH, Token: "token"}}, []string{"token is only valid for http"}},
+		{"retired transport", []RemoteHost{{Host: "a", Transport: "ssh", URL: "https://a.example.test", Token: "token"}}, []string{"invalid transport \"ssh\"", "use http with a url and token"}},
 		{"unknown transport", []RemoteHost{{Host: "a", Transport: RemoteTransport("sftp")}}, []string{"invalid transport"}},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
 			err := Config{RemoteHosts: tt.hosts}.ValidateRemoteHosts()
 			if len(tt.wantErr) == 0 {
 				require.NoError(t, err)
@@ -2716,6 +2854,7 @@ func TestIsDefaultAgentsviewDBPath(t *testing.T) {
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
 			assert.Equal(t, tc.want, IsDefaultAgentsviewDBPath(tc.dbPath))
 		})
 	}
@@ -2875,8 +3014,7 @@ func TestDisabledAgentsNormalizeWithoutHidingConfiguredDirs(t *testing.T) {
 disabled_agents = [" gemini ", "claude", "gemini"]
 `))
 
-	assert.Equal(t,
-		[]parser.AgentType{parser.AgentClaude, parser.AgentGemini},
+	assert.Equal(t, []parser.AgentType{parser.AgentClaude, parser.AgentGemini},
 		cfg.DisabledAgents,
 	)
 	assert.Equal(t, geminiDirs, cfg.ResolveDirs(parser.AgentGemini))
@@ -2972,5 +3110,40 @@ func TestResolveDirs_EvenerPrecedence(t *testing.T) {
 		require.NoError(t, err)
 		assert.Equal(t, []string{want}, cfg.ResolveDirs(parser.AgentType("evener")))
 		assert.True(t, cfg.IsUserConfigured(parser.AgentType("evener")))
+	})
+}
+
+func TestResolveDirs_CodebuffRootEnvVar(t *testing.T) {
+	t.Run("FREEBUFF_CONFIG_DIR re-roots the projects default", func(t *testing.T) {
+		dir := setupTestEnv(t)
+		setTestHome(t, canonicalTempDir(t))
+		root := filepath.Join(dir, "freebuff-root")
+		t.Setenv("CLAUDE_CONFIG_DIR", "")
+		t.Setenv("CODEX_HOME", "")
+		t.Setenv("CODEBUFF_DIR", "")
+		t.Setenv("FREEBUFF_CONFIG_DIR", root)
+		writeConfig(t, dir, map[string]any{})
+
+		cfg, err := LoadMinimal()
+		require.NoError(t, err)
+
+		assert.Equal(t, []string{filepath.Join(root, "projects")},
+			cfg.ResolveDirs(parser.AgentCodebuff))
+	})
+
+	t.Run("CODEBUFF_DIR wins over FREEBUFF_CONFIG_DIR", func(t *testing.T) {
+		dir := setupTestEnv(t)
+		setTestHome(t, canonicalTempDir(t))
+		t.Setenv("CLAUDE_CONFIG_DIR", "")
+		t.Setenv("CODEX_HOME", "")
+		t.Setenv("CODEBUFF_DIR", filepath.Join(dir, "override"))
+		t.Setenv("FREEBUFF_CONFIG_DIR", filepath.Join(dir, "freebuff-root"))
+		writeConfig(t, dir, map[string]any{})
+
+		cfg, err := LoadMinimal()
+		require.NoError(t, err)
+
+		assert.Equal(t, []string{filepath.Join(dir, "override")},
+			cfg.ResolveDirs(parser.AgentCodebuff))
 	})
 }

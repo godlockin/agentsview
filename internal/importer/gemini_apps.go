@@ -3,8 +3,6 @@ package importer
 import (
 	"context"
 	"errors"
-	"fmt"
-	"log"
 
 	"go.kenn.io/agentsview/internal/db"
 	"go.kenn.io/agentsview/internal/parser"
@@ -19,9 +17,9 @@ func ImportGeminiApps(
 	cb *ImportCallbacks,
 	machine ...string,
 ) (stats ImportStats, retErr error) {
-	fts := newLazyFTS(store, cb.indexing)
+	fts := newLazyFTS(ctx, store, cb.indexing)
 	defer func() {
-		if err := fts.restore(); err != nil {
+		if err := fts.restore(ctx); err != nil {
 			retErr = errors.Join(retErr, err)
 		}
 	}()
@@ -30,13 +28,11 @@ func ImportGeminiApps(
 		parser.AgentGeminiApps, parser.ProviderConfig{},
 	)
 	if !ok {
-		return stats, fmt.Errorf("gemini apps provider unavailable")
+		return stats, errors.New("gemini apps provider unavailable")
 	}
 	exporter, ok := provider.(parser.GeminiAppsExportParser)
 	if !ok {
-		return stats, fmt.Errorf(
-			"gemini apps provider does not support exports",
-		)
+		return stats, errors.New("gemini apps provider does not support exports")
 	}
 
 	parseSummary, err := exporter.ParseGeminiAppsExport(
@@ -52,24 +48,7 @@ func ImportGeminiApps(
 			status, err := upsertConversation(
 				ctx, store, result, fts,
 			)
-			if err != nil {
-				stats.Errors++
-				log.Printf(
-					"import: skipping %s: %v",
-					result.Session.ID, err,
-				)
-				cb.progress(stats)
-				return nil
-			}
-
-			switch status {
-			case importNew:
-				stats.Imported++
-			case importUpdated:
-				stats.Updated++
-			case importSkipped:
-				stats.Skipped++
-			}
+			stats.record(result.Session.ID, status, err)
 			cb.progress(stats)
 			return nil
 		},

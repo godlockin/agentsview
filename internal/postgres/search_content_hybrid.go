@@ -145,7 +145,7 @@ func (s *Store) hybridKeywordLegPG(
 func (s *Store) fetchHybridKeywordBatchPG(
 	ctx context.Context, f db.ContentSearchFilter, k, offset int,
 ) ([]pgHybridDisplay, error) {
-	scopeWhere, scopeArgs := buildPGSessionBaseFilter(semanticPGSessionFilter(f))
+	scopeWhere, scopeArgs := buildPGSessionBaseFilter(db.SemanticContentSessionFilter(f))
 	scopeWhere, scopeArgs = appendExcludeSessionIDsPG(
 		scopeWhere, scopeArgs, "id", f.ExcludeSessionIDs)
 	pb := &paramBuilder{n: len(scopeArgs), args: append([]any{}, scopeArgs...)}
@@ -194,7 +194,7 @@ func (s *Store) fetchHybridKeywordBatchPG(
 
 // pgKeywordApproxSnippet windows content around the pattern's term-aware span
 // (db.FTSSnippetRange, the same helper the fts snippet path uses via
-// pgSubstringSnippet), rune-snapped via pgSnippetBounds. Centering on the raw
+// pgSubstringSnippet), rune-snapped via db.SnippetBounds. Centering on the raw
 // pattern would fall back to the message start for quoted phrases or multi-term
 // queries whose pattern is not a literal substring; FTSSnippetRange instead
 // locates the de-quoted phrase, then the first matched term, then the start. The
@@ -202,7 +202,7 @@ func (s *Store) fetchHybridKeywordBatchPG(
 // the full content; redaction always runs on the full content, not this window.
 func pgKeywordApproxSnippet(content, pattern string) string {
 	start, end := db.FTSSnippetRange(pattern, content)
-	lo, hi := pgSnippetBounds(content, start, end)
+	lo, hi := db.SnippetBounds(content, start, end, db.ContentSnippetRadius)
 	return content[lo:hi]
 }
 
@@ -346,20 +346,23 @@ func (s *Store) enrichHybridMatchesPG(
 		}
 		score := m.Score
 		out = append(out, db.ContentMatch{
-			SessionID:       d.sessionID,
-			Project:         info.project,
-			Agent:           info.agent,
-			Location:        "message",
-			Role:            info.role,
-			Ordinal:         d.ordinal,
-			OrdinalRange:    [2]int{d.ordinalStart, d.ordinalEnd},
-			Subordinate:     d.subordinate,
-			Relationship:    info.relationshipType,
-			ParentSessionID: info.parentSessionID,
-			Sidechain:       info.isSidechain,
-			Timestamp:       info.timestamp,
-			Snippet:         f.SemanticSnippet(info.content, d.snippet),
-			Score:           &score,
+			SessionID:          d.sessionID,
+			Project:            info.project,
+			Agent:              info.agent,
+			Machine:            info.machine,
+			DisplayName:        info.displayName,
+			TranscriptRevision: info.transcriptRevision,
+			Location:           "message",
+			Role:               info.role,
+			Ordinal:            d.ordinal,
+			OrdinalRange:       [2]int{d.ordinalStart, d.ordinalEnd},
+			Subordinate:        d.subordinate,
+			Relationship:       info.relationshipType,
+			ParentSessionID:    info.parentSessionID,
+			Sidechain:          info.isSidechain,
+			Timestamp:          info.timestamp,
+			Snippet:            f.SemanticSnippet(info.content, d.snippet),
+			Score:              &score,
 		})
 	}
 	return db.ContentSearchPage{Matches: out}, nil

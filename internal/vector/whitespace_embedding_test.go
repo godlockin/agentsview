@@ -9,6 +9,7 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"go.kenn.io/kit/embedclient"
 	kitvec "go.kenn.io/kit/vector"
 )
 
@@ -41,7 +42,7 @@ func recordingEncoder(seen *[]string) kitvec.EncodeFunc {
 // build still completes and auto-activates.
 func TestBuildStampsWhitespaceOnlyDocumentWithoutEmbeddingIt(t *testing.T) {
 	ix := openTestIndex(t)
-	ctx := context.Background()
+	ctx := t.Context()
 	src := &fakeUnitSource{rows: []fakeUnit{
 		{unit: userDoc("s1", "", 0, "   \n\t   "), endedAt: "2024-01-01T00:00:00Z"},
 		{unit: userDoc("s1", "", 1, "real content"), endedAt: "2024-01-01T00:00:01Z"},
@@ -57,12 +58,12 @@ func TestBuildStampsWhitespaceOnlyDocumentWithoutEmbeddingIt(t *testing.T) {
 		"a stamped-without-vectors blank document still counts as covered")
 
 	var stamps int
-	require.NoError(t, ix.db.QueryRow(
+	require.NoError(t, ix.db.QueryRowContext(ctx,
 		`SELECT COUNT(*) FROM message_vectors_stamps`).Scan(&stamps))
 	assert.Equal(t, 2, stamps, "both documents are stamped")
 
 	var chunks int
-	require.NoError(t, ix.db.QueryRow(
+	require.NoError(t, ix.db.QueryRowContext(ctx,
 		`SELECT COUNT(*) FROM message_vectors_chunks`).Scan(&chunks))
 	assert.Equal(t, 1, chunks, "only the non-blank document has a chunk")
 }
@@ -84,7 +85,7 @@ func TestEmptyEmbeddingInputIsPermanent(t *testing.T) {
 // skip only it; aborting would wedge every later build at the same document.
 func TestBuildSkipsPermanentlyRejectedDocumentSharingABatch(t *testing.T) {
 	ix := openTestIndex(t)
-	ctx := context.Background()
+	ctx := t.Context()
 	src := &fakeUnitSource{rows: []fakeUnit{
 		{unit: userDoc("s1", "", 0, "one"), endedAt: "2024-01-01T00:00:00Z"},
 		{unit: userDoc("s1", "", 1, "poison"), endedAt: "2024-01-01T00:00:01Z"},
@@ -93,9 +94,7 @@ func TestBuildSkipsPermanentlyRejectedDocumentSharingABatch(t *testing.T) {
 
 	rejectPoison := func(_ context.Context, texts []string) ([][]float32, error) {
 		if slices.Contains(texts, "poison") {
-			return nil, &HTTPStatusError{
-				Status: 400, Body: "input exceeds maximum context length",
-			}
+			return nil, &embedclient.APIError{StatusCode: 400, Reason: embedclient.ReasonInputTooLong}
 		}
 		out := make([][]float32, len(texts))
 		for i := range texts {
@@ -118,7 +117,7 @@ func TestBuildSkipsPermanentlyRejectedDocumentSharingABatch(t *testing.T) {
 // without probing each document slice separately.
 func TestBuildTransientBatchErrorStillAborts(t *testing.T) {
 	ix := openTestIndex(t)
-	ctx := context.Background()
+	ctx := t.Context()
 	src := &fakeUnitSource{rows: []fakeUnit{
 		{unit: userDoc("s1", "", 0, "one"), endedAt: "2024-01-01T00:00:00Z"},
 		{unit: userDoc("s1", "", 1, "two"), endedAt: "2024-01-01T00:00:01Z"},
@@ -127,7 +126,7 @@ func TestBuildTransientBatchErrorStillAborts(t *testing.T) {
 	var calls int
 	failing := func(_ context.Context, _ []string) ([][]float32, error) {
 		calls++
-		return nil, &HTTPStatusError{Status: 503, Body: "upstream unavailable"}
+		return nil, &embedclient.APIError{StatusCode: 503}
 	}
 
 	result, err := ix.Build(ctx, src, failing, fakeGeneration("fake-model"),
@@ -161,7 +160,7 @@ func TestChunkSnippetResolvesIndexAcrossADroppedWindow(t *testing.T) {
 // would re-embed the document on every repair run, forever.
 func TestRepairKeepsDocumentWithADroppedWindow(t *testing.T) {
 	ix := openTestIndex(t)
-	ctx := context.Background()
+	ctx := t.Context()
 	src := &fakeUnitSource{rows: []fakeUnit{
 		{unit: userDoc("s1", "", 0, blankWindowContent()), endedAt: "2024-01-01T00:00:00Z"},
 	}}

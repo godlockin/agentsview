@@ -1,16 +1,19 @@
 package sync_test
 
 import (
+	"context"
 	"database/sql"
 	"encoding/json/v2"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	_ "github.com/mattn/go-sqlite3"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"go.kenn.io/agentsview/internal/db"
 	"go.kenn.io/agentsview/internal/parser"
 	"go.kenn.io/agentsview/internal/sync"
 )
@@ -43,7 +46,7 @@ func createForgeDB(t *testing.T, dir string) *forgeTestDB {
 			metrics TEXT
 		);
 	`
-	_, err = d.Exec(schema)
+	_, err = d.ExecContext(t.Context(), schema)
 	require.NoError(t, err, "creating forge schema")
 	return fixture
 }
@@ -56,7 +59,7 @@ func (f *forgeTestDB) close(t *testing.T) {
 
 func (f *forgeTestDB) mustExec(t *testing.T, msg, query string, args ...any) {
 	t.Helper()
-	_, err := f.db.Exec(query, args...)
+	_, err := f.db.ExecContext(t.Context(), query, args...)
 	require.NoError(t, err, msg)
 }
 
@@ -313,17 +316,17 @@ func TestSyncSingleSessionForge(t *testing.T) {
 	assertSessionProject(t, env.db, "forge:forge-sync-single", "agentsview")
 	assertSessionMessageCount(t, env.db, "forge:forge-sync-single", 3)
 
-	src := env.engine.FindSourceFile("forge:forge-sync-single")
+	src := env.engine.FindSourceFile(t.Context(), "forge:forge-sync-single")
 	// Forge is a provider-authoritative DB-backed provider: FindSourceFile
 	// resolves the per-session virtual <db>#<conversationID> path the
 	// provider parses, matching the stored session file_path.
 	wantSrc := filepath.Join(env.forgeDir, ".forge.db") + "#forge-sync-single"
 	assert.Equal(t, wantSrc, src)
 
-	mtime := env.engine.SourceMtime("forge:forge-sync-single")
+	mtime := env.engine.SourceMtime(t.Context(), "forge:forge-sync-single")
 	require.NotZero(t, mtime, "SourceMtime returned zero")
 
-	_, storedMtime, ok := env.db.GetSessionFileInfo("forge:forge-sync-single")
+	_, storedMtime, ok := env.db.GetSessionFileInfo(t.Context(), "forge:forge-sync-single")
 	require.True(t, ok, "session file info not found")
 	assert.Equal(t, mtime, storedMtime)
 
@@ -360,7 +363,7 @@ func TestSyncForgeMultiConversationIncremental(t *testing.T) {
 	assertSessionProject(t, env.db, "forge:multi-conv-B", "agentsview")
 
 	// Capture the stored mtime for A (should remain unchanged after the partial sync).
-	_, storedMtimeA, okA := env.db.GetSessionFileInfo("forge:multi-conv-A")
+	_, storedMtimeA, okA := env.db.GetSessionFileInfo(t.Context(), "forge:multi-conv-A")
 	require.True(t, okA, "session A file info not found after initial sync")
 
 	// Update only B's updated_at (and its context) to simulate a newer version.
@@ -374,12 +377,12 @@ func TestSyncForgeMultiConversationIncremental(t *testing.T) {
 	runSyncAndAssert(t, env.engine, sync.SyncStats{TotalSessions: 1, Synced: 1, Skipped: 0})
 
 	// A's stored mtime must be unchanged.
-	_, storedMtimeA2, okA2 := env.db.GetSessionFileInfo("forge:multi-conv-A")
+	_, storedMtimeA2, okA2 := env.db.GetSessionFileInfo(t.Context(), "forge:multi-conv-A")
 	require.True(t, okA2, "session A file info not found after partial sync")
 	assert.Equal(t, storedMtimeA, storedMtimeA2, "A's stored mtime changed")
 
 	// B's stored mtime must have advanced.
-	_, storedMtimeB2, okB2 := env.db.GetSessionFileInfo("forge:multi-conv-B")
+	_, storedMtimeB2, okB2 := env.db.GetSessionFileInfo(t.Context(), "forge:multi-conv-B")
 	require.True(t, okB2, "session B file info not found after partial sync")
 	assert.Greater(t, storedMtimeB2, storedMtimeA, "B's stored mtime did not advance")
 }
@@ -409,10 +412,10 @@ func TestSyncForgeMissingConversation(t *testing.T) {
 
 	// FindSourceFile still returns the db path (it's a directory-level lookup).
 	// SourceMtime returns 0 because the conversation row is gone.
-	mtime := env.engine.SourceMtime("forge:disappearing-conv")
+	mtime := env.engine.SourceMtime(t.Context(), "forge:disappearing-conv")
 	assert.Zero(t, mtime, "SourceMtime after delete")
 
-	src := env.engine.FindSourceFile("forge:disappearing-conv")
+	src := env.engine.FindSourceFile(t.Context(), "forge:disappearing-conv")
 	assert.Empty(t, src, "FindSourceFile after delete")
 
 	// SyncSingleSession must return an error indicating the conversation
@@ -494,12 +497,14 @@ func TestSyncForgeSubagentLinking(t *testing.T) {
 		"",
 	)
 
-	runSyncAndAssert(t, env.engine, sync.SyncStats{TotalSessions: 2, Synced: 2, Skipped: 0})
+	runSyncAndAssert(t, env.engine, sync.SyncStats{
+		TotalSessions: 2, Synced: 2, LinksUpdated: 1,
+	})
 
 	// After SyncAll the tool_call row must already carry subagent_session_id.
 	// This is set by the parser before LinkSubagentSessions runs.
 	var subagentSessID sql.NullString
-	err := env.db.Reader().QueryRow(
+	err := env.db.Reader().QueryRow(t.Context(),
 		`SELECT subagent_session_id FROM tool_calls WHERE session_id = ? AND tool_name = 'task'`,
 		"forge:"+parentID,
 	).Scan(&subagentSessID)
@@ -512,7 +517,7 @@ func TestSyncForgeSubagentLinking(t *testing.T) {
 	// be set without any SyncSingleSession workaround.
 	var parentSessID sql.NullString
 	var relType sql.NullString
-	err = env.db.Reader().QueryRow(
+	err = env.db.Reader().QueryRow(t.Context(),
 		`SELECT parent_session_id, relationship_type FROM sessions WHERE id = ?`,
 		"forge:"+childID,
 	).Scan(&parentSessID, &relType)
@@ -521,6 +526,135 @@ func TestSyncForgeSubagentLinking(t *testing.T) {
 	assert.Equal(t, "forge:"+parentID, parentSessID.String)
 	require.True(t, relType.Valid, "child relationship_type not valid")
 	assert.Equal(t, "subagent", relType.String)
+}
+
+func TestSyncForgeSubagentLinkFailureRetriesOnUnchangedPoll(t *testing.T) {
+	env := setupSingleAgentTestEnv(t, parser.AgentForge)
+	forge := createForgeDB(t, env.forgeDir)
+	forge.addConversation(t, "parent-conv", "Parent",
+		forgeParentContext("child-conv"),
+		"2026-05-02 09:00:00", "2026-05-02 09:01:00", "")
+	forge.addConversation(t, "child-conv", "Child",
+		forgeTestContext("Child work.", "Child done."),
+		"2026-05-02 09:00:30", "2026-05-02 09:01:30", "")
+	require.NoError(t, env.db.Update(t.Context(), func(tx *sql.Tx) error {
+		_, err := tx.ExecContext(t.Context(), `
+			CREATE TRIGGER fail_subagent_link
+			BEFORE UPDATE OF relationship_type ON sessions
+			WHEN NEW.id = 'forge:child-conv' AND NEW.relationship_type = 'subagent'
+			BEGIN
+				SELECT RAISE(FAIL, 'injected linking failure');
+			END;
+		`)
+		return err
+	}))
+
+	stats := env.engine.SyncAll(t.Context(), nil)
+	assert.Equal(t, 2, stats.Synced)
+	assert.Equal(t, 1, stats.Failed)
+	child, err := env.db.GetSession(t.Context(), "forge:child-conv")
+	require.NoError(t, err)
+	require.NotNil(t, child)
+	require.Nil(t, child.ParentSessionID)
+
+	require.NoError(t, env.db.Update(t.Context(), func(tx *sql.Tx) error {
+		_, err := tx.ExecContext(t.Context(), "DROP TRIGGER fail_subagent_link")
+		return err
+	}))
+	require.NoError(t, env.engine.ReconcileProviderRootsGrouped(
+		t.Context(), []sync.ProviderRootsGroup{{
+			Agent: parser.AgentForge, Roots: []string{env.forgeDir},
+		}},
+	))
+	child, err = env.db.GetSession(t.Context(), "forge:child-conv")
+	require.NoError(t, err)
+	require.NotNil(t, child)
+	require.NotNil(t, child.ParentSessionID)
+	assert.Equal(t, "forge:parent-conv", *child.ParentSessionID)
+}
+
+func TestSyncForgeCanceledImportRetriesLinksOnUnchangedPoll(t *testing.T) {
+	for _, rebuild := range []string{"none", "canceled", "failed swap", "installed"} {
+		t.Run(rebuild, func(t *testing.T) {
+			env := setupSingleAgentTestEnv(t, parser.AgentForge)
+			defer env.engine.Close()
+			forge := createForgeDB(t, env.forgeDir)
+			forge.addConversation(t, "parent-conv", "Parent",
+				forgeParentContext("child-conv"),
+				"2026-05-02 09:00:00", "2026-05-02 09:01:00", "")
+			forge.addConversation(t, "child-conv", "Child",
+				forgeTestContext("Child work.", "Child done."),
+				"2026-05-02 09:00:30", "2026-05-02 09:01:30", "")
+			ctx, cancel := context.WithCancel(t.Context())
+			defer cancel()
+			stats := env.engine.SyncAll(ctx, func(progress sync.Progress) {
+				if progress.SessionsDone == 2 {
+					cancel()
+				}
+			})
+			require.True(t, stats.Aborted)
+			require.Equal(t, 2, stats.Synced)
+			child, err := env.db.GetSession(t.Context(), "forge:child-conv")
+			require.NoError(t, err)
+			require.NotNil(t, child)
+			require.Nil(t, child.ParentSessionID)
+
+			switch rebuild {
+			case "canceled":
+				buildCtx, cancelBuild := context.WithCancel(t.Context())
+				defer cancelBuild()
+				reached := false
+				stats = env.engine.ResyncAll(buildCtx, func(p sync.Progress) {
+					if p.Detail == "Copying sync metadata" {
+						reached = true
+						cancelBuild()
+					}
+				})
+				require.True(t, reached)
+				require.True(t, stats.Aborted)
+				require.False(t, stats.ArchiveRebuilt)
+			case "failed swap":
+				restore := db.SetCloseDrainTimeoutForTest(100 * time.Millisecond)
+				defer restore()
+				// A reader held across the build prevents the live archive
+				// from closing, so the replacement cannot be installed.
+				pinned, err := env.db.Reader().Query(t.Context(), "SELECT 1")
+				require.NoError(t, err)
+				defer pinned.Close()
+				stats = env.engine.ResyncAll(t.Context(), nil)
+				require.NoError(t, pinned.Err())
+				require.NoError(t, pinned.Close())
+				require.True(t, stats.Aborted)
+				require.False(t, stats.ArchiveRebuilt)
+			case "installed":
+				stats = env.engine.ResyncAll(t.Context(), nil)
+				require.False(t, stats.Aborted)
+				require.True(t, stats.ArchiveRebuilt)
+				assert.False(t, env.engine.PendingSubagentLinks(),
+					"an installed replacement must not inherit the old retry")
+			}
+			if rebuild != "installed" {
+				child, err = env.db.GetSession(t.Context(), "forge:child-conv")
+				require.NoError(t, err)
+				require.NotNil(t, child)
+				require.Nil(t, child.ParentSessionID,
+					"a discarded rebuild must leave the live archive unchanged")
+			}
+
+			require.NoError(t, env.engine.ReconcileProviderRootsGrouped(
+				t.Context(), []sync.ProviderRootsGroup{{
+					Agent: parser.AgentForge, Roots: []string{env.forgeDir},
+				}},
+			))
+			child, err = env.db.GetSession(t.Context(), "forge:child-conv")
+			require.NoError(t, err)
+			require.NotNil(t, child)
+			require.NotNil(t, child.ParentSessionID,
+				"unchanged polling must repair links after a discarded rebuild")
+			assert.Equal(t, "forge:parent-conv", *child.ParentSessionID)
+			assert.False(t, env.engine.PendingSubagentLinks())
+		})
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -556,7 +690,7 @@ func TestSyncForgeFailureIsolation(t *testing.T) {
 
 	// Broken session must not be in the DB.
 	var count int
-	err := env.db.Reader().QueryRow(
+	err := env.db.Reader().QueryRow(t.Context(),
 		"SELECT COUNT(*) FROM sessions WHERE id = 'forge:broken-conv'",
 	).Scan(&count)
 	require.NoError(t, err, "query broken session")

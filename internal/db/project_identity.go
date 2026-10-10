@@ -117,6 +117,7 @@ func (db *DB) LoadProjectIdentityPublicationDelta(
 	if err != nil {
 		return delta, fmt.Errorf("listing changed project identity observations: %w", err)
 	}
+	defer rows.Close()
 	for rows.Next() {
 		var obs export.ProjectIdentityObservation
 		var observedAt string
@@ -154,6 +155,7 @@ func (db *DB) LoadProjectIdentityPublicationDelta(
 	if err != nil {
 		return delta, fmt.Errorf("listing project identity observation tombstones: %w", err)
 	}
+	defer rows.Close()
 	for rows.Next() {
 		var key ProjectIdentityObservationKey
 		if err := rows.Scan(
@@ -193,6 +195,7 @@ func (db *DB) LoadProjectIdentityPublicationDelta(
 	if err != nil {
 		return delta, fmt.Errorf("listing changed session project identity snapshots: %w", err)
 	}
+	defer rows.Close()
 	for rows.Next() {
 		var snapshot export.ProjectIdentityObservation
 		var observedAt string
@@ -280,10 +283,12 @@ func projectIdentityPublicationChangeWhere(
 	return where, args
 }
 
-var ErrDatabaseIDMissing = errors.New("database id is missing")
-var ErrArchiveIDMissing = errors.New("archive id is missing")
-var ErrArchiveSaltMissing = errors.New("archive salt is missing")
-var ErrArchiveSaltInvalid = errors.New("archive salt is invalid")
+var (
+	ErrDatabaseIDMissing  = errors.New("database id is missing")
+	ErrArchiveIDMissing   = errors.New("archive id is missing")
+	ErrArchiveSaltMissing = errors.New("archive salt is missing")
+	ErrArchiveSaltInvalid = errors.New("archive salt is invalid")
+)
 
 func validateArchiveSalt(salt string) (string, error) {
 	salt = strings.TrimSpace(salt)
@@ -323,16 +328,18 @@ func (db *DB) CopyArchiveIdentityFrom(sourcePath string) error {
 		createdAt string
 		updatedAt string
 	}
-	metadata := make(map[string]metadataRow, 2)
+	metadata := make(map[string]metadataRow, 3)
+	// A rebuilt archive stays as cold or active as the archive it replaces.
 	rows, err := conn.QueryContext(ctx, `
 		SELECT key, value, created_at, updated_at
 		FROM identity_source.archive_metadata
-		WHERE key IN (?, ?)`,
-		archiveMetadataArchiveIDKey, archiveMetadataArchiveSaltKey,
+		WHERE key IN (?, ?, ?)`,
+		archiveMetadataArchiveIDKey, archiveMetadataArchiveSaltKey, conversationExportInitializedKey,
 	)
 	if err != nil {
 		return fmt.Errorf("reading archive identity source: %w", err)
 	}
+	defer rows.Close()
 	for rows.Next() {
 		var key string
 		var row metadataRow
@@ -366,8 +373,12 @@ func (db *DB) CopyArchiveIdentityFrom(sourcePath string) error {
 	for _, key := range []string{
 		archiveMetadataArchiveIDKey,
 		archiveMetadataArchiveSaltKey,
+		conversationExportInitializedKey,
 	} {
-		row := metadata[key]
+		row, ok := metadata[key]
+		if !ok {
+			continue
+		}
 		if _, err := tx.ExecContext(ctx, `
 			INSERT INTO archive_metadata (key, value, created_at, updated_at)
 			VALUES (?, ?, ?, ?)
@@ -624,7 +635,7 @@ func (db *DB) SetDatabaseIDForTest(ctx context.Context, id string) error {
 	}
 	id = strings.TrimSpace(id)
 	if id == "" {
-		return fmt.Errorf("database id is required")
+		return errors.New("database id is required")
 	}
 
 	db.mu.Lock()
@@ -653,7 +664,7 @@ func (db *DB) SetArchiveIdentityForTest(ctx context.Context, id, salt string) er
 	id = strings.TrimSpace(id)
 	salt = strings.TrimSpace(salt)
 	if id == "" || salt == "" {
-		return fmt.Errorf("archive id and salt are required")
+		return errors.New("archive id and salt are required")
 	}
 	db.mu.Lock()
 	defer db.mu.Unlock()
@@ -750,12 +761,12 @@ func (db *DB) upsertProjectIdentityObservationWithSnapshotProject(
 // aggregate identity while preserving parser-time snapshot evidence. The
 // transaction-local insert result permits removal of only the fallback created
 // by this session write.
-func (db *DB) UpsertSessionWithProjectIdentity(
+func (db *DB) UpsertSessionWithProjectIdentity(ctx context.Context,
 	s Session,
 	obs export.ProjectIdentityObservation,
 	snapshotProject string,
 ) error {
-	_, err := db.upsertSessionWithProjectIdentity(
+	_, err := db.upsertSessionWithProjectIdentity(ctx,
 		s, obs, snapshotProject, true,
 	)
 	return err
@@ -765,18 +776,18 @@ func (db *DB) UpsertSessionWithProjectIdentity(
 // and its parser-time project identity without reviving a source-missing
 // tombstone. The returned bool reports whether retained content must be
 // replaced before the caller makes the session visible again.
-func (db *DB) UpsertSessionPendingContentWithProjectIdentity(
+func (db *DB) UpsertSessionPendingContentWithProjectIdentity(ctx context.Context,
 	s Session,
 	obs export.ProjectIdentityObservation,
 	snapshotProject string,
 ) (bool, error) {
-	result, err := db.upsertSessionWithProjectIdentity(
+	result, err := db.upsertSessionWithProjectIdentity(ctx,
 		s, obs, snapshotProject, false,
 	)
 	return result.sourceMissing, err
 }
 
-func (db *DB) upsertSessionWithProjectIdentity(
+func (db *DB) upsertSessionWithProjectIdentity(ctx context.Context,
 	s Session,
 	obs export.ProjectIdentityObservation,
 	snapshotProject string,
@@ -787,7 +798,7 @@ func (db *DB) upsertSessionWithProjectIdentity(
 		return sessionUpsertResult{}, err
 	}
 	if strings.TrimSpace(s.ID) == "" {
-		return sessionUpsertResult{}, fmt.Errorf("session id is required")
+		return sessionUpsertResult{}, errors.New("session id is required")
 	}
 	normalized, err := normalizeProjectIdentityObservation(obs)
 	if err != nil {
@@ -795,7 +806,7 @@ func (db *DB) upsertSessionWithProjectIdentity(
 	}
 	if normalized.SessionID == "" {
 		return sessionUpsertResult{},
-			fmt.Errorf("identity observation session id is required")
+			errors.New("identity observation session id is required")
 	}
 	if normalized.SessionID != s.ID {
 		return sessionUpsertResult{}, fmt.Errorf(
@@ -806,16 +817,17 @@ func (db *DB) upsertSessionWithProjectIdentity(
 	obs = normalized
 	db.mu.Lock()
 	defer db.mu.Unlock()
-	tx, err := db.getWriter().Begin()
+	tx, err := db.getWriter().Begin(ctx)
 	if err != nil {
 		return sessionUpsertResult{},
 			fmt.Errorf("beginning session identity upsert: %w", err)
 	}
 	defer func() { _ = tx.Rollback() }()
 	result, err := upsertSessionExec(
-		tx.Exec,
-		func(query string, args ...any) rowScanner {
-			return tx.QueryRow(query, args...)
+		ctx,
+		tx.ExecContext,
+		func(ctx context.Context, query string, args ...any) rowScanner {
+			return tx.QueryRowContext(ctx, query, args...)
 		},
 		s,
 		reviveSourceMissing,
@@ -918,7 +930,7 @@ func upsertProjectIdentityObservationWithSnapshotProjectTxContext(
 
 func writeSessionProjectIdentitySnapshotExec(
 	ctx context.Context,
-	exec contextExecer,
+	exec sqlContextExecer,
 	queryRow contextQueryRow,
 	obs export.ProjectIdentityObservation,
 	snapshotProject string,
@@ -998,6 +1010,7 @@ func (db *DB) RestoreSessionProjectsFromIdentitySnapshots(
 			"listing session project identity restores: %w", err,
 		)
 	}
+	defer rows.Close()
 	for rows.Next() {
 		var restore projectRestore
 		if err := rows.Scan(
@@ -1153,7 +1166,7 @@ func reconcileSessionProjectIdentityAggregatesTx(
 
 func upsertSessionProjectIdentitySnapshotExec(
 	ctx context.Context,
-	exec contextExecer,
+	exec sqlContextExecer,
 	queryRow contextQueryRow,
 	obs export.ProjectIdentityObservation,
 	allowProjectCorrection bool,
@@ -1239,15 +1252,11 @@ func upsertSessionProjectIdentitySnapshotExec(
 	return nil
 }
 
-type contextExecer interface {
-	ExecContext(context.Context, string, ...any) (sql.Result, error)
-}
-
 type contextQueryRow func(context.Context, string, ...any) rowScanner
 
 func upsertProjectIdentityObservationExec(
 	ctx context.Context,
-	exec contextExecer,
+	exec sqlContextExecer,
 	queryRow contextQueryRow,
 	obs export.ProjectIdentityObservation,
 ) error {
@@ -1257,7 +1266,7 @@ func upsertProjectIdentityObservationExec(
 
 func upsertProjectIdentityObservationExecExcludingRemote(
 	ctx context.Context,
-	exec contextExecer,
+	exec sqlContextExecer,
 	queryRow contextQueryRow,
 	obs export.ProjectIdentityObservation,
 	excludeRemote string,
@@ -1352,10 +1361,10 @@ func normalizeProjectIdentityObservation(
 	obs.WorktreeRootPath = strings.TrimSpace(obs.WorktreeRootPath)
 	obs.GitBranch = strings.TrimSpace(obs.GitBranch)
 	if obs.Project == "" {
-		return obs, fmt.Errorf("project is required")
+		return obs, errors.New("project is required")
 	}
 	if obs.Machine == "" {
-		return obs, fmt.Errorf("machine is required")
+		return obs, errors.New("machine is required")
 	}
 	if obs.ObservedAt.IsZero() {
 		obs.ObservedAt = time.Now().UTC()
@@ -1413,6 +1422,7 @@ func scrubProjectIdentityGitRemoteCredentialsTx(
 	if err != nil {
 		return fmt.Errorf("listing project identity remotes for scrub: %w", err)
 	}
+	defer rows.Close()
 
 	type pendingScrub struct {
 		obs       export.ProjectIdentityObservation

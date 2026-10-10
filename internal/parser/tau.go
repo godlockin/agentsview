@@ -3,7 +3,7 @@ package parser
 import (
 	"bufio"
 	"context"
-	"encoding/json"
+	"encoding/json/v2"
 	"errors"
 	"fmt"
 	"io"
@@ -15,6 +15,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/tidwall/gjson"
+	"go.kenn.io/agentsview/internal/ctxio"
 )
 
 type tauEntry struct {
@@ -31,7 +32,7 @@ func readTauEntries(ctx context.Context, path string) ([]tauEntry, error) {
 	}
 	defer f.Close()
 
-	reader := bufio.NewReader(checkedContextReader{ctx: ctx, reader: f})
+	reader := bufio.NewReader(ctxio.Reader{Context: ctx, Reader: f})
 	entries := make([]tauEntry, 0)
 	var line []byte
 	for {
@@ -330,8 +331,7 @@ func decodeTauMessage(
 			SourceParentUUID: parent,
 		}
 	case "assistant":
-		content, thinking, hasThinking, hasToolUse, toolCalls :=
-			tauExtractContent(message.Get("content"))
+		content, thinking, hasThinking, hasToolUse, toolCalls := tauExtractContent(message.Get("content"))
 		if content == "" && message.Get("errorMessage").Str != "" {
 			content = message.Get("errorMessage").Str
 		}
@@ -466,7 +466,7 @@ func applyTauUsage(pm *ParsedMessage, usage gjson.Result) {
 	if len(normalized) == 0 {
 		return
 	}
-	encoded, err := json.Marshal(normalized)
+	encoded, err := json.Marshal(normalized, json.Deterministic(true))
 	if err != nil {
 		return
 	}

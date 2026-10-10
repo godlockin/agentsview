@@ -27,20 +27,37 @@ coding yesterday?" — across multiple coding agents from one archive.
 
 !!! note
 
-    **As of 0.42.0**, usage totals are populated when the source session includes
-    token metadata for **Claude Code**, **Codex**, **Copilot CLI**, **OpenCode** and
-    OpenCode-format forks such as **IcodeMate**, **Kilo**, and **MiMoCode**,
-    **Cursor IDE**, **Posit Assistant**, **Pi**, **Prime Agent**, **Gemini**, **Qwen
-    Code**, **OpenClaw**, **QClaw**, **Hermes**, **WorkBuddy**, **Forge**,
-    **Piebald**, **Antigravity IDE/CLI**, **Zed**, **VS Code Copilot**, **Visual
-    Studio Copilot**, **Mistral Vibe**, **gptme**, and **Amp**.
+    Usage totals are populated when the source session includes token metadata for
+    **Claude Code**, **Codex**, **Copilot CLI**, **OpenCode** and OpenCode-format
+    forks such as **IcodeMate**, **Kilo**, and **MiMoCode**, **Cursor IDE**, **Posit
+    Assistant**, **Pi**, **Prime Agent**, **Gemini**, **Qwen Code**, **OpenClaw**,
+    **QClaw**, **Hermes**, **WorkBuddy**, **Forge**, **Piebald**, **Antigravity
+    IDE/CLI**, **Zed**, **VS Code Copilot**, **Visual Studio Copilot**, **Mistral
+    Vibe**, **gptme**, **Amp**, **Junie CLI**, **OMO**, and **StepCode**. Coverage
+    also includes **Cline CLI**, **Tencent CodeBuddy CN**, **Augure Code**,
+    **Augure Desktop 3 beta**, and **Charm Crush**, and reads **DeepSeek Harness**
+    formats through version 3.
 
-    Coverage is opportunistic rather than guaranteed for every session from those
-    agents: rows contribute to cost only when the local transcript includes usable
-    token counts and a model name that can be priced. Other supported agents still
-    appear in the session browser, search, and analytics even when their local logs
-    do not expose token usage. Warp records session-level totals, but those totals
-    are not yet folded into the per-message cost report.
+    Coverage depends on what each agent records. AgentsView uses recorded costs
+    when available; otherwise it estimates cost from usable token counts and a
+    model that can be priced. Sessions still appear in the browser, search, and
+    analytics when their logs do not expose usage. Warp records session-level
+    totals, but those totals are not yet folded into the per-message cost report.
+
+Crush contributes recorded session totals and cost, with no per-message token or
+cache breakdown. Its aggregate usage is attributed to the most recent assistant
+model, so it does not provide a model-by-model account of a session that
+switched models.
+
+Augure Code and Augure Desktop retain recorded usage. Proprietary Augure models
+have no catalog price, so token-based cost estimates remain unpriced unless you
+add [custom model pricing](#custom-model-pricing). Recorded authoritative costs
+are retained when the source provides them.
+
+Junie coverage is for CLI sessions; it excludes tool calls and IDE-only
+conversations. Antigravity plaintext-only transcripts include conversation,
+reasoning, and tool calls but no token usage or cost. Antigravity sessions with
+a usable database can still contribute recorded usage.
 
 When an agent filter selects only agents that do not expose per-message token
 rows, AgentsView reports that as an unsupported usage state instead of silently
@@ -162,8 +179,11 @@ and API model filters are unchanged.
 
 ### Summary Cards
 
-Eight baseline cards at the top summarize the selected window. The Total Cost
-card is featured with a larger value; the rest show total tokens, daily burn,
+Ten baseline cards at the top summarize the selected window. The Total Cost
+card is featured with a larger value. **Total Input** adds uncached input,
+cache writes, and cache reads, the full prompt volume the models read.
+**Uncached Input** counts input not reported as a cache read or cache write,
+with cache reads noted beneath it. The rest show output tokens, daily burn,
 peak day, cache hit rate, project and model counts, and active days. When
 Copilot-family sessions have priced usage, an additional **Copilot AI Credits**
 card shows the same spend converted at 100 credits per dollar.
@@ -177,7 +197,14 @@ or agent — toggle the grouping with the segment buttons in the panel header.
 Each series is colored consistently with the attribution panel below so you can
 cross-reference them.
 
+Choose **Smooth**, **Lines**, or **Bars** in the chart header. The page
+remembers the style in your browser. Days without spend remain visible as zero,
+and you can drag across the chart to select a narrower date range. The same
+controls work in Tokens mode.
+
 ![Cost over time chart](/docs/assets/generated/screenshots/usage-cost-trend.png)
+
+![Cost over time shown as bars](/docs/assets/generated/screenshots/cost-chart-bars.png)
 
 ### Cost Attribution
 
@@ -199,10 +226,11 @@ comparison uses the page's active date range and shared filters, then asks the
 backend to compute both slices.
 
 The result table shows total cost, session count, cost per session, total
-tokens, tokens per session, input tokens, output tokens, the absolute delta from
-left to right, and the percent delta when a ratio can be computed. It is useful
-for questions such as "how much more expensive was project A than project B this
-week?" or "how do two models compare after normalizing by session count?"
+tokens, tokens per session, uncached input tokens, output tokens, the absolute
+delta from left to right, and the percent delta when a ratio can be computed. It
+is useful for questions such as "how much more expensive was project A than
+project B this week?" or "how do two models compare after normalizing by session
+count?"
 
 The same comparison is available over REST:
 
@@ -506,6 +534,9 @@ catalog estimates because the later session total is outside the selected data.
 Model-filtered reports also remain catalog estimates because applying the whole
 session total to one selected model would overstate that model.
 
+Comma-separated usage filters trim spaces and ignore blank entries. Blank model
+filters keep the reported session total.
+
 ### Copilot AI Credits
 
 Usage reports compute **Copilot AI Credits** for Copilot-family agents
@@ -533,6 +564,11 @@ so the input side of the equation is accurate:
 If you upgraded from an earlier version, the first `usage` invocation triggers a
 full resync so these corrections apply to historical sessions.
 
+Codex also records prompt-cache writes inside its input count. AgentsView moves
+them into the cache-creation bucket so GPT-5.6 and later writes price at the
+cache-write rate. Hosted raw archives pick up the change through the existing
+[`pg raw-reparse hosted`](hosted-raw-sync.md#reparse-and-rollback) workflow.
+
 ### Amp Token Metrics
 
 Amp thread documents carry a `usage` object on each assistant message with the
@@ -543,9 +579,9 @@ model's own tokens rather than collapsing to one.
 Amp routes every prompt token into one of three input buckets. Anthropic-backed
 threads already use Anthropic's cache semantics and are read as-is.
 OpenAI-backed threads report `inputTokens` as zero and classify the whole
-uncached prompt as cache creation; because OpenAI does not bill cache writes,
-those tokens are recorded as uncached input and no cache-creation bucket is
-emitted — the same normalization the Codex parser applies for the same reason.
+uncached prompt as cache creation. That bucket is the whole uncached prompt
+rather than an OpenAI-reported cache write, so those tokens are recorded as
+uncached input and no cache-creation bucket is emitted.
 
 Two limits are worth knowing. Older threads can omit the model entirely. Usage
 reporting counts only rows that carry a model, so those inferences are absent
@@ -577,15 +613,26 @@ workflow also:
 - **Shares one database with the UI** — the same data powers
   [Analytics](/docs/usage/#dashboard) and session detail views, so there's no
   second index to keep fresh.
-- **Includes on-demand sync** — when no AgentsView server is running, `usage`
-  does a quick incremental sync scoped to files modified since the last sync
-  start time so reports always reflect current state. Skip with `--no-sync`
-  when you want to report only from the existing archive.
+- **Reads committed archive data** — daily reports can run while the daemon
+  imports new source changes. Run `agentsview sync` first when those changes
+  must be included. Session usage and statusline finish any pending startup
+  ingestion before querying, including when they reuse an existing daemon.
 
 ## `agentsview usage daily`
 
 Daily cost report. Outputs a tab-aligned table to stdout by default, or JSON
 with `--format json` (or the `--json` alias).
+
+A cold cache prepares the sessions needed for the report. Slow reports print
+preparation phases and elapsed time to stderr, including with JSON output. Usage
+reports can finish beyond the server's normal write timeout. Press Ctrl+C to
+stop waiting; shared cache preparation can continue in the daemon. Canceling
+daemon startup also leaves the detached child running.
+
+Required archive reparsing finishes before the daemon serves requests. Startup
+waits show phases and continue while progress updates arrive, including when a
+foreground server is starting in another terminal. Restart older daemons after
+upgrading to provide the usage progress endpoint.
 
 ```bash
 agentsview usage daily [flags]
@@ -600,8 +647,8 @@ agentsview usage daily [flags]
 | `--all`       | `false`       | Include all history; overrides the default 30-day window                 |
 | `--agent`     |               | Filter by agent name (e.g. `claude`, `codex`)                            |
 | `--breakdown` | `false`       | Show indented per-model sub-rows under each day                          |
-| `--offline`   | `false`       | Skip the LiteLLM fetch; use the embedded fallback pricing                |
-| `--no-sync`   | `false`       | Skip the on-demand sync pass before querying                             |
+| `--offline`   | `false`       | Read the archive directly without sync or pricing fetches                |
+| `--no-sync`   | `false`       | Skip source refresh; a new daemon starts without automatic sync          |
 | `--timezone`  | system        | IANA timezone name used for date bucketing                               |
 
 The default 30-day window only kicks in when neither `--since` nor `--until` nor
@@ -715,6 +762,9 @@ to X" still works.
     "cacheCreationTokens": 1172133,
     "cacheReadTokens": 10908442,
     "totalCost": 36.4700
+  },
+  "machine_labels": {
+    "build-host": "Build Host"
   }
 }
 ```
@@ -724,7 +774,13 @@ appears first. Daily entries always emit `modelBreakdowns`, `projectBreakdowns`,
 `agentBreakdowns`, and `machineBreakdowns` as arrays; empty breakdowns are `[]`,
 not omitted. `modelBreakdowns` always includes a row per model. The other three
 arrays are populated when `--breakdown` is passed; the flag also controls
-per-model terminal table output.
+per-model terminal table output. With `--breakdown`, `machine_labels` maps each
+`machineBreakdowns[].machineName` key to its display label and contains only
+keys present in the report. The map is `{}` when
+the archive has no labels or the catalog read fails; failures produce a warning
+on stderr while the report continues. Without `--breakdown`, the field is
+omitted and the command does not read the catalog. Adding this field does not
+change `schema_version`.
 
 ### JSON Contract
 
@@ -796,10 +852,10 @@ When no catalog bands or applied bands exist, their canonical JSON value is
 that null-versus-nonempty-array representation within schema version 5.
 
 Ordinary models have one resolution whose `priced_model` is the reported model.
-Fixed aliases such as `k2d6-agent` and `gpt-reserve` keep that reported name
-and resolve `priced_model` to a catalog row (`moonshot/kimi-k2.6` and
-`gpt-5.6-luna`). Timestamp-aware aliases can have more than one resolution in a
-report. For
+Fixed aliases such as `k2d6-agent`, `gpt-reserve`, and `codex-auto-review` keep
+that reported name and resolve `priced_model` to a catalog row
+(`moonshot/kimi-k2.6`, and `gpt-5.6-luna` for both Codex names).
+Timestamp-aware aliases can have more than one resolution in a report. For
 example, one `kimi-for-coding` entry can contain both `moonshot/kimi-k2.6` and
 `kimi-k3` resolutions when its rows span the pricing cutoff. An exact
 custom-pricing row for the reported alias takes precedence before timestamp
@@ -828,6 +884,12 @@ row, its model entry and resolution have `cost_source: "reported"`, the
 resolution has `matched_pattern: null`, and all four rate fields are zero. The
 reported amount remains authoritative; the zero rates express unavailable rate
 provenance, not a zero-rate calculation.
+
+A computed resolution with `matched_pattern: null` means no effective pricing
+row matched the model. Its rates are zero, so its tokens add nothing to the
+computed cost; add a `[custom_model_pricing]` row to price it.
+`pricing.fallback.models` lists models priced from the embedded catalog, not
+unpriced ones.
 
 `pricing.source` is one of `embedded`, `fetched`, `custom`, `custom+embedded`,
 or `custom+fetched`. Combined values always serialize `custom` first, followed
@@ -881,19 +943,20 @@ the display label or catalog key, represents project continuity.
 ## `agentsview usage statusline`
 
 One-line today's spend, designed for shell prompts, tmux status lines, and
-window titles.
+window titles. Statusline has a 30-second deadline covering startup and the
+report request; it returns an error if that deadline expires.
 
 ```bash
 agentsview usage statusline [flags]
 ```
 
-| Flag        | Default | Description                        |
-| ----------- | ------- | ---------------------------------- |
-| `--format`  | `human` | Output format: `human` or `json`   |
-| `--json`    | `false` | Alias for `--format json`          |
-| `--agent`   |         | Filter by agent name               |
-| `--offline` | `false` | Use embedded fallback pricing only |
-| `--no-sync` | `false` | Skip on-demand sync                |
+| Flag        | Default | Description                                      |
+| ----------- | ------- | ------------------------------------------------ |
+| `--format`  | `human` | Output format: `human` or `json`                 |
+| `--json`    | `false` | Alias for `--format json`                        |
+| `--agent`   |         | Filter by agent name                             |
+| `--offline` | `false` | Read the archive without sync or pricing fetches |
+| `--no-sync` | `false` | Skip source refresh                              |
 
 Output is a single line:
 
@@ -959,29 +1022,29 @@ format = "[$output]($style) "
 style = "bold green"
 ```
 
-Pair with `--no-sync` so the prompt never blocks on a sync pass; a separate
-`agentsview` server (or a periodic `agentsview sync` cron) keeps the database
-fresh.
+The offline flags read the existing archive without starting a daemon or syncing
+source files. A separate `agentsview serve` process or periodic
+`agentsview sync` keeps the archive fresh. Cache preparation can still take
+time.
 
-## On-Demand Sync
+## Source Freshness
 
-When no AgentsView server is running, the `usage` commands do a quick
-incremental sync before querying so reports always include recent activity:
+`usage daily` reads committed archive data. When it starts a daemon, routine
+source ingestion runs after readiness. Run `agentsview sync` before the report
+when it must include new source changes. Required archive reparsing still
+finishes before the daemon serves requests.
 
-1. If the parser data version has changed (i.e. you just upgraded), a full
-   resync runs first.
-1. Otherwise, the sync scans only files modified since the last recorded sync
-   start time, minus a 10-second safety margin to catch files written during
-   the prior sync.
+`session usage`, `token-use`, and `usage statusline` complete pending startup
+ingestion before querying. This also applies when a previous daily report
+started the daemon. Once startup ingestion is complete, subsequent queries do
+not repeat a full sync; the daemon's file watcher handles later source changes.
 
-If an `agentsview serve` process is already running, the file watcher already
-has you covered and the on-demand sync is skipped to avoid duplicate work. A
-running `pg serve` process does not keep your local SQLite archive fresh, so the
-CLI still treats the local archive as the source of truth for command-line
-reporting.
-
-Pass `--no-sync` to skip the refresh unconditionally — useful for scripting and
-for prompt modules that must stay snappy.
+`--no-sync` skips source refresh and starts any new daemon without automatic
+sync. It does not disable sync on an already-running daemon. `--offline` reads
+the archive directly, without daemon startup, source sync, or pricing fetches. A
+direct online query, when daemon autostart is disabled, retains its incremental
+refresh before reading. Read-only mirror daemons do not refresh the local SQLite
+archive; stop them to run a local online usage report.
 
 ## Scripting Examples
 

@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 
 	"github.com/spf13/cobra"
 	"go.kenn.io/agentsview/internal/config"
@@ -53,13 +54,23 @@ type workerResult struct {
 	// (total sessions, orphan counts, warnings, anomalies). The summary
 	// counters above remain the authoritative status inputs.
 	Stats *sync.SyncStats `json:"stats,omitempty"`
+	// LinkStateKnown marks an engine snapshot of Stats.LinksPending, even when
+	// unrelated source failures make the pass fail. Early failures lack it.
+	LinkStateKnown bool `json:"linkStateKnown,omitempty"`
+}
+
+// syncWorkerRequest carries the pass and any unfinished linking owned by the
+// daemon. An audit must receive that state even when no source has changed.
+type syncWorkerRequest struct {
+	Mode         string
+	LinksPending bool
 }
 
 // newSyncWorkerCommand registers the hidden self-exec'd worker. The daemon runs
 // it as a short-lived child so archive-scale allocation high-water returns to
 // the OS when the child exits, instead of pinning the daemon's RSS.
 func newSyncWorkerCommand() *cobra.Command {
-	var mode string
+	var request syncWorkerRequest
 	cmd := &cobra.Command{
 		Use:          "sync-worker",
 		Short:        "Run one heavy sync pass and stream a terminal result",
@@ -79,13 +90,15 @@ func newSyncWorkerCommand() *cobra.Command {
 			// log.Printf diagnostics would otherwise flood the serve
 			// console instead of landing in the debug log.
 			setupLogFile(cfg.DataDir)
-			return runSyncWorker(cfg, mode, cmd.OutOrStdout())
+			return runSyncWorker(cfg, request, cmd.OutOrStdout())
 		},
 	}
 	cmd.Flags().StringVar(
-		&mode, "mode", "",
+		&request.Mode, "mode", "",
 		"worker mode: startup, sync, resync-build, audit",
 	)
+	cmd.Flags().BoolVar(&request.LinksPending, "links-pending", false,
+		"finish parent linking retained by the daemon")
 	if err := cmd.MarkFlagRequired("mode"); err != nil {
 		panic(err)
 	}
@@ -95,16 +108,20 @@ func newSyncWorkerCommand() *cobra.Command {
 }
 
 // runSyncWorker runs one worker pass with a background context.
-func runSyncWorker(cfg config.Config, mode string, out io.Writer) error {
-	return runSyncWorkerContext(context.Background(), cfg, mode, out)
+func runSyncWorker(cfg config.Config, request syncWorkerRequest, out io.Writer) error {
+	return runSyncWorkerContext(context.Background(), cfg, request, out)
 }
 
 // runSyncWorkerContext dispatches on mode, streaming NDJSON progress and exactly
 // one terminal result. It returns nil only when the terminal result is Status
 // "ok" with authoritative discovery; the child's exit code follows this error.
 func runSyncWorkerContext(
-	ctx context.Context, cfg config.Config, mode string, out io.Writer,
+	ctx context.Context, cfg config.Config, request syncWorkerRequest, out io.Writer,
 ) error {
+	mode := request.Mode
+	stopProfile := startSyncWorkerProfile(mode)
+	defer stopProfile()
+
 	enc := jsontext.NewEncoder(out)
 	// Retain the first encode error: a dropped terminal-result line means the
 	// parent never sees the outcome, so the worker must exit non-zero even if the
@@ -131,7 +148,7 @@ func runSyncWorkerContext(
 		// they must refuse a stale-version archive rather than swap it out from
 		// under those readers; the real resync path is the resync-build flow,
 		// which swaps and resets caches daemon-side.
-		err = runSyncWorkerStartup(ctx, cfg, mode, emit, onProgress)
+		err = runSyncWorkerStartup(ctx, cfg, request, emit, onProgress)
 	case "resync-build":
 		err = runSyncWorkerResyncBuild(ctx, cfg, mode, emit, onProgress)
 	default:
@@ -157,22 +174,32 @@ func runSyncWorkerContext(
 func runSyncWorkerStartup(
 	ctx context.Context,
 	cfg config.Config,
-	mode string,
+	request syncWorkerRequest,
 	emit func(workerLine),
 	onProgress func(sync.Progress),
 ) error {
-	database, writeLock, err := openWorkerWriteDB(cfg)
+	mode := request.Mode
+	reportOpening := func(p db.OpenProgress) {
+		onProgress(sync.Progress{Phase: sync.PhaseOpeningDatabase, Detail: p.Detail, Resync: p.ResyncRequired})
+	}
+	reportOpening(db.OpenProgress{Detail: "Waiting for database write lock"})
+	database, writeLock, err := openWorkerWriteDB(ctx, cfg, reportOpening)
 	if err != nil {
 		return err
 	}
 	defer closeWriteDB(database, writeLock)
+	onProgress(sync.Progress{
+		Phase: sync.PhaseDiscovering, Detail: "Preparing session sync",
+		Resync: mode == "startup" && database.NeedsResync(),
+	})
 
 	// Remove stale temp DB from a prior crashed resync before ResyncAll
 	// stages a fresh one, matching runServe's startup cleanup.
 	cleanResyncTemp(cfg.DBPath)
 
-	engine := sync.NewEngine(database, workerEngineConfig(cfg))
+	engine := sync.NewEngine(ctx, database, workerEngineConfig(cfg))
 	defer engine.Close()
+	engine.RetainSubagentLinkRetry(request.LinksPending)
 
 	if database.NeedsResync() && mode != "startup" {
 		// A resync would CloseConnections + rename the archive file, but the
@@ -225,6 +252,8 @@ func runSyncWorkerStartup(
 		result = workerResultFromStats(ctx, engine.SyncAll(ctx, onProgress))
 	}
 
+	result.Stats.LinksPending = engine.PendingSubagentLinks()
+	result.LinkStateKnown = true
 	emit(workerLine{Result: &result})
 	if result.Status != "ok" || !result.DiscoveryComplete {
 		return fmt.Errorf("sync worker %s: %s", mode, result.Status)
@@ -255,17 +284,18 @@ func runSyncWorkerResyncBuild(
 	// other worker modes inherit this through openWorkerWriteDB -> openDB.
 	applyClassifierConfig(cfg)
 
-	origRO, err := db.OpenReadOnly(cfg.DBPath)
+	origRO, err := db.OpenReadOnly(ctx, cfg.DBPath)
 	if err != nil {
 		return fmt.Errorf("resync-build: open read-only archive: %w", err)
 	}
 	defer origRO.Close()
 
-	engine := sync.NewEngine(origRO, workerEngineConfig(cfg))
+	engine := sync.NewEngine(ctx, origRO, workerEngineConfig(cfg))
 	defer engine.Close()
 
 	_, stats, buildErr := engine.ResyncBuild(ctx, onProgress)
 	result := resyncBuildResultFromStats(ctx, stats, buildErr)
+	result.Stats.LinksPending = engine.PendingSubagentLinks()
 	emit(workerLine{Result: &result})
 	if result.Status != "ok" || !result.DiscoveryComplete {
 		if buildErr != nil {
@@ -370,8 +400,10 @@ func workerResultFromStats(
 // must tear down through closeWriteDB so a failed database close (undrained
 // connections) retains the write-owner flock instead of letting another
 // process acquire writer ownership alongside a surviving SQLite connection.
-func openWorkerWriteDB(cfg config.Config) (*db.DB, *writeOwnerLock, error) {
-	return openWriteDB(context.Background(), cfg)
+func openWorkerWriteDB(ctx context.Context, cfg config.Config, progress db.OpenProgressFunc) (*db.DB, *writeOwnerLock, error) {
+	return openWriteDBWith(ctx, cfg, func(ctx context.Context, cfg config.Config) (*db.DB, error) {
+		return openDBWithProgress(ctx, cfg, progress)
+	})
 }
 
 // workerEngineConfig mirrors the sync.EngineConfig literal in runServe minus the
@@ -387,6 +419,7 @@ func workerEngineConfig(cfg config.Config) sync.EngineConfig {
 		Machine:                 cfg.InstallationID,
 		BlockedResultCategories: cfg.ResultContentBlockedCategories,
 		ToolResultImages:        cfg.ToolResultImages,
+		AssetsDir:               filepath.Join(cfg.DataDir, "assets"),
 		ArchiveContent:          cfg.ArchiveContent,
 	}
 }

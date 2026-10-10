@@ -1,4 +1,5 @@
 import type { SessionGroup, SessionGroupInput } from "../../stores/sessions.svelte.js";
+import { sessionAncestryMatches } from "../../utils/session-ancestry.js";
 
 export const ITEM_HEIGHT = 42;
 const CHILD_ITEM_HEIGHT = 34;
@@ -119,20 +120,7 @@ function isTeammateByMessage(s: SessionGroupInput): boolean {
  * same teammate chain.
  */
 function isTeammate(s: SessionGroupInput, allSessions: SessionGroupInput[]): boolean {
-  if (isTeammateByMessage(s)) return true;
-  // Walk up the parent chain within the group to inherit.
-  if (s.parent_session_id) {
-    const visited = new Set<string>();
-    let cur: SessionGroupInput | undefined = s;
-    while (cur?.parent_session_id && !visited.has(cur.id)) {
-      visited.add(cur.id);
-      const parent = allSessions.find((p) => p.id === cur!.parent_session_id);
-      if (!parent) break;
-      if (isTeammateByMessage(parent)) return true;
-      cur = parent;
-    }
-  }
-  return false;
+  return sessionAncestryMatches(s, allSessions, isTeammateByMessage);
 }
 
 /**
@@ -154,18 +142,7 @@ export function isSubagentDescendant(
   s: SessionGroupInput,
   groupSessions: SessionGroupInput[],
 ): boolean {
-  if (isSubagent(s)) return true;
-  if (!s.parent_session_id) return false;
-  const visited = new Set<string>();
-  let cur: SessionGroupInput | undefined = s;
-  while (cur?.parent_session_id && !visited.has(cur.id)) {
-    visited.add(cur.id);
-    const parent = groupSessions.find((p) => p.id === cur!.parent_session_id);
-    if (!parent) break;
-    if (isSubagent(parent)) return true;
-    cur = parent;
-  }
-  return false;
+  return sessionAncestryMatches(s, groupSessions, isSubagent);
 }
 
 /**
@@ -241,7 +218,7 @@ function emitGroupItems(
     const hasFollowingGroup = subagents.length > 0 || teammates.length > 0;
     const isLast = i === continuations.length - 1 && !hasFollowingGroup;
     items.push({
-      id: `child:${s.id}`,
+      id: `child:${g.key}:${s.id}`,
       type: "session",
       label,
       count: 0,
@@ -286,7 +263,7 @@ function emitGroupItems(
       for (let i = 0; i < subagents.length; i++) {
         const s = subagents[i]!;
         items.push({
-          id: `child:${s.id}`,
+          id: `child:${g.key}:${s.id}`,
           type: "session",
           label,
           count: 0,
@@ -326,7 +303,7 @@ function emitGroupItems(
       for (let i = 0; i < teammates.length; i++) {
         const s = teammates[i]!;
         items.push({
-          id: `child:${s.id}`,
+          id: `child:${g.key}:${s.id}`,
           type: "session",
           label,
           count: 0,

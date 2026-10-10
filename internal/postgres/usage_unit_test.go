@@ -20,18 +20,6 @@ import (
 	pricingpkg "go.kenn.io/agentsview/internal/pricing"
 )
 
-func TestPaddedUTCBoundClampsBeforeYearOne(t *testing.T) {
-	t.Parallel()
-	assert.Equal(t,
-		"0001-01-01T00:00:00Z",
-		paddedUTCBound("0001-01-01T00:00:00Z", -14),
-	)
-	assert.Equal(t,
-		"2026-03-10T10:00:00Z",
-		paddedUTCBound("2026-03-11T00:00:00Z", -14),
-	)
-}
-
 type usageProbeDriver struct{}
 
 type usageProbeConn struct {
@@ -263,7 +251,7 @@ func TestPGGetDailyUsageReturnsDedupedSessionCounts(t *testing.T) {
 		pg: newUsageProbeDB(t, &usageProbeState{}),
 	}
 
-	result, err := store.GetDailyUsage(context.Background(), db.UsageFilter{
+	result, err := store.GetDailyUsage(t.Context(), db.UsageFilter{
 		From: "2024-06-15",
 		To:   "2024-06-15",
 	})
@@ -279,22 +267,6 @@ func TestPGGetDailyUsageReturnsDedupedSessionCounts(t *testing.T) {
 	assert.Equal(t, 1, result.SessionCounts.ByAgent["claude"])
 	assert.NotContains(t, countsByDisplay, "proj-b")
 	assert.Zero(t, result.SessionCounts.ByAgent["codex"])
-}
-
-func TestPGUsageDedupTokenForRowFallsBackToSourceUUIDWhenClaudePairIncomplete(t *testing.T) {
-	got, ok := pgUsageDedupTokenForRow(
-		"message",
-		"claude-code",
-		"msg-dup",
-		"",
-		"source-dup",
-		"",
-	)
-	require.True(t, ok, "expected source_uuid fallback key")
-	assert.Equal(t, pgUsageDedupToken{
-		kind:  "source",
-		value: "claude-code:source-dup",
-	}, got)
 }
 
 func TestPGUsageAmountsPreserveSessionSummaryUsageEventTokens(t *testing.T) {
@@ -504,7 +476,7 @@ func TestPGGetUsageMatchingSessionCountUsesSessionQuery(t *testing.T) {
 		pg: newUsageProbeDB(t, state),
 	}
 
-	count, err := store.GetUsageMatchingSessionCount(context.Background(), db.UsageFilter{
+	count, err := store.GetUsageMatchingSessionCount(t.Context(), db.UsageFilter{
 		Agent: "copilot",
 		Model: "gpt-5.3-codex",
 	})
@@ -868,6 +840,71 @@ func TestPGDailyUsageAmountsPrefersExactCustomGPTReserve(t *testing.T) {
 	resolutions := block.Models[pricingpkg.GPTReserveModelName].Resolutions
 	require.Len(t, resolutions, 1)
 	assert.Equal(t, pricingpkg.GPTReserveModelName, resolutions[0].PricedModel)
+}
+
+func TestPGDailyUsageAmountsPricesCodexAutoReviewAsLuna(t *testing.T) {
+	lunaCost := money.MustParseDollars("0.20")
+	resolver := export.NewPricingResolver([]export.EffectivePricingRow{{
+		ModelPattern: pricingpkg.GPT56LunaCanonical,
+		Rates:        export.ModelRates{InputPerMTok: lunaCost},
+	}})
+
+	_, _, _, _, cost, _, err := pgDailyUsageAmounts(pgDailyUsageScanRow{
+		usageSource: "provider",
+		model:       pricingpkg.CodexAutoReviewModelName,
+		inputTokens: 1_000_000,
+	}, resolver)
+	require.NoError(t, err)
+	assert.Equal(t, lunaCost, cost)
+	block, err := resolver.BuildBlock()
+	require.NoError(t, err)
+	require.Contains(t, block.Models, pricingpkg.CodexAutoReviewModelName)
+	resolutions := block.Models[pricingpkg.CodexAutoReviewModelName].Resolutions
+	require.Len(t, resolutions, 1)
+	assert.Equal(t, pricingpkg.GPT56LunaCanonical, resolutions[0].PricedModel)
+	assert.NotContains(t, block.Models, pricingpkg.GPT56LunaCanonical)
+}
+
+// TestPGDailyUsageAmountsPrefersExactCustomPrefixedCodexAutoReview proves an
+// exact custom row beats the alias for both the provider-prefixed name and the
+// bare name users configure today.
+func TestPGDailyUsageAmountsPrefersExactCustomPrefixedCodexAutoReview(t *testing.T) {
+	for _, model := range []string{
+		"openai/" + pricingpkg.CodexAutoReviewModelName,
+		pricingpkg.CodexAutoReviewModelName,
+	} {
+		t.Run(model, func(t *testing.T) {
+			resolver := export.NewPricingResolver([]export.EffectivePricingRow{
+				{
+					ModelPattern: model,
+					Rates: export.ModelRates{
+						InputPerMTok: money.MustParseDollars("7"),
+						Source:       export.PricingRowSourceCustom,
+					},
+				},
+				{
+					ModelPattern: pricingpkg.GPT56LunaCanonical,
+					Rates: export.ModelRates{
+						InputPerMTok: money.MustParseDollars("0.20"),
+						Source:       export.PricingRowSourceFetched,
+					},
+				},
+			})
+
+			_, _, _, _, cost, _, err := pgDailyUsageAmounts(pgDailyUsageScanRow{
+				usageSource: "provider",
+				model:       model,
+				inputTokens: 1_000_000,
+			}, resolver)
+			require.NoError(t, err)
+			assert.Equal(t, money.MustParseDollars("7"), cost)
+			block, err := resolver.BuildBlock()
+			require.NoError(t, err)
+			resolutions := block.Models[model].Resolutions
+			require.Len(t, resolutions, 1)
+			assert.Equal(t, model, resolutions[0].PricedModel)
+		})
+	}
 }
 
 func TestPGDailyUsageAmountsForwardsProviderToBilling(t *testing.T) {

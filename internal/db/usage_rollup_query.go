@@ -7,7 +7,6 @@ import (
 	"errors"
 	"fmt"
 	"slices"
-	"strings"
 
 	"go.kenn.io/agentsview/internal/export"
 )
@@ -43,8 +42,8 @@ func usageCacheReadShouldRecapture(err error) bool {
 	if errors.Is(err, errUsageCacheSourceChanged) {
 		return true
 	}
-	var missing *usageCacheMissingSessionError
-	return errors.As(err, &missing)
+	_, hasMissing := errors.AsType[*usageCacheMissingSessionError](err)
+	return hasMissing
 }
 
 func usageCursorIncluded(filter UsageFilter) bool {
@@ -360,6 +359,7 @@ func (cache *usageCache) usageRollupActivityQuery(
 	if err != nil {
 		return nil, err
 	}
+	defer rows.Close()
 	sessions := usageRollupSessionMap(snapshot)
 	result := make(map[string]UsageSessionInfo)
 	for rows.Next() {
@@ -397,7 +397,7 @@ func aggregateUsageRollupExceptions(
 	plain = filterUsageRollupOwners(plain, sessions, filter)
 	general = filterUsageRollupOwners(general, sessions, filter)
 	general = deduplicateUsageRollupGeneral(general)
-	survivors := append(plain, general...)
+	survivors := slices.Concat(plain, general)
 	type key struct {
 		session, date, model, providerID, priced, pattern, rateHash string
 		rateOK                                                      bool
@@ -423,10 +423,12 @@ func aggregateUsageRollupExceptions(
 		if priced.BandThreshold != nil {
 			band = *priced.BandThreshold
 		}
-		itemKey := key{fact.AttributionSessionID, fact.LocalDate, fact.Model,
+		itemKey := key{
+			fact.AttributionSessionID, fact.LocalDate, fact.Model,
 			fact.Fact.ProviderID,
-			priced.PricedModel, priced.MatchedPattern, priced.RateHash,
-			priced.RateOK, band}
+			priced.PricedModel, priced.MatchedPattern, priced.rateHash(),
+			priced.RateOK, band,
+		}
 		group := groups[itemKey]
 		if group == nil {
 			session := sessions[fact.AttributionSessionID]
@@ -523,7 +525,7 @@ func rankUsageRollupSnapshots(
 		group.rest = append(group.rest, index)
 		bySnapshot[key] = group
 	}
-	keys := usageSortedMapKeys(bySnapshot)
+	keys := SortedKeys(bySnapshot)
 	for _, key := range keys {
 		group := bySnapshot[key]
 		if len(group.rest) == 0 {
@@ -625,7 +627,7 @@ func filterUsageRollupOwners(
 }
 
 func usageCursorAutomatedScopePasses(filter UsageFilter, isHeadless bool) bool {
-	switch normalizeAutomatedScope(filter.AutomatedScope, filter.ExcludeAutomated) {
+	switch NormalizeAutomatedScope(filter.AutomatedScope, filter.ExcludeAutomated) {
 	case "human":
 		return !isHeadless
 	case "automated":
@@ -641,7 +643,7 @@ func deduplicateUsageRollupGeneral(facts []usageRollupFact) []usageRollupFact {
 		byKey[usageRollupGeneralKey(fact)] = append(
 			byKey[usageRollupGeneralKey(fact)], fact)
 	}
-	keys := usageSortedMapKeys(byKey)
+	keys := SortedKeys(byKey)
 	result := make([]usageRollupFact, 0, len(keys))
 	for _, key := range keys {
 		result = append(result, slices.MinFunc(byKey[key], compareUsageGeneralWinner))
@@ -719,9 +721,12 @@ func compareUsageGeneralWinner(left, right usageRollupFact) int {
 }
 
 func compareUsageFactTies(left, right usageRollupFact) int {
-	values := [][2]string{{left.SourceSessionID, right.SourceSessionID},
-		{left.Fact.Source, right.Fact.Source}, {left.Fact.SourceUUID, right.Fact.SourceUUID},
-		{left.Fact.UsageDedupKey, right.Fact.UsageDedupKey}}
+	values := [][2]string{
+		{left.SourceSessionID, right.SourceSessionID},
+		{left.Fact.Source, right.Fact.Source},
+		{left.Fact.SourceUUID, right.Fact.SourceUUID},
+		{left.Fact.UsageDedupKey, right.Fact.UsageDedupKey},
+	}
 	leftOrdinal, rightOrdinal := -1, -1
 	if left.Fact.MessageOrdinal != nil {
 		leftOrdinal = *left.Fact.MessageOrdinal
@@ -729,8 +734,10 @@ func compareUsageFactTies(left, right usageRollupFact) int {
 	if right.Fact.MessageOrdinal != nil {
 		rightOrdinal = *right.Fact.MessageOrdinal
 	}
-	orders := []int{cmp.Compare(values[0][0], values[0][1]),
-		cmp.Compare(leftOrdinal, rightOrdinal)}
+	orders := []int{
+		cmp.Compare(values[0][0], values[0][1]),
+		cmp.Compare(leftOrdinal, rightOrdinal),
+	}
 	for _, pair := range values[1:] {
 		orders = append(orders, cmp.Compare(pair[0], pair[1]))
 	}
@@ -763,9 +770,12 @@ func compareNullableInt64(left, right *int64, nilHigh bool) int {
 }
 
 func compareUsageFactsGroup(left, right usageFactsGroup) int {
-	for _, pair := range [][2]string{{left.Date, right.Date},
-		{left.SessionID, right.SessionID}, {left.Model, right.Model},
-		{left.ProviderID, right.ProviderID}} {
+	for _, pair := range [][2]string{
+		{left.Date, right.Date},
+		{left.SessionID, right.SessionID},
+		{left.Model, right.Model},
+		{left.ProviderID, right.ProviderID},
+	} {
 		if order := cmp.Compare(pair[0], pair[1]); order != 0 {
 			return order
 		}
@@ -774,11 +784,10 @@ func compareUsageFactsGroup(left, right usageFactsGroup) int {
 }
 
 func usageRollupModelPasses(filter UsageFilter, model string) bool {
-	if filter.Model != "" && !slices.Contains(strings.Split(filter.Model, ","), model) {
+	if values := CSVFilterValues(filter.Model); len(values) > 0 && !slices.Contains(values, model) {
 		return false
 	}
-	return filter.ExcludeModel == "" ||
-		!slices.Contains(strings.Split(filter.ExcludeModel, ","), model)
+	return !slices.Contains(CSVFilterValues(filter.ExcludeModel), model)
 }
 
 func usageRollupSessionMap(snapshot usageQuerySnapshot) map[string]usageQuerySession {
@@ -795,13 +804,4 @@ func usageRollupDateBounds(snapshot usageQuerySnapshot) (string, string) {
 	}
 	return snapshot.Intervals[0].FromLocalDate,
 		snapshot.Intervals[len(snapshot.Intervals)-1].ToLocalDate
-}
-
-func usageSortedMapKeys[T any](values map[string]T) []string {
-	keys := make([]string, 0, len(values))
-	for key := range values {
-		keys = append(keys, key)
-	}
-	slices.Sort(keys)
-	return keys
 }

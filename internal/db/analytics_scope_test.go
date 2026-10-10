@@ -1,7 +1,6 @@
 package db
 
 import (
-	"context"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -72,7 +71,7 @@ func TestResolveAnalyticsMessageScope(t *testing.T) {
 	t.Run("blank model returns nil", func(t *testing.T) {
 		d := setup(t)
 		scope, err := d.resolveAnalyticsMessageScope(
-			context.Background(),
+			t.Context(),
 			[]string{sessionA},
 			AnalyticsFilter{},
 			false,
@@ -84,7 +83,7 @@ func TestResolveAnalyticsMessageScope(t *testing.T) {
 	t.Run("matching session has rows", func(t *testing.T) {
 		d := setup(t)
 		scope, err := d.resolveAnalyticsMessageScope(
-			context.Background(),
+			t.Context(),
 			[]string{sessionA, sessionB},
 			AnalyticsFilter{Model: model},
 			true,
@@ -92,7 +91,7 @@ func TestResolveAnalyticsMessageScope(t *testing.T) {
 		require.NoError(t, err)
 		require.NotNil(t, scope)
 
-		bySession := scope.MessagesBySession()
+		bySession := scope
 
 		// sessionA: user + assistant pair both emitted
 		rowsA := bySession[sessionA]
@@ -108,7 +107,7 @@ func TestResolveAnalyticsMessageScope(t *testing.T) {
 	t.Run("StatsBySession counts user and assistant", func(t *testing.T) {
 		d := setup(t)
 		scope, err := d.resolveAnalyticsMessageScope(
-			context.Background(),
+			t.Context(),
 			[]string{sessionA},
 			AnalyticsFilter{Model: model},
 			false,
@@ -127,7 +126,7 @@ func TestResolveAnalyticsMessageScope(t *testing.T) {
 	t.Run("TimingBySession returns one entry per row", func(t *testing.T) {
 		d := setup(t)
 		scope, err := d.resolveAnalyticsMessageScope(
-			context.Background(),
+			t.Context(),
 			[]string{sessionA},
 			AnalyticsFilter{Model: model},
 			false,
@@ -143,7 +142,7 @@ func TestResolveAnalyticsMessageScope(t *testing.T) {
 	t.Run("includeContent=false omits content", func(t *testing.T) {
 		d := setup(t)
 		scope, err := d.resolveAnalyticsMessageScope(
-			context.Background(),
+			t.Context(),
 			[]string{sessionA},
 			AnalyticsFilter{Model: model},
 			false,
@@ -151,7 +150,7 @@ func TestResolveAnalyticsMessageScope(t *testing.T) {
 		require.NoError(t, err)
 		require.NotNil(t, scope)
 
-		rows := scope.MessagesBySession()[sessionA]
+		rows := scope[sessionA]
 		require.Len(t, rows, 2)
 		for _, row := range rows {
 			assert.Empty(t, row.Content, "content should be empty when includeContent=false")
@@ -161,7 +160,7 @@ func TestResolveAnalyticsMessageScope(t *testing.T) {
 	t.Run("includeContent=true populates content", func(t *testing.T) {
 		d := setup(t)
 		scope, err := d.resolveAnalyticsMessageScope(
-			context.Background(),
+			t.Context(),
 			[]string{sessionA},
 			AnalyticsFilter{Model: model},
 			true,
@@ -169,7 +168,7 @@ func TestResolveAnalyticsMessageScope(t *testing.T) {
 		require.NoError(t, err)
 		require.NotNil(t, scope)
 
-		rows := scope.MessagesBySession()[sessionA]
+		rows := scope[sessionA]
 		require.Len(t, rows, 2)
 		assert.Equal(t, "hello content", rows[0].Content,
 			"user row content should be populated")
@@ -181,7 +180,7 @@ func TestResolveAnalyticsMessageScope(t *testing.T) {
 		d := setup(t)
 		// Pass sessionA twice; resolver must not error or double-count.
 		scope, err := d.resolveAnalyticsMessageScope(
-			context.Background(),
+			t.Context(),
 			[]string{sessionA, sessionA},
 			AnalyticsFilter{Model: model},
 			false,
@@ -189,7 +188,7 @@ func TestResolveAnalyticsMessageScope(t *testing.T) {
 		require.NoError(t, err)
 		require.NotNil(t, scope)
 
-		rows := scope.MessagesBySession()[sessionA]
+		rows := scope[sessionA]
 		assert.Len(t, rows, 2, "dedup should keep exactly 2 rows")
 	})
 }

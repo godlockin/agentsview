@@ -97,6 +97,8 @@ function tenModelUsageSummary(): UsageSummaryResponse {
         machineBreakdowns: [],
       },
     ],
+    from: "2026-07-01",
+    to: "2026-07-01",
     modelTotals: models.map((model, index) => ({
       model,
       inputTokens: 10,
@@ -569,7 +571,7 @@ describe("UsagePage refresh behavior", () => {
     await flushEffects();
 
     const firstMark = () =>
-      document.querySelector<SVGElement>(".chart-svg .lc-bar, .chart-svg .lc-area-path");
+      document.querySelector<SVGElement>(".chart-svg .cost-seg, .chart-svg .lc-area-path");
     const firstDot = () => document.querySelector<HTMLElement>(".list-dot");
     expect(firstMark()?.getAttribute("fill")).toBe("var(--accent-blue)");
     expect(firstDot()?.style.background).toBe("var(--accent-blue)");

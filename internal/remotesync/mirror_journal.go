@@ -12,6 +12,7 @@ import (
 	"strings"
 
 	"go.kenn.io/agentsview/internal/parser"
+	"go.kenn.io/kit/atomicfile"
 )
 
 const (
@@ -138,8 +139,7 @@ func mergeMirrorChangesWithForce(
 	fileScopedPathBytes := 0
 	if journal.FileScopedDirs != nil {
 		var err error
-		fileScopedPathCount, fileScopedPathBytes, err =
-			validateFileScopedJournalDirs(journal.FileScopedDirs)
+		fileScopedPathCount, fileScopedPathBytes, err = validateFileScopedJournalDirs(journal.FileScopedDirs)
 		if err != nil {
 			return MirrorChangeJournal{}, JournalMergeStats{}, err
 		}
@@ -273,7 +273,7 @@ func loadMirrorChangeJournal(path string) (MirrorChangeJournal, error) {
 	}
 	if err != nil {
 		return MirrorChangeJournal{}, fmt.Errorf(
-			"%w: read %q: %v", ErrUnreadableMirrorJournal, path, err,
+			"%w: read %q: %w", ErrUnreadableMirrorJournal, path, err,
 		)
 	}
 
@@ -282,7 +282,7 @@ func loadMirrorChangeJournal(path string) (MirrorChangeJournal, error) {
 	}
 	if err := json.Unmarshal(data, &header); err != nil {
 		return MirrorChangeJournal{}, fmt.Errorf(
-			"%w: decode %q: %v", ErrMalformedMirrorJournal, path, err,
+			"%w: decode %q: %w", ErrMalformedMirrorJournal, path, err,
 		)
 	}
 	if header.Version != mirrorJournalVersion {
@@ -296,12 +296,12 @@ func loadMirrorChangeJournal(path string) (MirrorChangeJournal, error) {
 		data, &journal, json.RejectUnknownMembers(true),
 	); err != nil {
 		return MirrorChangeJournal{}, fmt.Errorf(
-			"%w: decode %q: %v", ErrMalformedMirrorJournal, path, err,
+			"%w: decode %q: %w", ErrMalformedMirrorJournal, path, err,
 		)
 	}
 	if err := validateMirrorChangeJournal(journal); err != nil {
 		return MirrorChangeJournal{}, fmt.Errorf(
-			"%w: validate %q: %v", ErrMalformedMirrorJournal, path, err,
+			"%w: validate %q: %w", ErrMalformedMirrorJournal, path, err,
 		)
 	}
 	return journal, nil
@@ -341,8 +341,7 @@ func validateMirrorChangeJournal(journal MirrorChangeJournal) error {
 	fileScopedPathBytes := 0
 	if journal.FileScopedDirs != nil {
 		var err error
-		fileScopedPathCount, fileScopedPathBytes, err =
-			validateFileScopedJournalDirs(journal.FileScopedDirs)
+		fileScopedPathCount, fileScopedPathBytes, err = validateFileScopedJournalDirs(journal.FileScopedDirs)
 		if err != nil {
 			return err
 		}
@@ -418,7 +417,7 @@ type mirrorJournalStore struct {
 func newMirrorJournalStore() mirrorJournalStore {
 	return mirrorJournalStore{
 		createTemp: os.CreateTemp,
-		rename:     os.Rename,
+		rename:     atomicfile.Replace,
 		remove:     os.Remove,
 		open:       os.Open,
 	}

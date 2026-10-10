@@ -138,6 +138,10 @@ func applyToolPenalties(
 	}
 }
 
+// HighContextPressure is the peak context-window ratio above which a
+// session is penalized and the Friction Log reports context pressure.
+const HighContextPressure = 0.9
+
 func applyContextPenalties(
 	in ScoreInput,
 	penalties map[string]int,
@@ -158,7 +162,7 @@ func applyContextPenalties(
 			penalties["mid_task_compactions"] = p
 		}
 	}
-	if in.PressureMax != nil && *in.PressureMax > 0.9 {
+	if in.PressureMax != nil && *in.PressureMax > HighContextPressure {
 		penalties["context_pressure_high"] = 10
 	}
 }
@@ -199,9 +203,9 @@ func isStuckReask(in ScoreInput) bool {
 		in.Heuristics.RunawayToolLoopCount > 0
 }
 
-func capPenalty(raw, max int) int {
-	if raw > max {
-		return max
+func capPenalty(raw, maximum int) int {
+	if raw > maximum {
+		return maximum
 	}
 	return raw
 }

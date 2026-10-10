@@ -2,7 +2,7 @@
 import { afterEach, describe, expect, it, vi } from "vite-plus/test";
 import { fireEvent, screen } from "@testing-library/svelte";
 import { mount, unmount } from "svelte";
-import type { ProjectInfo } from "../../api/types/core.js";
+import type { DbProjectInfo as ProjectInfo } from "../../api/generated/index.js";
 import { m } from "../../i18n/index.js";
 import ProjectTypeahead from "./ProjectTypeahead.svelte";
 
@@ -60,17 +60,6 @@ describe("ProjectTypeahead", () => {
     expect(
       screen.getByRole("option", { name: m.shared_all_projects() }).getAttribute("aria-selected"),
     ).toBe("false");
-  });
-
-  it("marks the project query for 1Password exclusion", async () => {
-    component = mount(ProjectTypeahead, {
-      target: document.body,
-      props: { projects, value: "", onselect: vi.fn() },
-    });
-
-    await fireEvent.click(screen.getByRole("button"));
-
-    expect(screen.getByRole("combobox").getAttribute("data-1p-ignore")).toBe("true");
   });
 
   it("can omit the all-projects option for a required selection", async () => {

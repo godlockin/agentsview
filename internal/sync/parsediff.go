@@ -34,9 +34,9 @@ type ParseDiffOptions struct {
 // state) and arms the engine's force-parse mode so every discovered
 // file is fully re-parsed regardless of stored size/mtime/data_version
 // state.
-func NewDiffEngine(database *db.DB, cfg EngineConfig) *Engine {
+func NewDiffEngine(ctx context.Context, database *db.DB, cfg EngineConfig) *Engine {
 	cfg.Ephemeral = true
-	e := NewEngine(database, cfg)
+	e := NewEngine(ctx, database, cfg)
 	e.forceParse = true
 	return e
 }
@@ -88,7 +88,7 @@ func (e *Engine) ParseDiff(ctx context.Context, opts ParseDiffOptions) (*ParseDi
 
 	// Newest first by source mtime (composite stats for virtual
 	// paths), tie-broken by path so the --limit sample is stable.
-	files, cutPaths, limited := sortAndLimitParseDiffFiles(
+	files, cutPaths, limited := sortAndLimitParseDiffFiles(ctx,
 		files, opts.Limit,
 	)
 	report.FilesLimited = limited
@@ -135,6 +135,7 @@ func (e *Engine) ParseDiff(ctx context.Context, opts ParseDiffOptions) (*ParseDi
 	// instead of parsing every remaining file just to drain it.
 	runCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
+	runCtx = parser.WithProjectRootMemo(runCtx)
 	results := e.startWorkers(runCtx, files)
 	for i := range total {
 		var r syncJob
@@ -219,18 +220,18 @@ func (e *Engine) parseDiffProviderSources(
 	ctx context.Context,
 	agentType parser.AgentType,
 ) ([]parser.DiscoveredFile, error) {
-	factory, ok := e.providerFactories[agentType]
+	factory, ok := e.sources().providerFactories[agentType]
 	if !ok || factory == nil {
 		return nil, nil
 	}
-	roots := e.agentDirs[agentType]
+	roots := e.sources().agentDirs[agentType]
 	if len(roots) == 0 {
 		return nil, nil
 	}
 	provider := factory.NewProvider(parser.ProviderConfig{
 		Roots:          roots,
 		Machine:        e.machine,
-		SourceMachines: e.sourceMachines[agentType],
+		SourceMachines: e.sources().sourceMachines[agentType],
 		PathRewriter:   e.pathRewriter,
 	})
 	sources, err := provider.Discover(ctx)
@@ -292,7 +293,7 @@ func (e *Engine) parseDiffAgentDiscoverable(def parser.AgentDef) bool {
 	// rejects them.
 	switch e.providerMigrationModes[def.Type] {
 	case parser.ProviderMigrationProviderAuthoritative:
-		factory, ok := e.providerFactories[def.Type]
+		factory, ok := e.sources().providerFactories[def.Type]
 		return ok && factory != nil
 	default:
 		return false
@@ -349,7 +350,7 @@ func (e *Engine) resolveParseDiffAgents(
 // mtime (tie-break: path ascending) and applies the file cap. It
 // returns the kept files and the base paths of files cut by the
 // limit, used by the final sweep's "not sampled" reason.
-func sortAndLimitParseDiffFiles(
+func sortAndLimitParseDiffFiles(ctx context.Context,
 	files []parser.DiscoveredFile, limit int,
 ) ([]parser.DiscoveredFile, map[string]bool, bool) {
 	mtimes := make(map[string]int64, len(files))
@@ -358,7 +359,7 @@ func sortAndLimitParseDiffFiles(
 			mtimes[f.Path] = m
 			continue
 		}
-		m, err := discoveredFileMtime(f)
+		m, err := discoveredFileMtime(ctx, f)
 		if err != nil {
 			m = 0
 		}
@@ -431,6 +432,7 @@ func parseDiffSourceKey(agent parser.AgentType, path string) string {
 var perSessionDBVirtualSourceBases = []string{
 	"opencode.db", "kilo.db", "mimocode.db", "sessions.db",
 	parser.WarpDBFilename, parser.ForgeDBFilename, parser.PiebaldDBFilename,
+	"openclaw-agent.sqlite",
 }
 
 func isPerSessionDBVirtualSource(agent parser.AgentType, path string) bool {
@@ -584,7 +586,7 @@ func (e *Engine) parseDiffSourceReliableForRaced(
 // Reasonix/Antigravity/...). Only literal-file sources reach here -- virtual
 // and DB-backed sources are gated out by parseDiffSourceReliableForRaced -- so
 // the OpenCode-format storage children (virtual "#rawID" paths) never apply.
-func parseDiffLiveMtime(
+func parseDiffLiveMtime(ctx context.Context,
 	agent parser.AgentType, path string,
 ) (int64, error) {
 	switch {
@@ -612,11 +614,11 @@ func parseDiffLiveMtime(
 		// change independently of chat-messages.json. Use the composite
 		// companion freshness so a companion-only rewrite is detected
 		// as a race rather than reported as drift.
-		return discoveredFileMtime(parser.DiscoveredFile{
+		return discoveredFileMtime(ctx, parser.DiscoveredFile{
 			Path: path, Agent: agent,
 		})
 	}
-	return discoveredFileMtime(parser.DiscoveredFile{
+	return discoveredFileMtime(ctx, parser.DiscoveredFile{
 		Path: path, Agent: agent,
 	})
 }
@@ -804,7 +806,7 @@ func (e *Engine) parseDiffCollectFile(
 			if stored != nil {
 				storedMtime = stored.FileMtime
 			}
-			liveMtime, err := parseDiffLiveMtime(
+			liveMtime, err := parseDiffLiveMtime(ctx,
 				pw.sess.Agent, pw.sess.File.Path,
 			)
 			liveOK := err == nil
@@ -870,6 +872,8 @@ func (e *Engine) parseDiffCollectFile(
 		}
 
 		switch class {
+		case DiffParseError:
+			// Parse failures are recorded before session classification.
 		case DiffNeedsRetry:
 			report.Totals.NeedsRetry++
 			report.Sessions = append(report.Sessions, entry)

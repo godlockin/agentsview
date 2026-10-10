@@ -18,7 +18,6 @@ type automatedAuditPGProgress struct {
 
 const fullAutomationCandidatesPG = `SELECT
 	s.id,
-	s.agent,
 	s.session_kind,
 	s.first_message,
 	s.user_message_count,
@@ -41,6 +40,9 @@ func backfillIsAutomatedPGWithProgress(
 	ctx context.Context, pg *sql.DB,
 ) (automatedAuditPGProgress, error) {
 	var progress automatedAuditPGProgress
+	if err := repairParentlessWorkersPG(ctx, pg); err != nil {
+		return progress, err
+	}
 	current := db.ClassifierHash()
 	var stored string
 	err := pg.QueryRowContext(ctx,
@@ -96,6 +98,15 @@ func backfillIsAutomatedPGWithProgress(
 	return progress, nil
 }
 
+func repairParentlessWorkersPG(ctx context.Context, pg *sql.DB) error {
+	if _, err := pg.ExecContext(ctx, `UPDATE sessions
+		SET relationship_type = 'subagent', updated_at = NOW()
+		WHERE `+db.ParentlessWorkerSQL); err != nil {
+		return fmt.Errorf("repairing PG parentless workers: %w", err)
+	}
+	return nil
+}
+
 func auditAutomatedFullPG(
 	ctx context.Context,
 	pg *sql.DB,
@@ -108,6 +119,7 @@ func auditAutomatedFullPG(
 			"querying PG automated backfill candidates: %w", err,
 		)
 	}
+	defer rows.Close()
 	setIDs, clearIDs, count, err := scanFullAutomationCandidatesPG(
 		rows, classifier,
 	)
@@ -130,7 +142,6 @@ func auditAutomatedMatchingHashPG(
 	rows, err := pg.QueryContext(ctx,
 		`SELECT
 			s.id,
-			s.agent,
 			s.session_kind,
 			s.user_message_count,
 			s.is_automated,
@@ -174,12 +185,12 @@ func auditAutomatedMatchingHashPG(
 			"querying bounded PG automated audit candidates: %w", err,
 		)
 	}
+	defer rows.Close()
 
 	var unresolved []string
 	for rows.Next() {
 		var (
 			id                      string
-			agent                   string
 			sessionKind             string
 			userMessageCount        int
 			rowAutomated            bool
@@ -191,7 +202,6 @@ func auditAutomatedMatchingHashPG(
 		)
 		if err := rows.Scan(
 			&id,
-			&agent,
 			&sessionKind,
 			&userMessageCount,
 			&rowAutomated,
@@ -207,16 +217,14 @@ func auditAutomatedMatchingHashPG(
 			)
 		}
 		progress.RowsPrefetched++
-		if db.IsAutomatedSessionMetadata(agent, sessionKind) {
-			setIDs, clearIDs = appendAutomationFlagChangePG(
-				setIDs, clearIDs, id, rowAutomated, true,
-			)
+		// SQLite keeps the stored verdict when usage-only storage discarded prompt evidence.
+		if promptEvidenceDiscarded {
 			continue
 		}
-
-		// Usage-only archives discard both text candidates. With at most
-		// one prompt, missing text cannot disprove the stored verdict.
-		if promptEvidenceDiscarded && userMessageCount <= 1 && firstUserLength.Int64 == 0 && firstMessageLength.Int64 == 0 {
+		if db.IsAutomatedSessionMetadata(sessionKind) {
+			setIDs, clearIDs = db.AppendAutomationFlagChange(
+				setIDs, clearIDs, id, rowAutomated, true,
+			)
 			continue
 		}
 
@@ -229,7 +237,7 @@ func auditAutomatedMatchingHashPG(
 			unresolved = append(unresolved, id)
 			continue
 		}
-		setIDs, clearIDs = appendAutomationFlagChangePG(
+		setIDs, clearIDs = db.AppendAutomationFlagChange(
 			setIDs, clearIDs, id, rowAutomated, want,
 		)
 	}
@@ -250,24 +258,30 @@ func auditAutomatedMatchingHashPG(
 		for i, id := range batch {
 			placeholders[i] = pb.add(id)
 		}
-		fullRows, err := pg.QueryContext(
-			ctx,
-			fullAutomationCandidatesPG+
-				" WHERE s.id IN ("+strings.Join(placeholders, ",")+")",
-			pb.args...,
-		)
-		if err != nil {
-			return nil, nil, fmt.Errorf(
-				"querying unresolved PG automated audit candidates: %w", err,
+		batchSet, batchClear, count, err := func() ([]string, []string, int, error) {
+			fullRows, err := pg.QueryContext(
+				ctx,
+				fullAutomationCandidatesPG+
+					" WHERE s.id IN ("+strings.Join(placeholders, ",")+")",
+				pb.args...,
 			)
-		}
-		batchSet, batchClear, count, scanErr :=
-			scanFullAutomationCandidatesPG(fullRows, classifier)
-		if closeErr := fullRows.Close(); scanErr == nil && closeErr != nil {
-			scanErr = closeErr
-		}
-		if scanErr != nil {
-			return nil, nil, scanErr
+			if err != nil {
+				return nil, nil, 0, fmt.Errorf(
+					"querying unresolved PG automated audit candidates: %w", err,
+				)
+			}
+			defer fullRows.Close()
+			batchSet, batchClear, count, scanErr := scanFullAutomationCandidatesPG(fullRows, classifier)
+			if closeErr := fullRows.Close(); scanErr == nil && closeErr != nil {
+				scanErr = closeErr
+			}
+			if scanErr != nil {
+				return nil, nil, 0, scanErr
+			}
+			return batchSet, batchClear, count, nil
+		}()
+		if err != nil {
+			return nil, nil, err
 		}
 		progress.RowsFullText += count
 		setIDs = append(setIDs, batchSet...)
@@ -283,7 +297,6 @@ func scanFullAutomationCandidatesPG(
 	for rows.Next() {
 		var (
 			id                      string
-			agent                   string
 			sessionKind             string
 			firstMessage            sql.NullString
 			firstUser               sql.NullString
@@ -292,7 +305,7 @@ func scanFullAutomationCandidatesPG(
 			promptEvidenceDiscarded bool
 		)
 		if err := rows.Scan(
-			&id, &agent, &sessionKind,
+			&id, &sessionKind,
 			&firstMessage, &userCount, &rowAutomated, &promptEvidenceDiscarded, &firstUser,
 		); err != nil {
 			return nil, nil, count, fmt.Errorf(
@@ -300,16 +313,15 @@ func scanFullAutomationCandidatesPG(
 			)
 		}
 		count++
-		want := db.IsAutomatedSessionMetadata(agent, sessionKind)
-		// Match the bounded audit: retain the verdict when classification
-		// needs prompt text that the source archive no longer stores.
-		if promptEvidenceDiscarded && !want && userCount <= 1 && firstUser.String == "" && firstMessage.String == "" {
+		// SQLite keeps the stored verdict when usage-only storage discarded prompt evidence.
+		if promptEvidenceDiscarded {
 			continue
 		}
+		want := db.IsAutomatedSessionMetadata(sessionKind)
 		want = want || classifier.IsAutomatedFromTextCandidates(
 			userCount, firstUser, firstMessage,
 		)
-		setIDs, clearIDs = appendAutomationFlagChangePG(
+		setIDs, clearIDs = db.AppendAutomationFlagChange(
 			setIDs, clearIDs, id, rowAutomated, want,
 		)
 	}
@@ -328,17 +340,4 @@ func automationEvidencePG(
 		FullByteLength: fullByteLength.Int64,
 		Valid:          fullByteLength.Valid,
 	}
-}
-
-func appendAutomationFlagChangePG(
-	setIDs, clearIDs []string,
-	id string,
-	rowAutomated, want bool,
-) ([]string, []string) {
-	if want && !rowAutomated {
-		setIDs = append(setIDs, id)
-	} else if !want && rowAutomated {
-		clearIDs = append(clearIDs, id)
-	}
-	return setIDs, clearIDs
 }

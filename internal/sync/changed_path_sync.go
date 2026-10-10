@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"log"
-	"slices"
 	"time"
 
 	"go.kenn.io/agentsview/internal/parser"
@@ -52,6 +51,7 @@ func (e *Engine) SyncChangedPathPlanWithOptionsContext(
 	options ChangedPathSyncOptions,
 	onProgress ProgressFunc,
 ) (ChangedPathSyncResult, error) {
+	ctx = e.parsePolicyContext(ctx)
 	result := ChangedPathSyncResult{
 		CachedSourceKeys:        make(map[string]struct{}),
 		CachedFallbackProviders: make(map[parser.AgentType]int),
@@ -132,8 +132,9 @@ func (e *Engine) SyncChangedPathPlanWithOptionsContext(
 	preContainerStates := e.captureSQLiteContainerStates(physicalPaths)
 	e.beginSQLiteContainerPass(files, preContainerStates)
 	processingCtx := context.WithValue(ctx, deferGlobalLinkContextKey{}, true)
+	processingCtx = parser.WithProjectRootMemo(processingCtx)
 	results := e.startWorkers(processingCtx, files)
-	affectedSessionIDs := make(map[string]struct{})
+	affectedSessionIDs := make(changedSessionLinks)
 	stats = e.collectAndBatchWithOptions(
 		processingCtx, results, len(files), len(files), func(progress Progress) {
 			progress.FallbackProviders = len(plan.FallbackProviders)
@@ -144,15 +145,7 @@ func (e *Engine) SyncChangedPathPlanWithOptionsContext(
 		}, syncWriteDefault, collectAndBatchOptions{
 			observeResult: func(job syncJob) {
 				result.FilesProcessed++
-				if job.incremental != nil {
-					affectedSessionIDs[job.incremental.sessionID] = struct{}{}
-				}
-				for _, parsed := range job.results {
-					affectedSessionIDs[applyIDPrefixToID(e.idPrefix, parsed.Session.ID)] = struct{}{}
-				}
-				for _, id := range job.excludedSessionIDs {
-					affectedSessionIDs[applyIDPrefixToID(e.idPrefix, id)] = struct{}{}
-				}
+				affectedSessionIDs.observe(job, e.idPrefix)
 				if !job.cachedSkip {
 					return
 				}
@@ -169,21 +162,9 @@ func (e *Engine) SyncChangedPathPlanWithOptionsContext(
 			},
 		},
 	)
-	if len(affectedSessionIDs) > 0 && !stats.Aborted {
-		ids := make([]string, 0, len(affectedSessionIDs))
-		for id := range affectedSessionIDs {
-			ids = append(ids, id)
-		}
-		slices.Sort(ids)
-		if err := e.db.LinkSubagentSessionsForSessions(ids); err != nil {
-			stats.RecordFailed()
-			processErr = errors.Join(processErr,
-				fmt.Errorf("link affected subagent sessions: %w", err))
-			if queueErr := e.db.QueueSubagentParentRepairs(ids); queueErr != nil {
-				processErr = errors.Join(processErr,
-					fmt.Errorf("queue affected subagent parent repairs: %w", queueErr))
-			}
-		}
+	if err := affectedSessionIDs.link(ctx, e, &stats); err != nil {
+		stats.RecordFailed()
+		processErr = errors.Join(processErr, err)
 	}
 	e.anomalies.applyTo(&stats)
 	// Pass-level failures cannot be attributed to one container, so they
@@ -194,7 +175,7 @@ func (e *Engine) SyncChangedPathPlanWithOptionsContext(
 	}
 	e.finishSQLiteContainerPass(true, false)
 	if !e.ephemeral {
-		e.persistSkipCache()
+		e.persistSkipCache(ctx)
 	}
 	e.mu.Lock()
 	e.lastSync = time.Now()

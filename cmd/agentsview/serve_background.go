@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -25,9 +26,12 @@ var errServeStartupInProgress = errors.New(
 	"agentsview serve startup is already in progress",
 )
 
-var waitForDaemonStartupForEnsure = WaitForDaemonStartupContext
-var startServeBackgroundProcessForEnsure = startServeBackgroundProcess
-var startServeBackgroundProcessForRun = startServeBackgroundProcess
+var (
+	waitForDaemonStartupForEnsure        = WaitForDaemonStartupContext
+	startServeBackgroundProcessForEnsure = startServeBackgroundProcess
+	startServeBackgroundProcessForRun    = startServeBackgroundProcess
+	backgroundServeProbeHook             func()
+)
 
 type backgroundLaunchPolicy struct {
 	// ConfigOnly starts exclusively from persistent configuration. In
@@ -46,10 +50,11 @@ type backgroundServeReadyWaitPolicy struct {
 }
 
 type backgroundLaunchResult struct {
-	Runtime  *DaemonRuntime
-	Started  bool
-	LogPath  string
-	childPID int
+	Runtime              *DaemonRuntime
+	Started              bool
+	LogPath              string
+	childPID             int
+	errorIncludesLogPath bool
 }
 
 func (p backgroundLaunchPolicy) operation() string {
@@ -119,7 +124,7 @@ func reportBackgroundLaunchInProgress(dataDir, authToken string) {
 		context.Background(), dataDir, authToken, backgroundServeReadyTimeout,
 	)
 	if rt := FindDaemonRuntime(dataDir, authToken); rt != nil &&
-		!rt.ReadOnly && !shouldUpgradeDaemonRuntime(rt, version) {
+		!rt.ReadOnly && !shouldReplaceDaemonRuntime(rt, version) {
 		fmt.Printf(
 			"agentsview already running at %s (pid %d)\n",
 			urlFromDaemonRuntime(rt),
@@ -158,15 +163,15 @@ func runServeBackgroundCommand(
 	}
 	defer func() { _ = launchLock.Unlock() }()
 
-	runServeBackground(mustLoadConfig(cmd), os.Args[1:], opts)
+	runServeBackground(cmd.Context(), mustLoadConfig(cmd), os.Args[1:], opts)
 }
 
 // runServeBackground preserves the serve --background CLI's fatal and output
 // behavior around the reusable, error-returning background launch path.
-func runServeBackground(
+func runServeBackground(ctx context.Context,
 	cfg config.Config, args []string, opts serveReplacementOptions,
 ) {
-	result, err := startServeBackground(
+	result, err := startServeBackground(ctx,
 		cfg, args, opts, backgroundLaunchPolicy{},
 	)
 	if err != nil {
@@ -204,7 +209,7 @@ func runServeBackground(
 // writable daemon, and starts a detached child when needed. The caller must
 // already hold the background launch lock. Unlike runServeBackground, this
 // lower-level entry point returns launch failures for non-CLI callers.
-func startServeBackground(
+func startServeBackground(ctx context.Context,
 	cfg config.Config,
 	args []string,
 	opts serveReplacementOptions,
@@ -272,7 +277,7 @@ func startServeBackground(
 			// runServeBackgroundCommand holds the background launch lock across
 			// this stop/start sequence, so another CLI launcher cannot race into
 			// the replacement gap.
-			if err := prepareBackgroundReplacement(
+			if err := prepareBackgroundReplacement(ctx,
 				&cfg, decision.Runtime, !policy.ConfigOnly,
 			); err != nil {
 				return result, fmt.Errorf("%s: %w", operation, err)
@@ -281,7 +286,7 @@ func startServeBackground(
 			for _, line := range serveDaemonReplacementLines(decision) {
 				fmt.Println(line)
 			}
-			if err := stopDaemonRuntimeForUpgrade(cfg, decision.Runtime); err != nil {
+			if err := stopDaemonRuntimeForUpgrade(ctx, cfg, decision.Runtime); err != nil {
 				return result, fmt.Errorf(
 					"%s: stopping daemon before restart: %w",
 					operation, err,
@@ -324,7 +329,8 @@ func startServeBackground(
 		args = serveBackgroundChildArgs(args)
 	}
 	args = serveBackgroundArgsWithNoSync(args, cfg.NoSync)
-	child, logPath, err := startServeBackgroundProcessForRun(cfg, args)
+	logOffset := backgroundServeLogSize(cfg.DataDir)
+	child, logPath, err := startServeBackgroundProcessForRun(ctx, cfg, args)
 	result.LogPath = logPath
 	if err != nil {
 		return result, fmt.Errorf("%s: %w", operation, err)
@@ -361,10 +367,9 @@ func startServeBackground(
 				"%s: waiting for server readiness: %w", operation, err,
 			)
 		}
-		return result, fmt.Errorf(
-			"%s: server exited before becoming ready: %w\nLogs: %s",
-			operation, err, logPath,
-		)
+		result.errorIncludesLogPath = true
+		return result, fmt.Errorf("%s: %w", operation,
+			backgroundServeExitError(err, logPath, logOffset))
 	}
 	result.Runtime = rt
 	return result, nil
@@ -384,7 +389,7 @@ func validateUniqueWritableDaemonSet(dataDir, authToken string) error {
 	)
 }
 
-func prepareBackgroundReplacement(
+func prepareBackgroundReplacement(ctx context.Context,
 	cfg *config.Config, rt *DaemonRuntime, adoptRuntimeOptions bool,
 ) error {
 	if cfg == nil {
@@ -393,7 +398,7 @@ func prepareBackgroundReplacement(
 	if err := validateUniqueWritableDaemonSet(cfg.DataDir, cfg.AuthToken); err != nil {
 		return err
 	}
-	if err := checkBackgroundReplacementDataVersion(cfg); err != nil {
+	if err := checkBackgroundReplacementDataVersion(ctx, cfg); err != nil {
 		return err
 	}
 	if adoptRuntimeOptions {
@@ -416,9 +421,10 @@ func ensureBackgroundServe(
 	ctx context.Context,
 	cfg *config.Config,
 	waitTimeout time.Duration,
+	allowReplacement bool,
 ) (*DaemonRuntime, error) {
 	if cfg == nil {
-		return nil, fmt.Errorf("nil config")
+		return nil, errors.New("nil config")
 	}
 	if err := ctx.Err(); err != nil {
 		return nil, err
@@ -454,16 +460,17 @@ func ensureBackgroundServe(
 		}
 		if rt := FindDaemonRuntime(cfg.DataDir, cfg.AuthToken); rt != nil &&
 			!rt.ReadOnly {
-			if shouldUpgradeDaemonRuntime(rt, version) {
-				return nil, fmt.Errorf(
-					"agentsview serve --background is already in progress",
-				)
+			if allowReplacement && shouldReplaceDaemonRuntime(rt, version) {
+				return nil, errors.New("agentsview serve --background is already in progress")
 			}
 			return rt, nil
 		}
 		if _, err := findIncompatibleWritableDaemonRuntime(
 			cfg.DataDir, cfg.AuthToken,
 		); err != nil {
+			if !allowReplacement {
+				return nil, longLivedDaemonCompatibilityError(err)
+			}
 			return nil, fmt.Errorf(
 				"incompatible daemon is already running: %w; run "+
 					"`agentsview daemon stop` before starting this version",
@@ -471,13 +478,9 @@ func ensureBackgroundServe(
 			)
 		}
 		if IsLocalDaemonActive(cfg.DataDir, cfg.AuthToken) {
-			return nil, fmt.Errorf(
-				"agentsview serve --background is already in progress",
-			)
+			return nil, errors.New("agentsview serve --background is already in progress")
 		}
-		return nil, fmt.Errorf(
-			"agentsview serve --background did not publish a runtime record",
-		)
+		return nil, errors.New("agentsview serve --background did not publish a runtime record")
 	}
 	defer func() { _ = launchLock.Unlock() }()
 
@@ -491,7 +494,7 @@ func ensureBackgroundServe(
 probeDaemon:
 	if rt := FindDaemonRuntime(cfg.DataDir, cfg.AuthToken); rt != nil &&
 		!rt.ReadOnly {
-		if shouldUpgradeDaemonRuntime(rt, version) {
+		if allowReplacement && shouldReplaceDaemonRuntime(rt, version) {
 			if waited, err := waitForExternalServeStartupBeforeReplacement(
 				ctx, cfg.DataDir, cfg.AuthToken, waitTimeout,
 			); waited {
@@ -503,12 +506,12 @@ probeDaemon:
 			if serveReplacementTargetChanged(*cfg, rt) {
 				goto probeDaemon
 			}
-			if err := prepareBackgroundReplacement(cfg, rt, true); err != nil {
+			if err := prepareBackgroundReplacement(ctx, cfg, rt, true); err != nil {
 				return nil, err
 			}
-			if err := stopDaemonRuntimeForUpgrade(*cfg, rt); err != nil {
+			if err := stopDaemonRuntimeForUpgrade(ctx, *cfg, rt); err != nil {
 				return nil, fmt.Errorf(
-					"stopping older daemon before restart: %w",
+					"stopping daemon with different version before restart: %w",
 					err,
 				)
 			}
@@ -523,7 +526,10 @@ probeDaemon:
 	if rt, err := findIncompatibleWritableDaemonRuntime(
 		cfg.DataDir, cfg.AuthToken,
 	); err != nil {
-		if rt != nil && shouldUpgradeIncompatibleDaemonRuntime(rt, version) {
+		if !allowReplacement {
+			return nil, longLivedDaemonCompatibilityError(err)
+		}
+		if rt != nil && shouldReplaceIncompatibleDaemonRuntime(rt, version) {
 			if waited, err := waitForExternalServeStartupBeforeReplacement(
 				ctx, cfg.DataDir, cfg.AuthToken, waitTimeout,
 			); waited {
@@ -535,12 +541,12 @@ probeDaemon:
 			if serveReplacementTargetChanged(*cfg, rt) {
 				goto probeDaemon
 			}
-			if err := prepareBackgroundReplacement(cfg, rt, true); err != nil {
+			if err := prepareBackgroundReplacement(ctx, cfg, rt, true); err != nil {
 				return nil, err
 			}
-			if stopErr := stopDaemonRuntimeForUpgrade(*cfg, rt); stopErr != nil {
+			if stopErr := stopDaemonRuntimeForUpgrade(ctx, *cfg, rt); stopErr != nil {
 				return nil, fmt.Errorf(
-					"stopping older daemon before restart: %w",
+					"stopping daemon with different version before restart: %w",
 					stopErr,
 				)
 			}
@@ -567,7 +573,10 @@ probeDaemon:
 		if rt, err := findIncompatibleWritableDaemonRuntime(
 			cfg.DataDir, cfg.AuthToken,
 		); err != nil {
-			if rt != nil && shouldUpgradeIncompatibleDaemonRuntime(rt, version) {
+			if !allowReplacement {
+				return nil, longLivedDaemonCompatibilityError(err)
+			}
+			if rt != nil && shouldReplaceIncompatibleDaemonRuntime(rt, version) {
 				if waited, err := waitForExternalServeStartupBeforeReplacement(
 					ctx, cfg.DataDir, cfg.AuthToken, waitTimeout,
 				); waited {
@@ -579,12 +588,12 @@ probeDaemon:
 				if serveReplacementTargetChanged(*cfg, rt) {
 					goto probeDaemon
 				}
-				if err := prepareBackgroundReplacement(cfg, rt, true); err != nil {
+				if err := prepareBackgroundReplacement(ctx, cfg, rt, true); err != nil {
 					return nil, err
 				}
-				if stopErr := stopDaemonRuntimeForUpgrade(*cfg, rt); stopErr != nil {
+				if stopErr := stopDaemonRuntimeForUpgrade(ctx, *cfg, rt); stopErr != nil {
 					return nil, fmt.Errorf(
-						"stopping older daemon before restart: %w",
+						"stopping daemon with different version before restart: %w",
 						stopErr,
 					)
 				}
@@ -605,10 +614,13 @@ probeDaemon:
 	args := []string{"serve"}
 	args = serveBackgroundArgsWithNoSync(args, cfg.NoSync)
 	args = serveBackgroundArgsWithSkipInitialSync(args, cfg.SkipInitialSync)
-	child, logPath, err := startServeBackgroundProcessForEnsure(*cfg, args)
+	logOffset := backgroundServeLogSize(cfg.DataDir)
+	child, logPath, err := startServeBackgroundProcessForEnsure(ctx, *cfg, args)
 	if err != nil {
 		return nil, err
 	}
+	progress := daemonLaunchProgressWriter{w: os.Stderr}
+	progress.launch(child.Process.Pid, logPath)
 	waitCh := make(chan error, 1)
 	go func() {
 		waitCh <- child.Wait()
@@ -617,10 +629,12 @@ probeDaemon:
 		ctx, cfg.DataDir, cfg.AuthToken, waitCh, waitTimeout,
 	)
 	if err != nil {
-		return nil, fmt.Errorf(
-			"server exited before becoming ready: %w; logs: %s",
-			err, logPath,
-		)
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			return nil, daemonWaitCanceledError("daemon autostart", backgroundLaunchResult{
+				childPID: child.Process.Pid, LogPath: logPath,
+			})
+		}
+		return nil, backgroundServeExitError(err, logPath, logOffset)
 	}
 	if rt == nil {
 		return nil, fmt.Errorf(
@@ -643,8 +657,14 @@ func waitForExternalServeStartup(
 	if waitTimeout <= 0 {
 		waitTimeout = backgroundServeReadyTimeout
 	}
-	deadline := time.Now().Add(waitTimeout)
+	started := time.Now()
+	deadline := started.Add(waitTimeout)
+	progress := daemonLaunchProgressWriter{w: os.Stderr}
+	var lastUpdate time.Time
 	for isExternalDaemonStarting(dataDir) {
+		if backgroundServeProbeHook != nil {
+			backgroundServeProbeHook()
+		}
 		if err := ctx.Err(); err != nil {
 			return nil, true, err
 		}
@@ -652,6 +672,12 @@ func waitForExternalServeStartup(
 			!rt.ReadOnly && rt.RuntimeFallback {
 			return rt, true, nil
 		}
+		state := readStartupState(dataDir)
+		if state != nil && state.UpdatedAt.After(lastUpdate) {
+			lastUpdate = state.UpdatedAt
+			deadline = time.Now().Add(waitTimeout)
+		}
+		progress.progress(state, startupSnapshotElapsed(state, started, time.Now()))
 		remaining := time.Until(deadline)
 		if remaining <= 0 {
 			return nil, true, errServeStartupInProgress
@@ -680,9 +706,8 @@ func waitForExternalServeStartup(
 			err,
 		)
 	}
-	return nil, true, fmt.Errorf(
-		"agentsview serve startup finished without publishing a writable " +
-			"runtime record",
+	return nil, true, errors.New("agentsview serve startup finished without publishing a writable " +
+		"runtime record",
 	)
 }
 
@@ -776,11 +801,11 @@ func sameDaemonReplacementTarget(a, b *DaemonRuntime) bool {
 		a.Record.Address == b.Record.Address
 }
 
-func checkBackgroundReplacementDataVersion(cfg *config.Config) error {
+func checkBackgroundReplacementDataVersion(ctx context.Context, cfg *config.Config) error {
 	if cfg == nil || cfg.DBPath == "" {
 		return nil
 	}
-	return db.CheckDataVersion(cfg.DBPath)
+	return db.CheckDataVersion(ctx, cfg.DBPath)
 }
 
 func waitForBackgroundLaunchOwner(
@@ -791,6 +816,9 @@ func waitForBackgroundLaunchOwner(
 ) {
 	deadline := time.Now().Add(waitTimeout)
 	for time.Now().Before(deadline) {
+		if backgroundServeProbeHook != nil {
+			backgroundServeProbeHook()
+		}
 		if isExternalDaemonStarting(dataDir) {
 			_, _, _ = waitForExternalServeStartup(
 				ctx, dataDir, authToken, time.Until(deadline),
@@ -853,11 +881,19 @@ func adoptBackgroundLaunchConfig(cfg *config.Config) {
 	cfg.AuthToken = reloaded.AuthToken
 }
 
-func startServeBackgroundProcess(
+func startServeBackgroundProcess(ctx context.Context,
 	cfg config.Config,
 	args []string,
 ) (*exec.Cmd, string, error) {
 	logPath := serveLogPath(cfg.DataDir)
+	if err := ctx.Err(); err != nil {
+		return nil, logPath, err
+	}
+	// Surface the actionable version error in the caller before re-exec hides
+	// it behind a child exit status. The child also checks before any writes.
+	if err := db.CheckDataVersion(ctx, cfg.DBPath); err != nil {
+		return nil, logPath, err
+	}
 	exe, err := os.Executable()
 	if err != nil {
 		return nil, logPath, fmt.Errorf("finding executable: %w", err)
@@ -887,7 +923,8 @@ func startServeBackgroundProcess(
 	defer devNull.Close()
 
 	childArgs := serveBackgroundChildArgs(args)
-	cmd := exec.Command(exe, childArgs...)
+	// The daemon outlives the launcher; readiness still uses the caller context.
+	cmd := exec.CommandContext(context.WithoutCancel(ctx), exe, childArgs...)
 	cmd.Env = append(os.Environ(), backgroundChildEnvVar+"=1")
 	if cfg.DataDir != "" {
 		cmd.Env = append(cmd.Env, "AGENTSVIEW_DATA_DIR="+cfg.DataDir)
@@ -900,6 +937,34 @@ func startServeBackgroundProcess(
 		return nil, logPath, fmt.Errorf("starting server: %w", err)
 	}
 	return cmd, logPath, nil
+}
+
+func backgroundServeLogSize(dataDir string) int64 {
+	if info, err := os.Stat(serveLogPath(dataDir)); err == nil {
+		return info.Size()
+	}
+	return 0
+}
+
+func backgroundServeExitError(cause error, logPath string, logOffset int64) error {
+	err := fmt.Errorf("server exited before becoming ready: %w\nLogs: %s", cause, logPath)
+	logFile, openErr := os.Open(logPath)
+	if openErr != nil {
+		return err
+	}
+	defer logFile.Close()
+	info, statErr := logFile.Stat()
+	if statErr != nil {
+		return err
+	}
+	// Read only this launch's output, bounded even after a verbose startup.
+	const maxOutput = 8 * 1024
+	start := max(logOffset, info.Size()-maxOutput)
+	output, readErr := io.ReadAll(io.NewSectionReader(logFile, start, maxOutput))
+	if readErr != nil || len(strings.TrimSpace(string(output))) == 0 {
+		return err
+	}
+	return fmt.Errorf("%w\n\n%s", err, strings.TrimSpace(string(output)))
 }
 
 func serveBackgroundChildArgs(args []string) []string {
@@ -981,9 +1046,10 @@ func waitForBackgroundServeReady(
 	waitCh <-chan error,
 	timeout time.Duration,
 ) (*DaemonRuntime, error) {
+	progress := daemonLaunchProgressWriter{w: os.Stderr}
 	return waitForBackgroundServeReadyWithPolicy(
 		ctx, dataDir, authToken, waitCh, timeout,
-		backgroundServeReadyWaitPolicy{},
+		backgroundServeReadyWaitPolicy{Observe: progress.progress},
 	)
 }
 
@@ -1029,7 +1095,7 @@ func waitForBackgroundServeReadyWithPolicy(
 		select {
 		case err := <-waitCh:
 			if err == nil {
-				err = fmt.Errorf("server process exited")
+				err = errors.New("server process exited")
 			}
 			return nil, err
 		case <-ctx.Done():

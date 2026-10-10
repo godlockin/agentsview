@@ -18,6 +18,7 @@ import (
 	"unicode/utf8"
 
 	"go.kenn.io/agentsview/internal/config"
+	"go.kenn.io/agentsview/internal/stringutil"
 )
 
 // ErrContextOverflow reports a prompt the server rejected as too large for
@@ -70,6 +71,14 @@ var errClientOnlyResponseLimit = errors.New(
 	"distill response exceeds a client-only resource limit",
 )
 
+// errDisallowedEntryType marks an entry whose type is valid in general but
+// was left out of this request's enum. Only some units narrow the enum, so a
+// server that ignores it still answers unrestricted units correctly: like
+// errClientOnlyResponseLimit, it indicts one model output, not the endpoint.
+var errDisallowedEntryType = errors.New(
+	"distill response uses an entry type this unit does not allow",
+)
+
 // requestStatusError carries the HTTP status of a permanent server
 // rejection so callers can tell endpoint-scoped failures from
 // input-specific ones.
@@ -94,8 +103,8 @@ func endpointScopedRejection(err error) bool {
 		errors.Is(err, errRedirectRefused) {
 		return true
 	}
-	var rejection *requestStatusError
-	if !errors.As(err, &rejection) {
+	rejection, hasRejection := errors.AsType[*requestStatusError](err)
+	if !hasRejection {
 		return false
 	}
 	switch rejection.status {
@@ -159,7 +168,9 @@ const maxRetryDelay = 30 * time.Second
 // v3: truncation always splits; the entry-capped compact retry is gone.
 // v4: maxItems/maxLength bounds on entries, fields, and entities.
 // v5: body maxLength is enforced client-side only for grammar compatibility.
-const extractionProtocolVersion = 5
+// v6: action units whose messages ran no tool drop 'procedure' and open
+// with unexecutedActionPreamble; units carry that tool evidence.
+const extractionProtocolVersion = 6
 
 // Local resource bounds on a single distill response. The transport cap
 // only bounds bytes; within it a compromised or misconfigured endpoint
@@ -200,44 +211,46 @@ var entryTypes = []string{
 }
 
 // entrySchema constrains decoding so the model can only produce parseable
-// entries; validation failures become server-side sampling constraints
-// instead of client-side parse errors.
-var entrySchema = map[string]any{
-	"type": "object",
-	"properties": map[string]any{
-		"entries": map[string]any{
-			"type":     "array",
-			"maxItems": maxResponseEntries,
-			"items": map[string]any{
-				"type": "object",
-				"properties": map[string]any{
-					"type": map[string]any{
-						"type": "string",
-						"enum": entryTypes,
-					},
-					"title": map[string]any{
-						"type": "string", "minLength": 1,
-						"maxLength": maxEntryTitleChars,
-					},
-					"body": map[string]any{
-						"type": "string", "minLength": 1,
-					},
-					"entities": map[string]any{
-						"type":     "array",
-						"maxItems": maxEntryEntities,
-						"items": map[string]any{
-							"type":      "string",
-							"maxLength": maxEntityChars,
+// entries of the given types; validation failures become server-side
+// sampling constraints instead of client-side parse errors.
+func entrySchema(types []string) map[string]any {
+	return map[string]any{
+		"type": "object",
+		"properties": map[string]any{
+			"entries": map[string]any{
+				"type":     "array",
+				"maxItems": maxResponseEntries,
+				"items": map[string]any{
+					"type": "object",
+					"properties": map[string]any{
+						"type": map[string]any{
+							"type": "string",
+							"enum": types,
+						},
+						"title": map[string]any{
+							"type": "string", "minLength": 1,
+							"maxLength": maxEntryTitleChars,
+						},
+						"body": map[string]any{
+							"type": "string", "minLength": 1,
+						},
+						"entities": map[string]any{
+							"type":     "array",
+							"maxItems": maxEntryEntities,
+							"items": map[string]any{
+								"type":      "string",
+								"maxLength": maxEntityChars,
+							},
 						},
 					},
+					"required":             []string{"type", "title", "body", "entities"},
+					"additionalProperties": false,
 				},
-				"required":             []string{"type", "title", "body", "entities"},
-				"additionalProperties": false,
 			},
 		},
-	},
-	"required":             []string{"entries"},
-	"additionalProperties": false,
+		"required":             []string{"entries"},
+		"additionalProperties": false,
+	}
 }
 
 // Client distills unit text into entries through an OpenAI-compatible chat
@@ -318,13 +331,22 @@ func (c *Client) ValidateRequestShape() error {
 func (c *Client) DistillWithRecovery(
 	ctx context.Context, systemPrompt, text string, maxAttempts int,
 ) ([]Entry, Usage, error) {
+	return c.distillWithRecovery(ctx, systemPrompt, text, entryTypes, maxAttempts)
+}
+
+// distillWithRecovery is DistillWithRecovery with the response restricted
+// to types, a subset of entryTypes.
+func (c *Client) distillWithRecovery(
+	ctx context.Context, systemPrompt, text string, types []string,
+	maxAttempts int,
+) ([]Entry, Usage, error) {
 	var total Usage
 	if err := c.ValidateRequestShape(); err != nil {
 		return nil, total, err
 	}
 	var lastErr error
 	for attempt := range maxAttempts {
-		entries, usage, err := c.distill(ctx, systemPrompt, text)
+		entries, usage, err := c.distill(ctx, systemPrompt, text, types)
 		total.PromptTokens += usage.PromptTokens
 		total.CompletionTokens += usage.CompletionTokens
 		if err == nil {
@@ -339,8 +361,8 @@ func (c *Client) DistillWithRecovery(
 				ErrPersistentTruncation,
 			)
 		}
-		var transient *transientError
-		if !errors.As(err, &transient) {
+		transient, hasTransient := errors.AsType[*transientError](err)
+		if !hasTransient {
 			return nil, total, err
 		}
 		lastErr = err
@@ -368,7 +390,7 @@ func (c *Client) DistillWithRecovery(
 }
 
 func (c *Client) distill(
-	ctx context.Context, systemPrompt, text string,
+	ctx context.Context, systemPrompt, text string, types []string,
 ) ([]Entry, Usage, error) {
 	payload := map[string]any{
 		"model":       c.Model,
@@ -383,7 +405,7 @@ func (c *Client) distill(
 			"json_schema": map[string]any{
 				"name":   "session_readout",
 				"strict": true,
-				"schema": entrySchema,
+				"schema": entrySchema(types),
 			},
 		},
 	}
@@ -558,7 +580,7 @@ func (c *Client) distill(
 	if len(parsed.Choices) == 0 {
 		// The body parsed, so its usage is real cost even without choices.
 		return nil, parsed.Usage, &transientError{
-			err: fmt.Errorf("distill response has no choices"),
+			err: errors.New("distill response has no choices"),
 		}
 	}
 	// From here the server reports token usage even when the attempt fails,
@@ -583,14 +605,14 @@ func (c *Client) distill(
 		// Empty content with a normal finish reason means the token budget
 		// went somewhere invisible (typically hidden reasoning the request
 		// shape should have disabled).
-		return nil, parsed.Usage, fmt.Errorf(
-			"distill response content is empty; check the model profile's " +
-				"request shape",
+		return nil, parsed.Usage, errors.New("distill response content is empty; check the model profile's " +
+			"request shape",
 		)
 	}
-	entries, err := parseEntries(choice.Message.Content)
+	entries, err := parseEntries(choice.Message.Content, types)
 	if err != nil {
-		if errors.Is(err, errClientOnlyResponseLimit) {
+		if errors.Is(err, errClientOnlyResponseLimit) ||
+			errors.Is(err, errDisallowedEntryType) {
 			return nil, parsed.Usage, err
 		}
 		// The server was asked for constrained decoding, so a violation
@@ -691,15 +713,7 @@ func (c *Client) responseDetail(raw []byte) string {
 		return "(response body withheld: endpoint URL carries " +
 			"credential material)"
 	}
-	detail := stripControls(string(raw))
-	if len(detail) > 200 {
-		cut := 200
-		for cut > 0 && !utf8.RuneStart(detail[cut]) {
-			cut--
-		}
-		detail = detail[:cut]
-	}
-	return detail
+	return stringutil.SafeTruncate(stripControls(string(raw)), 200)
 }
 
 // transportErrorDetail prepares a transport-layer error's text for error
@@ -745,12 +759,7 @@ func stripControls(s string) string {
 // finish_reason or entry field can approach the transport limit, and these
 // errors persist into per-session failure rows.
 func boundedToken(value string, maxRunes int) string {
-	value = stripControls(value)
-	runes := []rune(value)
-	if len(runes) <= maxRunes {
-		return value
-	}
-	return string(runes[:maxRunes]) + "…(truncated)"
+	return stringutil.TruncateRunes(stripControls(value), maxRunes, "…(truncated)")
 }
 
 // parseEntries decodes and validates distilled content against the same
@@ -759,7 +768,7 @@ func boundedToken(value string, maxRunes int) string {
 // this walks raw messages instead), unknown keys, nulls, and trailing data
 // are rejected, and every entry needs a known type, a non-blank title and
 // body, and an entities array of strings.
-func parseEntries(content string) ([]Entry, error) {
+func parseEntries(content string, types []string) ([]Entry, error) {
 	top, err := strictObject(jsontext.Value(content), []string{"entries"})
 	if err != nil {
 		return nil, err
@@ -790,6 +799,13 @@ func parseEntries(content string) ([]Entry, error) {
 				"entry %d: type %q is not one of %s",
 				i, boundedToken(entry.Type, 60),
 				strings.Join(entryTypes, ", "),
+			)
+		}
+		if !slices.Contains(types, entry.Type) {
+			return nil, fmt.Errorf(
+				"%w: entry %d has type %q; allowed: %s",
+				errDisallowedEntryType, i, entry.Type,
+				strings.Join(types, ", "),
 			)
 		}
 		if entry.Title, err = strictString(fields["title"], "title"); err != nil {
@@ -853,7 +869,7 @@ func strictObject(
 	data jsontext.Value, keys []string,
 ) (map[string]jsontext.Value, error) {
 	if isJSONNull(data) {
-		return nil, fmt.Errorf("expected an object, got null")
+		return nil, errors.New("expected an object, got null")
 	}
 	var object map[string]jsontext.Value
 	if err := json.Unmarshal(data, &object); err != nil {

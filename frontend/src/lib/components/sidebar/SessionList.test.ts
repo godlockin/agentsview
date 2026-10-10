@@ -67,6 +67,7 @@ describe("SessionList filter dropdown", () => {
         return 1;
       });
     sessions.sessions = [];
+    sessions.projects = [];
     sessions.agents = [];
     sessions.machines = [];
     sessions.activeSessionId = null;
@@ -210,6 +211,7 @@ describe("SessionList filter dropdown", () => {
     await tick();
 
     expect(document.body.textContent).toContain("重命名");
+    expect(document.body.textContent).toContain("更改项目");
     expect(document.body.textContent).toContain("在新标签页打开");
     expect(document.body.textContent).toContain("删除");
 
@@ -247,6 +249,81 @@ describe("SessionList filter dropdown", () => {
 
     const indicators = document.querySelectorAll('[aria-label="Unread messages"]');
     expect(indicators).toHaveLength(1);
+  });
+
+  it("assigns an individual session from its searchable project editor", async () => {
+    sessions.projects = [{ name: "destination", session_count: 4 }];
+    sessions.sessions = [
+      makeSession({
+        id: "move-session",
+        display_name: "Move this session",
+        is_index_only: false,
+        project_assigned: false,
+      }),
+    ];
+    vi.spyOn(sessions, "hydrateVisibleSessions").mockResolvedValue(undefined);
+    vi.spyOn(sessions, "loadProjects").mockResolvedValue(undefined);
+    const assign = vi.spyOn(sessions, "assignSessionProject").mockResolvedValue("destination");
+
+    component = mount(SessionList, { target: document.body });
+    await tick();
+    document
+      .querySelector<HTMLElement>(".session-item")!
+      .dispatchEvent(new MouseEvent("contextmenu", { bubbles: true, clientX: 12, clientY: 12 }));
+    await tick();
+    Array.from(document.querySelectorAll<HTMLButtonElement>(".context-menu-item"))
+      .find((button) => button.textContent?.includes("Change project"))!
+      .click();
+    await tick();
+
+    expect(document.body.textContent).toContain(m.data_session_assignment_automatic());
+    document
+      .querySelector<HTMLButtonElement>(`[title="${m.data_session_assignment_target()}"]`)!
+      .click();
+    await tick();
+    document
+      .querySelector<HTMLElement>('[role="option"]')!
+      .dispatchEvent(new MouseEvent("mousedown", { bubbles: true }));
+    await tick();
+    Array.from(document.querySelectorAll<HTMLButtonElement>(".project-editor button"))
+      .find((button) => button.textContent?.includes(m.data_session_assignment_save()))!
+      .click();
+    await tick();
+
+    expect(assign).toHaveBeenCalledWith("move-session", "destination");
+  });
+
+  it("restores automatic assignment for a manually moved session", async () => {
+    sessions.sessions = [
+      makeSession({
+        id: "manual-session",
+        display_name: "Manual session",
+        is_index_only: false,
+        project_assigned: true,
+      }),
+    ];
+    vi.spyOn(sessions, "hydrateVisibleSessions").mockResolvedValue(undefined);
+    vi.spyOn(sessions, "loadProjects").mockResolvedValue(undefined);
+    const clear = vi.spyOn(sessions, "clearSessionProjectAssignment").mockResolvedValue("proj");
+
+    component = mount(SessionList, { target: document.body });
+    await tick();
+    document
+      .querySelector<HTMLElement>(".session-item")!
+      .dispatchEvent(new MouseEvent("contextmenu", { bubbles: true, clientX: 12, clientY: 12 }));
+    await tick();
+    Array.from(document.querySelectorAll<HTMLButtonElement>(".context-menu-item"))
+      .find((button) => button.textContent?.includes("Change project"))!
+      .click();
+    await tick();
+
+    expect(document.body.textContent).toContain(m.data_session_assignment_manual());
+    Array.from(document.querySelectorAll<HTMLButtonElement>(".project-editor button"))
+      .find((button) => button.textContent?.includes(m.data_session_assignment_use_automatic()))!
+      .click();
+    await tick();
+
+    expect(clear).toHaveBeenCalledWith("manual-session");
   });
 });
 
@@ -672,6 +749,47 @@ describe("SessionList visible hydration", () => {
     expect(openSpy).toHaveBeenCalledWith("/sessions/native-open-session", "_blank", "noopener");
   });
 
+  it.each(["continuation", "subagent", "teammate"])(
+    "renders a shared %s under both expanded parent groups",
+    async (kind) => {
+      sessions.sessions = [
+        makeSession({ id: "root-a", display_name: "Parent A" }),
+        makeSession({ id: "root-b", display_name: "Parent B" }),
+        makeSession({
+          id: "shared-child",
+          display_name: "Shared child",
+          parent_session_ids: ["root-a", "root-b"],
+          relationship_type: kind === "subagent" ? "subagent" : "continuation",
+          is_teammate: kind === "teammate",
+        }),
+      ];
+      vi.spyOn(sessions, "hydrateVisibleSessions").mockResolvedValue(undefined);
+
+      component = mount(SessionList, { target: document.body });
+      await tick();
+      for (const id of ["root-a", "root-b"]) {
+        const expand = document.querySelector<HTMLButtonElement>(
+          `[data-session-id="${id}"] button[aria-label="Expand"]`,
+        );
+        expect(expand).not.toBeNull();
+        expand!.click();
+        await tick();
+      }
+
+      expect(document.querySelectorAll('[data-session-id="shared-child"]')).toHaveLength(2);
+      document
+        .querySelector<HTMLButtonElement>(
+          '[data-session-id="root-a"] button[aria-label="Collapse"]',
+        )!
+        .click();
+      await tick();
+      expect(document.querySelectorAll('[data-session-id="shared-child"]')).toHaveLength(1);
+      expect(document.querySelector('[data-session-id="shared-child"]')?.textContent).toContain(
+        "Shared child",
+      );
+    },
+  );
+
   it("uses is_teammate for the collapsed group teammate hint", async () => {
     sessions.sessions = [
       makeSession({ id: "root", display_name: "Root", is_index_only: true }),
@@ -831,6 +949,19 @@ describe("SessionList visible hydration", () => {
 
 function makeSession(overrides: Partial<Session> & { id: string }): Session {
   return {
+    compaction_count: 0,
+    consecutive_failure_max: 0,
+    edit_churn_count: 0,
+    ended_with_role: "",
+    final_failure_streak: 0,
+    has_peak_context_tokens: false,
+    has_total_output_tokens: false,
+    mid_task_compaction_count: 0,
+    outcome: "",
+    outcome_confidence: "",
+    secret_leak_count: 0,
+    tool_failure_signal_count: 0,
+    tool_retry_count: 0,
     project: "proj",
     machine: "local",
     agent: "claude",

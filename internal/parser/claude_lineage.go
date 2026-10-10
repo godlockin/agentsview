@@ -53,8 +53,8 @@ const (
 	// re-reads of transcript heads.
 	claudeSniffCacheMaxEntries = 8192
 	// claudeSniffDigestBytes bounds the transcript prefix hashed to
-	// verify sniff-cache entries without reliable change times. Size and
-	// mtime alone cannot detect a same-length rewrite that restores mtime,
+	// verify every metadata-matching sniff-cache entry. Size, mtime and
+	// ctime can all match after a rapid same-length rewrite,
 	// so those hits require an unchanged leading digest too.
 	// Heads whose parse runs past the bound are not memoized.
 	claudeSniffDigestBytes = 64 << 10
@@ -71,7 +71,6 @@ type claudeHeadSniff struct {
 type claudeSniffCacheEntry struct {
 	size    int64
 	mtimeNS int64
-	ctimeNS int64
 	headSHA [sha256.Size]byte
 	sniff   claudeHeadSniff
 }
@@ -94,9 +93,14 @@ type claudeParseOptions struct {
 	siblingLineage bool
 	// uploadIdentity enables adoption of explicit rooted transcript IDs.
 	uploadIdentity bool
-	// compatibleTitleEvents enables the sessionName, custom-title, and
-	// ai-title fields written by compatible transcript producers.
+	// compatibleTitleEvents enables the sessionName and ai-title fields
+	// written by compatible transcript producers and ranks custom-title
+	// ahead of them.
 	compatibleTitleEvents bool
+	// aiTitleFallback enables native Claude ai-title metadata. A user rename
+	// (/rename command or custom-title) keeps priority; sessionName remains a
+	// compatible-only field.
+	aiTitleFallback bool
 }
 
 // claudeLineagePlan describes an established fork lineage: the leading
@@ -118,21 +122,16 @@ func claudeSniffHead(
 	}
 	info, err := os.Stat(path)
 	if err != nil || info.IsDir() {
-		return claudeHeadSniff{}, nil
+		return claudeHeadSniff{}, nil //nolint:nilerr // Unavailable optional lineage metadata yields no lineage hint.
 	}
-	ctimeNS, changeTimeVerified := codexIndexChangeTime(path, info)
 	claudeSniffMu.Lock()
 	e, cached := claudeSniffCache[path]
 	claudeSniffMu.Unlock()
 	if cached && e.size == info.Size() && e.mtimeNS == info.ModTime().UnixNano() {
-		if changeTimeVerified && ctimeNS != 0 && e.ctimeNS == ctimeNS {
-			return e.sniff, nil
-		}
 		// Matching metadata does not prove matching content: a
-		// same-length rewrite that restores the mtime would replay a
-		// stale root uuid or bg stamp into lineage resolution. Verify
-		// a bounded digest of the leading bytes before trusting the
-		// memo.
+		// same-length rewrite can restore mtime while ctime also stays
+		// unchanged. Verify the bounded leading-byte digest on every
+		// metadata hit before reusing a root UUID or background stamp.
 		headSHA, ok := claudeHeadDigest(path)
 		if ok && headSHA == e.headSHA {
 			return e.sniff, nil
@@ -154,7 +153,6 @@ func claudeSniffHead(
 		claudeSniffCache[path] = claudeSniffCacheEntry{
 			size:    info.Size(),
 			mtimeNS: info.ModTime().UnixNano(),
-			ctimeNS: ctimeNS,
 			headSHA: headSHA,
 			sniff:   sniff,
 		}
@@ -354,8 +352,8 @@ func claudeLineageCaptureSiblings(ctx context.Context, path string) ([]string, e
 
 // claudeResolveSiblingLineage establishes the background-fork lineage
 // for path, or returns nil when no lineage can be positively oriented.
-// Sibling discovery is head-sniff only (memoized per size, mtime, and
-// change time, with a bounded digest when change time is unavailable).
+// Sibling discovery is head-sniff only (memoized per size and mtime,
+// with a bounded leading digest verifying every metadata hit).
 // Qualifying candidates' full uuid sets are read once per full parse of a
 // bg-marked fork.
 func claudeResolveSiblingLineage(
@@ -371,7 +369,7 @@ func claudeResolveSiblingLineage(
 	dir := filepath.Dir(path)
 	dirEntries, err := os.ReadDir(dir)
 	if err != nil {
-		return nil, nil
+		return nil, nil //nolint:nilerr // Unavailable optional lineage metadata yields no lineage hint.
 	}
 	base := filepath.Base(path)
 	type candidate struct {

@@ -3,7 +3,6 @@ package duckdb
 import (
 	"context"
 	"database/sql"
-	"encoding/json/v2"
 	"fmt"
 	"os"
 	"sort"
@@ -51,7 +50,7 @@ type MirrorProbe struct {
 	// SourceArchiveID is the provenance id stamped onto mirror rows. "" on
 	// mirrors written before the id was recorded.
 	SourceArchiveID  string
-	Scope            string // canonical scope string, see canonicalPushScope
+	Scope            string // canonical scope string, see db.CanonicalPushScope
 	LastPushCutoff   string
 	LastPushAt       string
 	LastPushMachine  string
@@ -75,7 +74,7 @@ func ProbeMirror(ctx context.Context, path string) (MirrorProbe, error) {
 		return MirrorProbe{}, fmt.Errorf("statting duckdb mirror %s: %w", path, err)
 	}
 
-	conn, err := OpenReadOnly(path)
+	conn, err := OpenReadOnly(ctx, path)
 	if err != nil {
 		return MirrorProbe{
 			FileExists:   true,
@@ -114,19 +113,6 @@ func isMirrorLockConflictError(err error) bool {
 	msg := err.Error()
 	return strings.Contains(msg, "Could not set lock") ||
 		strings.Contains(msg, "Conflicting lock")
-}
-
-// isMirrorOpenInSameProcessError reports whether err is duckdb-go's
-// same-process double-open rejection ("Can't open a connection to same
-// database file with a different configuration than existing connections"):
-// duckdb-go caches instances per literal DSN, so opening the same path with
-// a DIFFERENT access mode than an existing in-process handle is rejected. A
-// read-only probe hits it when the same process holds the mirror read-write
-// (a push in flight), and a push's write open hits it when the same process
-// holds the mirror read-only (a serving Store). Same-DSN opens share the
-// cached instance instead and never hit this.
-func isMirrorOpenInSameProcessError(err error) bool {
-	return err != nil && strings.Contains(err.Error(), "same database file")
 }
 
 func probeOpenMirror(ctx context.Context, conn *sql.DB) MirrorProbe {
@@ -327,37 +313,4 @@ func rebuildReason(
 	default:
 		return ""
 	}
-}
-
-// canonicalPushScope renders a push's project filters into a deterministic
-// string suitable for storing in mirror metadata and comparing across runs.
-// Unfiltered pushes (no include/exclude projects) canonicalize to "" so the
-// common case never round-trips through JSON.
-func canonicalPushScope(projects, excludeProjects []string) string {
-	if len(projects) == 0 && len(excludeProjects) == 0 {
-		return ""
-	}
-	scope := struct {
-		Projects []string `json:"projects,omitempty"`
-		Exclude  []string `json:"exclude,omitempty"`
-	}{
-		Projects: sortedCopy(projects),
-		Exclude:  sortedCopy(excludeProjects),
-	}
-	data, err := json.Marshal(scope)
-	if err != nil {
-		// json.Marshal only fails on unsupported types; []string always
-		// marshals, so this is unreachable in practice.
-		return ""
-	}
-	return string(data)
-}
-
-func sortedCopy(values []string) []string {
-	if len(values) == 0 {
-		return nil
-	}
-	out := append([]string(nil), values...)
-	sort.Strings(out)
-	return out
 }

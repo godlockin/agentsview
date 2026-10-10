@@ -20,6 +20,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"go.kenn.io/agentsview/internal/dbtest"
 	"go.kenn.io/agentsview/internal/parser"
 	"go.kenn.io/agentsview/internal/sync"
 )
@@ -37,7 +38,7 @@ func createWarpDB(t *testing.T, dir string) *warpTestDB {
 	d, err := sql.Open("sqlite3", path)
 	require.NoError(t, err, "opening warp test db")
 	t.Cleanup(func() { _ = d.Close() })
-	_, err = d.Exec(`
+	_, err = d.ExecContext(t.Context(), `
 		CREATE TABLE agent_conversations (
 			id INTEGER PRIMARY KEY NOT NULL,
 			conversation_id TEXT NOT NULL,
@@ -70,7 +71,7 @@ func (w *warpTestDB) addConversation(
 	t *testing.T, convID, lastModified string, prompts ...string,
 ) {
 	t.Helper()
-	_, err := w.db.Exec(
+	_, err := w.db.ExecContext(t.Context(),
 		`INSERT INTO agent_conversations
 			(conversation_id, conversation_data, last_modified_at)
 		 VALUES (?, '{}', ?)`,
@@ -79,7 +80,7 @@ func (w *warpTestDB) addConversation(
 	require.NoError(t, err, "insert warp conversation")
 	for i, p := range prompts {
 		input := fmt.Sprintf(`[{"Query":{"text":%q,"context":[]}}]`, p)
-		_, err := w.db.Exec(
+		_, err := w.db.ExecContext(t.Context(),
 			`INSERT INTO ai_queries
 				(exchange_id, conversation_id, start_ts, input,
 				 working_directory, output_status, model_id)
@@ -94,22 +95,22 @@ func (w *warpTestDB) addConversation(
 
 func createWindsurfWorkspaceDB(t *testing.T, root, payload string) string {
 	t.Helper()
+
 	workspaceDir := filepath.Join(root, "workspaceStorage", "workspace-hash")
 	require.NoError(t, os.MkdirAll(workspaceDir, 0o755))
-	require.NoError(t,
-		os.WriteFile(
-			filepath.Join(workspaceDir, "workspace.json"),
-			[]byte(`{"folder":"file:///work/demo"}`),
-			0o644,
-		),
+	require.NoError(t, os.WriteFile(
+		filepath.Join(workspaceDir, "workspace.json"),
+		[]byte(`{"folder":"file:///work/demo"}`),
+		0o644,
+	),
 	)
 	dbPath := filepath.Join(workspaceDir, "state.vscdb")
 	conn, err := sql.Open("sqlite3", dbPath)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = conn.Close() })
-	_, err = conn.Exec(`CREATE TABLE ItemTable (key TEXT PRIMARY KEY, value TEXT)`)
+	_, err = conn.ExecContext(t.Context(), `CREATE TABLE ItemTable (key TEXT PRIMARY KEY, value TEXT)`)
 	require.NoError(t, err)
-	_, err = conn.Exec(
+	_, err = conn.ExecContext(t.Context(),
 		`INSERT INTO ItemTable (key, value) VALUES (?, ?)`,
 		"workbench.panel.aichat.view.aichat.chatdata",
 		payload,
@@ -120,17 +121,18 @@ func createWindsurfWorkspaceDB(t *testing.T, root, payload string) string {
 
 func createTraeStateDB(t *testing.T, root string, sessions []any) string {
 	t.Helper()
+
 	storageDir := filepath.Join(root, "globalStorage")
 	require.NoError(t, os.MkdirAll(storageDir, 0o755))
 	dbPath := filepath.Join(storageDir, "state.vscdb")
 	conn, err := sql.Open("sqlite3", dbPath)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = conn.Close() })
-	_, err = conn.Exec(`CREATE TABLE ItemTable (key TEXT PRIMARY KEY, value TEXT)`)
+	_, err = conn.ExecContext(t.Context(), `CREATE TABLE ItemTable (key TEXT PRIMARY KEY, value TEXT)`)
 	require.NoError(t, err)
 	value, err := json.Marshal(map[string]any{"list": sessions})
 	require.NoError(t, err)
-	_, err = conn.Exec(
+	_, err = conn.ExecContext(t.Context(),
 		`INSERT INTO ItemTable (key, value) VALUES (?, ?)`,
 		"memento/icube-ai-agent-storage",
 		string(value),
@@ -359,6 +361,61 @@ func TestParseDiffDBBackedLimitOrdersByPerSessionMtime(t *testing.T) {
 		"cut session reads as not-sampled")
 }
 
+func TestParseDiffOpenClawSQLiteLimitNewestFirst(t *testing.T) {
+	root := t.TempDir()
+	dbPath := createOpenClawSyncSQLiteFixture(t, root, "a-older")
+	addOpenClawSyncSQLiteSession(t, dbPath, "z-newer")
+	setOpenClawSyncSQLiteSessionCreatedAt(t, dbPath, "a-older", 1_700_000_000_100)
+	setOpenClawSyncSQLiteSessionCreatedAt(t, dbPath, "z-newer", 1_700_000_000_300)
+
+	database := dbtest.OpenTestDB(t)
+	engine := sync.NewEngine(t.Context(), database, sync.EngineConfig{
+		AgentDirs: map[parser.AgentType][]string{parser.AgentOpenClaw: {root}},
+		Machine:   "local",
+	})
+	stats := engine.SyncAll(t.Context(), nil)
+	require.False(t, stats.Aborted, "initial sync aborted: %+v", stats)
+	require.Equal(t, 2, stats.Synced)
+	engine.Close()
+
+	diffEngine := sync.NewDiffEngine(t.Context(), database, sync.EngineConfig{
+		AgentDirs: map[parser.AgentType][]string{parser.AgentOpenClaw: {root}},
+		Machine:   "local",
+	})
+	defer diffEngine.Close()
+	report, err := diffEngine.ParseDiff(t.Context(), sync.ParseDiffOptions{
+		Agents: []parser.AgentType{parser.AgentOpenClaw},
+		Limit:  1,
+	})
+	require.NoError(t, err)
+	require.NotNil(t, report)
+
+	assert.True(t, report.FilesLimited)
+	assert.Equal(t, sync.ParseDiffTotals{
+		Examined: 1, Identical: 1, Skipped: 1,
+	}, report.Totals)
+	assert.Zero(t, report.Totals.Changed)
+
+	skipped := findSessionDiff(report, "openclaw:main:a-older")
+	require.NotNil(t, skipped)
+	assert.Equal(t, sync.DiffSkipped, skipped.Class)
+	assert.Contains(t, skipped.Reason, "limit")
+	assert.Nil(t, findSessionDiff(report, "openclaw:main:z-newer"))
+}
+
+func setOpenClawSyncSQLiteSessionCreatedAt(
+	t *testing.T, dbPath, sessionID string, createdAt int64,
+) {
+	t.Helper()
+	database, err := sql.Open("sqlite3", dbPath)
+	require.NoError(t, err)
+	defer database.Close()
+	_, err = database.ExecContext(t.Context(), `
+		UPDATE transcript_events SET created_at = ? WHERE session_id = ?
+	`, createdAt, sessionID)
+	require.NoError(t, err)
+}
+
 func TestParseDiffWindsurfLimitScopesPerSession(t *testing.T) {
 	env := setupSingleAgentTestEnv(t, parser.AgentWindsurf)
 	createWindsurfWorkspaceDB(t, env.windsurfDir, `{
@@ -423,7 +480,7 @@ func TestParseDiffTraePartialRemovalUsesContainerPresenceSweep(t *testing.T) {
 		"list": []any{traeParseDiffSession("trae-a", "Answer A.")},
 	})
 	require.NoError(t, err)
-	_, err = conn.Exec(
+	_, err = conn.ExecContext(t.Context(),
 		`UPDATE ItemTable SET value = ? WHERE key = ?`,
 		string(value), "memento/icube-ai-agent-storage",
 	)

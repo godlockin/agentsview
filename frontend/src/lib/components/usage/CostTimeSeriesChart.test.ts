@@ -12,7 +12,6 @@ import { usageChartColorMaps } from "../../utils/usageChartColors.js";
 import { setLocale } from "../../i18n/index.js";
 
 const OBSERVED_WIDTH = 1648;
-const originalClientWidth = Object.getOwnPropertyDescriptor(HTMLElement.prototype, "clientWidth");
 
 class ImmediateResizeObserver implements ResizeObserver {
   private readonly callback: ResizeObserverCallback;
@@ -77,10 +76,12 @@ function dailyEntry(index: number): DbDailyUsageEntry {
   };
 }
 
-function usageSummary(): UsageSummaryResponse {
+function usageSummary(
+  daily = Array.from({ length: 15 }, (_, index) => dailyEntry(index)),
+): UsageSummaryResponse {
   return {
-    from: "2026-06-04",
-    to: "2026-06-18",
+    from: daily[0]!.date,
+    to: daily.at(-1)!.date,
     projects: {},
     totals: {
       inputTokens: 1500,
@@ -90,7 +91,7 @@ function usageSummary(): UsageSummaryResponse {
       totalCost: testMoney(150),
       cacheSavings: testMoney(0),
     },
-    daily: Array.from({ length: 15 }, (_, i) => dailyEntry(i)),
+    daily,
     projectTotals: [
       {
         project_key: "pl1:sha256:agentsview",
@@ -153,6 +154,7 @@ describe("CostTimeSeriesChart", () => {
     usage.summary = usageSummary();
     usage.selectedTimeRange = null;
     usage.toggles.timeSeries.groupBy = "project";
+    usage.toggles.timeSeries.view = "smooth";
     settings.chartPalette = "agentsview";
     setLocale("en");
   });
@@ -169,9 +171,6 @@ describe("CostTimeSeriesChart", () => {
     settings.chartPalette = "agentsview";
     setLocale("en");
     document.body.innerHTML = "";
-    if (originalClientWidth) {
-      Object.defineProperty(HTMLElement.prototype, "clientWidth", originalClientWidth);
-    }
   });
 
   it("renders localized French currency labels", async () => {
@@ -199,22 +198,21 @@ describe("CostTimeSeriesChart", () => {
   });
 
   it("renders a visible stacked bar for a one-day range", async () => {
-    usage.summary = usageSummary();
-    usage.summary.daily = [dailyEntry(0)];
+    usage.summary = usageSummary([dailyEntry(0)]);
 
     const component = mountChart();
     await tick();
 
-    const bar = document.querySelector<SVGRectElement>("rect.lc-bar");
+    const bar = document.querySelector<SVGRectElement>("rect.cost-seg");
     expect(bar).not.toBeNull();
     expect(Number(bar!.getAttribute("width"))).toBeGreaterThan(0);
     expect(Number(bar!.getAttribute("height"))).toBeGreaterThan(0);
-    expect(Number(bar!.getAttribute("opacity") ?? 1)).toBe(1);
+    expect(document.querySelector("path.lc-area-path")).toBeNull();
 
     unmount(component);
   });
 
-  it("renders stacked area colors without dimming them", async () => {
+  it("renders stacked areas without dimming their colors", async () => {
     const component = mountChart();
     await tick();
 
@@ -225,91 +223,207 @@ describe("CostTimeSeriesChart", () => {
     unmount(component);
   });
 
-  it("brushes a date range and exposes a clear-selection action", async () => {
+  it("renders a zero-usage day between populated dates", async () => {
+    usage.summary = usageSummary();
+    usage.summary.from = "2026-06-04";
+    usage.summary.to = "2026-06-06";
+    usage.summary.daily = [dailyEntry(0), dailyEntry(2)];
+
     const component = mountChart();
     await tick();
+
+    const labels = Array.from(document.querySelectorAll<SVGTextElement>("text.x-label")).map(
+      (label) => label.textContent?.trim(),
+    );
+    expect(labels).toContain("Jun 5");
+    const hits = document.querySelectorAll<SVGRectElement>(".slot-hit");
+    expect(hits).toHaveLength(3);
+    hits[1]!.dispatchEvent(new MouseEvent("mouseenter", { bubbles: true }));
+    await tick();
+    const tooltip = document.querySelector(".tooltip")!;
+    expect(tooltip.querySelector(".tooltip-date")?.textContent).toContain("Jun 5, 2026");
+    expect(tooltip.querySelector(".tooltip-row")?.textContent).toContain("$0.00");
+
+    unmount(component);
+  });
+
+  it("draws a zero-usage day as an empty bar slot in bars mode", async () => {
+    usage.toggles.timeSeries.view = "bars";
+    usage.summary = usageSummary();
+    usage.summary.from = "2026-06-04";
+    usage.summary.to = "2026-06-06";
+    usage.summary.daily = [dailyEntry(0), dailyEntry(2)];
+
+    const component = mountChart();
     await tick();
 
-    await vi.waitFor(() => {
-      expect(document.querySelector(".lc-brush-context")).not.toBeNull();
-    });
-    const brush = document.querySelector<HTMLElement>(".lc-brush-context");
-    expect(brush).not.toBeNull();
+    const days = Array.from(document.querySelectorAll<SVGGElement>("[data-cost-bar]"));
+    expect(days).toHaveLength(3);
+    expect(days.map((day) => day.querySelectorAll("rect.cost-seg").length)).toEqual([1, 0, 1]);
+    expect(document.querySelector("path.lc-area-path")).toBeNull();
+
+    unmount(component);
+  });
+
+  it("draws smooth areas by default without dipping below zero or above the peak", async () => {
+    usage.summary = usageSummary(
+      Array.from({ length: 6 }, (_, index) => {
+        const entry = dailyEntry(index);
+        const cost = index % 2 === 0 ? testMoney(0) : testMoney(10);
+        entry.projectBreakdowns = [{ ...entry.projectBreakdowns![0]!, cost }];
+        entry.totalCost = cost;
+        return entry;
+      }),
+    );
+
+    const component = mountChart();
+    await tick();
+
+    const path = document.querySelector<SVGPathElement>("path.lc-area-path")!;
+    const d = path.getAttribute("d")!;
+    expect(d).toContain("C");
+    const ys = [...d.matchAll(/(-?[\d.]+),(-?[\d.]+)/g)].map((match) => Number(match[2]));
+    const peakY = Math.min(...ys);
+    const baselineY = Math.max(...ys);
+    // The plot spans y 8..168; a 10-dollar peak on a 10-dollar scale reaches the top.
+    expect(baselineY).toBeCloseTo(168, 5);
+    expect(peakY).toBeCloseTo(8, 5);
+    expect(document.querySelectorAll("rect.cost-seg")).toHaveLength(0);
+
+    unmount(component);
+  });
+
+  it("draws straight area segments in lines mode", async () => {
+    usage.toggles.timeSeries.view = "lines";
+
+    const component = mountChart();
+    await tick();
+
+    const d = document.querySelector<SVGPathElement>("path.lc-area-path")!.getAttribute("d")!;
+    expect(d).not.toContain("C");
+    expect(d).toContain("L");
+
+    unmount(component);
+  });
+
+  it("switches chart style from the segmented control and remembers it", async () => {
+    const setView = vi.spyOn(usage, "setTimeSeriesView");
+    const component = mountChart();
+    await tick();
+
+    const group = document.querySelector<HTMLElement>(
+      '[role="radiogroup"][aria-label="Chart style"]',
+    )!;
+    const radios = Array.from(group.querySelectorAll<HTMLButtonElement>('[role="radio"]'));
+    expect(radios.map((radio) => radio.textContent?.trim())).toEqual(["Smooth", "Lines", "Bars"]);
+    expect(radios[0]!.getAttribute("aria-checked")).toBe("true");
+
+    radios[2]!.click();
+    await tick();
+
+    expect(setView).toHaveBeenCalledWith("bars");
+    expect(usage.toggles.timeSeries.view).toBe("bars");
+    expect(document.querySelectorAll("rect.cost-seg").length).toBeGreaterThan(0);
+    expect(document.querySelector("path.lc-area-path")).toBeNull();
+
+    unmount(component);
+  });
+
+  it("keeps the no-data state when the usage response has no daily entries", async () => {
+    usage.summary = usageSummary();
+    usage.summary.daily = [];
+
+    const component = mountChart();
+    await tick();
+
+    expect(document.querySelector(".empty")?.textContent).toContain("No data for this period");
+    expect(document.querySelector(".chart-svg")).toBeNull();
+
+    unmount(component);
+  });
+
+  it("marks a selected range and exposes a clear-selection action", async () => {
+    const component = mountChart();
+    await tick();
+
+    expect(document.querySelector(".range-selection")).toBeNull();
     usage.selectedTimeRange = { from: "2026-06-07", to: "2026-06-10" };
     await tick();
     const clear = [...document.querySelectorAll<HTMLButtonElement>("button")].find(
       (button) => button.textContent?.trim() === "Clear selection",
     );
     expect(clear).toBeDefined();
-    await vi.waitFor(() => {
-      expect(document.querySelector(".usage-brush-range")).not.toBeNull();
-    });
+    expect(document.querySelector(".range-selection")).not.toBeNull();
+    const pressed = Array.from(document.querySelectorAll(".slot-hit")).map((hit) =>
+      hit.getAttribute("aria-pressed"),
+    );
+    expect(pressed.filter((value) => value === "true")).toHaveLength(4);
+    expect(pressed[3]).toBe("true");
+    expect(pressed[6]).toBe("true");
 
     usage.selectedTimeRange = null;
     await tick();
-    await vi.waitFor(() => {
-      expect(document.querySelector(".usage-brush-range")).toBeNull();
-    });
+    expect(document.querySelector(".range-selection")).toBeNull();
 
     unmount(component);
   });
 
-  it("commits a pointer brush through the chart boundary", async () => {
-    Object.defineProperty(HTMLElement.prototype, "clientWidth", {
-      configurable: true,
-      get: () => OBSERVED_WIDTH,
-    });
-    const setTimeRange = vi.spyOn(usage, "setTimeRange").mockImplementation(() => {});
-    const component = mountChart();
-    await tick();
-    await tick();
-
-    await vi.waitFor(() => {
-      expect(document.querySelector(".lc-brush-context")).not.toBeNull();
-    });
-    const brush = document.querySelector<HTMLElement>(".lc-brush-context")!;
-    expect(Number.parseFloat(brush.style.width)).toBeGreaterThan(0);
-    vi.spyOn(brush, "getBoundingClientRect").mockReturnValue({
-      x: 0,
-      y: 0,
-      left: 0,
-      top: 0,
-      right: OBSERVED_WIDTH,
-      bottom: 180,
-      width: OBSERVED_WIDTH,
-      height: 180,
-      toJSON: () => ({}),
-    });
-
-    brush.dispatchEvent(
-      new MouseEvent("pointerdown", { bubbles: true, clientX: 390, clientY: 60 }),
-    );
-    window.dispatchEvent(
-      new MouseEvent("pointermove", { bubbles: true, clientX: 730, clientY: 60 }),
-    );
-    await tick();
-    expect(document.querySelector(".usage-brush-range")).not.toBeNull();
-    brush.dispatchEvent(new MouseEvent("pointerup", { bubbles: true, clientX: 730, clientY: 60 }));
-    await tick();
-
-    expect(setTimeRange).toHaveBeenCalledOnce();
-    expect(setTimeRange.mock.calls[0]?.[0]).not.toBe(setTimeRange.mock.calls[0]?.[1]);
-    unmount(component);
-  });
-
-  it("commits a date range from keyboard-accessible controls", async () => {
+  it("drags across days to select a date range", async () => {
     const setTimeRange = vi.spyOn(usage, "setTimeRange").mockImplementation(() => {});
     const component = mountChart();
     await tick();
 
-    const form = document.querySelector<HTMLFormElement>("form.keyboard-range")!;
-    const from = form.elements.namedItem("from") as HTMLInputElement;
-    const to = form.elements.namedItem("to") as HTMLInputElement;
-    from.value = "2026-06-07";
-    to.value = "2026-06-10";
-    form.dispatchEvent(new SubmitEvent("submit", { bubbles: true, cancelable: true }));
+    const hits = document.querySelectorAll<SVGRectElement>(".slot-hit");
+    hits[3]!.dispatchEvent(new MouseEvent("pointerdown", { bubbles: true, button: 0 }));
+    await tick();
+    const endX = Number(hits[6]!.getAttribute("x"));
+    const endWidth = Number(hits[6]!.getAttribute("width"));
+    document
+      .querySelector(".chart-body")!
+      .dispatchEvent(
+        new MouseEvent("pointermove", { bubbles: true, clientX: endX + endWidth / 2 }),
+      );
+    await tick();
+    expect(document.querySelector(".range-selection")).not.toBeNull();
+    window.dispatchEvent(new MouseEvent("pointerup", { bubbles: true }));
+    await tick();
 
     expect(setTimeRange).toHaveBeenCalledExactlyOnceWith("2026-06-07", "2026-06-10");
+    unmount(component);
+  });
+
+  it("ignores a single-day click", async () => {
+    const setTimeRange = vi.spyOn(usage, "setTimeRange").mockImplementation(() => {});
+    const component = mountChart();
+    await tick();
+
+    const hit = document.querySelectorAll<SVGRectElement>(".slot-hit")[2]!;
+    hit.dispatchEvent(new MouseEvent("pointerdown", { bubbles: true, button: 0 }));
+    window.dispatchEvent(new MouseEvent("pointerup", { bubbles: true }));
+    await tick();
+
+    expect(setTimeRange).not.toHaveBeenCalled();
+    unmount(component);
+  });
+
+  it("selects and clears a range from the keyboard", async () => {
+    const setTimeRange = vi.spyOn(usage, "setTimeRange").mockImplementation(() => {});
+    const clearTimeRange = vi.spyOn(usage, "clearTimeRange").mockImplementation(() => {});
+    const component = mountChart();
+    await tick();
+
+    const hits = document.querySelectorAll<SVGRectElement>(".slot-hit");
+    hits[3]!.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true }));
+    hits[3]!.dispatchEvent(
+      new KeyboardEvent("keydown", { key: "ArrowRight", shiftKey: true, bubbles: true }),
+    );
+    expect(setTimeRange).toHaveBeenCalledExactlyOnceWith("2026-06-07", "2026-06-08");
+
+    usage.selectedTimeRange = { from: "2026-06-07", to: "2026-06-08" };
+    await tick();
+    hits[4]!.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true }));
+    expect(clearTimeRange).toHaveBeenCalledOnce();
+
     unmount(component);
   });
 
@@ -322,15 +436,15 @@ describe("CostTimeSeriesChart", () => {
     const labels = Array.from(document.querySelectorAll<SVGTextElement>("text.y-label")).map(
       (label) => label.textContent?.trim(),
     );
-    expect(labels).toContain("50");
+    // Output tokens peak at 50 a day; a four-step scale tops out at 60.
+    expect(labels.at(-1)).toBe("60");
     expect(labels).not.toContain("150");
 
     unmount(component);
   });
 
   it("keeps projects with the same display label as distinct series", async () => {
-    usage.summary = usageSummary();
-    usage.summary.daily = [dailyEntry(0)];
+    usage.summary = usageSummary([dailyEntry(0)]);
     usage.summary.daily[0]!.projectBreakdowns = [
       { ...usage.summary.daily[0]!.projectBreakdowns![0]!, cost: testMoney(6) },
       {
@@ -343,15 +457,14 @@ describe("CostTimeSeriesChart", () => {
     const component = mountChart();
     await tick();
 
-    expect(document.querySelectorAll(".chart-svg rect.lc-bar")).toHaveLength(2);
+    expect(document.querySelectorAll(".chart-svg rect.cost-seg")).toHaveLength(2);
     expect(document.querySelectorAll(".legend-item")).toHaveLength(2);
     unmount(component);
   });
 
   it("uses distinct active model colors for paths and legend dots", async () => {
-    usage.summary = usageSummary();
     usage.toggles.timeSeries.groupBy = "model";
-    usage.summary.daily = [
+    usage.summary = usageSummary([
       modelDailyEntry(0, [
         { modelName: "claude-sonnet-5", cost: testMoney(6) },
         { modelName: "claude-opus-4-8", cost: testMoney(4) },
@@ -360,7 +473,7 @@ describe("CostTimeSeriesChart", () => {
         { modelName: "claude-sonnet-5", cost: testMoney(3) },
         { modelName: "claude-opus-4-8", cost: testMoney(2) },
       ]),
-    ];
+    ]);
 
     const component = mountChart();
     await tick();
@@ -377,12 +490,11 @@ describe("CostTimeSeriesChart", () => {
   });
 
   it("assigns the first usage color to a single rendered model series", async () => {
-    usage.summary = usageSummary();
     usage.toggles.timeSeries.groupBy = "model";
-    usage.summary.daily = [
+    usage.summary = usageSummary([
       modelDailyEntry(0, [{ modelName: "single-model", cost: testMoney(6) }]),
       modelDailyEntry(1, [{ modelName: "single-model", cost: testMoney(3) }]),
-    ];
+    ]);
 
     const component = mountChart();
     await tick();
@@ -395,18 +507,17 @@ describe("CostTimeSeriesChart", () => {
   });
 
   it("renders ten named series before rolling the rest into Other", async () => {
-    usage.summary = usageSummary();
     usage.toggles.timeSeries.groupBy = "model";
     const models = Array.from({ length: 11 }, (_, index) => ({
       modelName: `model-${index}`,
       cost: testMoney(11 - index),
     }));
-    usage.summary.daily = [modelDailyEntry(0, models)];
+    usage.summary = usageSummary([modelDailyEntry(0, models)]);
 
     const component = mountChart();
     await tick();
 
-    const marks = Array.from(document.querySelectorAll<SVGElement>(".chart-svg rect.lc-bar"));
+    const marks = Array.from(document.querySelectorAll<SVGElement>(".chart-svg rect.cost-seg"));
     const dots = Array.from(document.querySelectorAll<HTMLElement>(".legend-dot"));
     expect(marks).toHaveLength(11);
     expect(dots).toHaveLength(11);
@@ -416,9 +527,8 @@ describe("CostTimeSeriesChart", () => {
   });
 
   it("shows hovered series in descending value order", async () => {
-    usage.summary = usageSummary();
     usage.toggles.timeSeries.groupBy = "model";
-    usage.summary.daily = [
+    usage.summary = usageSummary([
       modelDailyEntry(0, [
         { modelName: "small", cost: testMoney(1) },
         { modelName: "large", cost: testMoney(9) },
@@ -429,36 +539,16 @@ describe("CostTimeSeriesChart", () => {
         { modelName: "large", cost: testMoney(3) },
         { modelName: "medium", cost: testMoney(8) },
       ]),
-    ];
+    ]);
 
     const component = mountChart();
     await tick();
-    const target = document.querySelector<HTMLElement>(".lc-tooltip-context")!;
-    Object.defineProperty(target, "offsetWidth", {
-      configurable: true,
-      value: OBSERVED_WIDTH,
-    });
-    Object.defineProperty(target, "offsetHeight", {
-      configurable: true,
-      value: 180,
-    });
-    target.dispatchEvent(
-      new MouseEvent("pointerenter", {
-        bubbles: true,
-        clientX: 50,
-        clientY: 40,
-      }),
-    );
-    target.dispatchEvent(
-      new MouseEvent("pointermove", {
-        bubbles: true,
-        clientX: 50,
-        clientY: 40,
-      }),
-    );
+    document
+      .querySelector(".slot-hit")!
+      .dispatchEvent(new MouseEvent("mouseenter", { bubbles: true }));
     await tick();
 
-    const tooltip = document.querySelector(".usage-series-tooltip")!;
+    const tooltip = document.querySelector(".tooltip")!;
     expect(tooltip).toBeTruthy();
     expect(tooltip.querySelector(".tooltip-date")?.textContent).toContain("Jun 4, 2026");
     const rows = Array.from(tooltip.querySelectorAll(".tooltip-row"));
@@ -472,59 +562,23 @@ describe("CostTimeSeriesChart", () => {
   });
 
   it("shows the hovered non-first date", async () => {
-    Object.defineProperty(HTMLElement.prototype, "clientWidth", {
-      configurable: true,
-      get: () => OBSERVED_WIDTH,
-    });
-    usage.summary = usageSummary();
     usage.toggles.timeSeries.groupBy = "model";
-    usage.summary.daily = [
+    usage.summary = usageSummary([
       modelDailyEntry(0, [{ modelName: "model", cost: testMoney(1) }]),
       modelDailyEntry(1, [{ modelName: "model", cost: testMoney(2) }]),
       modelDailyEntry(2, [{ modelName: "model", cost: testMoney(3) }]),
-    ];
+    ]);
 
     const component = mountChart();
     await tick();
-    const target = document.querySelector<HTMLElement>(".lc-tooltip-context")!;
-    Object.defineProperty(target, "offsetWidth", {
-      configurable: true,
-      value: OBSERVED_WIDTH,
-    });
-    Object.defineProperty(target, "offsetHeight", {
-      configurable: true,
-      value: 180,
-    });
-    vi.spyOn(target, "getBoundingClientRect").mockReturnValue({
-      x: 0,
-      y: 0,
-      left: 0,
-      top: 0,
-      right: OBSERVED_WIDTH,
-      bottom: 180,
-      width: OBSERVED_WIDTH,
-      height: 180,
-      toJSON: () => ({}),
-    });
-    target.dispatchEvent(
-      new MouseEvent("pointerenter", {
-        bubbles: true,
-        clientX: OBSERVED_WIDTH - 30,
-        clientY: 40,
-      }),
-    );
-    target.dispatchEvent(
-      new MouseEvent("pointermove", {
-        bubbles: true,
-        clientX: OBSERVED_WIDTH - 30,
-        clientY: 40,
-      }),
-    );
+    const hit = document.querySelectorAll(".slot-hit")[2]!;
+    hit.dispatchEvent(new MouseEvent("mouseenter", { bubbles: true }));
     await tick();
 
-    expect(document.querySelector(".usage-series-tooltip .tooltip-date")?.textContent).toContain(
-      "Jun 6, 2026",
-    );
+    expect(document.querySelector(".tooltip .tooltip-date")?.textContent).toContain("Jun 6, 2026");
+    hit.dispatchEvent(new MouseEvent("mouseleave", { bubbles: true }));
+    await tick();
+    expect(document.querySelector(".tooltip")).toBeNull();
     unmount(component);
   });
 
@@ -571,9 +625,8 @@ describe("CostTimeSeriesChart", () => {
 
   it("uses aggregate-cost-ranked Matplotlib colors for model paths and legend dots", async () => {
     settings.chartPalette = "matplotlib";
-    usage.summary = usageSummary();
     usage.toggles.timeSeries.groupBy = "model";
-    usage.summary.daily = [
+    usage.summary = usageSummary([
       modelDailyEntry(0, [
         { modelName: "gpt-5.6-sol", cost: testMoney(8) },
         { modelName: "claude-opus-5", cost: testMoney(4) },
@@ -582,7 +635,7 @@ describe("CostTimeSeriesChart", () => {
         { modelName: "gpt-5.6-sol", cost: testMoney(3) },
         { modelName: "claude-opus-5", cost: testMoney(2) },
       ]),
-    ];
+    ]);
 
     const component = mountChart();
     await tick();

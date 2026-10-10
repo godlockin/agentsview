@@ -6,12 +6,34 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/assert"
+
+	"go.kenn.io/agentsview/internal/parser"
 )
 
 func resetUserAutomationPatterns() {
 	SetUserAutomationPrefixes(nil)
 	SetUserAutomationSubstrings(nil)
 	SetUserAutomationExactMatches(nil)
+}
+
+func TestIsAutomatedSessionMetadata(t *testing.T) {
+	tests := []struct {
+		name        string
+		sessionKind string
+		want        bool
+	}{
+		{"NonInteractive", parser.SessionKindNonInteractive, false},
+		{"Roborev", parser.SessionKindRoborev, true},
+		{"EmptyKind", "", false},
+		{"Background", "bg", false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := IsAutomatedSessionMetadata(tt.sessionKind)
+			assert.Equal(t, tt.want, got,
+				"IsAutomatedSessionMetadata(%q)", tt.sessionKind)
+		})
+	}
 }
 
 func TestIsAutomatedSession(t *testing.T) {

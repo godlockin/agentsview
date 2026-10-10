@@ -73,6 +73,7 @@ func (db *DB) applyArtifactImportedSession(
 		)
 	}
 	write = sanitizeSessionBatchWrite(write)
+	write.Messages = db.projectSessionBatchMessages(write)
 	write.Session, write.Messages = db.sessionAndMessagesForStorage(
 		write.Session, write.Messages,
 	)
@@ -236,6 +237,7 @@ func satisfyAllArtifactCheckpointStagesTx(
 	if err != nil {
 		return fmt.Errorf("reading satisfiable artifact checkpoint stages: %w", err)
 	}
+	defer rows.Close()
 	var sequences []int
 	for rows.Next() {
 		var sequence int

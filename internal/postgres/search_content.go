@@ -8,14 +8,8 @@ import (
 	"slices"
 	"strings"
 	"time"
-	"unicode/utf8"
 
 	"go.kenn.io/agentsview/internal/db"
-	"go.kenn.io/agentsview/internal/secrets"
-)
-
-const (
-	pgSnippetRadius = 60 // chars of context on each side of a match
 )
 
 // SearchContent implements content search for the PostgreSQL read-only store.
@@ -53,6 +47,9 @@ func (s *Store) SearchContent(
 		}
 		return s.searchContentHybridPG(ctx, f)
 	}
+	if f.Mode == "terms" {
+		return s.searchContentTermsPG(ctx, f)
+	}
 
 	if len(f.Sources) == 0 {
 		f.Sources = []string{"messages", "tool_input", "tool_result"}
@@ -82,18 +79,34 @@ func pgHasSource(f db.ContentSearchFilter, src string) bool {
 	return slices.Contains(f.Sources, src)
 }
 
-// pgSessionFilter builds a db.SessionFilter from a ContentSearchFilter.
-func pgSessionFilter(f db.ContentSearchFilter) db.SessionFilter {
-	return db.SessionFilter{
-		Project: f.Project, ExcludeProject: f.ExcludeProject,
-		Machine: f.Machine, GitBranch: f.GitBranch, Agent: f.Agent,
-		Date: f.Date, DateFrom: f.DateFrom, DateTo: f.DateTo,
-		Timezone:         f.Timezone,
-		ActiveSince:      f.ActiveSince,
-		ExcludeOneShot:   !f.IncludeOneShot,
-		ExcludeAutomated: !f.IncludeAutomated,
-		IncludeChildren:  f.IncludeChildren,
+// searchContentTermsPG runs the shared terms-mode query
+// (db.BuildTermsSearchSQL) against PostgreSQL.
+func (s *Store) searchContentTermsPG(
+	ctx context.Context, f db.ContentSearchFilter,
+) (db.ContentSearchPage, error) {
+	if err := db.ValidateTermsFilter(f); err != nil {
+		return db.ContentSearchPage{}, err
 	}
+	terms := db.ParseContentSearchTerms(f.Pattern)
+	if len(terms) == 0 {
+		return db.ContentSearchPage{}, nil
+	}
+	query, args, err := db.BuildTermsSearchSQL(f, terms, db.PostgresQueryDialect())
+	if err != nil {
+		return db.ContentSearchPage{}, err
+	}
+	rows, err := s.pg.QueryContext(ctx, query, args...)
+	if err != nil {
+		return db.ContentSearchPage{}, fmt.Errorf("pg terms search: %w", err)
+	}
+	defer rows.Close()
+	var timestamp *time.Time
+	return db.ScanTermsMatches(rows, f, terms, &timestamp, func() string {
+		if timestamp == nil {
+			return ""
+		}
+		return FormatISO8601(*timestamp)
+	})
 }
 
 // appendExcludeSessionIDsPG adds `NOT (col = ANY($n))` using a Postgres text
@@ -117,7 +130,7 @@ func appendExcludeSessionIDsPG(
 func (s *Store) searchContentSubstringPG(
 	ctx context.Context, f db.ContentSearchFilter,
 ) (db.ContentSearchPage, error) {
-	scopeWhere, scopeArgs := buildPGSessionFilter(pgSessionFilter(f))
+	scopeWhere, scopeArgs := db.BuildContentScopeSQL(f, db.PostgresQueryDialect())
 	scopeWhere, scopeArgs = appendExcludeSessionIDsPG(
 		scopeWhere, scopeArgs, "id", f.ExcludeSessionIDs)
 	escapedPat := escapeLike(f.Pattern)
@@ -145,7 +158,7 @@ func (s *Store) searchContentSubstringPG(
 	limitP := pb.add(f.Limit + 1)
 	offsetP := pb.add(f.Cursor)
 	query := "WITH scoped AS (SELECT id FROM sessions WHERE " + scopeWhere + ") " +
-		"SELECT session_id, project, agent, location, role, tool_name, " +
+		"SELECT session_id, project, agent, transcript_revision, location, role, tool_name, " +
 		"ordinal, ts, snippet FROM (" +
 		strings.Join(branches, " UNION ALL ") +
 		") sub ORDER BY sort_ts DESC NULLS LAST, session_id ASC, ordinal ASC, src ASC, row_id ASC " +
@@ -172,7 +185,9 @@ func pgMessagesBranch(
 
 	// Select the full content; the snippet is windowed and redacted in Go.
 	return fmt.Sprintf(`
-		SELECT m.session_id, s.project, s.agent, 'message' AS location,
+		SELECT m.session_id, s.project, s.agent,
+			COALESCE(s.transcript_revision,'') AS transcript_revision,
+			'message' AS location,
 			m.role AS role, '' AS tool_name, m.ordinal,
 			m.timestamp AS ts,
 			m.content AS snippet, 0 AS src, 0::bigint AS row_id,
@@ -224,7 +239,9 @@ func pgToolInputBranch(
 	ilikeParam := pb.add(ilikePat)
 
 	return fmt.Sprintf(`
-		SELECT tc.session_id, s.project, s.agent, 'tool_input' AS location,
+		SELECT tc.session_id, s.project, s.agent,
+			COALESCE(s.transcript_revision,'') AS transcript_revision,
+			'tool_input' AS location,
 			'assistant' AS role, tc.tool_name, tc.message_ordinal AS ordinal,
 			m.timestamp AS ts,
 			tc.input_json AS snippet, 1 AS src, tc.id AS row_id,
@@ -249,7 +266,9 @@ func pgToolResultContentBranch(
 	ilikeParam := pb.add(ilikePat)
 
 	return fmt.Sprintf(`
-		SELECT tc.session_id, s.project, s.agent, 'tool_result' AS location,
+		SELECT tc.session_id, s.project, s.agent,
+			COALESCE(s.transcript_revision,'') AS transcript_revision,
+			'tool_result' AS location,
 			'assistant' AS role, tc.tool_name, tc.message_ordinal AS ordinal,
 			m.timestamp AS ts,
 			tc.result_content AS snippet, 2 AS src, tc.id AS row_id,
@@ -277,7 +296,9 @@ func pgToolResultEventsBranch(
 	ilikeParam := pb.add(ilikePat)
 
 	return fmt.Sprintf(`
-		SELECT tre.session_id, s.project, s.agent, 'tool_result' AS location,
+		SELECT tre.session_id, s.project, s.agent,
+			COALESCE(s.transcript_revision,'') AS transcript_revision,
+			'tool_result' AS location,
 			'assistant' AS role, '' AS tool_name,
 			tre.tool_call_message_ordinal AS ordinal,
 			tre.timestamp AS ts,
@@ -311,7 +332,7 @@ func (s *Store) scanPGContentMatches(
 		var body string
 		var ts *time.Time
 		if err := rows.Scan(
-			&m.SessionID, &m.Project, &m.Agent,
+			&m.SessionID, &m.Project, &m.Agent, &m.TranscriptRevision,
 			&m.Location, &m.Role, &m.ToolName, &m.Ordinal,
 			&ts, &body,
 		); err != nil {
@@ -353,7 +374,7 @@ func (s *Store) searchContentRegexPG(
 		return db.ContentSearchPage{},
 			&db.SearchInputError{Msg: fmt.Sprintf("search: invalid regex: %v", err)}
 	}
-	lit := literalPrefixPG(f.Pattern)
+	lit := db.LiteralPrefix(f.Pattern)
 
 	rows, err := s.pgRegexCandidateRows(ctx, f, lit)
 	if err != nil {
@@ -368,7 +389,7 @@ func (s *Store) searchContentRegexPG(
 		var body string
 		var ts *time.Time
 		if err := rows.Scan(
-			&m.SessionID, &m.Project, &m.Agent,
+			&m.SessionID, &m.Project, &m.Agent, &m.TranscriptRevision,
 			&m.Location, &m.Role, &m.ToolName, &m.Ordinal,
 			&ts, &body,
 		); err != nil {
@@ -386,7 +407,7 @@ func (s *Store) searchContentRegexPG(
 			seen++
 			continue
 		}
-		m.Snippet = pgBuildSnippet(f, body, loc[0], loc[1])
+		m.Snippet = f.BuildSnippet(body, loc[0], loc[1])
 		out = append(out, m)
 		if len(out) > f.Limit {
 			break
@@ -402,11 +423,7 @@ func (s *Store) searchContentRegexPG(
 	if err := rows.Close(); err != nil {
 		return db.ContentSearchPage{}, fmt.Errorf("closing pg regex candidates: %w", err)
 	}
-	page := db.ContentSearchPage{Matches: out}
-	if len(out) > f.Limit {
-		page.Matches = out[:f.Limit]
-		page.NextCursor = f.Cursor + f.Limit
-	}
+	page := f.Page(out)
 	if err := s.deriveLexicalUnitsPG(ctx, page.Matches); err != nil {
 		return db.ContentSearchPage{}, err
 	}
@@ -417,7 +434,7 @@ func (s *Store) searchContentRegexPG(
 func (s *Store) pgRegexCandidateRows(
 	ctx context.Context, f db.ContentSearchFilter, lit string,
 ) (*sql.Rows, error) {
-	scopeWhere, scopeArgs := buildPGSessionFilter(pgSessionFilter(f))
+	scopeWhere, scopeArgs := db.BuildContentScopeSQL(f, db.PostgresQueryDialect())
 	scopeWhere, scopeArgs = appendExcludeSessionIDsPG(
 		scopeWhere, scopeArgs, "id", f.ExcludeSessionIDs)
 
@@ -441,13 +458,14 @@ func (s *Store) pgRegexCandidateRows(
 	}
 	if len(branches) == 0 {
 		q := "SELECT '' AS session_id, '' AS project, '' AS agent, " +
-			"'' AS location, '' AS role, '' AS tool_name, 0 AS ordinal, " +
+			"'' AS transcript_revision, '' AS location, '' AS role, " +
+			"'' AS tool_name, 0 AS ordinal, " +
 			"'' AS ts, '' AS body WHERE FALSE"
 		return s.pg.QueryContext(ctx, q)
 	}
 
 	query := "WITH scoped AS (SELECT id FROM sessions WHERE " + scopeWhere + ") " +
-		"SELECT session_id, project, agent, location, role, tool_name, " +
+		"SELECT session_id, project, agent, transcript_revision, location, role, tool_name, " +
 		"ordinal, ts, body FROM (" +
 		strings.Join(branches, " UNION ALL ") +
 		") sub ORDER BY sort_ts DESC NULLS LAST, session_id ASC, ordinal ASC, src ASC, row_id ASC"
@@ -478,7 +496,9 @@ func pgMessagesCandidateBranch(
 	}
 
 	return fmt.Sprintf(`
-		SELECT m.session_id, s.project, s.agent, 'message' AS location,
+		SELECT m.session_id, s.project, s.agent,
+			COALESCE(s.transcript_revision,'') AS transcript_revision,
+			'message' AS location,
 			m.role AS role, '' AS tool_name, m.ordinal,
 			m.timestamp AS ts,
 			m.content AS body, 0 AS src, 0::bigint AS row_id,
@@ -496,19 +516,7 @@ func pgToolInputCandidateBranch(
 ) string {
 	prefilter := pgPrefilterClause("tc.input_json", lit, pb)
 
-	return fmt.Sprintf(`
-		SELECT tc.session_id, s.project, s.agent, 'tool_input' AS location,
-			'assistant' AS role, tc.tool_name, tc.message_ordinal AS ordinal,
-			m.timestamp AS ts,
-			tc.input_json AS body, 1 AS src, tc.id AS row_id,
-			COALESCE(s.ended_at, s.started_at, s.created_at) AS sort_ts
-		FROM tool_calls tc
-		JOIN sessions s ON s.id = tc.session_id
-		JOIN scoped sc ON sc.id = tc.session_id
-		JOIN messages m ON m.session_id = tc.session_id
-			AND m.ordinal = tc.message_ordinal
-		WHERE %s`,
-		prefilter)
+	return "\n\t\tSELECT tc.session_id, s.project, s.agent,\n\t\t\tCOALESCE(s.transcript_revision,'') AS transcript_revision,\n\t\t\t'tool_input' AS location, 'assistant' AS role, tc.tool_name,\n\t\t\ttc.message_ordinal AS ordinal, m.timestamp AS ts,\n\t\t\ttc.input_json AS body, 1 AS src, tc.id AS row_id,\n\t\t\tCOALESCE(s.ended_at, s.started_at, s.created_at) AS sort_ts\n\t\tFROM tool_calls tc\n\t\tJOIN sessions s ON s.id = tc.session_id\n\t\tJOIN scoped sc ON sc.id = tc.session_id\n\t\tJOIN messages m ON m.session_id = tc.session_id\n\t\t\tAND m.ordinal = tc.message_ordinal\n\t\tWHERE " + prefilter
 }
 
 // pgToolResultContentCandidateBranch: candidate result_content rows (no events).
@@ -518,7 +526,9 @@ func pgToolResultContentCandidateBranch(
 	prefilter := pgPrefilterClause("tc.result_content", lit, pb)
 
 	return fmt.Sprintf(`
-		SELECT tc.session_id, s.project, s.agent, 'tool_result' AS location,
+		SELECT tc.session_id, s.project, s.agent,
+			COALESCE(s.transcript_revision,'') AS transcript_revision,
+			'tool_result' AS location,
 			'assistant' AS role, tc.tool_name, tc.message_ordinal AS ordinal,
 			m.timestamp AS ts,
 			tc.result_content AS body, 2 AS src, tc.id AS row_id,
@@ -544,43 +554,7 @@ func pgToolResultEventsCandidateBranch(
 ) string {
 	prefilter := pgPrefilterClause("tre.content", lit, pb)
 
-	return fmt.Sprintf(`
-		SELECT tre.session_id, s.project, s.agent, 'tool_result' AS location,
-			'assistant' AS role, '' AS tool_name,
-			tre.tool_call_message_ordinal AS ordinal,
-			tre.timestamp AS ts,
-			tre.content AS body, 3 AS src, tre.id AS row_id,
-			COALESCE(s.ended_at, s.started_at, s.created_at) AS sort_ts
-		FROM tool_result_events tre
-		JOIN sessions s ON s.id = tre.session_id
-		JOIN scoped sc ON sc.id = tre.session_id
-		WHERE %s`,
-		prefilter)
-}
-
-// pgSnippetBounds returns the rune-snapped byte window around [start,end),
-// mirroring snippetBounds in internal/db/search_content.go.
-func pgSnippetBounds(text string, start, end int) (int, int) {
-	lo := max(start-pgSnippetRadius, 0)
-	hi := min(end+pgSnippetRadius, len(text))
-	for lo < start && !utf8.RuneStart(text[lo]) {
-		lo++
-	}
-	for hi > end && hi < len(text) && !utf8.RuneStart(text[hi]) {
-		hi--
-	}
-	return lo, hi
-}
-
-// pgBuildSnippet windows body around [start,end) and, unless reveal is set,
-// masks secrets overlapping the window (including straddling ones) via
-// secrets.RedactWindow, so a pre-truncated snippet can never leak a fragment.
-func pgBuildSnippet(f db.ContentSearchFilter, body string, start, end int) string {
-	lo, hi := pgSnippetBounds(body, start, end)
-	if f.RevealSecrets {
-		return body[lo:hi]
-	}
-	return secrets.RedactWindow(body, lo, hi)
+	return "\n\t\tSELECT tre.session_id, s.project, s.agent,\n\t\t\tCOALESCE(s.transcript_revision,'') AS transcript_revision,\n\t\t\t'tool_result' AS location, 'assistant' AS role, '' AS tool_name,\n\t\t\ttre.tool_call_message_ordinal AS ordinal, tre.timestamp AS ts,\n\t\t\ttre.content AS body, 3 AS src, tre.id AS row_id,\n\t\t\tCOALESCE(s.ended_at, s.started_at, s.created_at) AS sort_ts\n\t\tFROM tool_result_events tre\n\t\tJOIN sessions s ON s.id = tre.session_id\n\t\tJOIN scoped sc ON sc.id = tre.session_id\n\t\tWHERE " + prefilter
 }
 
 // pgSubstringSnippet builds a substring-match snippet: it locates the
@@ -590,19 +564,8 @@ func pgBuildSnippet(f db.ContentSearchFilter, body string, start, end int) strin
 func pgSubstringSnippet(f db.ContentSearchFilter, body string) string {
 	if f.Mode == "fts" {
 		start, end := db.FTSSnippetRange(f.Pattern, body)
-		return pgBuildSnippet(f, body, start, end)
+		return f.BuildSnippet(body, start, end)
 	}
 	start, end, _ := db.CaseInsensitiveSpan(body, f.Pattern)
-	return pgBuildSnippet(f, body, start, end)
-}
-
-// literalPrefixPG returns the required literal prefix from a regex pattern,
-// identical to the SQLite-side literalPrefix.
-func literalPrefixPG(pattern string) string {
-	re, err := regexp.Compile(pattern)
-	if err != nil {
-		return ""
-	}
-	prefix, _ := re.LiteralPrefix()
-	return prefix
+	return f.BuildSnippet(body, start, end)
 }

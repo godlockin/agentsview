@@ -12,7 +12,7 @@ import { starred } from "./starred.svelte.js";
 import { yokedDates } from "./yokedDates.svelte.js";
 import type { Filters } from "./sessions.svelte.js";
 import type { Session } from "../api/types.js";
-import { ApiError, callGenerated } from "../api/runtime.js";
+import { ApiError } from "../api/runtime.js";
 import { rollingRange } from "../utils/dates.js";
 
 const api = vi.hoisted(() => ({
@@ -63,7 +63,7 @@ vi.mock("../api/client.js", () => ({
 
 vi.mock("../api/runtime.js", async (importOriginal) => ({
   ...(await importOriginal<typeof import("../api/runtime.js")>()),
-  callGenerated: vi.fn((request: () => Promise<unknown>) => request()),
+
   isAbortError: vi.fn(
     (error: unknown) => error instanceof DOMException && error.name === "AbortError",
   ),
@@ -115,6 +115,7 @@ type SkinnySessionRow = {
   parent_session_id?: string | null;
   relationship_type?: string | null;
   project: string;
+  project_assigned?: boolean;
   machine: string;
   agent: string;
   agent_label?: string | null;
@@ -207,10 +208,16 @@ describe("SessionsStore", () => {
       ...resolvedOptions,
       timeZone: "America/New_York",
     });
-    vi.mocked(callGenerated).mockImplementation((request: () => Promise<unknown>) => request());
+
     storageData.clear();
     mockSidebarPage();
     mockSidebarIndex();
+    vi.mocked(SessionsService.getApiV1SessionsSidebarIndex).mockImplementation((params) =>
+      api.getSidebarSessionIndex(params),
+    );
+    vi.mocked(SessionsService.getApiV1SessionsById).mockImplementation(({ id }) =>
+      api.getSession(id),
+    );
     starred.filterOnly = false;
     starred.ids = new Set();
     yokedDates.setEnabled(false);
@@ -579,11 +586,12 @@ describe("SessionsStore", () => {
       expect(sessions.nextCursor).toBe("next");
     });
 
-    it("keeps sidebar rows skinny and carries teammate classification", async () => {
+    it("keeps sidebar rows skinny and carries sidebar classifications", async () => {
       vi.mocked(api.getSidebarSessionIndex).mockResolvedValue({
         sessions: [
           makeSkinnyRow({
             id: "team",
+            project_assigned: true,
             is_teammate: true,
           }),
         ],
@@ -598,6 +606,7 @@ describe("SessionsStore", () => {
       expect(api.listSessions).not.toHaveBeenCalled();
       expect(sessions.sessions[0]).toMatchObject({
         id: "team",
+        project_assigned: true,
         is_teammate: true,
         is_index_only: true,
       });
@@ -629,14 +638,6 @@ describe("SessionsStore", () => {
     });
 
     it("aborts an in-flight sidebar load when the filter signature changes", async () => {
-      const signals: AbortSignal[] = [];
-      vi.mocked(callGenerated).mockImplementation(
-        (request: () => Promise<unknown>, signal?: AbortSignal) => {
-          if (signal) signals.push(signal);
-          return request();
-        },
-      );
-
       vi.mocked(api.getSidebarSessionIndex)
         .mockReturnValueOnce(new Promise(() => {}))
         .mockResolvedValueOnce({
@@ -648,12 +649,16 @@ describe("SessionsStore", () => {
       const detach = sessions.attachSidebar();
       void sessions.load();
       await Promise.resolve();
-      expect(signals[0]?.aborted).toBe(false);
+      expect(
+        vi.mocked(SessionsService.getApiV1SessionsSidebarIndex).mock.calls[0]?.[1]?.signal?.aborted,
+      ).toBe(false);
 
       sessions.filters.project = "changed";
       await sessions.load();
 
-      expect(signals[0]?.aborted).toBe(true);
+      expect(
+        vi.mocked(SessionsService.getApiV1SessionsSidebarIndex).mock.calls[0]?.[1]?.signal?.aborted,
+      ).toBe(true);
       expect(api.getSidebarSessionIndex).toHaveBeenCalledTimes(2);
       detach();
     });
@@ -880,7 +885,7 @@ describe("SessionsStore", () => {
       ]);
       await sessions.load();
 
-      expect(sessions.sessions[0]!.display_name).toBeNull();
+      expect(sessions.sessions[0]!.display_name).toBeUndefined();
       expect(sessions.sessions[0]!.first_message).toBe("hydrated detail");
       expect(sessions.sessions[0]!.is_index_only).toBe(false);
     });
@@ -1647,6 +1652,75 @@ describe("SessionsStore", () => {
   });
 
   describe("loadMore serialization", () => {
+    it("reloads the first page when the pagination cursor expires", async () => {
+      sessions.sessions = [makeSession({ id: "old" })];
+      sessions.nextCursor = "expired";
+      api.getSidebarSessionIndex
+        .mockRejectedValueOnce(new ApiError(400, "invalid cursor"))
+        .mockResolvedValueOnce({
+          sessions: [makeSkinnyRow({ id: "current" })],
+          total: 2,
+          next_cursor: "fresh",
+        });
+
+      await sessions.loadMore();
+
+      expect(api.getSidebarSessionIndex).toHaveBeenCalledTimes(2);
+      expect(api.getSidebarSessionIndex.mock.calls.map(([params]) => params.cursor)).toEqual([
+        "expired",
+        undefined,
+      ]);
+      expect(sessions.sessions.map((session) => session.id)).toEqual(["current"]);
+      expect(sessions.nextCursor).toBe("fresh");
+      expect(sessions.loading).toBe(false);
+    });
+
+    it("discards an expired cursor even when the first-page reload fails", async () => {
+      sessions.sessions = [makeSession({ id: "old" })];
+      sessions.nextCursor = "expired";
+      api.getSidebarSessionIndex
+        .mockRejectedValueOnce(new ApiError(400, "invalid cursor"))
+        .mockRejectedValueOnce(new ApiError(503, "temporarily unavailable"));
+
+      await sessions.loadMore();
+      await sessions.loadMore();
+
+      expect(api.getSidebarSessionIndex).toHaveBeenCalledTimes(2);
+      expect(sessions.sessions.map((session) => session.id)).toEqual(["old"]);
+      expect(sessions.nextCursor).toBeNull();
+      expect(sessions.loading).toBe(false);
+    });
+
+    it("does not reload after an obsolete pagination request rejects its cursor", async () => {
+      let rejectPage!: (error: Error) => void;
+      sessions.nextCursor = "expired";
+      api.getSidebarSessionIndex.mockReturnValueOnce(
+        new Promise((_, reject) => {
+          rejectPage = reject;
+        }),
+      );
+
+      const page = sessions.loadMore();
+      mockSidebarPage({ next_cursor: "current" });
+      await sessions.load();
+      rejectPage(new ApiError(400, "invalid cursor"));
+      await page;
+
+      expect(api.getSidebarSessionIndex).toHaveBeenCalledTimes(2);
+      expect(sessions.nextCursor).toBe("current");
+    });
+
+    it("preserves unrelated pagination failures", async () => {
+      sessions.nextCursor = "valid";
+      const error = new ApiError(400, "invalid timezone");
+      api.getSidebarSessionIndex.mockRejectedValueOnce(error);
+
+      await expect(sessions.loadMore()).rejects.toBe(error);
+
+      expect(api.getSidebarSessionIndex).toHaveBeenCalledTimes(1);
+      expect(sessions.nextCursor).toBe("valid");
+    });
+
     it("should pass the browser timezone in loadMore", async () => {
       sessions.nextCursor = "cur-timezone";
 
@@ -2279,7 +2353,7 @@ describe("SessionsStore", () => {
 
       await sessions.renameSession("s1", null);
 
-      expect(sessions.sessions[0]!.display_name).toBeNull();
+      expect(sessions.sessions[0]!.display_name).toBeUndefined();
     });
 
     it("keeps agent name restored by backend when rename is cleared", async () => {
@@ -2790,12 +2864,12 @@ describe("SessionsStore", () => {
 
   describe("route cancellation", () => {
     it("aborts pagination and treats cancellation as normal completion", async () => {
-      const signals: AbortSignal[] = [];
-      vi.mocked(callGenerated).mockImplementation(
-        (request: () => Promise<unknown>, signal?: AbortSignal) => {
-          if (signal) signals.push(signal);
-          return rejectGeneratedRequestOnAbort(request, signal);
-        },
+      vi.mocked(SessionsService.getApiV1SessionsSidebarIndex).mockImplementation(
+        (params, options) =>
+          rejectGeneratedRequestOnAbort(
+            () => api.getSidebarSessionIndex(params),
+            options?.signal ?? undefined,
+          ) as ReturnType<typeof SessionsService.getApiV1SessionsSidebarIndex>,
       );
       vi.mocked(api.getSidebarSessionIndex).mockReturnValue(new Promise(() => {}));
       sessions.nextCursor = "next";
@@ -2804,13 +2878,25 @@ describe("SessionsStore", () => {
       await Promise.resolve();
       sessions.cancelRouteReads();
 
-      expect(signals).toHaveLength(1);
-      expect(signals[0]?.aborted).toBe(true);
+      expect(
+        vi
+          .mocked(SessionsService.getApiV1SessionsSidebarIndex)
+          .mock.calls.map((call) => call[1]?.signal),
+      ).toHaveLength(1);
+      expect(
+        vi.mocked(SessionsService.getApiV1SessionsSidebarIndex).mock.calls[0]?.[1]?.signal?.aborted,
+      ).toBe(true);
       await expect(load).resolves.toBeUndefined();
     });
 
     it("keeps a replacement signal-detail request registered", async () => {
-      vi.mocked(callGenerated).mockImplementation(rejectGeneratedRequestOnAbort);
+      vi.mocked(SessionsService.getApiV1SessionsById).mockImplementation(
+        ({ id }, options) =>
+          rejectGeneratedRequestOnAbort(
+            () => api.getSession(id),
+            options?.signal ?? undefined,
+          ) as ReturnType<typeof SessionsService.getApiV1SessionsById>,
+      );
       vi.mocked(api.getSession).mockReturnValue(new Promise(() => {}));
 
       const obsolete = sessions.fetchSignalDetail("detail");
@@ -2829,6 +2915,19 @@ describe("SessionsStore", () => {
 
 function makeSession(overrides: Partial<Session> & { id: string }): Session {
   return {
+    compaction_count: 0,
+    consecutive_failure_max: 0,
+    edit_churn_count: 0,
+    ended_with_role: "",
+    final_failure_streak: 0,
+    has_peak_context_tokens: false,
+    has_total_output_tokens: false,
+    mid_task_compaction_count: 0,
+    outcome: "",
+    outcome_confidence: "",
+    secret_leak_count: 0,
+    tool_failure_signal_count: 0,
+    tool_retry_count: 0,
     project: "proj",
     machine: "local",
     agent: "claude",
@@ -2933,6 +3032,25 @@ describe("buildSessionGroups", () => {
 
     expect(groups).toHaveLength(1);
     expect(groups[0]!.sessions.map((s) => s.id)).toContain("teammate");
+  });
+
+  it("includes a shared hosted child under both proven parent variants", () => {
+    const rows = [
+      makeSession({ id: "parent-a", project: "proj" }),
+      makeSession({ id: "parent-b", project: "proj" }),
+      {
+        ...makeSession({ id: "shared-child", project: "proj" }),
+        parent_session_ids: ["parent-a", "parent-b"],
+        relationship_type: "subagent",
+      },
+    ];
+    const groups = buildSessionGroups(rows);
+    expect(
+      groups.map((group) => ({ key: group.key, ids: group.sessions.map((session) => session.id) })),
+    ).toEqual([
+      { key: "parent-a", ids: ["parent-a", "shared-child"] },
+      { key: "parent-b", ids: ["parent-b", "shared-child"] },
+    ]);
   });
 
   it("groups two-session chain", () => {

@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"slices"
+	"strconv"
 	"strings"
 
 	"go.kenn.io/agentsview/internal/config"
@@ -57,8 +58,8 @@ func (db *DB) usageOnlyStorage() bool {
 	return db.ArchiveContent().UsageOnly()
 }
 
-// ErrArchiveContentExcluded reports a write that the archive's content
-// policy does not store. Callers can match it with errors.Is.
+// ErrArchiveContentExcluded reports data that the archive's content policy
+// does not permit storing or exporting. Callers can match it with errors.Is.
 var ErrArchiveContentExcluded = errors.New(
 	"archive content policy excludes this data",
 )
@@ -78,27 +79,23 @@ func (db *DB) requireDerivedTextStorage(kind string) error {
 }
 
 func (db *DB) sessionForStorage(session Session) Session {
-	if !db.usageOnlyStorage() {
-		return session
-	}
-	// Derive automation while the parser/importer preview is still present.
-	// The retained session row is authoritative after transcript text is gone.
-	session.IsAutomated = sessionIsAutomated(session)
-	session.PreserveStoredAutomation = session.FirstMessage == nil &&
-		session.UserMessageCount <= 1
-	session.FirstMessage = nil
-	session.DisplayName = nil
-	session.SessionName = nil
-	session.PreserveSessionName = false
-	session.SecretLeakCount = 0
-	session.SecretsRulesVersion = ""
-	return session
+	return sessionForStoragePolicy(session, db.ArchiveContent())
 }
 
 func (db *DB) sessionAndMessagesForStorage(
 	session Session, messages []Message,
 ) (Session, []Message) {
-	switch db.ArchiveContent() {
+	return ProjectSessionForStoragePolicy(
+		session, messages, db.ArchiveContent(),
+	)
+}
+
+// ProjectSessionForStoragePolicy applies an explicit storage policy without a
+// database handle. Hosted and local ingestion use this same projection.
+func ProjectSessionForStoragePolicy(
+	session Session, messages []Message, policy config.ArchiveContent,
+) (Session, []Message) {
+	switch policy {
 	case config.ArchiveContentUsage:
 		// Some importers do not precompute IsAutomated. Classify from the raw
 		// messages before the storage projection drops user text.
@@ -106,12 +103,35 @@ func (db *DB) sessionAndMessagesForStorage(
 			IsAutomatedTranscript(
 				session.UserMessageCount, messages, session.FirstMessage,
 			)
-		return db.sessionForStorage(session), usageOnlyMessages(messages)
+		return sessionForStoragePolicy(session, policy), usageOnlyMessages(messages)
 	case config.ArchiveContentTranscripts:
 		return session, transcriptMessages(messages)
 	default:
 		return session, messages
 	}
+}
+
+func sessionForStoragePolicy(
+	session Session, policy config.ArchiveContent,
+) Session {
+	if !policy.UsageOnly() {
+		return session
+	}
+	// Derive automation while the parser/importer preview is still present.
+	// The retained session row is authoritative after transcript text is gone.
+	session.IsAutomated = sessionIsAutomated(session)
+	if !session.UsageAutomationProjected {
+		session.PreserveStoredAutomation = session.FirstMessage == nil &&
+			session.UserMessageCount <= 1
+		session.UsageAutomationProjected = true
+	}
+	session.FirstMessage = nil
+	session.DisplayName = nil
+	session.SessionName = nil
+	session.PreserveSessionName = false
+	session.SecretLeakCount = 0
+	session.SecretsRulesVersion = ""
+	return session
 }
 
 // ProjectSessionForStorage applies this database handle's storage policy to a
@@ -282,6 +302,11 @@ func transcriptSubagentLinks(
 	stored := slices.Clone(links)
 	for i := range stored {
 		stored[i].ResultContent = ""
+		stored[i].ResultEvents = slices.Clone(stored[i].ResultEvents)
+		for j := range stored[i].ResultEvents {
+			PrepareToolResultEvent(&stored[i].ResultEvents[j])
+			stored[i].ResultEvents[j].Content = ""
+		}
 	}
 	return stored
 }
@@ -373,9 +398,7 @@ func usageOnlySubagentLinks(
 // from rows the write path only updates in part: session titles the upsert
 // leaves untouched and pin notes a message replacement carries across.
 func clearUsageOnlyTextTx(
-	tx interface {
-		Exec(string, ...any) (sql.Result, error)
-	},
+	tx transactionQueries,
 	sessionID string,
 ) error {
 	if _, err := tx.Exec(
@@ -401,7 +424,7 @@ func clearUsageOnlyTextTx(
 		}
 	}
 
-	return nil
+	return clearUsageOnlyConversationTx(tx, sessionID)
 }
 
 // settleUsageOnlySessionTx brings an existing session row that predates the
@@ -422,16 +445,16 @@ func updateUsageOnlyAutomationTx(
 	}
 	var userMessageCount int
 	var automated bool
-	var agent, sessionKind string
+	var sessionKind string
 	err := tx.QueryRow(
-		`SELECT user_message_count, is_automated, agent, session_kind
+		`SELECT user_message_count, is_automated, session_kind
 		   FROM sessions WHERE id = ?`,
 		sessionID,
-	).Scan(&userMessageCount, &automated, &agent, &sessionKind)
+	).Scan(&userMessageCount, &automated, &sessionKind)
 	if err != nil {
 		return err
 	}
-	if IsAutomatedSessionMetadata(agent, sessionKind) {
+	if IsAutomatedSessionMetadata(sessionKind) {
 		if automated {
 			return nil
 		}
@@ -468,16 +491,32 @@ func messagesForSession(messages []Message, sessionID string) []Message {
 // The SQL mirrors usageOnlyMessages and transcriptMessages column for column.
 func applyArchiveContentToCopiedSessionsTx(
 	ctx context.Context, tx *sql.Tx, tempIDsTable string,
-	policy config.ArchiveContent,
+	policy config.ArchiveContent, sourceVersion int,
 ) error {
+	var err error
 	switch policy {
+	case config.ArchiveContentFull:
+		// Sanitized content and its conversation projection were copied
+		// together. Neither needs to be read and rewritten when unchanged.
+		if sourceVersion >= sanitizedSourceDataVersion {
+			return nil
+		}
 	case config.ArchiveContentTranscripts:
-		return dropCopiedToolContentTx(ctx, tx, tempIDsTable)
+		err = dropCopiedToolContentTx(ctx, tx, tempIDsTable)
 	case config.ArchiveContentUsage:
-		return compactCopiedSessionsForUsageTx(ctx, tx, tempIDsTable)
-	default:
-		return nil
+		err = compactCopiedSessionsForUsageTx(ctx, tx, tempIDsTable)
 	}
+	if err != nil {
+		return err
+	}
+	if active, err := conversationExportActiveTx(contextTransaction{ctx: ctx, tx: tx}); err != nil || !active {
+		return err
+	}
+	where := "session_id IN (SELECT id FROM " + tempIDsTable + ")"
+	if err := refreshConversationMessagesFromArchiveTx(ctx, tx, where); err != nil {
+		return err
+	}
+	return applyConversationPolicyGapsTx(ctx, tx, where)
 }
 
 // toolOutputMarkerDataVersion is the first data version whose parsers mark
@@ -499,7 +538,7 @@ func dropCopiedToolContentTx(
 		return ` IN (SELECT s.id FROM sessions s
 			WHERE s.id` + inCopied + `
 			  AND s.data_version < ` +
-			fmt.Sprint(toolOutputMarkerDataVersion) + `
+			strconv.Itoa(toolOutputMarkerDataVersion) + `
 			  AND s.agent IN (` + agents + `))`
 	}
 	statements := []struct {
@@ -530,13 +569,15 @@ func dropCopiedToolContentTx(
 			UPDATE messages SET content = '', content_length = 0
 			WHERE is_system = 1 AND session_id` +
 			inUnmarked(`'`+string(parser.AgentZencoder)+`'`)},
-		// Codex and TraeX stored unpaired agent notifications as ordinary
-		// user rows, with no field that distinguishes them from prompts.
-		{"unmarked Codex and TraeX tool output", `
+		// Codex, TraeX, and Augure Code stored unpaired agent notifications
+		// as ordinary user rows, with no field that distinguishes them from
+		// prompts.
+		{"unmarked Codex, TraeX, and Augure Code tool output", `
 			UPDATE messages SET content = '', content_length = 0
 			WHERE role = 'user' AND session_id` +
 			inUnmarked(`'`+string(parser.AgentCodex)+`', '`+
-				string(parser.AgentTraeX)+`'`)},
+				string(parser.AgentTraeX)+`', '`+
+				string(parser.AgentAugureCode)+`'`)},
 		// gptme stored tool output as assistant rows without a model, while
 		// model replies carry the model name.
 		{"unmarked gptme tool output", `
@@ -597,6 +638,9 @@ func compactCopiedSessionsForUsageTx(
 	ctx context.Context, tx *sql.Tx, tempIDsTable string,
 ) error {
 	inCopied := ` IN (SELECT id FROM ` + tempIDsTable + `)`
+	if _, err := tx.ExecContext(ctx, `UPDATE conversation_messages SET body=NULL,digest='',text_bytes=0,gap='archive_content_excluded' WHERE session_id`+inCopied); err != nil {
+		return err
+	}
 	statements := []struct {
 		label string
 		sql   string
@@ -661,6 +705,9 @@ func compactCopiedSessionsForUsageTx(
 		return fmt.Errorf("listing copied sessions: %w", err)
 	}
 	for _, id := range ids {
+		if err := clearUsageOnlyConversationTx(contextTransaction{ctx: ctx, tx: tx}, id); err != nil {
+			return err
+		}
 		if err := settleUsageOnlySignalsTx(tx, id); err != nil {
 			return fmt.Errorf("settling copied signals for %s: %w", id, err)
 		}
@@ -694,6 +741,7 @@ func redactCopiedToolUseRenderingsTx(
 	if err != nil {
 		return fmt.Errorf("listing copied tool renderings: %w", err)
 	}
+	defer rows.Close()
 	type pending struct {
 		id      int64
 		content string

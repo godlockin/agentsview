@@ -7,9 +7,9 @@ import (
 	"database/sql"
 	"encoding/hex"
 	"encoding/json/v2"
+	"errors"
 	"fmt"
 	"slices"
-	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -20,6 +20,7 @@ import (
 	"go.kenn.io/agentsview/internal/export"
 	"go.kenn.io/agentsview/internal/money"
 	pricingpkg "go.kenn.io/agentsview/internal/pricing"
+	"go.kenn.io/agentsview/internal/storage"
 )
 
 func (s *Sync) syncModelPricing(ctx context.Context) error {
@@ -28,7 +29,7 @@ func (s *Sync) syncModelPricing(ctx context.Context) error {
 		return err
 	}
 	if len(prices) == 0 {
-		prices = duckFallbackPricingRows()
+		prices = db.FallbackMirrorPricingRows(time.Now().UTC().Format(time.RFC3339Nano))
 	}
 	if len(prices) == 0 {
 		return s.syncGenAIPricing(ctx)
@@ -112,14 +113,6 @@ type duckGenAIPricingRow interface {
 	Scan(...any) error
 }
 
-func embeddedDuckGenAIPricingDocument() db.GenAIPricingDocument {
-	embedded := pricingpkg.EmbeddedGenAIDocument()
-	return db.GenAIPricingDocument{
-		Version: embedded.Version, SourceRef: embedded.SourceRef,
-		Source: db.GenAIPricingSourceEmbedded, Data: embedded.RawJSON(),
-	}
-}
-
 func loadDuckGenAIPricing(
 	ctx context.Context, q duckGenAIPricingQuerier,
 ) (*db.GenAIPricingDocument, error) {
@@ -136,7 +129,7 @@ func scanDuckGenAIPricing(
 		&document.Version, &document.SourceRef, &document.Source,
 		&document.Data, &document.UpdatedAt,
 	)
-	if err == sql.ErrNoRows {
+	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
 	}
 	if err != nil {
@@ -186,7 +179,7 @@ func (s *Sync) syncGenAIPricing(ctx context.Context) error {
 		return fmt.Errorf("reading local GenAI pricing document: %w", err)
 	}
 	if document == nil {
-		embedded := embeddedDuckGenAIPricingDocument()
+		embedded := db.EmbeddedGenAIPricingDocument()
 		document = &embedded
 	}
 	tx, err := s.duck.BeginTx(ctx, nil)
@@ -590,13 +583,12 @@ func (s *Sync) loadIdentityPublicationScope(
 				"loading project identity observations: %w", err,
 			)
 		}
-		observations = filterIdentityScope(
+		observations = db.FilterIdentityScope(
 			observations, s.projects, s.excludeProjects,
 		)
-		snapshots, err =
-			s.local.ListPublishableSessionProjectIdentitySnapshots(
-				ctx, nil, s.projects, s.excludeProjects,
-			)
+		snapshots, err = s.local.ListPublishableSessionProjectIdentitySnapshots(
+			ctx, nil, s.projects, s.excludeProjects,
+		)
 		if err != nil {
 			return nil, nil, delta, fmt.Errorf(
 				"loading session project identity snapshots: %w", err,
@@ -604,44 +596,18 @@ func (s *Sync) loadIdentityPublicationScope(
 		}
 	}
 	if len(refreshSessionIDs) > 0 {
-		refreshSnapshots, loadErr :=
-			s.local.ListPublishableSessionProjectIdentitySnapshots(
-				ctx, refreshSessionIDs, s.projects, s.excludeProjects,
-			)
+		refreshSnapshots, loadErr := s.local.ListPublishableSessionProjectIdentitySnapshots(
+			ctx, refreshSessionIDs, s.projects, s.excludeProjects,
+		)
 		if loadErr != nil {
 			return nil, nil, delta, fmt.Errorf(
 				"loading refreshed session project identity snapshots: %w",
 				loadErr,
 			)
 		}
-		snapshots = mergeProjectIdentitySnapshots(snapshots, refreshSnapshots)
+		snapshots = db.MergeProjectIdentitySnapshots(snapshots, refreshSnapshots)
 	}
 	return observations, snapshots, delta, nil
-}
-
-// filterIdentityScope restricts a full-publication listing to the push
-// scope. The delta path does not need this: LoadProjectIdentityPublicationDelta
-// applies projects/excludeProjects in SQL.
-func filterIdentityScope(
-	items []export.ProjectIdentityObservation, projects, excludeProjects []string,
-) []export.ProjectIdentityObservation {
-	if len(projects) == 0 && len(excludeProjects) == 0 {
-		return items
-	}
-	out := items[:0]
-	for _, item := range items {
-		if projectMatchesPushScope(item.Project, projects, excludeProjects) {
-			out = append(out, item)
-		}
-	}
-	return out
-}
-
-func projectMatchesPushScope(project string, projects, excludeProjects []string) bool {
-	if len(projects) > 0 && !slices.Contains(projects, project) {
-		return false
-	}
-	return !slices.Contains(excludeProjects, project)
 }
 
 func (s *Sync) writeIdentityPublication(
@@ -729,57 +695,6 @@ func (s *Sync) writeIdentityPublication(
 	return nil
 }
 
-func mergeProjectIdentitySnapshots(
-	base, refresh []export.ProjectIdentityObservation,
-) []export.ProjectIdentityObservation {
-	merged := make(map[string]export.ProjectIdentityObservation, len(base)+len(refresh))
-	for _, snapshot := range base {
-		merged[snapshot.SessionID] = snapshot
-	}
-	for _, snapshot := range refresh {
-		merged[snapshot.SessionID] = snapshot
-	}
-	out := make([]export.ProjectIdentityObservation, 0, len(merged))
-	for _, snapshot := range merged {
-		out = append(out, snapshot)
-	}
-	sort.Slice(out, func(i, j int) bool {
-		return out[i].SessionID < out[j].SessionID
-	})
-	return out
-}
-
-func duckFallbackPricingRows() []db.ModelPricing {
-	src := pricingpkg.FallbackPricing()
-	out := make([]db.ModelPricing, len(src))
-	now := time.Now().UTC().Format(time.RFC3339Nano)
-	for i, p := range src {
-		bands := make([]db.PricingBand, len(p.Bands))
-		for j, band := range p.Bands {
-			bands[j] = db.PricingBand{
-				AboveInputTokens:       band.AboveInputTokens,
-				InputPerMTok:           band.InputPerMTok,
-				OutputPerMTok:          band.OutputPerMTok,
-				CacheCreationPerMTok:   band.CacheCreationPerMTok,
-				CacheCreation1hPerMTok: band.CacheCreation1hPerMTok,
-				CacheReadPerMTok:       band.CacheReadPerMTok,
-				UpdatedAt:              now,
-			}
-		}
-		out[i] = db.ModelPricing{
-			ModelPattern:           p.ModelPattern,
-			InputPerMTok:           p.InputPerMTok,
-			OutputPerMTok:          p.OutputPerMTok,
-			CacheCreationPerMTok:   p.CacheCreationPerMTok,
-			CacheCreation1hPerMTok: p.CacheCreation1hPerMTok,
-			CacheReadPerMTok:       p.CacheReadPerMTok,
-			UpdatedAt:              now,
-			Bands:                  bands,
-		}
-	}
-	return out
-}
-
 // applyDeletionDelta removes every mirror session tombstoned in the local
 // deletion journal within (after, through]. This is the mirror-resident
 // replacement for the old local-scan hard-delete reconciliation: the
@@ -797,7 +712,7 @@ func duckFallbackPricingRows() []db.ModelPricing {
 // so a never-mirrored out-of-scope deletion stays invisible to filtered
 // diagnostics. Work stays bounded by the delta either way.
 func (s *Sync) applyDeletionDelta(
-	ctx context.Context, after, through int64, result *PushResult,
+	ctx context.Context, after, through int64, result *storage.MirrorPushResult,
 ) error {
 	tombstones, err := s.local.LoadSessionDeletionDelta(
 		ctx, after, through, nil, nil,
@@ -841,7 +756,7 @@ func (s *Sync) selectTombstonesToApply(
 			continue
 		}
 		seen[tombstone.SessionID] = true
-		if projectMatchesPushScope(tombstone.Project, s.projects, s.excludeProjects) {
+		if db.ProjectMatchesPushScope(tombstone.Project, s.projects, s.excludeProjects) {
 			apply = append(apply, tombstone.SessionID)
 		} else {
 			outOfScope = append(outOfScope, tombstone.SessionID)
@@ -1172,7 +1087,7 @@ func (s *Sync) upsertSession(
 ) error {
 	query := `
 		INSERT INTO sessions (
-			id, project, machine, agent,
+			id, project, project_assigned, machine, agent,
 			agent_label, entrypoint, session_kind,
 			first_message, display_name, session_name, started_at, ended_at,
 			message_count, user_message_count,
@@ -1196,7 +1111,7 @@ func (s *Sync) upsertSession(
 			termination_status, secret_leak_count, secrets_rules_version,
 			agentsview_push_fingerprint, source_archive_id
 		) VALUES (
-			?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+			?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
 			?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
 			?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
 			?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
@@ -1204,6 +1119,7 @@ func (s *Sync) upsertSession(
 	query += `
 		ON CONFLICT(id) DO UPDATE SET
 			project = excluded.project,
+			project_assigned = excluded.project_assigned,
 			machine = excluded.machine,
 			agent = excluded.agent,
 			agent_label = excluded.agent_label,
@@ -1288,8 +1204,8 @@ func sessionInsertArgs(
 	fingerprint string,
 ) []any {
 	return []any{
-		sess.ID, sess.Project,
-		mirroredSessionMachine(sess, fallbackMachine), sess.Agent,
+		sess.ID, sess.Project, sess.ProjectAssigned,
+		db.MirroredSessionMachine(sess, fallbackMachine), sess.Agent,
 		sess.AgentLabel, sess.Entrypoint, sess.SessionKind,
 		nilString(sess.FirstMessage), nilString(sess.DisplayName),
 		nilString(sess.SessionName),
@@ -1297,7 +1213,7 @@ func sessionInsertArgs(
 		sess.MessageCount, sess.UserMessageCount,
 		nilString(sess.FilePath), sess.FileSize, sess.FileMtime,
 		sess.FileInode, sess.FileDevice, nilString(sess.FileHash),
-		nilTime(sess.LocalModifiedAt), transcriptRevisionValue(sess.TranscriptRevision),
+		nilTime(sess.LocalModifiedAt), db.TranscriptRevisionValue(sess.TranscriptRevision),
 		nilString(sess.ParentSessionID),
 		sess.RelationshipType, sess.TotalOutputTokens,
 		sess.PeakContextTokens, sess.HasTotalOutputTokens,
@@ -1323,16 +1239,6 @@ func sessionInsertArgs(
 		sess.SecretLeakCount, sess.SecretsRulesVersion,
 		nilEmpty(fingerprint), archiveID,
 	}
-}
-
-// mirroredSessionMachine preserves the source archive's machine identity.
-// "local" and empty are local-only sentinels, so only those use the machine
-// configured for this mirror push.
-func mirroredSessionMachine(sess db.Session, fallbackMachine string) string {
-	if sess.Machine != "" && sess.Machine != "local" {
-		return sess.Machine
-	}
-	return fallbackMachine
 }
 
 func insertMessages(
@@ -1621,13 +1527,6 @@ func insertPinnedMessages(
 func nilString(value *string) any {
 	if value == nil || *value == "" {
 		return nil
-	}
-	return *value
-}
-
-func transcriptRevisionValue(value *string) string {
-	if value == nil || *value == "" {
-		return "0"
 	}
 	return *value
 }

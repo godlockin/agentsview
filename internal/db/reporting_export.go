@@ -4,8 +4,10 @@ import (
 	"cmp"
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"math"
+	"slices"
 	"sort"
 	"time"
 
@@ -20,10 +22,34 @@ type ReportingExportOptions struct {
 	Date          time.Time
 	Now           time.Time
 	SchemaVersion int
+	ProjectKeys   []string
+	Bucket        string
 
 	// afterSnapshot is a deterministic test seam for proving that every source
 	// read uses the transaction established before this callback.
-	afterSnapshot func()
+	afterSnapshot   func()
+	afterSourceLoad func(reportingSourceLoadStats)
+}
+
+// ReportingDigestExportOptions selects an inclusive UTC date range and fixes
+// the current time used to decide which hours have closed.
+type ReportingDigestExportOptions struct {
+	From          time.Time
+	To            time.Time
+	Now           time.Time
+	SchemaVersion int
+	ProjectKeys   []string
+	Bucket        string
+
+	afterSnapshot   func()
+	afterSourceLoad func(reportingSourceLoadStats)
+}
+
+type resolvedReportingDate struct {
+	date      time.Time
+	end       time.Time
+	hourCount int
+	complete  bool
 }
 
 // ExportReportingDay builds an hourly reporting document from one read
@@ -40,6 +66,13 @@ func (db *DB) ExportReportingDay(
 			"unsupported reporting schema version %d", schemaVersion,
 		)
 	}
+	if err := export.ValidateReportingProjectScope(schemaVersion, opts.ProjectKeys); err != nil {
+		return export.ReportingDay{}, err
+	}
+	bucket, err := export.ParseReportingBucket(schemaVersion, opts.Bucket)
+	if err != nil {
+		return export.ReportingDay{}, err
+	}
 	date, _, hourCount, complete, err := resolveReportingExportRange(opts)
 	if err != nil {
 		return export.ReportingDay{}, err
@@ -53,8 +86,6 @@ func (db *DB) ExportReportingDay(
 		_ = tx.Rollback()
 	}()
 
-	// Establish the snapshot before constructing the in-memory document. The
-	// following implementation stages load all source rows through this tx.
 	var snapshotMarker int
 	if err := tx.QueryRowContext(
 		ctx, "SELECT COUNT(*) FROM archive_metadata",
@@ -65,90 +96,233 @@ func (db *DB) ExportReportingDay(
 		opts.afterSnapshot()
 	}
 
-	hours, err := db.reportingHoursFromSnapshot(
-		ctx, tx, date, hourCount, schemaVersion,
+	source, err := db.loadReportingExportSource(
+		ctx, tx, date, date.Add(time.Duration(hourCount)*time.Hour), schemaVersion,
 	)
 	if err != nil {
 		return export.ReportingDay{}, err
 	}
-	day, _, err := export.FinalizeReportingDay(export.ReportingDay{
-		SchemaVersion: schemaVersion,
-		Date:          date.Format("2006-01-02"),
-		Complete:      complete,
-		Hours:         hours,
-	})
-	if err != nil {
-		return export.ReportingDay{}, fmt.Errorf("finalize reporting date: %w", err)
+	if opts.afterSourceLoad != nil {
+		opts.afterSourceLoad(source.observerStats())
 	}
 	if err := tx.Commit(); err != nil {
 		return export.ReportingDay{}, fmt.Errorf("commit reporting snapshot: %w", err)
 	}
+
+	hours, err := reportingHoursFromSource(
+		ctx, source.forDate(date, date.Add(time.Duration(hourCount)*time.Hour)),
+		date, hourCount, schemaVersion, opts.ProjectKeys, bucket,
+	)
+	if err != nil {
+		return export.ReportingDay{}, err
+	}
+	day := export.ReportingDay{
+		SchemaVersion: schemaVersion,
+		Date:          date.Format("2006-01-02"),
+		Complete:      complete,
+		Hours:         hours,
+	}
+	if schemaVersion == export.ReportingJointSchemaVersion {
+		day.BucketSeconds = int(bucket / time.Second)
+	}
+	day, _, err = export.FinalizeReportingDay(day)
+	if err != nil {
+		return export.ReportingDay{}, fmt.Errorf("finalize reporting date: %w", err)
+	}
 	return day, nil
 }
 
-func (db *DB) reportingHoursFromSnapshot(
-	ctx context.Context, tx *sql.Tx, date time.Time, hourCount, schemaVersion int,
+// ExportReportingDigest builds compact day projections from one read
+// transaction. Daily usage survivor selection and allocation still run once
+// for each date after its source rows are narrowed in memory.
+func (db *DB) ExportReportingDigest(
+	ctx context.Context, opts ReportingDigestExportOptions,
+) ([]export.ReportingDigestDay, error) {
+	schemaVersion := opts.SchemaVersion
+	if schemaVersion == 0 {
+		schemaVersion = export.ReportingSchemaVersion
+	}
+	if !export.IsSupportedReportingSchemaVersion(schemaVersion) {
+		return nil, fmt.Errorf(
+			"unsupported reporting schema version %d", schemaVersion,
+		)
+	}
+	if err := export.ValidateReportingProjectScope(schemaVersion, opts.ProjectKeys); err != nil {
+		return nil, err
+	}
+	bucket, err := export.ParseReportingBucket(schemaVersion, opts.Bucket)
+	if err != nil {
+		return nil, err
+	}
+	from, err := normalizeReportingDate(opts.From)
+	if err != nil {
+		return nil, err
+	}
+	to, err := normalizeReportingDate(opts.To)
+	if err != nil {
+		return nil, err
+	}
+	if from.After(to) {
+		return nil, errors.New("reporting date range must not be reversed")
+	}
+	now := opts.Now
+	if now.IsZero() {
+		now = time.Now()
+	}
+	now = now.UTC()
+
+	dates := make([]resolvedReportingDate, 0, int(to.Sub(from)/(24*time.Hour))+1)
+	unionEnd := from
+	for date := from; !date.After(to); date = date.Add(24 * time.Hour) {
+		resolvedDate, _, hourCount, complete, resolveErr := resolveReportingExportRange(ReportingExportOptions{
+			Date: date,
+			Now:  now,
+		})
+		if resolveErr != nil {
+			return nil, resolveErr
+		}
+		end := resolvedDate.Add(time.Duration(hourCount) * time.Hour)
+		dates = append(dates, resolvedReportingDate{
+			date: resolvedDate, end: end,
+			hourCount: hourCount, complete: complete,
+		})
+		if end.After(unionEnd) {
+			unionEnd = end
+		}
+	}
+
+	tx, err := db.getReader().BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
+	if err != nil {
+		return nil, fmt.Errorf("begin reporting snapshot: %w", err)
+	}
+	defer func() {
+		_ = tx.Rollback()
+	}()
+	var snapshotMarker int
+	if err := tx.QueryRowContext(
+		ctx, "SELECT COUNT(*) FROM archive_metadata",
+	).Scan(&snapshotMarker); err != nil {
+		return nil, fmt.Errorf("establish reporting snapshot: %w", err)
+	}
+	if opts.afterSnapshot != nil {
+		opts.afterSnapshot()
+	}
+	source, err := db.loadReportingExportSource(
+		ctx, tx, from, unionEnd, schemaVersion,
+	)
+	if err != nil {
+		return nil, err
+	}
+	if opts.afterSourceLoad != nil {
+		opts.afterSourceLoad(source.observerStats())
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, fmt.Errorf("commit reporting snapshot: %w", err)
+	}
+
+	days := make([]export.ReportingDigestDay, 0, len(dates))
+	for _, resolved := range dates {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		hours, renderErr := reportingHoursFromSource(
+			ctx,
+			source.forDate(resolved.date, resolved.end),
+			resolved.date,
+			resolved.hourCount,
+			schemaVersion,
+			opts.ProjectKeys,
+			bucket,
+		)
+		if renderErr != nil {
+			return nil, renderErr
+		}
+		day := export.ReportingDay{
+			SchemaVersion: schemaVersion,
+			Date:          resolved.date.Format("2006-01-02"),
+			Complete:      resolved.complete,
+			Hours:         hours,
+		}
+		if schemaVersion == export.ReportingJointSchemaVersion {
+			day.BucketSeconds = int(bucket / time.Second)
+		}
+		day, _, err = export.FinalizeReportingDay(day)
+		if err != nil {
+			return nil, fmt.Errorf("finalize reporting date: %w", err)
+		}
+		days = append(days, reportingDigestDayFromDay(day))
+	}
+	return days, nil
+}
+
+func normalizeReportingDate(date time.Time) (time.Time, error) {
+	_, offset := date.Zone()
+	if offset != 0 || date.Hour() != 0 || date.Minute() != 0 ||
+		date.Second() != 0 || date.Nanosecond() != 0 {
+		return time.Time{}, errors.New("reporting date must be UTC midnight")
+	}
+	return date.UTC(), nil
+}
+
+func reportingDigestDayFromDay(day export.ReportingDay) export.ReportingDigestDay {
+	hourDigests := make([]string, len(day.Hours))
+	for i := range day.Hours {
+		hourDigests[i] = day.Hours[i].Digest
+	}
+	return export.ReportingDigestDay{
+		Date:        day.Date,
+		Complete:    day.Complete,
+		HasData:     day.HasData,
+		DayDigest:   day.Digest,
+		HourDigests: hourDigests,
+	}
+}
+
+func reportingHoursFromSource(
+	ctx context.Context,
+	source reportingDaySource,
+	date time.Time,
+	hourCount, schemaVersion int,
+	projectKeys []string,
+	bucket time.Duration,
 ) ([]export.ReportingHour, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	hours := make([]export.ReportingHour, hourCount)
 	if hourCount == 0 {
 		return hours, nil
 	}
 	end := date.Add(time.Duration(hourCount) * time.Hour)
 	query, err := activity.ResolveQuery(activity.QueryInput{
-		Preset:         "custom",
-		From:           date.Format(time.RFC3339),
-		To:             end.Format(time.RFC3339),
-		Timezone:       "UTC",
-		BucketOverride: "5m",
+		Preset:   "custom",
+		From:     date.Format(time.RFC3339),
+		To:       end.Format(time.RFC3339),
+		Timezone: "UTC",
 	}, end)
 	if err != nil {
 		return nil, fmt.Errorf("resolve reporting snapshot range: %w", err)
 	}
-	filter := AnalyticsFilter{
-		Timezone:         "UTC",
-		IncludeSubagents: true,
-		IncludeForks:     true,
-	}
-	rangeStartUTC, rangeEndUTC := activityReportRangeBoundsUTC(query)
-	sessions, ids, err := db.activityReportSessionsFrom(
-		ctx, tx, filter, rangeStartUTC, rangeEndUTC,
+	// Preserve the shared range and inactivity-gap policy. Export bucket sizes
+	// have their own validated complete-hour contract, separate from UI presets.
+	query.Bucket = activity.BucketSpec{Unit: activity.BucketMinute, NominalSeconds: int(bucket / time.Second)}
+	resolver := export.NewPricingResolver(source.pricing)
+	sessionUsageCandidates := source.usageCandidates
+	sessionUsage, _, err := materializeActivityReportUsageCandidates(
+		sessionUsageCandidates, nil, nil, nil, resolver,
 	)
 	if err != nil {
 		return nil, err
 	}
-	events, err := db.activityReportActivityFrom(ctx, tx, ids)
-	if err != nil {
-		return nil, err
-	}
-	lowerBound := paddedUTCBound(date.Format(time.RFC3339), -14)
-	upperBound := paddedUTCBound(end.Format(time.RFC3339), 14)
-	usageSessions, usageIDs, err := db.reportingUsageSessionsFrom(
-		ctx, tx, lowerBound, upperBound,
-	)
-	if err != nil {
-		return nil, err
-	}
-	sessionUsage, _, err := db.activityReportUsageCandidatesFrom(
-		ctx,
-		tx,
-		usageIDs,
-		lowerBound,
-		upperBound,
-		true,
-	)
-	if err != nil {
-		return nil, err
-	}
-	standaloneUsage, err := db.reportingStandaloneUsageCandidatesFrom(
-		ctx, tx, query,
-	)
-	if err != nil {
-		return nil, err
-	}
+	standaloneUsage := source.standaloneUsage
 	usage := append(
 		append([]activity.UsageRow(nil), sessionUsage...),
 		standaloneUsage...,
 	)
+	sessions := source.activitySessions
+	ids := source.activityIDs
+	events := source.activityEvents
+	usageSessions := source.usageSessions
 	allSessions := mergeReportingSessions(sessions, usageSessions)
 	sessionByID := make(map[string]activity.SessionMeta, len(allSessions))
 	for _, session := range allSessions {
@@ -160,39 +334,59 @@ func (db *DB) reportingHoursFromSnapshot(
 	if err != nil {
 		return nil, err
 	}
+	projects := source.projects
+	var references map[string]export.ProjectReference
+	if schemaVersion == export.ReportingJointSchemaVersion {
+		references = source.references
+		sessions, ids, events, usage = scopeJointReporting(sessions, events, usage, sessionByID, projects, projectKeys)
+		for i := range sessions {
+			sessions[i].ProjectKey = export.ProjectKeyForEntry(projects[sessions[i].Project])
+		}
+	}
 	activityIDs := reportingSessionIDSet(ids)
 	activityUsage := reportingActivityUsage(usage, activityIDs)
-
-	projectLabels := activityReportProjectLabels(allSessions)
-	projects, err := db.reportingProjectIdentityMapFrom(ctx, tx, projectLabels)
-	if err != nil {
-		return nil, err
-	}
-	createdAt, err := reportingSessionCreatedAtFrom(ctx, tx, ids)
-	if err != nil {
-		return nil, err
-	}
+	createdAt := source.createdAt
+	gapCap := time.Duration(query.GapCapSeconds) * time.Second
 	firstSeen := buildReportingFirstSeen(
 		date,
 		end,
-		time.Duration(query.GapCapSeconds)*time.Second,
+		gapCap,
 		sessions,
 		createdAt,
 		events,
 		activityUsage,
 	)
+	// Pair once for the whole range. Prior-model inheritance does not depend on
+	// the pruning window, and each hour's window [hourStart-gapCap, hourEnd)
+	// lies inside the daily one, so the start-ordered subslice for an hour
+	// equals pairing that hour on its own.
+	dayCandidates := activity.PairActivityEvents(events, date, end, gapCap)
+	candidateStartsAt := func(c activity.IntervalCandidate, at time.Time) int {
+		return c.Start.Compare(at)
+	}
 	for i := range hours {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		hourStart := date.Add(time.Duration(i) * time.Hour)
 		hourEnd := hourStart.Add(time.Hour)
-		gapCap := time.Duration(query.GapCapSeconds) * time.Second
-		candidates := activity.PairActivityEvents(events, hourStart, hourEnd, gapCap)
-		report, aggregateErr := activity.AggregateCandidates(ctx, activity.Params{
+		var candidates []activity.IntervalCandidate
+		if len(dayCandidates) > 0 {
+			first, _ := slices.BinarySearchFunc(dayCandidates, hourStart.Add(-gapCap), candidateStartsAt)
+			last, _ := slices.BinarySearchFunc(dayCandidates, hourEnd, candidateStartsAt)
+			candidates = dayCandidates[first:last:last]
+		}
+		aggregate := activity.AggregateCandidates
+		if schemaVersion == export.ReportingJointSchemaVersion {
+			aggregate = activity.AggregateCandidatesWithJointActivity
+		}
+		report, aggregateErr := aggregate(ctx, activity.Params{
 			RangeStart:    hourStart,
 			RangeEnd:      hourEnd,
 			Loc:           time.UTC,
 			EffectiveEnd:  hourEnd,
 			GapCapSeconds: query.GapCapSeconds,
-			Bucket:        activity.BucketSpec{Unit: activity.BucketMinute, NominalSeconds: 300},
+			Bucket:        query.Bucket,
 		}, append([]activity.SessionMeta(nil), sessions...), candidates, activityUsage)
 		if aggregateErr != nil {
 			return nil, fmt.Errorf(
@@ -225,7 +419,14 @@ func (db *DB) reportingHoursFromSnapshot(
 			hour.Activity.Totals.ActiveMinutes > 0 ||
 			firstSeen[i].hasAny()
 		if !hour.HasData {
-			hour = quietReportingHour(hourStart, schemaVersion)
+			hour = quietReportingHour(hourStart, schemaVersion, bucket)
+		}
+		if schemaVersion == export.ReportingJointSchemaVersion {
+			hour.BucketSeconds = int(bucket / time.Second)
+			hour.Joint, err = jointReportingHour(hourStart, bucket, report.JointActivity, report.BySession, usage, sessionByID, projects, references, projectKeys)
+			if err != nil {
+				return nil, err
+			}
 		}
 		hours[i] = hour
 	}
@@ -259,7 +460,8 @@ func (db *DB) reportingUsageSessionsFrom(
 			s.machine,
 			COALESCE(s.started_at, ''),
 			COALESCE(s.ended_at, ''),
-			COALESCE(s.is_automated, 0)
+			COALESCE(s.is_automated, 0),
+			s.relationship_type = 'subagent'
 		FROM sessions s
 		JOIN usage_session_ids u ON u.session_id = s.id
 		ORDER BY s.id`,
@@ -285,6 +487,7 @@ func (db *DB) reportingUsageSessionsFrom(
 			&session.StartedAt,
 			&session.EndedAt,
 			&session.IsAutomated,
+			&session.IsSubagent,
 		); err != nil {
 			return nil, nil, fmt.Errorf(
 				"scanning reporting usage session: %w", err,
@@ -316,7 +519,7 @@ func (db *DB) reportingStandaloneUsageCandidatesFrom(
 		`SELECT 1 FROM sqlite_master
 		 WHERE type = 'table' AND name = 'cursor_usage_events'`,
 	).Scan(&tableExists)
-	if err == sql.ErrNoRows {
+	if errors.Is(err, sql.ErrNoRows) {
 		return []activity.UsageRow{}, nil
 	}
 	if err != nil {
@@ -325,10 +528,10 @@ func (db *DB) reportingStandaloneUsageCandidatesFrom(
 		)
 	}
 
-	lowerBound := paddedUTCBound(
+	lowerBound := PaddedUTCBound(
 		query.RangeStart.UTC().Format(time.RFC3339), -14,
 	)
-	upperBound := paddedUTCBound(
+	upperBound := PaddedUTCBound(
 		query.RangeEnd.UTC().Format(time.RFC3339), 14,
 	)
 	rows, err := tx.QueryContext(ctx, `
@@ -369,7 +572,7 @@ func (db *DB) reportingStandaloneUsageCandidatesFrom(
 		row.InputTokens,
 			row.OutputTokens,
 			row.CacheCreationTokens,
-			row.CacheReadTokens = usageEventRowTokens(
+			row.CacheReadTokens = UsageEventRowTokens(
 			"cursor",
 			inputTokens,
 			outputTokens,
@@ -570,7 +773,7 @@ func allocateReportingUsageCosts(
 			continue
 		}
 		key := usageCostAllocationKey{
-			date:       localDate(row.Timestamp, time.UTC),
+			date:       LocalDate(row.Timestamp, time.UTC),
 			project:    row.Project,
 			agent:      row.Agent,
 			machine:    row.Machine,
@@ -612,6 +815,7 @@ func allocateReportingUsageCosts(
 			for i, index := range indices {
 				out[index].Cost = costs[i]
 				out[index].CostSource = export.CostSourceReported
+				out[index].CostAllocated = true
 				out[index].Priced = true
 				out[index].Contributes = true
 			}
@@ -621,80 +825,6 @@ func allocateReportingUsageCosts(
 		out[i].SessionCost = nil
 	}
 	return out, nil
-}
-
-func (db *DB) reportingProjectIdentityMapFrom(
-	ctx context.Context,
-	tx *sql.Tx,
-	labels []string,
-) (map[string]export.ProjectMapEntry, error) {
-	if len(labels) == 0 {
-		return map[string]export.ProjectMapEntry{}, nil
-	}
-	observations, err := db.listProjectIdentityObservationsFrom(ctx, tx, labels)
-	if err != nil {
-		return nil, err
-	}
-	archiveID, err := sessionExportMetadataValue(
-		ctx,
-		tx,
-		archiveMetadataArchiveIDKey,
-		ErrArchiveIDMissing,
-		"archive id",
-	)
-	if err != nil {
-		return nil, err
-	}
-	archiveSalt, err := sessionExportMetadataValue(
-		ctx,
-		tx,
-		archiveMetadataArchiveSaltKey,
-		ErrArchiveSaltMissing,
-		"archive salt",
-	)
-	if err != nil {
-		return nil, err
-	}
-	return export.BuildProjectsMapWithScope(
-		labels,
-		observations,
-		export.IdentityScope{ArchiveID: archiveID, ArchiveSalt: archiveSalt},
-	), nil
-}
-
-func reportingSessionCreatedAtFrom(
-	ctx context.Context, tx *sql.Tx, ids []string,
-) (map[string]time.Time, error) {
-	out := make(map[string]time.Time, len(ids))
-	if len(ids) == 0 {
-		return out, nil
-	}
-	err := queryChunked(ids, func(chunk []string) error {
-		placeholders, args := inPlaceholders(chunk)
-		rows, err := tx.QueryContext(
-			ctx,
-			`SELECT id, created_at FROM sessions WHERE id IN `+placeholders,
-			args...,
-		)
-		if err != nil {
-			return fmt.Errorf("querying reporting session creation times: %w", err)
-		}
-		defer rows.Close()
-		for rows.Next() {
-			var id, raw string
-			if err := rows.Scan(&id, &raw); err != nil {
-				return fmt.Errorf("scanning reporting session creation time: %w", err)
-			}
-			if created, err := parseTimestamp(raw); err == nil {
-				out[id] = created.UTC()
-			}
-		}
-		if err := rows.Err(); err != nil {
-			return fmt.Errorf("iterating reporting session creation times: %w", err)
-		}
-		return nil
-	})
-	return out, err
 }
 
 type reportingFirstSeenCounts struct {
@@ -1145,7 +1275,7 @@ func addReportingUsageBreakdown(
 func reportingUsageBreakdowns(
 	values map[string]*reportingUsageAccum,
 ) []export.ReportingUsageBreakdown {
-	keys := reportingSortedKeys(values)
+	keys := SortedKeys(values)
 	out := make([]export.ReportingUsageBreakdown, 0, len(keys))
 	for _, key := range keys {
 		value := values[key]
@@ -1168,7 +1298,7 @@ func reportingUsageProjectBreakdowns(
 	values map[string]*reportingUsageAccum,
 	projects map[string]export.ProjectMapEntry,
 ) []export.ReportingUsageProjectBreakdown {
-	keys := reportingSortedKeys(values)
+	keys := SortedKeys(values)
 	out := make([]export.ReportingUsageProjectBreakdown, 0, len(keys))
 	for _, project := range keys {
 		value := values[project]
@@ -1194,7 +1324,9 @@ func reportingUsageProjectBreakdowns(
 	return out
 }
 
-func reportingSortedKeys[T any](values map[string]T) []string {
+// SortedKeys returns the map keys sorted; never nil so JSON renders "[]"
+// rather than "null".
+func SortedKeys[T any](values map[string]T) []string {
 	keys := make([]string, 0, len(values))
 	for key := range values {
 		keys = append(keys, key)
@@ -1213,7 +1345,7 @@ func resolveReportingExportRange(
 		date.Minute() != 0 ||
 		date.Second() != 0 ||
 		date.Nanosecond() != 0 {
-		err = fmt.Errorf("reporting date must be UTC midnight")
+		err = errors.New("reporting date must be UTC midnight")
 		return
 	}
 	date = date.UTC()
@@ -1225,7 +1357,7 @@ func resolveReportingExportRange(
 	now = now.UTC()
 	closedThrough := now.Truncate(time.Hour)
 	if date.After(closedThrough) {
-		err = fmt.Errorf("reporting date is in the future")
+		err = errors.New("reporting date is in the future")
 		return
 	}
 
@@ -1235,15 +1367,15 @@ func resolveReportingExportRange(
 	}
 	hourCount = int(closedThrough.Sub(date) / time.Hour)
 	if hourCount < 0 {
-		err = fmt.Errorf("reporting date is in the future")
+		err = errors.New("reporting date is in the future")
 	}
 	return
 }
 
-func quietReportingHour(start time.Time, schemaVersion int) export.ReportingHour {
-	buckets := make([]export.ReportingActivityBucket, 12)
+func quietReportingHour(start time.Time, schemaVersion int, duration time.Duration) export.ReportingHour {
+	buckets := make([]export.ReportingActivityBucket, int(time.Hour/duration))
 	for i := range buckets {
-		buckets[i].Start = start.Add(time.Duration(i) * 5 * time.Minute).
+		buckets[i].Start = start.Add(time.Duration(i) * duration).
 			Format(time.RFC3339)
 	}
 	return export.ReportingHour{

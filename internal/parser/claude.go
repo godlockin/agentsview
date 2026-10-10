@@ -21,6 +21,8 @@ import (
 	"unicode/utf8"
 
 	"github.com/tidwall/gjson"
+	"go.kenn.io/agentsview/internal/ctxio"
+	"go.kenn.io/agentsview/internal/stringutil"
 )
 
 var (
@@ -54,7 +56,9 @@ type dagEntry struct {
 // claudeQueuedCommand is a user message Claude Code persisted as
 // type=attachment with attachment.type=queued_command — i.e. a
 // prompt the user typed while a tool call was still running.
-// These records have no uuid/parentUuid, so we collect them out
+// Claude Code also uses this shape for task notifications and for
+// messages another session sent, which queuedCommandMessage
+// classifies as system rows. These records have no uuid/parentUuid, so we collect them out
 // of band and splice them into the message stream by timestamp
 // after DAG processing completes.
 type claudeQueuedCommand struct {
@@ -125,6 +129,7 @@ func claudeParseFile(
 		cwd              string
 		gitBranch        string
 		displayName      string
+		renameSeen       bool
 		compatibleName   string
 		compatibleAI     string
 		compatibleCustom string
@@ -186,20 +191,13 @@ func claudeParseFile(
 		}
 
 		entryType := gjson.GetBytes(lineBytes, "type").Str
-		if opts.compatibleTitleEvents {
-			if compatibleName == "" {
+		if opts.compatibleTitleEvents || opts.aiTitleFallback {
+			if opts.compatibleTitleEvents && compatibleName == "" {
 				compatibleName = strings.Clone(strings.TrimSpace(
 					gjson.GetBytes(lineBytes, "sessionName").Str,
 				))
 			}
-			switch entryType {
-			case "custom-title":
-				if value := strings.TrimSpace(
-					gjson.GetBytes(lineBytes, "customTitle").Str,
-				); value != "" {
-					compatibleCustom = strings.Clone(value)
-				}
-			case "ai-title":
+			if entryType == "ai-title" {
 				if value := strings.TrimSpace(
 					gjson.GetBytes(lineBytes, "aiTitle").Str,
 				); value != "" {
@@ -289,6 +287,20 @@ func claudeParseFile(
 			continue
 		}
 
+		// Current Claude Code records /rename as a custom-title
+		// record and repeats it after later turns. It rejects empty
+		// names, so an empty value is not a clear.
+		if entryType == "custom-title" {
+			if value := strings.TrimSpace(
+				gjson.GetBytes(lineBytes, "customTitle").Str,
+			); value != "" {
+				displayName = strings.Clone(value)
+				compatibleCustom = displayName
+				renameSeen = true
+			}
+			continue
+		}
+
 		// Handle system records. /rename local commands update the
 		// display name; last rename wins (empty arg clears it).
 		if entryType == "system" {
@@ -296,6 +308,7 @@ func claudeParseFile(
 				gjson.GetBytes(lineBytes, "content").Str,
 			); ok {
 				displayName = strings.Clone(name)
+				renameSeen = true
 			}
 			continue
 		}
@@ -420,6 +433,8 @@ func claudeParseFile(
 		displayName = firstNonEmptyJSONLString(
 			compatibleCustom, compatibleAI, compatibleName, displayName,
 		)
+	} else if opts.aiTitleFallback && !renameSeen {
+		displayName = compatibleAI
 	}
 
 	meta := claudeSessionMeta{
@@ -485,6 +500,10 @@ func claudeParseFile(
 	// "awaiting_user" can be distinguished from a generic clean
 	// termination.
 	for i := range results {
+		results[i].Session.RelationshipType = PromoteParentlessWorker(
+			results[i].Session.ParentSessionID, results[i].Session.RelationshipType,
+			claudeWorkerMessages(results[i].Session.Entrypoint, results[i].Session.SessionKind, results[i].Messages),
+		)
 		if err := ctx.Err(); err != nil {
 			return nil, nil, err
 		}
@@ -493,6 +512,7 @@ func claudeParseFile(
 			lastAssistantStopReason(results[i].Messages),
 			lastLineFailed,
 		)
+		results[i].Session.claudeRenameSeen = renameSeen
 	}
 
 	// Drop content-free /usage probe sessions (e.g. CodexBar's
@@ -545,23 +565,34 @@ type claudeCompactField struct {
 
 func compactClaudeEntry(line []byte) string {
 	topFields := []claudeCompactField{
-		{name: "uuid"}, {name: "parentUuid"}, {name: "timestamp"},
-		{name: "isCompactSummary"}, {name: "isSidechain"},
-		{name: "isMeta"}, {name: "requestId"}, {name: "promptSource"},
+		{name: "uuid"},
+		{name: "parentUuid"},
+		{name: "timestamp"},
+		{name: "isCompactSummary"},
+		{name: "isSidechain"},
+		{name: "isMeta"},
+		{name: "requestId"},
+		{name: "promptSource"},
+		{name: "turnOrigin"},
 		{name: "effort"},
 	}
 	messageFields := []claudeCompactField{
-		{name: "content"}, {name: "id"}, {name: "stop_reason"},
-		{name: "model"}, {name: "usage"},
+		{name: "content"},
+		{name: "id"},
+		{name: "stop_reason"},
+		{name: "model"},
+		{name: "usage"},
 	}
 	snapshotFields := []claudeCompactField{
 		{name: "timestamp"},
 	}
+	originFields := []claudeCompactField{{name: "kind"}}
 	// searchCount is how many billed server-side web searches a
 	// WebSearch tool result performed; it is the only surviving record
 	// of them in a Claude Code transcript.
 	toolResultFields := []claudeCompactField{
-		{name: "agentId"}, {name: "persistedOutputPath"},
+		{name: "agentId"},
+		{name: "persistedOutputPath"},
 		{name: "searchCount"},
 	}
 
@@ -570,7 +601,7 @@ func compactClaudeEntry(line []byte) string {
 	// scan per field made it the dominant per-line parse cost. Only the
 	// first occurrence of a key is kept, matching gjson.Get's
 	// duplicate-key behavior.
-	var seenMessage, seenSnapshot, seenToolResult bool
+	var seenMessage, seenSnapshot, seenToolResult, seenOrigin bool
 	gjson.Parse(string(line)).ForEach(func(key, value gjson.Result) bool {
 		switch key.Str {
 		case "message":
@@ -588,6 +619,11 @@ func compactClaudeEntry(line []byte) string {
 				seenToolResult = true
 				setClaudeCompactFields(toolResultFields, value)
 			}
+		case "origin":
+			if !seenOrigin {
+				seenOrigin = true
+				setClaudeCompactFields(originFields, value)
+			}
 		default:
 			setClaudeCompactField(topFields, key.Str, value)
 		}
@@ -596,7 +632,7 @@ func compactClaudeEntry(line []byte) string {
 
 	var b strings.Builder
 	b.Grow(compactClaudeEntrySize(
-		topFields, snapshotFields, messageFields, toolResultFields,
+		topFields, snapshotFields, messageFields, toolResultFields, originFields,
 	))
 	b.WriteByte('{')
 	first := true
@@ -604,6 +640,7 @@ func compactClaudeEntry(line []byte) string {
 	writeClaudeCompactObject(&b, &first, "snapshot", snapshotFields)
 	writeClaudeCompactObject(&b, &first, "message", messageFields)
 	writeClaudeCompactObject(&b, &first, "toolUseResult", toolResultFields)
+	writeClaudeCompactObject(&b, &first, "origin", originFields)
 	b.WriteByte('}')
 	return b.String()
 }
@@ -715,22 +752,20 @@ func lastAssistantStopReason(messages []ParsedMessage) string {
 // provider-owned incremental body; it carries no legacy entrypoint
 // naming so the provider can call it without shimming a Parse* free
 // function.
-var ErrDAGDetected = fmt.Errorf(
-	"incremental parse: DAG uuid detected",
-)
+var ErrDAGDetected = errors.New("incremental parse: DAG uuid detected")
 
 // ErrClaudeIncrementalNeedsFullParse signals that appended Claude
 // lines contain content the incremental path cannot stitch into
 // already-stored rows (renames and late identity fields).
-var ErrClaudeIncrementalNeedsFullParse = fmt.Errorf(
-	"incremental parse: appended Claude lines require full parse",
-)
+var ErrClaudeIncrementalNeedsFullParse = errors.New("incremental parse: appended Claude lines require full parse")
 
 type ClaudeSubagentLink struct {
 	ToolUseID         string
 	SubagentSessionID string
 	ResultContentRaw  string
 	ResultContentLen  int
+	ResultStatus      string
+	ResultTimestamp   time.Time
 	HasResult         bool
 }
 
@@ -768,6 +803,13 @@ type claudeIncrementalScan struct {
 	// continuation, so such appends stay incremental. nil keeps the
 	// conservative fallback.
 	storedTailClaudeMessageID *string
+	// storedSessionName is the session_name already persisted for this
+	// session ("" when the row carries none), or nil when the call site
+	// cannot supply it. An appended ai-title can only change the stored
+	// session while that name is still empty, and an appended custom-title
+	// only when it differs from that name, so repeated title records stay on
+	// the incremental path. nil keeps the append incremental.
+	storedSessionName *string
 }
 
 func claudeParseSessionFrom(
@@ -788,7 +830,9 @@ func claudeParseSessionFrom(
 		// messages are found.
 		latestTS               time.Time
 		sawRename              bool
+		sawAITitle             bool
 		sawSessionIdentityEdit bool
+		appendedCustomTitle    string
 	)
 
 	consumed, err := readJSONLFrom(
@@ -802,6 +846,18 @@ func claudeParseSessionFrom(
 			entryType := gjson.Get(line, "type").Str
 			if claudeSessionIdentityUpdate(line, stored) {
 				sawSessionIdentityEdit = true
+			}
+			if entryType == "ai-title" &&
+				strings.TrimSpace(gjson.Get(line, "aiTitle").Str) != "" {
+				sawAITitle = true
+			}
+			if entryType == "custom-title" {
+				if value := strings.TrimSpace(
+					gjson.Get(line, "customTitle").Str,
+				); value != "" {
+					appendedCustomTitle = value
+				}
+				return
 			}
 			if entryType == "system" {
 				if _, ok := extractRenameName(
@@ -891,6 +947,23 @@ func claudeParseSessionFrom(
 	// the empty-entries early return below would silently succeed. Check
 	// first and force a full parse so the display name is persisted.
 	if sawRename {
+		return nil, nil, time.Time{}, 0, ErrClaudeIncrementalNeedsFullParse
+	}
+	// An appended ai-title is not an entry either, so the same
+	// empty-entries early return would consume it and silently drop the
+	// generated title. Escalate only while the title could still fill an
+	// empty stored session_name: the producer repeats the record (mean
+	// 15.96 per transcript, maximum 454 for one distinct value), so a
+	// session that already carries its title must not force a replacing
+	// full parse on every later window.
+	if sawAITitle && scan.storedSessionName != nil &&
+		*scan.storedSessionName == "" {
+		return nil, nil, time.Time{}, 0, ErrClaudeIncrementalNeedsFullParse
+	}
+	// Claude Code repeats the custom-title record after later turns, so
+	// escalate only when the appended name differs from the stored one.
+	if appendedCustomTitle != "" && scan.storedSessionName != nil &&
+		*scan.storedSessionName != appendedCustomTitle {
 		return nil, nil, time.Time{}, 0, ErrClaudeIncrementalNeedsFullParse
 	}
 	if sawSessionIdentityEdit {
@@ -1002,6 +1075,23 @@ func claudeSessionIdentityUpdate(line string, stored claudeStoredIdentity) bool 
 		strings.TrimSpace(gjson.Get(line, "sessionKind").Str) != ""
 }
 
+func claudeSDKPrompt(line string) bool {
+	return gjson.Get(line, "turnOrigin").Str == "sdk" &&
+		gjson.Get(line, "origin.kind").Str != "human"
+}
+
+func claudeWorkerMessages(entrypoint, kind string, messages []ParsedMessage) bool {
+	if entrypoint != "sdk-cli" || kind != "" {
+		return false
+	}
+	for _, message := range messages {
+		if isRealClaudeUserMessage(message) {
+			return message.claudeSDKOrigin
+		}
+	}
+	return false
+}
+
 // collectClaudeUnmatchedToolResults returns result links for appended
 // tool_result blocks whose tool_use lives outside the appended window.
 // In-append results pair at write time and agentId-linked results are
@@ -1066,6 +1156,8 @@ func collectClaudeUnmatchedToolResults(
 				ToolUseID:        result.ToolUseID,
 				ResultContentRaw: result.ContentRaw,
 				ResultContentLen: result.ContentLength,
+				ResultStatus:     result.Status,
+				ResultTimestamp:  parseTimestamp(gjson.Get(e.line, "timestamp").Str),
 				HasResult:        true,
 			})
 			return true
@@ -1087,6 +1179,8 @@ func collectClaudeSubagentLinks(entries []dagEntry) []ClaudeSubagentLink {
 		if gjson.Get(entry.line, "isMeta").Bool() {
 			link.ResultContentRaw = ""
 			link.ResultContentLen = 0
+			link.ResultStatus = ""
+			link.ResultTimestamp = time.Time{}
 			link.HasResult = false
 		}
 		links = append(links, link)
@@ -1245,8 +1339,7 @@ func extractMessagesFrom(
 		}
 
 		content := gjson.Get(e.line, "message.content")
-		text, thinkingText, hasThinking, hasToolUse, tcs, trs :=
-			ExtractTextContent(context.Background(), content)
+		text, thinkingText, hasThinking, hasToolUse, tcs, trs := ExtractTextContent(context.Background(), content)
 
 		// Convert command/skill invocation XML into readable
 		// text (e.g. "/roborev-fix 450"). If the content
@@ -1294,8 +1387,7 @@ func extractMessagesFrom(
 			// Split it into a hidden system-metadata message plus the
 			// real prompt, so first_message and the visible transcript
 			// show only the prompt.
-			if subtype, envelope, remainder, ok :=
-				splitClaudeIDEEnvelopePrompt(text); ok {
+			if subtype, envelope, remainder, ok := splitClaudeIDEEnvelopePrompt(text); ok {
 				hidden := claudeIDEEnvelopeMessage(e, ordinal, subtype, envelope)
 				if remainder == "" || isClaudeSystemMessage(remainder) {
 					// The remainder is discarded, so no visible
@@ -1699,6 +1791,8 @@ func extractToolResultAgentIDLink(line string) (ClaudeSubagentLink, bool) {
 		SubagentSessionID: sessionID,
 		ResultContentRaw:  toolResult.ContentRaw,
 		ResultContentLen:  toolResult.ContentLength,
+		ResultStatus:      toolResult.Status,
+		ResultTimestamp:   parseTimestamp(gjson.Get(line, "timestamp").Str),
 		HasResult:         true,
 	}, true
 }
@@ -2257,16 +2351,16 @@ func resolveClaudePersistedToolResultsContext(
 
 	var top map[string]jsontext.Value
 	if err := json.Unmarshal([]byte(line), &top); err != nil || top == nil {
-		return line, nil
+		return line, nil //nolint:nilerr // Optional persisted-output enrichment preserves the original transcript on failure.
 	}
 
 	var msg map[string]jsontext.Value
 	if err := json.Unmarshal(top["message"], &msg); err != nil || msg == nil {
-		return line, nil
+		return line, nil //nolint:nilerr // Optional persisted-output enrichment preserves the original transcript on failure.
 	}
 	var blocks []jsontext.Value
 	if err := json.Unmarshal(msg["content"], &blocks); err != nil {
-		return line, nil
+		return line, nil //nolint:nilerr // Optional persisted-output enrichment preserves the original transcript on failure.
 	}
 
 	persistedPath := ""
@@ -2315,12 +2409,12 @@ func resolveClaudePersistedToolResultsContext(
 		}
 		contentData, err := json.Marshal(output)
 		if err != nil {
-			return line, nil
+			return line, nil //nolint:nilerr // Optional persisted-output enrichment preserves the original transcript on failure.
 		}
 		block["content"] = contentData
 		blocks[i], err = json.Marshal(block, json.Deterministic(true))
 		if err != nil {
-			return line, nil
+			return line, nil //nolint:nilerr // Optional persisted-output enrichment preserves the original transcript on failure.
 		}
 		changed = true
 	}
@@ -2330,17 +2424,17 @@ func resolveClaudePersistedToolResultsContext(
 
 	contentData, err := json.Marshal(blocks)
 	if err != nil {
-		return line, nil
+		return line, nil //nolint:nilerr // Optional persisted-output enrichment preserves the original transcript on failure.
 	}
 	msg["content"] = contentData
 	messageData, err := json.Marshal(msg, json.Deterministic(true))
 	if err != nil {
-		return line, nil
+		return line, nil //nolint:nilerr // Optional persisted-output enrichment preserves the original transcript on failure.
 	}
 	top["message"] = messageData
 	encoded, err := json.Marshal(top, json.Deterministic(true))
 	if err != nil {
-		return line, nil
+		return line, nil //nolint:nilerr // Optional persisted-output enrichment preserves the original transcript on failure.
 	}
 	return string(encoded), nil
 }
@@ -2398,10 +2492,10 @@ func readClaudePersistedToolResultContext(
 		}
 		f, err := os.Open(cleanResult)
 		if err != nil {
-			return "", false, nil
+			return "", false, nil //nolint:nilerr // Optional persisted-output enrichment preserves the original transcript on failure.
 		}
 		b, readErr := io.ReadAll(io.LimitReader(
-			checkedContextReader{ctx: ctx, reader: f}, maxPersistedToolResultSize+1,
+			ctxio.Reader{Context: ctx, Reader: f}, maxPersistedToolResultSize+1,
 		))
 		closeErr := f.Close()
 		if errors.Is(readErr, context.Canceled) ||
@@ -2409,11 +2503,11 @@ func readClaudePersistedToolResultContext(
 			return "", false, readErr
 		}
 		if readErr != nil || closeErr != nil {
-			return "", false, nil
+			return "", false, nil //nolint:nilerr // Optional persisted-output enrichment preserves the original transcript on failure.
 		}
 		if len(b) > maxPersistedToolResultSize {
-			b = b[:maxPersistedToolResultSize]
-			b = append(b, "\n\n[agentsview: persisted tool result truncated at 16 MiB]"...)
+			return stringutil.SafeTruncate(string(b), maxPersistedToolResultSize) +
+				"\n\n[agentsview: persisted tool result truncated at 16 MiB]", true, nil
 		}
 		return string(b), true, nil
 	}
@@ -2554,8 +2648,7 @@ func extractMessagesContext(
 		}
 
 		content := gjson.Get(e.line, "message.content")
-		text, thinkingText, hasThinking, hasToolUse, tcs, trs :=
-			ExtractTextContent(ctx, content)
+		text, thinkingText, hasThinking, hasToolUse, tcs, trs := ExtractTextContent(ctx, content)
 
 		// Convert command/skill invocation XML into readable
 		// text (e.g. "/roborev-fix 450"). If the content
@@ -2603,8 +2696,7 @@ func extractMessagesContext(
 			// Split it into a hidden system-metadata message plus the
 			// real prompt, so first_message and the visible transcript
 			// show only the prompt.
-			if subtype, envelope, remainder, ok :=
-				splitClaudeIDEEnvelopePrompt(text); ok {
+			if subtype, envelope, remainder, ok := splitClaudeIDEEnvelopePrompt(text); ok {
 				hidden := claudeIDEEnvelopeMessage(e, ordinal, subtype, envelope)
 				if remainder == "" || isClaudeSystemMessage(remainder) {
 					// The remainder is discarded, so no visible
@@ -2641,6 +2733,7 @@ func extractMessagesContext(
 			SourceParentUUID:   e.parentUuid,
 			IsSidechain:        gjson.Get(e.line, "isSidechain").Bool(),
 			PromptSource:       gjson.Get(e.line, "promptSource").Str,
+			claudeSDKOrigin:    claudeSDKPrompt(e.line),
 			tokenPresenceKnown: e.entryType == "assistant",
 		}
 
@@ -2849,17 +2942,7 @@ func ExtractCwdFromSession(path string) string {
 }
 
 func truncate(s string, maxLen int) string {
-	s = strings.TrimSpace(s)
-	if len(s) <= maxLen {
-		return s
-	}
-	// Truncate at a valid rune boundary to avoid producing
-	// invalid UTF-8.
-	r := []rune(s)
-	if len(r) <= maxLen {
-		return s
-	}
-	return string(r[:maxLen]) + "..."
+	return stringutil.TruncateRunes(strings.TrimSpace(s), maxLen, "...")
 }
 
 // extractRenameName returns the argument of a Claude Code /rename
@@ -3020,10 +3103,7 @@ func firstMessageAndUserCountContext(
 		if err := contextErrEvery(ctx, i); err != nil {
 			return "", 0, err
 		}
-		if m.IsSystem {
-			continue
-		}
-		if m.Role != RoleUser || m.Content == "" {
+		if !isRealClaudeUserMessage(m) {
 			continue
 		}
 		userCount++
@@ -3037,6 +3117,10 @@ func firstMessageAndUserCountContext(
 	return firstMsg, userCount, ctx.Err()
 }
 
+func isRealClaudeUserMessage(m ParsedMessage) bool {
+	return !m.IsSystem && m.Role == RoleUser && m.Content != ""
+}
+
 // isUsageProbeSession reports whether a parsed session's only real
 // user turn(s) are the /usage command — a content-free usage probe
 // (for example CodexBar's ClaudeProbe, which runs `claude /usage` to
@@ -3047,7 +3131,7 @@ func firstMessageAndUserCountContext(
 func isUsageProbeSession(messages []ParsedMessage) bool {
 	sawUsage := false
 	for _, m := range messages {
-		if m.IsSystem || m.Role != RoleUser || m.Content == "" {
+		if !isRealClaudeUserMessage(m) {
 			continue
 		}
 		if strings.TrimSpace(m.Content) != "/usage" {
@@ -3110,6 +3194,11 @@ func classifyClaudeSystemMessage(content string) string {
 		return "interrupted"
 	case strings.HasPrefix(trimmed, "<task-notification>"):
 		return "task_notification"
+	case strings.HasPrefix(trimmed, "<cross-session-message"):
+		// Another Claude Code session sent this message. Claude Code
+		// persists it as a queued_command whose prompt keeps the
+		// sender attributes in this wrapper.
+		return "peer_message"
 	case strings.HasPrefix(trimmed, "Stop hook feedback:"):
 		return "stop_hook"
 	case strings.HasPrefix(trimmed, "<system-reminder>"):

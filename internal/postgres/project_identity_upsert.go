@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"strconv"
 	"strings"
 
 	"go.kenn.io/agentsview/internal/db"
@@ -647,95 +648,6 @@ const projectIdentityObservationConflictClause = `
 			key_source = EXCLUDED.key_source,
 			key = EXCLUDED.key`
 
-// projectIdentityRootKey identifies the root a fallback (empty git_remote)
-// observation competes with real-remote observations over.
-type projectIdentityRootKey struct {
-	archiveID string
-	project   string
-	machine   string
-	rootPath  string
-}
-
-func observationRootKey(
-	obs export.ProjectIdentityObservation,
-) projectIdentityRootKey {
-	return projectIdentityRootKey{
-		archiveID: obs.SourceArchiveID,
-		project:   obs.Project,
-		machine:   obs.Machine,
-		rootPath:  obs.RootPath,
-	}
-}
-
-type projectIdentityObservationPlan struct {
-	// realRemote holds deduped observations with a git remote.
-	realRemote []export.ProjectIdentityObservation
-	// ambiguous holds deduped empty-remote observations that must coexist
-	// with real-remote evidence for the same root.
-	ambiguous []export.ProjectIdentityObservation
-	// fallbacks holds deduped empty-remote observations whose root has no
-	// real-remote observation in the batch. Whether each survives still
-	// depends on the rows already in PG.
-	fallbacks []export.ProjectIdentityObservation
-	// realRoots lists the roots of realRemote in first-seen order; stale
-	// fallback rows for these roots must be deleted.
-	realRoots []projectIdentityRootKey
-}
-
-// planProjectIdentityObservationSync reduces a batch to the final state of
-// applying upsertProjectIdentityObservation to each row in order: the last
-// observation per conflict key wins. Ordinary empty-remote fallbacks never
-// survive alongside real-remote evidence for the same root, while ambiguous
-// observations always survive because they are conflicting evidence rather
-// than root-derived fallbacks.
-func planProjectIdentityObservationSync(
-	observations []export.ProjectIdentityObservation,
-) projectIdentityObservationPlan {
-	type conflictKey struct {
-		root      projectIdentityRootKey
-		gitRemote string
-	}
-	keyOrder := make([]conflictKey, 0, len(observations))
-	latest := make(map[conflictKey]export.ProjectIdentityObservation,
-		len(observations))
-	realRootSet := make(map[projectIdentityRootKey]bool)
-
-	var plan projectIdentityObservationPlan
-	for _, obs := range observations {
-		key := conflictKey{
-			root: observationRootKey(obs), gitRemote: obs.GitRemote,
-		}
-		previous, seen := latest[key]
-		if !seen {
-			keyOrder = append(keyOrder, key)
-		} else if key.gitRemote == "" &&
-			previous.RemoteResolution == export.ProjectResolutionAmbiguous &&
-			obs.RemoteResolution != export.ProjectResolutionAmbiguous {
-			continue
-		}
-		latest[key] = obs
-		if obs.GitRemote != "" && !realRootSet[key.root] {
-			realRootSet[key.root] = true
-			plan.realRoots = append(plan.realRoots, key.root)
-		}
-	}
-	for _, key := range keyOrder {
-		obs := latest[key]
-		if obs.GitRemote != "" {
-			plan.realRemote = append(plan.realRemote, obs)
-			continue
-		}
-		if obs.RemoteResolution == export.ProjectResolutionAmbiguous {
-			plan.ambiguous = append(plan.ambiguous, obs)
-			continue
-		}
-		if !realRootSet[key.root] {
-			plan.fallbacks = append(plan.fallbacks, obs)
-		}
-	}
-	return plan
-}
-
 // syncProjectIdentityObservationsBatch applies a batch of observations with
 // set-based statements: one DELETE for stale fallback rows, one existence
 // probe for fallback candidates, and multi-row upserts. The final table
@@ -746,22 +658,22 @@ func syncProjectIdentityObservationsBatch(
 	tx *sql.Tx,
 	observations []export.ProjectIdentityObservation,
 ) error {
-	plan := planProjectIdentityObservationSync(observations)
+	plan := db.PlanProjectIdentityObservationSync(observations)
 	if err := deleteProjectIdentityFallbackRows(
-		ctx, tx, plan.realRoots,
+		ctx, tx, plan.RealRoots,
 	); err != nil {
 		return err
 	}
 	fallbacks, err := projectIdentityFallbacksWithoutRealRemote(
-		ctx, tx, plan.fallbacks,
+		ctx, tx, plan.Fallbacks,
 	)
 	if err != nil {
 		return err
 	}
 	unconditional := make([]export.ProjectIdentityObservation, 0,
-		len(plan.realRemote)+len(plan.ambiguous))
-	unconditional = append(unconditional, plan.realRemote...)
-	unconditional = append(unconditional, plan.ambiguous...)
+		len(plan.RealRemote)+len(plan.Ambiguous))
+	unconditional = append(unconditional, plan.RealRemote...)
+	unconditional = append(unconditional, plan.Ambiguous...)
 	if err := insertProjectIdentityObservations(ctx, tx, unconditional); err != nil {
 		return err
 	}
@@ -778,14 +690,14 @@ const projectIdentityInsertBatchSize = 500
 
 const projectIdentitySnapshotInsertBatchSize = 500
 
-func rootKeyTupleArgs(keys []projectIdentityRootKey) (string, []any) {
+func rootKeyTupleArgs(keys []db.ProjectIdentityRootKey) (string, []any) {
 	tuples := make([]string, len(keys))
 	args := make([]any, 0, len(keys)*4)
 	for i, key := range keys {
 		base := i * 4
 		tuples[i] = fmt.Sprintf("($%d, $%d, $%d, $%d)",
 			base+1, base+2, base+3, base+4)
-		args = append(args, key.archiveID, key.project, key.machine, key.rootPath)
+		args = append(args, key.ArchiveID, key.Project, key.Machine, key.RootPath)
 	}
 	return strings.Join(tuples, ", "), args
 }
@@ -793,7 +705,7 @@ func rootKeyTupleArgs(keys []projectIdentityRootKey) (string, []any) {
 func deleteProjectIdentityFallbackRows(
 	ctx context.Context,
 	tx *sql.Tx,
-	roots []projectIdentityRootKey,
+	roots []db.ProjectIdentityRootKey,
 ) error {
 	for start := 0; start < len(roots); start += projectIdentityRootKeyBatchSize {
 		end := min(start+projectIdentityRootKeyBatchSize, len(roots))
@@ -803,7 +715,7 @@ func deleteProjectIdentityFallbackRows(
 		if _, err := tx.ExecContext(ctx, `
 			DELETE FROM source_project_identity_observations
 			WHERE git_remote = ''
-			  AND remote_resolution != $`+fmt.Sprint(ambiguousParam)+`
+			  AND remote_resolution != $`+strconv.Itoa(ambiguousParam)+`
 			  AND (source_archive_id, project, machine, root_path) IN (`+tuples+`)`,
 			args...,
 		); err != nil {
@@ -826,36 +738,43 @@ func projectIdentityFallbacksWithoutRealRemote(
 	if len(candidates) == 0 {
 		return nil, nil
 	}
-	shadowed := make(map[projectIdentityRootKey]bool)
+	shadowed := make(map[db.ProjectIdentityRootKey]bool)
 	for start := 0; start < len(candidates); start += projectIdentityRootKeyBatchSize {
-		end := min(start+projectIdentityRootKeyBatchSize, len(candidates))
-		keys := make([]projectIdentityRootKey, 0, end-start)
-		for _, obs := range candidates[start:end] {
-			keys = append(keys, observationRootKey(obs))
-		}
-		tuples, args := rootKeyTupleArgs(keys)
-		ambiguousParam := len(args) + 1
-		args = append(args, export.ProjectResolutionAmbiguous)
-		rows, err := tx.QueryContext(ctx, `
+		if err := func() error {
+			end := min(start+projectIdentityRootKeyBatchSize, len(candidates))
+			keys := make([]db.ProjectIdentityRootKey, 0, end-start)
+			for _, obs := range candidates[start:end] {
+				keys = append(keys, db.ObservationRootKey(obs))
+			}
+			tuples, args := rootKeyTupleArgs(keys)
+			ambiguousParam := len(args) + 1
+			args = append(args, export.ProjectResolutionAmbiguous)
+			rows, err := tx.QueryContext(ctx, `
 			SELECT DISTINCT source_archive_id, project, machine, root_path
 			FROM source_project_identity_observations
 			WHERE (git_remote != '' OR remote_resolution = $`+
-			fmt.Sprint(ambiguousParam)+`)
+				strconv.Itoa(ambiguousParam)+`)
 			  AND (source_archive_id, project, machine, root_path) IN (`+tuples+`)`,
-			args...,
-		)
-		if err != nil {
-			return nil, fmt.Errorf(
-				"checking pg project identity remote observations: %w", err,
+				args...,
 			)
-		}
-		if err := scanProjectIdentityRootKeys(rows, shadowed); err != nil {
+			if err != nil {
+				return fmt.Errorf(
+					"checking pg project identity remote observations: %w", err,
+				)
+			}
+			defer rows.Close()
+			if err := scanProjectIdentityRootKeys(rows, shadowed); err != nil {
+				return err
+			}
+
+			return nil
+		}(); err != nil {
 			return nil, err
 		}
 	}
 	out := make([]export.ProjectIdentityObservation, 0, len(candidates))
 	for _, obs := range candidates {
-		if !shadowed[observationRootKey(obs)] {
+		if !shadowed[db.ObservationRootKey(obs)] {
 			out = append(out, obs)
 		}
 	}
@@ -863,13 +782,13 @@ func projectIdentityFallbacksWithoutRealRemote(
 }
 
 func scanProjectIdentityRootKeys(
-	rows *sql.Rows, out map[projectIdentityRootKey]bool,
+	rows *sql.Rows, out map[db.ProjectIdentityRootKey]bool,
 ) error {
 	defer rows.Close()
 	for rows.Next() {
-		var key projectIdentityRootKey
+		var key db.ProjectIdentityRootKey
 		if err := rows.Scan(
-			&key.archiveID, &key.project, &key.machine, &key.rootPath,
+			&key.ArchiveID, &key.Project, &key.Machine, &key.RootPath,
 		); err != nil {
 			return fmt.Errorf(
 				"scanning pg project identity remote observation: %w", err,

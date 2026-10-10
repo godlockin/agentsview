@@ -86,7 +86,7 @@ func (p *antigravityCLIProvider) Parse(
 	}
 	src, ok := p.sources.sourceFromRef(req.Source)
 	if !ok {
-		return ParseOutcome{}, fmt.Errorf("antigravity cli source path unavailable")
+		return ParseOutcome{}, errors.New("antigravity cli source path unavailable")
 	}
 	if _, err := os.Stat(src.Path); err != nil {
 		if os.IsNotExist(err) {
@@ -344,16 +344,19 @@ func (s antigravityCLISourceSet) WatchPlan(context.Context) (WatchPlan, error) {
 	roots := make([]WatchRoot, 0, len(s.roots)*5)
 	for _, root := range s.roots {
 		roots = append(roots,
+			// Only brain/<id>/*.md artifacts are parsed; see the IDE
+			// provider's brain root for why deeper subtrees stay unwatched.
 			WatchRoot{
 				Path:         filepath.Join(root, "brain"),
 				Recursive:    true,
+				MaxDepth:     1,
 				IncludeGlobs: []string{"*.md", "*.md.metadata.json"},
 				DebounceKey:  string(AgentAntigravityCLI) + ":brain:" + root,
 			},
 			WatchRoot{
 				Path:         filepath.Join(root, "conversations"),
 				Recursive:    false,
-				IncludeGlobs: []string{"*.db", "*.db-*", "*.pb", "*.trajectory.json"},
+				IncludeGlobs: []string{"*.db", "*.db-wal", "*.pb", "*.trajectory.json"},
 				DebounceKey:  string(AgentAntigravityCLI) + ":conversations:" + root,
 			},
 			WatchRoot{
@@ -430,7 +433,7 @@ func (s antigravityCLISourceSet) FindSource(
 		if path == "" {
 			continue
 		}
-		project := ""
+		var project string
 		id := strings.TrimPrefix(req.RawSessionID, antigravityImplicitTag)
 		if projects[root] == nil {
 			projects[root] = buildAntigravityCLIProjectMap(root)
@@ -452,7 +455,7 @@ func (s antigravityCLISourceSet) Fingerprint(
 	}
 	src, ok := s.sourceFromRef(source)
 	if !ok {
-		return SourceFingerprint{}, fmt.Errorf("antigravity cli source path unavailable")
+		return SourceFingerprint{}, errors.New("antigravity cli source path unavailable")
 	}
 	key := firstNonEmptyJSONLString(source.FingerprintKey, source.Key, src.Path)
 	info, err := AntigravityCLIFileInfo(src.Path)
@@ -678,14 +681,16 @@ func antigravityCLISourcePathForEvent(root, path string) (string, string, bool) 
 	}
 	name := parts[1]
 	switch {
+	// A bare ".db-shm" event never resolves to the session: every parse's
+	// read-only open rewrites that index, so honoring it would make each
+	// parse schedule the next one. Committed writes land in the main file
+	// or the -wal.
 	case strings.HasSuffix(name, ".db") ||
-		strings.HasSuffix(name, ".db-wal") ||
-		strings.HasSuffix(name, ".db-shm"):
+		strings.HasSuffix(name, ".db-wal"):
 		if parts[0] != "conversations" {
 			return "", "", false
 		}
-		base := strings.TrimSuffix(strings.TrimSuffix(name, "-wal"), "-shm")
-		id := strings.TrimSuffix(base, ".db")
+		id := strings.TrimSuffix(strings.TrimSuffix(name, "-wal"), ".db")
 		if !IsValidSessionID(id) {
 			return "", "", false
 		}

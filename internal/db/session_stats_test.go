@@ -1,7 +1,6 @@
 package db
 
 import (
-	"context"
 	"encoding/json/jsontext"
 	"encoding/json/v2"
 	"fmt"
@@ -75,10 +74,10 @@ func Test_insertSessionFixture_isAutomated_patch(t *testing.T) {
 	})
 
 	var autoFlag, humanFlag int
-	require.NoError(t, d.getReader().QueryRow(
+	require.NoError(t, d.getReader().QueryRow(t.Context(),
 		"SELECT is_automated FROM sessions WHERE id = ?", "auto-1",
 	).Scan(&autoFlag), "read auto-1")
-	require.NoError(t, d.getReader().QueryRow(
+	require.NoError(t, d.getReader().QueryRow(t.Context(),
 		"SELECT is_automated FROM sessions WHERE id = ?", "human-1",
 	).Scan(&humanFlag), "read human-1")
 	require.Equal(t, 1, autoFlag, "auto-1 is_automated")
@@ -105,8 +104,8 @@ func Test_loadSessionsInWindow_isAutomated(t *testing.T) {
 	for _, r := range rows {
 		byID[r.id] = r.isAutomated
 	}
-	require.Equal(t, true, byID["auto"], "auto.isAutomated")
-	require.Equal(t, false, byID["human"], "human.isAutomated")
+	require.True(t, byID["auto"], "auto.isAutomated")
+	require.False(t, byID["human"], "human.isAutomated")
 }
 
 // insertSessionFixture inserts a sessionFixture via the standard
@@ -176,7 +175,7 @@ func insertSessionFixture(t *testing.T, d *DB, f sessionFixture) {
 	if f.isAutomated {
 		want = 1
 	}
-	_, err := d.getWriter().Exec(
+	_, err := d.getWriter().Exec(t.Context(),
 		"UPDATE sessions SET is_automated = ? WHERE id = ?",
 		want, f.id,
 	)
@@ -205,7 +204,7 @@ func seedAssistantActivity(
 	for i := range n {
 		msgs = append(msgs, asstMsg(sessionID, i+1, "reply"))
 	}
-	require.NoError(t, d.InsertMessages(msgs),
+	require.NoError(t, d.InsertMessages(t.Context(), msgs),
 		"seedAssistantActivity %s: InsertMessages", sessionID)
 	if toolCalls == 0 {
 		return
@@ -215,7 +214,7 @@ func seedAssistantActivity(
 	// INSERT ... SELECT ordinal to find the message_id.
 	for i := range toolCalls {
 		ord := (i % n) + 1
-		_, err := d.getWriter().Exec(`
+		_, err := d.getWriter().Exec(t.Context(), `
 			INSERT INTO tool_calls
 				(message_id, session_id, tool_name, category)
 			SELECT id, session_id, 'Read', 'file'
@@ -243,11 +242,11 @@ func seedToolCallsByCategory(
 	for i, cat := range categories {
 		msgs = append(msgs, asstMsg(sessionID, i+1, "reply-"+cat))
 	}
-	require.NoError(t, d.InsertMessages(msgs),
+	require.NoError(t, d.InsertMessages(t.Context(), msgs),
 		"seedToolCallsByCategory %s: InsertMessages", sessionID)
 	for i, cat := range categories {
 		ord := i + 1
-		_, err := d.getWriter().Exec(`
+		_, err := d.getWriter().Exec(t.Context(), `
 			INSERT INTO tool_calls
 				(message_id, session_id, tool_name, category)
 			SELECT id, session_id, ?, ?
@@ -290,7 +289,7 @@ func seedModelMessages(
 		)
 		msgs = append(msgs, m)
 	}
-	require.NoError(t, d.InsertMessages(msgs),
+	require.NoError(t, d.InsertMessages(t.Context(), msgs),
 		"seedModelMessages %s: InsertMessages", sessionID)
 }
 
@@ -345,7 +344,7 @@ func TestPickMaxLabel_TiesBreakByPriority(t *testing.T) {
 
 func TestGetSessionStats_TotalsAndArchetypes(t *testing.T) {
 	d := testDB(t)
-	ctx := context.Background()
+	ctx := t.Context()
 
 	// 5 sessions: 2 automation (is_automated=true),
 	//             2 deep (userMsgs 20, 40),
@@ -410,9 +409,9 @@ func TestGetSessionStats_TotalsAndArchetypes(t *testing.T) {
 	assert.NotEmpty(t, stats.Window.Until,
 		"window.until (since=%q)", stats.Window.Since)
 	_, errSince := time.Parse(time.RFC3339, stats.Window.Since)
-	assert.NoError(t, errSince, "window.since not RFC3339")
+	require.NoError(t, errSince, "window.since not RFC3339")
 	_, errUntil := time.Parse(time.RFC3339, stats.Window.Until)
-	assert.NoError(t, errUntil, "window.until not RFC3339")
+	require.NoError(t, errUntil, "window.until not RFC3339")
 
 	// Filters echo the inputs and default Agent to "all".
 	assert.Equal(t, "all", stats.Filters.Agent, "filters.agent")
@@ -432,7 +431,7 @@ func TestGetSessionStats_TotalsAndArchetypes(t *testing.T) {
 // (userMsgs 1) and short, like a real workflow subagent.
 func TestGetSessionStats_SubagentTotals(t *testing.T) {
 	d := testDB(t)
-	ctx := context.Background()
+	ctx := t.Context()
 
 	// One multi-turn root session (10 user msgs, 20 messages, ~100 min,
 	// 1000 output tokens) and one one-shot subagent (1 user msg, 5
@@ -544,7 +543,7 @@ func Test_computeTotalsAndArchetypes_flagAuthority(t *testing.T) {
 
 func TestGetSessionStats_FilterByAgent(t *testing.T) {
 	d := testDB(t)
-	ctx := context.Background()
+	ctx := t.Context()
 
 	insertSessionFixture(t, d, sessionFixture{
 		id: "c1", agent: "claude", userMsgs: 10,
@@ -579,7 +578,7 @@ func TestGetSessionStats_FilterByAgent(t *testing.T) {
 
 func TestGetSessionStats_FilterByProject(t *testing.T) {
 	d := testDB(t)
-	ctx := context.Background()
+	ctx := t.Context()
 
 	for i, p := range []string{"alpha", "alpha", "beta", "gamma"} {
 		insertSessionFixture(t, d, sessionFixture{
@@ -668,14 +667,38 @@ func TestParseWindowPoint(t *testing.T) {
 		want             time.Time
 		wantErrSubstring string
 	}{
-		{name: "Nd duration anchors at now", in: "7d",
-			want: time.Date(2026, 4, 11, 12, 0, 0, 0, time.UTC)},
-		{name: "Nh duration", in: "48h",
-			want: time.Date(2026, 4, 16, 12, 0, 0, 0, time.UTC)},
-		{name: "bare date is start of UTC day", in: "2026-04-01",
-			want: time.Date(2026, 4, 1, 0, 0, 0, 0, time.UTC)},
-		{name: "garbage is a hard error", in: "7x",
-			wantErrSubstring: "Nd, Nh, or YYYY-MM-DD"},
+		{
+			name: "Nd duration anchors at now", in: "7d",
+			want: time.Date(2026, 4, 11, 12, 0, 0, 0, time.UTC),
+		},
+		{
+			name: "Nh duration", in: "48h",
+			want: time.Date(2026, 4, 16, 12, 0, 0, 0, time.UTC),
+		},
+		{
+			name: "bare date is start of UTC day", in: "2026-04-01",
+			want: time.Date(2026, 4, 1, 0, 0, 0, 0, time.UTC),
+		},
+		{
+			name: "RFC3339 UTC timestamp", in: "2026-04-01T12:30:00.123Z",
+			want: time.Date(2026, 4, 1, 12, 30, 0, 123000000, time.UTC),
+		},
+		{
+			name: "RFC3339 negative offset", in: "2026-04-01T00:00:00-05:00",
+			want: time.Date(2026, 4, 1, 5, 0, 0, 0, time.UTC),
+		},
+		{
+			name: "RFC3339 positive offset", in: "2026-04-01T00:00:00+09:30",
+			want: time.Date(2026, 3, 31, 14, 30, 0, 0, time.UTC),
+		},
+		{
+			name: "garbage is a hard error", in: "7x",
+			wantErrSubstring: "expected Nd, Nh, YYYY-MM-DD, or RFC3339",
+		},
+		{
+			name: "timestamp requires a timezone", in: "2026-04-01T00:00:00",
+			wantErrSubstring: "expected Nd, Nh, YYYY-MM-DD, or RFC3339",
+		},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -691,9 +714,35 @@ func TestParseWindowPoint(t *testing.T) {
 	}
 }
 
+func TestGetSessionStats_WindowOffsets(t *testing.T) {
+	d := testDB(t)
+	for _, fixture := range []sessionFixture{
+		{id: "before", startedAt: "2026-03-08T04:59:59Z", userMsgs: 1},
+		{id: "start", startedAt: "2026-03-08T05:00:00Z", userMsgs: 2},
+		{id: "inside", startedAt: "2026-03-09T03:59:59Z", userMsgs: 9},
+		{id: "end", startedAt: "2026-03-09T04:00:00Z", userMsgs: 32},
+	} {
+		insertSessionFixture(t, d, fixture)
+	}
+
+	// Local midnights span 23 hours when daylight saving time starts.
+	stats, err := d.GetSessionStats(t.Context(), StatsFilter{
+		Since: "2026-03-08T00:00:00-05:00",
+		Until: "2026-03-09T00:00:00-04:00",
+	})
+	require.NoError(t, err)
+	assert.Equal(t, StatsWindow{
+		Since: "2026-03-08T05:00:00Z",
+		Until: "2026-03-09T04:00:00Z",
+		Days:  1,
+	}, stats.Window)
+	assert.Equal(t, 2, stats.Totals.SessionsAll)
+	assert.Equal(t, 11, stats.Totals.UserMessagesTotal)
+}
+
 func TestGetSessionStats_Distributions(t *testing.T) {
 	d := testDB(t)
-	ctx := context.Background()
+	ctx := t.Context()
 
 	// Seven sessions chosen to place rows in each interesting bucket
 	// for duration and peak_context. is_automated drives the scope_human
@@ -832,7 +881,7 @@ func TestGetSessionStats_Distributions(t *testing.T) {
 
 func TestGetSessionStats_Distributions_NullPeakContext(t *testing.T) {
 	d := testDB(t)
-	ctx := context.Background()
+	ctx := t.Context()
 
 	// One Claude session lacks peak-context data; it must land in
 	// NullCount rather than any peak_context bucket (including bucket 0).
@@ -877,7 +926,7 @@ func TestGetSessionStats_Distributions_NullPeakContext(t *testing.T) {
 
 func TestGetSessionStats_Distributions_PeakContextNonClaude(t *testing.T) {
 	d := testDB(t)
-	ctx := context.Background()
+	ctx := t.Context()
 
 	// Regression for #646: hermes (and kimi/forge/zed) sessions carry
 	// peak_context_tokens, but the distribution only counted rows with
@@ -960,13 +1009,13 @@ func seedVelocityMessages(
 			Timestamp:     ts,
 		})
 	}
-	require.NoError(t, d.InsertMessages(msgs),
+	require.NoError(t, d.InsertMessages(t.Context(), msgs),
 		"seedVelocityMessages %s: InsertMessages", sessionID)
 }
 
 func TestGetSessionStats_Velocity(t *testing.T) {
 	d := testDB(t)
-	ctx := context.Background()
+	ctx := t.Context()
 
 	// Two sessions with carefully chosen per-message gaps so the
 	// expected percentile/mean/hourly values are determined.
@@ -1003,20 +1052,20 @@ func TestGetSessionStats_Velocity(t *testing.T) {
 	require.NoError(t, err, "GetSessionStats")
 
 	// Turn cycle seconds, sorted = [5,10,15,20,30].
-	// percentileFloat: P50 idx=int(5*0.5)=2 → 15, P90 idx=4 → 30.
+	// PercentileFloat: P50 idx=int(5*0.5)=2 → 15, P90 idx=4 → 30.
 	// Mean = (5+10+15+20+30)/5 = 16.
 	tc := stats.Velocity.TurnCycleSeconds
-	assert.Equal(t, 15.0, tc.P50, "TurnCycleSeconds.P50")
-	assert.Equal(t, 30.0, tc.P90, "TurnCycleSeconds.P90")
+	assert.InDelta(t, 15.0, tc.P50, 0, "TurnCycleSeconds.P50")
+	assert.InDelta(t, 30.0, tc.P90, 0, "TurnCycleSeconds.P90")
 	assert.InDelta(t, 16.0, tc.Mean, 0.001,
 		"TurnCycleSeconds.Mean")
 
 	// First response seconds, sorted = [10,30].
-	// percentileFloat: P50 idx=int(2*0.5)=1 → 30, P90 idx=1 → 30.
+	// PercentileFloat: P50 idx=int(2*0.5)=1 → 30, P90 idx=1 → 30.
 	// Mean = (10+30)/2 = 20.
 	fr := stats.Velocity.FirstResponseSeconds
-	assert.Equal(t, 30.0, fr.P50, "FirstResponseSeconds.P50")
-	assert.Equal(t, 30.0, fr.P90, "FirstResponseSeconds.P90")
+	assert.InDelta(t, 30.0, fr.P50, 0, "FirstResponseSeconds.P50")
+	assert.InDelta(t, 30.0, fr.P90, 0, "FirstResponseSeconds.P90")
 	assert.InDelta(t, 20.0, fr.Mean, 0.001,
 		"FirstResponseSeconds.Mean")
 
@@ -1032,20 +1081,20 @@ func TestGetSessionStats_Velocity(t *testing.T) {
 // and every output field must read as 0 rather than NaN / unset.
 func TestGetSessionStats_Velocity_Empty(t *testing.T) {
 	d := testDB(t)
-	ctx := context.Background()
+	ctx := t.Context()
 
 	stats, err := d.GetSessionStats(ctx, StatsFilter{Since: "28d"})
 	require.NoError(t, err, "GetSessionStats")
 
 	tc := stats.Velocity.TurnCycleSeconds
-	assert.Equal(t, 0.0, tc.P50, "TurnCycleSeconds.P50 want zero: %+v", tc)
-	assert.Equal(t, 0.0, tc.P90, "TurnCycleSeconds.P90 want zero: %+v", tc)
-	assert.Equal(t, 0.0, tc.Mean, "TurnCycleSeconds.Mean want zero: %+v", tc)
+	assert.InDelta(t, 0.0, tc.P50, 0, "TurnCycleSeconds.P50 want zero: %+v", tc)
+	assert.InDelta(t, 0.0, tc.P90, 0, "TurnCycleSeconds.P90 want zero: %+v", tc)
+	assert.InDelta(t, 0.0, tc.Mean, 0, "TurnCycleSeconds.Mean want zero: %+v", tc)
 	fr := stats.Velocity.FirstResponseSeconds
-	assert.Equal(t, 0.0, fr.P50, "FirstResponseSeconds.P50 want zero: %+v", fr)
-	assert.Equal(t, 0.0, fr.P90, "FirstResponseSeconds.P90 want zero: %+v", fr)
-	assert.Equal(t, 0.0, fr.Mean, "FirstResponseSeconds.Mean want zero: %+v", fr)
-	assert.Equal(t, 0.0, stats.Velocity.MessagesPerActiveHour,
+	assert.InDelta(t, 0.0, fr.P50, 0, "FirstResponseSeconds.P50 want zero: %+v", fr)
+	assert.InDelta(t, 0.0, fr.P90, 0, "FirstResponseSeconds.P90 want zero: %+v", fr)
+	assert.InDelta(t, 0.0, fr.Mean, 0, "FirstResponseSeconds.Mean want zero: %+v", fr)
+	assert.InDelta(t, 0.0, stats.Velocity.MessagesPerActiveHour, 0,
 		"MessagesPerActiveHour")
 }
 
@@ -1054,7 +1103,7 @@ func TestGetSessionStats_Velocity_Empty(t *testing.T) {
 // must all collapse to the same value.
 func TestGetSessionStats_Velocity_SingleTurn(t *testing.T) {
 	d := testDB(t)
-	ctx := context.Background()
+	ctx := t.Context()
 
 	// 2 msgs at offsets 0,60 (seconds): user→assistant delta = 60s.
 	// Adjacent gap = 60s → activeMinutes = 1, totalMsgs = 2,
@@ -1071,13 +1120,13 @@ func TestGetSessionStats_Velocity_SingleTurn(t *testing.T) {
 	require.NoError(t, err, "GetSessionStats")
 
 	tc := stats.Velocity.TurnCycleSeconds
-	assert.Equal(t, 60.0, tc.P50, "TurnCycleSeconds.P50")
-	assert.Equal(t, 60.0, tc.P90, "TurnCycleSeconds.P90")
+	assert.InDelta(t, 60.0, tc.P50, 0, "TurnCycleSeconds.P50")
+	assert.InDelta(t, 60.0, tc.P90, 0, "TurnCycleSeconds.P90")
 	assert.InDelta(t, 60.0, tc.Mean, 0.001,
 		"TurnCycleSeconds.Mean")
 	fr := stats.Velocity.FirstResponseSeconds
-	assert.Equal(t, 60.0, fr.P50, "FirstResponseSeconds.P50")
-	assert.Equal(t, 60.0, fr.P90, "FirstResponseSeconds.P90")
+	assert.InDelta(t, 60.0, fr.P50, 0, "FirstResponseSeconds.P50")
+	assert.InDelta(t, 60.0, fr.P90, 0, "FirstResponseSeconds.P90")
 	assert.InDelta(t, 60.0, fr.Mean, 0.001,
 		"FirstResponseSeconds.Mean")
 	assert.Greater(t, stats.Velocity.MessagesPerActiveHour, 0.0,
@@ -1093,7 +1142,7 @@ func TestGetSessionStats_Velocity_SingleTurn(t *testing.T) {
 // remain 0 even though the session survived the len(msgs) >= 2 filter.
 func TestGetSessionStats_Velocity_ZeroActive(t *testing.T) {
 	d := testDB(t)
-	ctx := context.Background()
+	ctx := t.Context()
 
 	start := time.Now().UTC().Add(-2 * time.Hour).
 		Format(time.RFC3339)
@@ -1106,13 +1155,13 @@ func TestGetSessionStats_Velocity_ZeroActive(t *testing.T) {
 	stats, err := d.GetSessionStats(ctx, StatsFilter{Since: "28d"})
 	require.NoError(t, err, "GetSessionStats")
 
-	assert.Equal(t, 0.0, stats.Velocity.MessagesPerActiveHour,
+	assert.InDelta(t, 0.0, stats.Velocity.MessagesPerActiveHour, 0,
 		"MessagesPerActiveHour")
 }
 
 func TestGetSessionStats_ToolMixAndModelMix(t *testing.T) {
 	d := testDB(t)
-	ctx := context.Background()
+	ctx := t.Context()
 
 	// Session tm1: 4 tool_calls across 3 categories (Bash×2, Edit, Read).
 	insertSessionFixture(t, d, sessionFixture{
@@ -1191,7 +1240,7 @@ func TestGetSessionStats_ToolMixAndModelMix(t *testing.T) {
 // the agent filter must not appear in ToolMix or ModelMix.
 func TestGetSessionStats_ToolMixAndModelMix_Filters(t *testing.T) {
 	d := testDB(t)
-	ctx := context.Background()
+	ctx := t.Context()
 
 	// In-window claude session: should contribute to both mixes.
 	// seedToolCallsByCategory uses ordinals 1..2; seedModelMessages
@@ -1266,7 +1315,7 @@ func TestGetSessionStats_ToolMixAndModelMix_Filters(t *testing.T) {
 // maps (not nil) so the JSON output keeps stable keys.
 func TestGetSessionStats_ToolMixAndModelMix_Empty(t *testing.T) {
 	d := testDB(t)
-	ctx := context.Background()
+	ctx := t.Context()
 
 	stats, err := d.GetSessionStats(ctx, StatsFilter{Since: "28d"})
 	require.NoError(t, err, "GetSessionStats")
@@ -1283,7 +1332,7 @@ func TestGetSessionStats_ToolMixAndModelMix_Empty(t *testing.T) {
 // sessions, with alphabetical tie-breaking for determinism.
 func TestGetSessionStats_AgentPortfolio(t *testing.T) {
 	d := testDB(t)
-	ctx := context.Background()
+	ctx := t.Context()
 
 	// 3 claude sessions: messages 5,7,10 → 22; tokens 100,200,300 → 600.
 	claude := []struct {
@@ -1360,7 +1409,7 @@ func TestGetSessionStats_AgentPortfolio(t *testing.T) {
 // claude wins because "claude" < "codex".
 func TestGetSessionStats_AgentPortfolio_TieBreak(t *testing.T) {
 	d := testDB(t)
-	ctx := context.Background()
+	ctx := t.Context()
 
 	for _, id := range []string{"cl1", "cl2"} {
 		insertSessionFixture(t, d, sessionFixture{
@@ -1398,7 +1447,7 @@ func TestGetSessionStats_AgentPortfolio_TieBreak(t *testing.T) {
 // {} not null) and Primary must be empty without crashing.
 func TestGetSessionStats_AgentPortfolio_Empty(t *testing.T) {
 	d := testDB(t)
-	ctx := context.Background()
+	ctx := t.Context()
 
 	stats, err := d.GetSessionStats(ctx, StatsFilter{Since: "28d"})
 	require.NoError(t, err, "GetSessionStats")
@@ -1506,7 +1555,7 @@ func seedCacheEconomicsMessage(
 	m.OutputTokens = b.output
 	m.HasOutputTokens = true
 	m.TokenUsage = jsontext.Value(payload)
-	require.NoError(t, d.InsertMessages([]Message{m}),
+	require.NoError(t, d.InsertMessages(t.Context(), []Message{m}),
 		"seedCacheEconomicsMessage %s ord=%d", sessionID, ordinal)
 }
 
@@ -1518,7 +1567,7 @@ func seedCacheEconomicsMessage(
 // dollar calculations against hand-computed values.
 func TestGetSessionStats_CacheEconomics(t *testing.T) {
 	d := testDB(t)
-	ctx := context.Background()
+	ctx := t.Context()
 
 	require.NoError(t, d.UpsertModelPricing([]ModelPricing{
 		{
@@ -1661,7 +1710,7 @@ func TestGetSessionStats_CacheEconomicsUsesHistoricalRates(t *testing.T) {
 				cacheCreation: 50_000, cacheRead: 50_000,
 			},
 		)
-		_, err := d.getWriter().Exec(
+		_, err := d.getWriter().Exec(t.Context(),
 			`UPDATE messages SET timestamp = ? WHERE session_id = ?`,
 			fixture.timestamp, fixture.id,
 		)
@@ -1679,7 +1728,7 @@ func TestGetSessionStats_CacheEconomicsUsesHistoricalRates(t *testing.T) {
 
 func TestGetSessionStats_CacheEconomicsClampsRawTokenUsage(t *testing.T) {
 	d := testDB(t)
-	ctx := context.Background()
+	ctx := t.Context()
 	const maxTokens = MaxPlausibleTokens
 
 	require.NoError(t, d.UpsertModelPricing([]ModelPricing{{
@@ -1739,7 +1788,7 @@ func TestGetSessionStats_CacheEconomicsClampsRawTokenUsage(t *testing.T) {
 // as a legitimate empty cache-economics section.
 func TestGetSessionStats_CacheEconomics_NoClaude(t *testing.T) {
 	d := testDB(t)
-	ctx := context.Background()
+	ctx := t.Context()
 
 	// Pricing is present so the nil result isn't an artifact of a
 	// missing pricing map.
@@ -1768,7 +1817,7 @@ func TestGetSessionStats_CacheEconomics_NoClaude(t *testing.T) {
 // without tripping the nil-vs-populated rule.
 func TestGetSessionStats_CacheEconomics_ZeroDenominatorSkipped(t *testing.T) {
 	d := testDB(t)
-	ctx := context.Background()
+	ctx := t.Context()
 
 	require.NoError(t, d.UpsertModelPricing([]ModelPricing{{
 		ModelPattern: "claude-opus-4-7",
@@ -1896,7 +1945,7 @@ func findHourlyUTC(
 
 func TestGetSessionStats_Temporal_HourlyGrouping(t *testing.T) {
 	d := testDB(t)
-	ctx := context.Background()
+	ctx := t.Context()
 
 	// Three hours of activity: H-5 (2 user msgs in one session),
 	// H-4 (1 user msg in a different session), H-3 (2 user msgs
@@ -1956,7 +2005,7 @@ func TestGetSessionStats_Temporal_HourlyGrouping(t *testing.T) {
 
 func TestGetSessionStats_Temporal_MidnightBoundary(t *testing.T) {
 	d := testDB(t)
-	ctx := context.Background()
+	ctx := t.Context()
 
 	// Pick a fixed day inside the default 28d window and seed one
 	// message 1 second before midnight UTC and one 1 second after.
@@ -1998,7 +2047,7 @@ func TestGetSessionStats_Temporal_MidnightBoundary(t *testing.T) {
 
 func TestGetSessionStats_Temporal_OutOfWindowExcluded(t *testing.T) {
 	d := testDB(t)
-	ctx := context.Background()
+	ctx := t.Context()
 
 	// One session inside the window, one outside. With Since=2d, the
 	// out-of-window session should not contribute sessionIDs, so its
@@ -2031,7 +2080,7 @@ func TestGetSessionStats_Temporal_OutOfWindowExcluded(t *testing.T) {
 
 func TestGetSessionStats_Temporal_SessionsDistinctPerHour(t *testing.T) {
 	d := testDB(t)
-	ctx := context.Background()
+	ctx := t.Context()
 
 	// Same session sends 3 user messages in H-6 (counts as 1 session,
 	// 3 user_messages) and 1 user message in H-5 (counts as 1 session,
@@ -2065,18 +2114,18 @@ func TestGetSessionStats_Temporal_SessionsDistinctPerHour(t *testing.T) {
 
 func TestGetSessionStats_Temporal_EmptyWindowEmptySlice(t *testing.T) {
 	d := testDB(t)
-	ctx := context.Background()
+	ctx := t.Context()
 
 	stats, err := d.GetSessionStats(ctx, StatsFilter{Since: "28d"})
 	require.NoError(t, err, "GetSessionStats")
 	assert.NotNil(t, stats.Temporal.HourlyUTC,
 		"hourly_utc must be a non-nil empty slice, got nil")
-	assert.Len(t, stats.Temporal.HourlyUTC, 0, "hourly_utc: got len")
+	assert.Empty(t, stats.Temporal.HourlyUTC, "hourly_utc: got len")
 	// Reporter timezone may now be empty when the host only exposes the
 	// Local sentinel; otherwise it must still be a loadable IANA name.
 	if stats.Temporal.ReporterTimezone != "" {
 		_, tzErr := time.LoadLocation(stats.Temporal.ReporterTimezone)
-		assert.NoError(t, tzErr,
+		require.NoError(t, tzErr,
 			"reporter_timezone must stay loadable when populated")
 	}
 	// JSON encoding must emit [] not null.
@@ -2087,7 +2136,7 @@ func TestGetSessionStats_Temporal_EmptyWindowEmptySlice(t *testing.T) {
 
 func TestGetSessionStats_Temporal_ReporterTimezone_FilterWins(t *testing.T) {
 	d := testDB(t)
-	ctx := context.Background()
+	ctx := t.Context()
 
 	stats, err := d.GetSessionStats(ctx, StatsFilter{
 		Since:    "28d",
@@ -2099,20 +2148,11 @@ func TestGetSessionStats_Temporal_ReporterTimezone_FilterWins(t *testing.T) {
 }
 
 func TestReporterTimezone_Precedence(t *testing.T) {
-	prev, hadTZ := os.LookupEnv("TZ")
-	t.Cleanup(func() {
-		if hadTZ {
-			_ = os.Setenv("TZ", prev)
-		} else {
-			_ = os.Unsetenv("TZ")
-		}
-	})
-	oldLocal := time.Local
-	t.Cleanup(func() { time.Local = oldLocal })
+	oldLocal := time.Local                      //nolint:forbidigo // Exercise report formatting and date buckets in the local calendar timezone.
+	t.Cleanup(func() { time.Local = oldLocal }) //nolint:forbidigo // Exercise report formatting and date buckets in the local calendar timezone.
 
 	// Filter wins over env.
-	err := os.Setenv("TZ", "Europe/Berlin")
-	require.NoError(t, err, "set TZ")
+	t.Setenv("TZ", "Europe/Berlin")
 	assert.Equal(t, "Asia/Tokyo",
 		reporterTimezone(StatsFilter{Timezone: "Asia/Tokyo"}),
 		"filter wins")
@@ -2122,16 +2162,15 @@ func TestReporterTimezone_Precedence(t *testing.T) {
 		reporterTimezone(StatsFilter{}), "env wins")
 
 	// No filter, no env, valid local name → local wins.
-	err = os.Unsetenv("TZ")
-	require.NoError(t, err, "unset TZ")
-	time.Local = time.FixedZone("America/New_York", -5*60*60)
+	require.NoError(t, os.Unsetenv("TZ"), "unset TZ")
+	time.Local = time.FixedZone("America/New_York", -5*60*60) //nolint:forbidigo // Exercise report formatting and date buckets in the local calendar timezone.
 	assert.Equal(t, "America/New_York",
 		reporterTimezone(StatsFilter{}),
 		"valid local name should pass through")
 
 	// No filter, no env, Local sentinel → use the platform resolver when it is
 	// available, otherwise retain the existing empty metadata fallback.
-	time.Local = time.FixedZone("Local", 0)
+	time.Local = time.FixedZone("Local", 0) //nolint:forbidigo // Exercise report formatting and date buckets in the local calendar timezone.
 	mapped := reporterTimezone(StatsFilter{})
 	if mapped != "" {
 		_, err := time.LoadLocation(mapped)
@@ -2141,17 +2180,18 @@ func TestReporterTimezone_Precedence(t *testing.T) {
 
 func TestReporterTimezoneUsesPlatformMapping(t *testing.T) {
 	previousTZ, hadTZ := os.LookupEnv("TZ")
+	if hadTZ {
+		t.Setenv("TZ", previousTZ)
+	}
 	require.NoError(t, os.Unsetenv("TZ"))
 	t.Cleanup(func() {
-		if hadTZ {
-			_ = os.Setenv("TZ", previousTZ)
-		} else {
+		if !hadTZ {
 			_ = os.Unsetenv("TZ")
 		}
 	})
-	oldLocal := time.Local
-	time.Local = time.FixedZone("Local", 0)
-	t.Cleanup(func() { time.Local = oldLocal })
+	oldLocal := time.Local                      //nolint:forbidigo // Exercise report formatting and date buckets in the local calendar timezone.
+	time.Local = time.FixedZone("Local", 0)     //nolint:forbidigo // Exercise report formatting and date buckets in the local calendar timezone.
+	t.Cleanup(func() { time.Local = oldLocal }) //nolint:forbidigo // Exercise report formatting and date buckets in the local calendar timezone.
 
 	got := reporterTimezone(StatsFilter{})
 	if runtime.GOOS == "windows" {
@@ -2166,20 +2206,21 @@ func TestReporterTimezoneUsesPlatformMapping(t *testing.T) {
 
 func TestGetSessionStatsReportsPlatformTimezone(t *testing.T) {
 	previousTZ, hadTZ := os.LookupEnv("TZ")
+	if hadTZ {
+		t.Setenv("TZ", previousTZ)
+	}
 	require.NoError(t, os.Unsetenv("TZ"))
 	t.Cleanup(func() {
-		if hadTZ {
-			_ = os.Setenv("TZ", previousTZ)
-		} else {
+		if !hadTZ {
 			_ = os.Unsetenv("TZ")
 		}
 	})
-	oldLocal := time.Local
-	time.Local = time.FixedZone("Local", 0)
-	t.Cleanup(func() { time.Local = oldLocal })
+	oldLocal := time.Local                      //nolint:forbidigo // Exercise report formatting and date buckets in the local calendar timezone.
+	time.Local = time.FixedZone("Local", 0)     //nolint:forbidigo // Exercise report formatting and date buckets in the local calendar timezone.
+	t.Cleanup(func() { time.Local = oldLocal }) //nolint:forbidigo // Exercise report formatting and date buckets in the local calendar timezone.
 
 	stats, err := testDB(t).GetSessionStats(
-		context.Background(), StatsFilter{Since: "28d"})
+		t.Context(), StatsFilter{Since: "28d"})
 	require.NoError(t, err)
 	if runtime.GOOS == "windows" {
 		require.NotEmpty(t, stats.Temporal.ReporterTimezone)
@@ -2196,7 +2237,7 @@ func TestGetSessionStatsReportsPlatformTimezone(t *testing.T) {
 
 func TestGetSessionStats_Temporal_FilterByAgentFlowsThrough(t *testing.T) {
 	d := testDB(t)
-	ctx := context.Background()
+	ctx := t.Context()
 
 	// Two sessions, same hour, different agents. Filter=claude must
 	// leave the codex session's messages out of hourly_utc.
@@ -2228,7 +2269,7 @@ func TestGetSessionStats_Temporal_FilterByAgentFlowsThrough(t *testing.T) {
 
 func TestGetSessionStats_Temporal_IgnoresAssistantMessages(t *testing.T) {
 	d := testDB(t)
-	ctx := context.Background()
+	ctx := t.Context()
 
 	// Only assistant messages in a session — hourly_utc must be empty.
 	insertSessionFixture(t, d, sessionFixture{
@@ -2248,7 +2289,7 @@ func TestGetSessionStats_Temporal_IgnoresAssistantMessages(t *testing.T) {
 
 func TestGetSessionStats_Temporal_SkipsEmptyTimestamps(t *testing.T) {
 	d := testDB(t)
-	ctx := context.Background()
+	ctx := t.Context()
 
 	// User message with empty timestamp must not bucket to epoch or
 	// anywhere else — strftime returns NULL for empty strings and we
@@ -2278,7 +2319,7 @@ func TestGetSessionStats_Temporal_SkipsEmptyTimestamps(t *testing.T) {
 // regression in the loader or aggregator would be caught.
 func TestGetSessionStats_Outcomes_Happy(t *testing.T) {
 	d := testDB(t)
-	ctx := context.Background()
+	ctx := t.Context()
 
 	// s-a: completed / grade A / 2 tools / 1 retry / 3 compactions / 5 churn
 	insertSessionFixture(t, d, sessionFixture{
@@ -2386,7 +2427,7 @@ func TestGetSessionStats_Outcomes_Happy(t *testing.T) {
 // a pure codex workload as having an outcome signal of all-zeroes.
 func TestGetSessionStats_Outcomes_NoClaude(t *testing.T) {
 	d := testDB(t)
-	ctx := context.Background()
+	ctx := t.Context()
 
 	insertSessionFixture(t, d, sessionFixture{
 		id: "cx1", agent: "codex", userMsgs: 3, startedAt: hoursAgo(2),
@@ -2408,7 +2449,7 @@ func TestGetSessionStats_Outcomes_NoClaude(t *testing.T) {
 // zeroed rates when no tools were recorded.
 func TestGetSessionStats_Outcomes_NoGrade(t *testing.T) {
 	d := testDB(t)
-	ctx := context.Background()
+	ctx := t.Context()
 
 	insertSessionFixture(t, d, sessionFixture{
 		id: "ng", userMsgs: 2, startedAt: hoursAgo(2),
@@ -2425,7 +2466,7 @@ func TestGetSessionStats_Outcomes_NoGrade(t *testing.T) {
 	assert.NotNil(t, out.GradeDistribution,
 		"GradeDistribution: want empty map")
 	assert.Empty(t, out.GradeDistribution, "GradeDistribution")
-	assert.Equal(t, 0.0, out.ToolRetryRate,
+	assert.InDelta(t, 0.0, out.ToolRetryRate, 0,
 		"ToolRetryRate want 0 (no tools)")
 	assert.Equal(t, 1, out.Success, "Success: got")
 }
@@ -2445,7 +2486,7 @@ func seedToolCallsByName(
 	for i, c := range calls {
 		msgs = append(msgs, asstMsg(sessionID, i+1, "reply-"+c.toolName))
 	}
-	require.NoError(t, d.InsertMessages(msgs),
+	require.NoError(t, d.InsertMessages(t.Context(), msgs),
 		"seedToolCallsByName %s: InsertMessages", sessionID)
 	for i, c := range calls {
 		ord := i + 1
@@ -2453,7 +2494,7 @@ func seedToolCallsByName(
 		if c.skillName != "" {
 			skill = c.skillName
 		}
-		_, err := d.getWriter().Exec(`
+		_, err := d.getWriter().Exec(t.Context(), `
 			INSERT INTO tool_calls
 				(message_id, session_id, tool_name, category, skill_name)
 			SELECT id, session_id, ?, ?, ?
@@ -2486,7 +2527,7 @@ type toolCallSeed struct {
 //     -> 2 distinct names
 func TestGetSessionStats_Adoption_Happy(t *testing.T) {
 	d := testDB(t)
-	ctx := context.Background()
+	ctx := t.Context()
 
 	// ad1: one ExitPlanMode, zero Task, one Skill("brainstorm").
 	insertSessionFixture(t, d, sessionFixture{
@@ -2565,7 +2606,7 @@ func TestGetSessionStats_Adoption_Happy(t *testing.T) {
 // workload as having legitimate all-zero adoption signal.
 func TestGetSessionStats_Adoption_NoClaude(t *testing.T) {
 	d := testDB(t)
-	ctx := context.Background()
+	ctx := t.Context()
 
 	insertSessionFixture(t, d, sessionFixture{
 		id: "cx1", agent: "codex", userMsgs: 3,
@@ -2589,6 +2630,18 @@ func TestGetSessionStats_Adoption_NoClaude(t *testing.T) {
 // require the binary.
 func skipIfNoGit(t *testing.T) {
 	t.Helper()
+	// Keep Git fixture commands and production reads inside test-owned state.
+	for _, entry := range os.Environ() {
+		key, _, _ := strings.Cut(entry, "=")
+		if strings.HasPrefix(key, "GIT_") {
+			t.Setenv(key, "")
+			require.NoError(t, os.Unsetenv(key))
+		}
+	}
+	globalConfig := filepath.Join(t.TempDir(), "gitconfig")
+	require.NoError(t, os.WriteFile(globalConfig, nil, 0o600))
+	t.Setenv("GIT_CONFIG_GLOBAL", globalConfig)
+	t.Setenv("GIT_CONFIG_NOSYSTEM", "1")
 	if _, err := exec.LookPath("git"); err != nil {
 		t.Skipf("git not available on PATH: %v", err)
 	}
@@ -2599,7 +2652,7 @@ func skipIfNoGit(t *testing.T) {
 // test helpers are unexported.
 func statsRunGit(t *testing.T, repo string, env []string, args ...string) {
 	t.Helper()
-	cmd := exec.Command("git", args...)
+	cmd := exec.CommandContext(t.Context(), "git", args...)
 	cmd.Dir = repo
 	cmd.Env = append(os.Environ(), env...)
 	out, err := cmd.CombinedOutput()
@@ -2638,6 +2691,22 @@ func statsCommitFile(
 	statsRunGit(t, repo, env, "commit", "-q", "-m", message)
 }
 
+func statsIsolateGit(t *testing.T) {
+	t.Helper()
+	// Keep fixture commands and outcome lookups independent of host Git state.
+	for _, entry := range os.Environ() {
+		name, _, _ := strings.Cut(entry, "=")
+		if strings.HasPrefix(strings.ToUpper(name), "GIT_") {
+			t.Setenv(name, "")
+			require.NoError(t, os.Unsetenv(name))
+		}
+	}
+	globalConfig := filepath.Join(t.TempDir(), "gitconfig")
+	require.NoError(t, os.WriteFile(globalConfig, nil, 0o600))
+	t.Setenv("GIT_CONFIG_GLOBAL", globalConfig)
+	t.Setenv("GIT_CONFIG_NOSYSTEM", "1")
+}
+
 var (
 	statsOutcomeRepoOnce sync.Once
 	statsOutcomeRepoDir  string
@@ -2646,9 +2715,10 @@ var (
 
 func statsOutcomeRepo(t *testing.T) string {
 	t.Helper()
+	statsIsolateGit(t)
 	statsOutcomeRepoOnce.Do(func() {
-		dir, err := os.MkdirTemp("", "agentsview-stats-outcome-*")
-		require.NoError(t, err, "create stats outcome repo dir")
+		dir := filepath.Join(testDBFixtureTempDir, "stats-outcome")
+		require.NoError(t, os.MkdirAll(dir, 0o700), "create stats outcome repo dir")
 		statsOutcomeRepoDir = dir
 		statsOutcomeRepoPath = filepath.Join(dir, "repo")
 		statsInitRepoAt(t, statsOutcomeRepoPath)
@@ -2670,6 +2740,46 @@ func statsOutcomeRepo(t *testing.T) string {
 	return statsOutcomeRepoPath
 }
 
+func TestGetSessionStats_OutcomeStats_ExclusiveEnd(t *testing.T) {
+	skipIfNoGit(t)
+	statsIsolateGit(t)
+	repo := t.TempDir()
+	statsInitRepoAt(t, repo)
+	// The selected local day spans 23 hours across the spring DST change.
+	for _, stamp := range []string{
+		"2026-03-08T04:59:59Z", // before the selected day
+		"2026-03-08T05:00:00Z", // first included second
+		"2026-03-09T03:59:59Z", // last included second
+		"2026-03-09T04:00:00Z", // next midnight
+	} {
+		statsRunGit(t, repo, []string{
+			"GIT_AUTHOR_DATE=" + stamp, "GIT_COMMITTER_DATE=" + stamp,
+		}, "commit", "--allow-empty", "-q", "-m", "boundary fixture")
+	}
+	d := testDB(t)
+	insertSessionFixture(t, d, sessionFixture{
+		id: "boundary", agent: "claude", userMsgs: 5,
+		startedAt: "2026-03-08T12:00:00Z", cwd: repo,
+	})
+	for _, tc := range []struct {
+		until   string
+		commits int
+	}{
+		{"2026-03-09T00:00:00-04:00", 2},
+		{"2026-03-09T00:00:00.5-04:00", 3},
+	} {
+		t.Run(tc.until, func(t *testing.T) {
+			stats, err := d.GetSessionStats(t.Context(), StatsFilter{
+				Since: "2026-03-08T00:00:00-05:00", Until: tc.until,
+				IncludeGitOutcomes: true,
+			})
+			require.NoError(t, err)
+			require.NotNil(t, stats.OutcomeStats)
+			assert.Equal(t, tc.commits, stats.OutcomeStats.Commits)
+		})
+	}
+}
+
 // TestGetSessionStats_OutcomeStats_Happy seeds sessions whose cwd
 // points inside a real fixture repo, verifies outcome_stats is off by
 // default, and asserts that enabling it surfaces the author-filtered
@@ -2680,7 +2790,7 @@ func statsOutcomeRepo(t *testing.T) string {
 func TestGetSessionStats_OutcomeStats_Happy(t *testing.T) {
 	skipIfNoGit(t)
 	d := testDB(t)
-	ctx := context.Background()
+	ctx := t.Context()
 
 	repo := statsOutcomeRepo(t)
 
@@ -2724,7 +2834,7 @@ func TestGetSessionStats_OutcomeStats_Happy(t *testing.T) {
 func TestOutcomeStatsClosedWriterUsesReadOnlyCache(t *testing.T) {
 	skipIfNoGit(t)
 	d := testDB(t)
-	ctx := context.Background()
+	ctx := t.Context()
 	repo := statsOutcomeRepo(t)
 	insertSessionFixture(t, d, sessionFixture{
 		id: "closed-writer", agent: "claude", userMsgs: 5,
@@ -2748,7 +2858,7 @@ func TestOutcomeStatsClosedWriterUsesReadOnlyCache(t *testing.T) {
 // serialising as {"repos_active":0,...}.
 func TestGetSessionStats_OutcomeStats_NoCwd(t *testing.T) {
 	d := testDB(t)
-	ctx := context.Background()
+	ctx := t.Context()
 
 	insertSessionFixture(t, d, sessionFixture{
 		id: "nc1", agent: "claude", userMsgs: 5,
@@ -2768,7 +2878,7 @@ func TestGetSessionStats_OutcomeStats_NoCwd(t *testing.T) {
 // non-git workflows that happen to record a cwd.
 func TestGetSessionStats_OutcomeStats_CwdOutsideRepo(t *testing.T) {
 	d := testDB(t)
-	ctx := context.Background()
+	ctx := t.Context()
 
 	// t.TempDir() is nested under Go's test temp root, which is not
 	// itself inside a git repo on any supported platform.
@@ -2781,4 +2891,178 @@ func TestGetSessionStats_OutcomeStats_CwdOutsideRepo(t *testing.T) {
 	stats, err := d.GetSessionStats(ctx, StatsFilter{Since: "28d"})
 	require.NoError(t, err, "GetSessionStats")
 	assert.Nil(t, stats.OutcomeStats, "OutcomeStats")
+}
+
+// statsCanonPath resolves symlinks so a fixture path compares equal to the
+// canonical path `git rev-parse --show-toplevel` prints. On macOS the test
+// temp root lives under /var, which is a symlink to /private/var.
+func statsCanonPath(t *testing.T, path string) string {
+	t.Helper()
+	resolved, err := filepath.EvalSymlinks(path)
+	require.NoError(t, err, "EvalSymlinks %s", path)
+	return resolved
+}
+
+// TestOutcomeStatsNamesRepoWhoseGHLookupFailed pins that a pull-request
+// lookup which fails is reported rather than dropped. Before this, the
+// failure went to the daemon log and the response was an ordinary-looking
+// block, so a caller reading prs_opened could not tell a genuine count from
+// one missing an unknown number of repositories.
+func TestOutcomeStatsNamesRepoWhoseGHLookupFailed(t *testing.T) {
+	skipIfNoGit(t)
+	if _, err := exec.LookPath("gh"); err != nil {
+		t.Skipf("gh not available on PATH: %v", err)
+	}
+	t.Setenv("GH_REPO", "")
+	// This repository has no remotes, so gh fails before any network lookup.
+	repo := statsOutcomeRepo(t)
+	d := testDB(t)
+	insertSessionFixture(t, d, sessionFixture{
+		id: "gh-failed", agent: "claude", userMsgs: 5,
+		startedAt: hoursAgo(5), cwd: repo,
+	})
+
+	stats, err := d.GetSessionStats(t.Context(), StatsFilter{
+		Since: "28d", IncludeGitOutcomes: true, GHToken: "test-token",
+	})
+	require.NoError(t, err, "GetSessionStats")
+	out := stats.OutcomeStats
+	require.NotNil(t, out, "OutcomeStats")
+	assert.Equal(t, 3, out.Commits,
+		"the git side of the repository still contributes")
+	require.Len(t, out.Skipped, 1,
+		"the repository whose gh lookup failed must be named")
+	assert.Equal(t, statsCanonPath(t, repo), out.Skipped[0].Repo, "Skipped[0].Repo")
+	assert.Equal(t, "pr", out.Skipped[0].Op, "Skipped[0].Op")
+	assert.Contains(t, out.Skipped[0].Reason, "no git remotes found",
+		"Skipped[0].Reason must carry why the lookup failed")
+}
+
+// TestOutcomeStatsNamesRepoWhoseGitLogFailed pins the same contract for the
+// commit side: a `git log` that fails drops the repository's commits, and the
+// response has to say so.
+func TestOutcomeStatsNamesRepoWhoseGitLogFailed(t *testing.T) {
+	skipIfNoGit(t)
+	repo := t.TempDir()
+	statsInitRepoAt(t, repo)
+	// This log-only setting fails on every platform while repository
+	// discovery and author lookup still work.
+	statsRunGit(t, repo, nil, "config", "log.showSignature", "invalid")
+	d := testDB(t)
+	insertSessionFixture(t, d, sessionFixture{
+		id: "log-failed", agent: "claude", userMsgs: 5,
+		startedAt: hoursAgo(5), cwd: repo,
+	})
+
+	stats, err := d.GetSessionStats(t.Context(), StatsFilter{
+		Since: "28d", IncludeGitOutcomes: true,
+	})
+	require.NoError(t, err, "GetSessionStats")
+	require.NotNil(t, stats.OutcomeStats,
+		"a block that reports the skip must be returned, not nil")
+	out := stats.OutcomeStats
+	assert.Zero(t, out.ReposActive,
+		"a repository whose log failed is not active")
+	require.Len(t, out.Skipped, 1,
+		"the repository whose git log failed must be named")
+	assert.Equal(t, statsCanonPath(t, repo), out.Skipped[0].Repo, "Skipped[0].Repo")
+	assert.Equal(t, "log", out.Skipped[0].Op, "Skipped[0].Op")
+	assert.Contains(t, out.Skipped[0].Reason, "bad boolean config value",
+		"Skipped[0].Reason must carry why the lookup failed")
+}
+
+// TestOutcomeStatsSkippedEmptyWhenNothingFailed pins that the new field stays
+// empty on the ordinary path, so its presence means something really was
+// missed.
+func TestOutcomeStatsSkippedEmptyWhenNothingFailed(t *testing.T) {
+	skipIfNoGit(t)
+	d := testDB(t)
+	insertSessionFixture(t, d, sessionFixture{
+		id: "nothing-failed", agent: "claude", userMsgs: 5,
+		startedAt: hoursAgo(5), cwd: statsOutcomeRepo(t),
+	})
+
+	stats, err := d.GetSessionStats(t.Context(), StatsFilter{
+		Since: "28d", IncludeGitOutcomes: true,
+	})
+	require.NoError(t, err, "GetSessionStats")
+	require.NotNil(t, stats.OutcomeStats, "OutcomeStats")
+	assert.Empty(t, stats.OutcomeStats.Skipped, "Skipped")
+}
+
+// TestOutcomeStatsNamesRepoWithoutAuthorEmail verifies that a missing author
+// is reported while another repository still contributes its commit counts.
+func TestOutcomeStatsNamesRepoWithoutAuthorEmail(t *testing.T) {
+	skipIfNoGit(t)
+	repo := statsOutcomeRepo(t)
+	// AuthorEmail's runner strips GIT_CONFIG_GLOBAL and reads global config,
+	// so isolate HOME and XDG_CONFIG_HOME as well as the fixture commands.
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(home, ".config"))
+	missingAuthor := t.TempDir()
+	statsInitRepoAt(t, missingAuthor)
+	statsCommitFile(t, missingAuthor, "a.txt", "one line\n", "initial commit")
+	statsRunGit(t, missingAuthor, nil, "config", "--unset", "user.email")
+
+	d := testDB(t)
+	for i, cwd := range []string{repo, missingAuthor} {
+		insertSessionFixture(t, d, sessionFixture{
+			id: "author-" + strconv.Itoa(i), agent: "claude", userMsgs: 5,
+			startedAt: hoursAgo(5), cwd: cwd,
+		})
+	}
+
+	stats, err := d.GetSessionStats(t.Context(), StatsFilter{
+		Since: "28d", IncludeGitOutcomes: true,
+	})
+	require.NoError(t, err, "GetSessionStats")
+	require.NotNil(t, stats.OutcomeStats, "OutcomeStats")
+	out := stats.OutcomeStats
+	assert.Equal(t, 1, out.ReposActive)
+	assert.Equal(t, 3, out.Commits, "the configured repository still contributes")
+	require.Len(t, out.Skipped, 1)
+	assert.Equal(t, statsCanonPath(t, missingAuthor), out.Skipped[0].Repo)
+	assert.Equal(t, "author", out.Skipped[0].Op)
+	assert.Equal(t, "no author email configured", out.Skipped[0].Reason)
+}
+
+func TestGetSessionStats_OutcomeStatsUnionsCheckouts(t *testing.T) {
+	skipIfNoGit(t)
+	for _, linked := range []bool{false, true} {
+		t.Run(fmt.Sprintf("linked=%t", linked), func(t *testing.T) {
+			d := testDB(t)
+			main := filepath.Join(t.TempDir(), "main")
+			statsInitRepoAt(t, main)
+			statsCommitFile(t, main, "base.txt", "base\n", "base")
+			other := filepath.Join(t.TempDir(), "feature")
+			if linked {
+				statsRunGit(t, main, nil, "worktree", "add", "-b", "feature", other)
+			} else {
+				statsRunGit(t, main, nil, "clone", "--quiet", main, other)
+				statsRunGit(t, other, nil, "config", "user.email", "test@example.com")
+				statsRunGit(t, other, nil, "config", "commit.gpgsign", "false")
+			}
+			statsCommitFile(t, main, "main.txt", "one\ntwo\n", "main work")
+			statsCommitFile(t, other, "feature.txt", "feature\n", "feature work")
+			for i, repo := range []string{main, other} {
+				statsRunGit(t, repo, nil, "config", "remote.origin.url", "https://example.com/team/repo.git")
+				insertSessionFixture(t, d, sessionFixture{
+					id: fmt.Sprintf("checkout-%d", i), agent: "claude", userMsgs: 1,
+					startedAt: hoursAgo(1), cwd: repo,
+				})
+			}
+			filter := StatsFilter{
+				Since:              time.Now().Add(-24 * time.Hour).UTC().Format(time.DateOnly),
+				Until:              time.Now().Add(24 * time.Hour).UTC().Format(time.DateOnly),
+				IncludeGitOutcomes: true,
+			}
+			for range 2 { // Check both fresh computation and cached commit data.
+				stats, err := d.GetSessionStats(t.Context(), filter)
+				require.NoError(t, err)
+				require.NotNil(t, stats.OutcomeStats)
+				assert.Equal(t, &StatsOutcomeStats{ReposActive: 1, Commits: 3, LOCAdded: 4, FilesChanged: 3}, stats.OutcomeStats)
+			}
+		})
+	}
 }

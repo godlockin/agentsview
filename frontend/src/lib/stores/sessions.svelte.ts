@@ -1,7 +1,12 @@
 import type { DataChangedEvent } from "../api/client.js";
-import { MetadataService, SessionsService } from "../api/generated/index";
-import { callGenerated, isAbortError, isNotFoundError } from "../api/runtime.js";
-import type { Session, ProjectInfo, AgentInfo, SidebarSessionIndexRow } from "../api/types.js";
+import { MetadataService, SessionsService, SettingsService } from "../api/generated/index";
+import { ApiError, isAbortError, isNotFoundError } from "../api/runtime.js";
+import type { Session } from "../api/types.js";
+import type {
+  DbProjectInfo as ProjectInfo,
+  DbAgentInfo as AgentInfo,
+  DbSidebarSessionIndexRow as SidebarSessionIndexRow,
+} from "../api/generated/index.js";
 import { sync } from "./sync.svelte.js";
 import { events } from "./events.svelte.js";
 import { starred } from "./starred.svelte.js";
@@ -30,8 +35,10 @@ const RECENTLY_DELETED_TTL_MS = 10_000;
 export interface SessionGroupInput {
   id: string;
   parent_session_id?: string | null;
+  parent_session_ids?: string[];
   relationship_type?: string | null;
   project: string;
+  project_assigned?: boolean;
   machine: string;
   agent: string;
   agent_label?: string | null;
@@ -517,10 +524,7 @@ class SessionsStore {
       total: this.total,
     };
     try {
-      const index = await callGenerated(
-        (options) => SessionsService.getApiV1SessionsSidebarIndex(params, options),
-        signal,
-      );
+      const index = await SessionsService.getApiV1SessionsSidebarIndex(params, { signal });
       if (this.loadVersion !== version) return;
 
       this.sidebarIndexVersion = indexVersion;
@@ -606,10 +610,7 @@ class SessionsStore {
         const promise = this.runSidebarHydration(async () => {
           if (signal.aborted) return;
           try {
-            const hydrated = await callGenerated(
-              (options) => SessionsService.getApiV1SessionsById({ id }, options),
-              signal,
-            );
+            const hydrated = await SessionsService.getApiV1SessionsById({ id }, { signal });
             if (
               version !== this.sidebarIndexVersion ||
               epoch !== (this.sidebarHydrationEpochByVersion.get(version) ?? 0)
@@ -689,17 +690,13 @@ class SessionsStore {
     const signal = this.routeSignal();
     this.loading = true;
     try {
-      const index = await callGenerated(
-        (options) =>
-          SessionsService.getApiV1SessionsSidebarIndex(
-            {
-              ...this.apiParams,
-              cursor: this.nextCursor!,
-              limit: SESSION_PAGE_SIZE,
-            },
-            options,
-          ),
-        signal,
+      const index = await SessionsService.getApiV1SessionsSidebarIndex(
+        {
+          ...this.apiParams,
+          cursor: this.nextCursor!,
+          limit: SESSION_PAGE_SIZE,
+        },
+        { signal },
       );
       if (this.loadVersion !== version) return;
       // Merge index-page order first, appended rows last. Rows outside
@@ -723,7 +720,12 @@ class SessionsStore {
       this.nextCursor = index.next_cursor ?? null;
       this.total = index.total;
     } catch (error) {
-      if (signal.aborted || isAbortError(error)) return;
+      if (signal.aborted || isAbortError(error) || this.loadVersion !== version) return;
+      if (error instanceof ApiError && error.status === 400 && error.message === "invalid cursor") {
+        this.nextCursor = null;
+        await this.load({ force: true });
+        return;
+      }
       throw error;
     } finally {
       if (this.loadVersion === version) {
@@ -881,10 +883,7 @@ class SessionsStore {
     const entry = { id, promise: Promise.resolve() };
     entry.promise = (async () => {
       try {
-        const session = await callGenerated(
-          (options) => SessionsService.getApiV1SessionsById({ id }, options),
-          signal,
-        );
+        const session = await SessionsService.getApiV1SessionsById({ id }, { signal });
         if (this.activeSessionId === id && this.navigateRead.isCurrent(signal)) {
           const idx = this.sessions.findIndex((s) => s.id === id);
           if (idx >= 0) {
@@ -964,10 +963,7 @@ class SessionsStore {
     const version = ++this.refreshVersion;
     const signal = this.refreshRead.begin();
     try {
-      const session = await callGenerated(
-        (options) => SessionsService.getApiV1SessionsById({ id }, options),
-        signal,
-      );
+      const session = await SessionsService.getApiV1SessionsById({ id }, { signal });
       if (
         this.refreshVersion !== version ||
         this.activeSessionId !== id ||
@@ -994,9 +990,9 @@ class SessionsStore {
     const version = ++this.childSessionsVersion;
     const signal = this.childSessionsRead.begin();
     try {
-      const children = await callGenerated(
-        (options) => SessionsService.getApiV1SessionsByIdChildren({ id: parentId }, options),
-        signal,
+      const children = await SessionsService.getApiV1SessionsByIdChildren(
+        { id: parentId },
+        { signal },
       );
       if (
         this.childSessionsVersion !== version ||
@@ -1047,10 +1043,7 @@ class SessionsStore {
     const signal = this.routeSignal();
     this.signalDetailLoading = true;
     try {
-      const session = await callGenerated(
-        (options) => SessionsService.getApiV1SessionsById({ id }, options),
-        signal,
-      );
+      const session = await SessionsService.getApiV1SessionsById({ id }, { signal });
       if (signal.aborted) return;
       this.signalDetailCache.set(id, {
         basis: session.health_score_basis ?? null,
@@ -1072,7 +1065,7 @@ class SessionsStore {
         this.sessions[idx] = {
           ...s,
           health_score_basis: detail.basis,
-          health_penalties: detail.penalties,
+          health_penalties: detail.penalties ?? undefined,
         };
       }
     }
@@ -1453,10 +1446,47 @@ class SessionsStore {
       // Explicitly null it out so the store reflects the cleared state rather
       // than keeping the stale value until the next SSE-triggered refresh.
       if (displayName === null && updated.display_name === undefined) {
-        merged.display_name = null;
+        merged.display_name = undefined;
       }
       this.sessions[idx] = merged;
     }
+  }
+
+  async assignSessionProject(id: string, project: string) {
+    const assignment = await SettingsService.putApiV1SettingsSessionProjectAssignmentsBySessionId(
+      {
+        sessionId: id,
+      },
+      { project },
+    );
+    const idx = this.sessions.findIndex((session) => session.id === id);
+    if (idx !== -1) {
+      this.sessions[idx] = {
+        ...this.sessions[idx]!,
+        project: assignment.project,
+        project_assigned: true,
+      };
+    }
+    this.invalidateProjectCache();
+    await this.load({ force: true });
+    return assignment.project;
+  }
+
+  async clearSessionProjectAssignment(id: string) {
+    const cleared = await SettingsService.deleteApiV1SettingsSessionProjectAssignmentsBySessionId({
+      sessionId: id,
+    });
+    const idx = this.sessions.findIndex((session) => session.id === id);
+    if (idx !== -1) {
+      this.sessions[idx] = {
+        ...this.sessions[idx]!,
+        project: cleared.project,
+        project_assigned: false,
+      };
+    }
+    this.invalidateProjectCache();
+    await this.load({ force: true });
+    return cleared.project;
   }
 
   private startLiveRefresh() {
@@ -1565,21 +1595,34 @@ export function createSessionsStore(): SessionsStore {
 
 function sidebarIndexRowToSession(row: SidebarSessionIndexRow, existing?: Session): Session {
   const skinny: Session = {
+    compaction_count: 0,
+    consecutive_failure_max: 0,
+    edit_churn_count: 0,
+    ended_with_role: "",
+    final_failure_streak: 0,
+    mid_task_compaction_count: 0,
+    outcome: "",
+    outcome_confidence: "",
+    secret_leak_count: 0,
+    tool_failure_signal_count: 0,
+    tool_retry_count: 0,
     id: row.id,
     project: row.project,
+    project_assigned: row.project_assigned ?? false,
     machine: row.machine,
     agent: row.agent,
     agent_label: row.agent_label ?? undefined,
     entrypoint: row.entrypoint ?? undefined,
     first_message: null,
-    display_name: row.display_name ?? null,
+    display_name: row.display_name ?? undefined,
     started_at: row.started_at,
     ended_at: row.ended_at,
     message_count: row.message_count,
     user_message_count: row.user_message_count,
     parent_session_id: row.parent_session_id ?? undefined,
+    parent_session_ids: row.parent_session_ids,
     relationship_type: row.relationship_type ?? undefined,
-    termination_status: row.termination_status ?? null,
+    termination_status: row.termination_status ?? undefined,
     total_output_tokens: 0,
     peak_context_tokens: 0,
     has_total_output_tokens: false,
@@ -1595,6 +1638,7 @@ function sidebarIndexRowToSession(row: SidebarSessionIndexRow, existing?: Sessio
     ...skinny,
     ...existing,
     project: skinny.project,
+    project_assigned: skinny.project_assigned,
     machine: skinny.machine,
     agent: skinny.agent,
     agent_label: skinny.agent_label,
@@ -1605,6 +1649,7 @@ function sidebarIndexRowToSession(row: SidebarSessionIndexRow, existing?: Sessio
     message_count: skinny.message_count,
     user_message_count: skinny.user_message_count,
     parent_session_id: skinny.parent_session_id,
+    parent_session_ids: skinny.parent_session_ids,
     relationship_type: skinny.relationship_type,
     termination_status: skinny.termination_status,
     transcript_revision: skinny.transcript_revision,
@@ -1754,6 +1799,30 @@ function findRoot(
   return cur;
 }
 
+// A hosted equal-content child may belong to several proven parent cohorts.
+// Keep every reachable loaded root, without choosing a representative parent.
+function findPublicRoots(id: string, byId: Map<string, SessionGroupInput>): string[] {
+  const pending = [id];
+  const visited = new Set<string>();
+  const roots = new Set<string>();
+  while (pending.length) {
+    const current = pending.pop()!;
+    if (visited.has(current)) continue;
+    visited.add(current);
+    const row = byId.get(current);
+    const parents = (
+      row?.parent_session_ids?.length
+        ? row.parent_session_ids
+        : row?.parent_session_id
+          ? [row.parent_session_id]
+          : []
+    ).filter((parent) => byId.has(parent));
+    if (!parents.length) roots.add(current);
+    else pending.push(...parents);
+  }
+  return [...roots].sort();
+}
+
 export function buildSessionGroups(sessions: SessionGroupInput[]): SessionGroup[] {
   const byId = new Map<string, SessionGroupInput>();
   for (const s of sessions) {
@@ -1764,33 +1833,37 @@ export function buildSessionGroups(sessions: SessionGroupInput[]): SessionGroup[
   const groupMap = new Map<string, SessionGroup>();
   const insertionOrder: string[] = [];
 
+  const pluralParents = sessions.some((s) => s.parent_session_ids?.length);
   for (const s of sessions) {
-    const root = findRoot(s.id, byId, rootCache);
-    // Sessions without a parent_session_id that aren't
-    // pointed to by anyone get root == their own id, so
-    // they form a single-session group naturally.
-    const key = root;
+    const roots = pluralParents ? findPublicRoots(s.id, byId) : [findRoot(s.id, byId, rootCache)];
+    if (!roots.length) roots.push(findRoot(s.id, byId, rootCache));
+    for (const root of roots) {
+      // Sessions without a parent_session_id that aren't
+      // pointed to by anyone get root == their own id, so
+      // they form a single-session group naturally.
+      const key = root;
 
-    let group = groupMap.get(key);
-    if (!group) {
-      group = {
-        key,
-        project: s.project,
-        sessions: [],
-        primarySessionId: s.id,
-        totalMessages: 0,
-        firstMessage: null,
-        startedAt: null,
-        endedAt: null,
-      };
-      groupMap.set(key, group);
-      insertionOrder.push(key);
+      let group = groupMap.get(key);
+      if (!group) {
+        group = {
+          key,
+          project: s.project,
+          sessions: [],
+          primarySessionId: s.id,
+          totalMessages: 0,
+          firstMessage: null,
+          startedAt: null,
+          endedAt: null,
+        };
+        groupMap.set(key, group);
+        insertionOrder.push(key);
+      }
+
+      group.sessions.push(s);
+      group.totalMessages += s.message_count;
+      group.startedAt = minString(group.startedAt, s.started_at);
+      group.endedAt = maxString(group.endedAt, s.ended_at);
     }
-
-    group.sessions.push(s);
-    group.totalMessages += s.message_count;
-    group.startedAt = minString(group.startedAt, s.started_at);
-    group.endedAt = maxString(group.endedAt, s.ended_at);
   }
 
   // Adopt orphaned teammate sessions so they NEVER appear at root level.

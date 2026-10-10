@@ -1,16 +1,10 @@
 import { afterEach, describe, expect, it, vi } from "vite-plus/test";
-import {
-  activateRecallExtractionGeneration,
-  fetchRecallEntries,
-  fetchRecallExtractionProgress,
-  retireRecallExtractionGeneration,
-} from "./recall.js";
-
+import { RecallService } from "./generated/index.js";
 afterEach(() => {
   vi.unstubAllGlobals();
 });
 
-describe("fetchRecallEntries", () => {
+describe("generated recall entries", () => {
   it("sends every corpus-browser filter to the Recall API", async () => {
     const fetchMock = vi.fn().mockResolvedValue(
       new Response(
@@ -25,12 +19,13 @@ describe("fetchRecallEntries", () => {
     );
     vi.stubGlobal("fetch", fetchMock);
 
-    const page = await fetchRecallEntries({
-      query: "bounded pass",
+    const page = await RecallService.getApiV1RecallEntries({
+      q: "bounded pass",
       project: "project-a",
       type: "decision",
-      sourceRunId: "generation-a",
-      reviewState: "human_reviewed",
+      source_run_id: "generation-a",
+      status: "archived",
+      review_state: "human_reviewed",
       limit: 75,
     });
 
@@ -43,17 +38,47 @@ describe("fetchRecallEntries", () => {
       project: "project-a",
       type: "decision",
       source_run_id: "generation-a",
+      status: "archived",
       review_state: "human_reviewed",
     });
     expect(page).toEqual({
       entries: [],
-      nextCursor: "cursor-2",
-      resultCap: 500,
+      trusted_only: false,
+      next_cursor: "cursor-2",
+      result_cap: 500,
     });
   });
 });
 
-describe("fetchRecallExtractionProgress", () => {
+describe("generated recall entry review", () => {
+  it("posts one encoded review action and returns the updated entry", async () => {
+    const updated = {
+      id: "entry one",
+      status: "archived",
+      review_state: "human_rejected",
+    };
+    const fetchMock = vi.fn().mockResolvedValue(
+      new Response(JSON.stringify(updated), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      }),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    await expect(
+      RecallService.postApiV1RecallEntriesByIdReview({ id: "entry one" }, { action: "archive" }),
+    ).resolves.toEqual(updated);
+    expect(fetchMock).toHaveBeenCalledWith(
+      "/api/v1/recall/entries/entry%20one/review",
+      expect.objectContaining({
+        method: "POST",
+        body: JSON.stringify({ action: "archive" }),
+      }),
+    );
+  });
+});
+
+describe("generated recall extraction progress", () => {
   it("sends bounded generation, state, and cursor filters", async () => {
     const fetchMock = vi.fn().mockResolvedValue(
       new Response(
@@ -67,7 +92,7 @@ describe("fetchRecallExtractionProgress", () => {
     );
     vi.stubGlobal("fetch", fetchMock);
 
-    const page = await fetchRecallExtractionProgress({
+    const page = await RecallService.getApiV1RecallExtractionProgress({
       generation: "generation-a",
       state: "failed",
       cursor: "progress-cursor-1",
@@ -84,9 +109,9 @@ describe("fetchRecallExtractionProgress", () => {
       cursor: "progress-cursor-1",
     });
     expect(page).toEqual({
-      generationFingerprint: "generation-a",
+      generation_fingerprint: "generation-a",
       progress: [],
-      nextCursor: "progress-cursor-2",
+      next_cursor: "progress-cursor-2",
     });
   });
 });
@@ -100,7 +125,7 @@ describe("Recall extraction generation actions", () => {
     );
     vi.stubGlobal("fetch", fetchMock);
 
-    await activateRecallExtractionGeneration();
+    await RecallService.postApiV1RecallExtractionActivate();
 
     expect(fetchMock).toHaveBeenCalledWith(
       "/api/v1/recall/extraction/activate",
@@ -116,11 +141,33 @@ describe("Recall extraction generation actions", () => {
     );
     vi.stubGlobal("fetch", fetchMock);
 
-    await retireRecallExtractionGeneration("generation old");
+    await RecallService.postApiV1RecallExtractionGenerationsByFingerprintRetire({
+      fingerprint: "generation old",
+    });
 
     expect(fetchMock).toHaveBeenCalledWith(
       "/api/v1/recall/extraction/generations/generation%20old/retire",
       expect.objectContaining({ method: "POST" }),
     );
+  });
+});
+
+describe("generated recall import", () => {
+  it("sends NDJSON records without JSON quoting", async () => {
+    const ndjson = '{"candidate_id":"a"}\n{"candidate_id":"b"}\n';
+    const body = new Blob([ndjson], { type: "application/x-ndjson" });
+    const fetchMock = vi.fn().mockResolvedValue(
+      new Response('{"imported":0,"skipped":0}', {
+        headers: { "Content-Type": "application/json" },
+      }),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    await RecallService.postApiV1RecallImport(body);
+
+    expect(fetchMock).toHaveBeenCalledOnce();
+    const init = fetchMock.mock.calls[0]?.[1];
+    expect(init?.body).toBe(body);
+    expect(await (init?.body as Blob).text()).toBe(ndjson);
   });
 });

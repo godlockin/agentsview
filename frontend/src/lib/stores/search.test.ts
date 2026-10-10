@@ -1,9 +1,12 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test";
 import { SearchService } from "../api/generated/index.js";
 import { ApiError } from "../api/runtime.js";
-import type { SearchResponse } from "../api/types.js";
-import type { DbContentMatch } from "../api/generated/index.js";
+import type { SearchResponse } from "../api/generated/index.js";
+import type { DbContentMatch, ServiceContentSearchResult } from "../api/generated/index.js";
 import { SEARCH_MODE_STORAGE_KEY, createSearchStore, type SearchMode } from "./search.svelte.js";
+import { reportTelemetry } from "../utils/telemetry.js";
+
+vi.mock("../utils/telemetry.js", () => ({ reportTelemetry: vi.fn() }));
 
 vi.mock("../api/generated/index.js", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../api/generated/index.js")>();
@@ -18,6 +21,18 @@ vi.mock("../api/generated/index.js", async (importOriginal) => {
 
 const searchService = vi.mocked(SearchService);
 const DEBOUNCE_MS = 300;
+
+function contentResult(matches: DbContentMatch[]): ServiceContentSearchResult {
+  return {
+    matches,
+    revision_bound: false,
+    coverage: {
+      status: "ready",
+      lexical: { status: "ready" },
+      semantic: { status: "ready" },
+    },
+  };
+}
 
 function memoryStorage(initial: Record<string, string> = {}) {
   const values = new Map(Object.entries(initial));
@@ -35,6 +50,7 @@ function fullTextResponse(query: string, count = 1): SearchResponse {
     results: Array.from({ length: count }, (_, index) => ({
       session_id: `full-${index}`,
       project: "alpha",
+      machine: "node-a",
       agent: "codex",
       name: `Result ${index}`,
       ordinal: index + 2,
@@ -49,6 +65,8 @@ function contentMatch(sessionId: string, ordinal: number, score: number): DbCont
   return {
     session_id: sessionId,
     project: "semantic-project",
+    machine: "node-a",
+    display_name: null,
     agent: "claude",
     location: "message",
     role: "user",
@@ -172,9 +190,9 @@ describe("SearchStore", () => {
     async (mode: SearchMode) => {
       const store = createSearchStore(memoryStorage());
       store.setMode(mode);
-      searchService.getApiV1SearchContent.mockResolvedValueOnce({
-        matches: [contentMatch("semantic-1", 4, 0.9)],
-      });
+      searchService.getApiV1SearchContent.mockResolvedValueOnce(
+        contentResult([contentMatch("semantic-1", 4, 0.9)]),
+      );
 
       store.search("  padded query  ", "semantic-project");
       await runDebounce();
@@ -207,6 +225,77 @@ describe("SearchStore", () => {
     },
   );
 
+  it.each(["fulltext", "semantic", "hybrid"] as const)(
+    "reruns %s with the selected dates and removes bounds for All time",
+    async (mode) => {
+      const store = createSearchStore(memoryStorage());
+      store.setMode(mode);
+      searchService.getApiV1Search.mockResolvedValue(fullTextResponse("needle"));
+      searchService.getApiV1SearchContent.mockResolvedValue(contentResult([]));
+      const request =
+        mode === "fulltext" ? searchService.getApiV1Search : searchService.getApiV1SearchContent;
+
+      store.search("needle", "alpha");
+      await runDebounce();
+      store.setRange({ mode: "custom", from: "2026-07-01", to: "2026-07-14" });
+      await flushMicrotasks();
+
+      expect(request).toHaveBeenCalledTimes(2);
+      expect(request).toHaveBeenLastCalledWith(
+        expect.objectContaining({
+          project: "alpha",
+          date_from: "2026-07-01",
+          date_to: "2026-07-14",
+          ...(mode === "fulltext"
+            ? {}
+            : {
+                timezone: Intl.DateTimeFormat().resolvedOptions().timeZone,
+              }),
+        }),
+        expect.anything(),
+      );
+
+      store.setRange({ mode: "relative", days: 0 });
+      await flushMicrotasks();
+      const params = request.mock.calls.at(-1)![0];
+      expect(params).not.toHaveProperty("date_from");
+      expect(params).not.toHaveProperty("date_to");
+      expect(request).toHaveBeenCalledTimes(3);
+    },
+  );
+
+  it("cancels the previous range request and keeps the range across retries and mode changes", async () => {
+    const store = createSearchStore(memoryStorage());
+    store.setMode("semantic");
+    const old = deferred<ServiceContentSearchResult>();
+    searchService.getApiV1SearchContent.mockReturnValueOnce(old.promise);
+    searchService.getApiV1SearchContent.mockRejectedValueOnce(new Error("timeout"));
+    store.search("needle");
+    await runDebounce();
+    const oldSignal = searchService.getApiV1SearchContent.mock.calls[0]![1]!.signal!;
+
+    store.setRange({ mode: "calendar", unit: "day", anchor: "2026-07-04" });
+    await flushMicrotasks();
+    expect(oldSignal.aborted).toBe(true);
+    old.resolve(contentResult([contentMatch("out-of-range", 1, 0.9)]));
+    await flushMicrotasks();
+    expect(store.results).toEqual([]);
+    expect(store.error?.kind).toBe("timeout");
+
+    searchService.getApiV1SearchContent.mockResolvedValue(
+      contentResult([contentMatch("in-range", 4, 0.8)]),
+    );
+    store.retry();
+    await flushMicrotasks();
+    store.setMode("hybrid");
+    await flushMicrotasks();
+    expect(searchService.getApiV1SearchContent).toHaveBeenLastCalledWith(
+      expect.objectContaining({ mode: "hybrid", date_from: "2026-07-04", date_to: "2026-07-04" }),
+      expect.anything(),
+    );
+    expect(store.results[0]?.session_id).toBe("in-range");
+  });
+
   it("deduplicates ranked content results in response order and truncates to 30", async () => {
     const store = createSearchStore(memoryStorage({ [SEARCH_MODE_STORAGE_KEY]: "semantic" }));
     const matches = [
@@ -217,7 +306,7 @@ describe("SearchStore", () => {
         contentMatch(`session-${index}`, index + 4, 100 - index),
       ),
     ];
-    searchService.getApiV1SearchContent.mockResolvedValueOnce({ matches });
+    searchService.getApiV1SearchContent.mockResolvedValueOnce(contentResult(matches));
 
     store.search("ranked");
     await runDebounce();
@@ -288,7 +377,7 @@ describe("SearchStore", () => {
     const storage = memoryStorage();
     const store = createSearchStore(storage);
     store.search("  rerun me  ", "alpha");
-    searchService.getApiV1SearchContent.mockResolvedValueOnce({ matches: [] });
+    searchService.getApiV1SearchContent.mockResolvedValueOnce(contentResult([]));
 
     store.setMode("semantic");
     await flushMicrotasks();
@@ -322,7 +411,7 @@ describe("SearchStore", () => {
     expect(store.error).not.toBeNull();
 
     vi.clearAllMocks();
-    searchService.getApiV1SearchContent.mockResolvedValueOnce({ matches: [] });
+    searchService.getApiV1SearchContent.mockResolvedValueOnce(contentResult([]));
     store.retry();
     await flushMicrotasks();
     await vi.advanceTimersByTimeAsync(DEBOUNCE_MS + 10);
@@ -381,9 +470,9 @@ describe("SearchStore", () => {
     store.search("stale");
     await runDebounce();
 
-    searchService.getApiV1SearchContent.mockResolvedValueOnce({
-      matches: [contentMatch("newer", 8, 0.8)],
-    });
+    searchService.getApiV1SearchContent.mockResolvedValueOnce(
+      contentResult([contentMatch("newer", 8, 0.8)]),
+    );
     store.setMode("semantic");
     await flushMicrotasks();
 
@@ -424,5 +513,65 @@ describe("SearchStore", () => {
     expect(store.results).toEqual([]);
     expect(store.query).toBe("");
     expect(store.isSearching).toBe(false);
+  });
+});
+
+describe("SearchStore telemetry", () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+    vi.mocked(reportTelemetry).mockClear();
+    searchService.getApiV1Search.mockResolvedValue(fullTextResponse("needle"));
+    searchService.getApiV1SearchContent.mockResolvedValue(contentResult([]));
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it("reports each search mode once per palette open", async () => {
+    const store = createSearchStore(memoryStorage());
+    store.search("foo");
+    await runDebounce();
+    store.search("foo bar");
+    await runDebounce();
+    store.setSort("recency");
+    store.setMode("semantic");
+    store.setMode("hybrid");
+    store.setMode("fulltext");
+    store.setMode("semantic");
+    store.clear();
+    store.search("another query");
+    await runDebounce();
+    expect(vi.mocked(reportTelemetry).mock.calls).toEqual([
+      ["search_run", { query_type: "text" }],
+      ["search_run", { query_type: "semantic" }],
+      ["search_run", { query_type: "hybrid" }],
+    ]);
+
+    store.reportedModes.clear();
+    store.search("needle");
+    await runDebounce();
+    expect(reportTelemetry).toHaveBeenLastCalledWith("search_run", { query_type: "semantic" });
+    expect(reportTelemetry).toHaveBeenCalledTimes(4);
+  });
+
+  it("does not report another search when semantic setup retries the same mode", async () => {
+    const store = createSearchStore(memoryStorage());
+    store.search("needle");
+    await runDebounce();
+    searchService.getApiV1SearchContent.mockRejectedValueOnce(
+      generatedApiError(501, "Semantic search is unavailable"),
+    );
+    store.setMode("semantic");
+    await flushMicrotasks();
+    expect(store.error?.kind).toBe("semantic-unavailable");
+
+    store.retry();
+    await flushMicrotasks();
+    expect(store.error).toBeNull();
+    expect(vi.mocked(reportTelemetry).mock.calls).toEqual([
+      ["search_run", { query_type: "text" }],
+      ["search_run", { query_type: "semantic" }],
+    ]);
   });
 });

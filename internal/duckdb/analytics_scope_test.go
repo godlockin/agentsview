@@ -3,7 +3,6 @@
 package duckdb
 
 import (
-	"context"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -52,14 +51,14 @@ func TestResolveAnalyticsMessageScope(t *testing.T) {
 
 	t.Run("blank model returns nil", func(t *testing.T) {
 		scope, err := store.resolveAnalyticsMessageScope(
-			context.Background(), []string{sessionA}, db.AnalyticsFilter{}, false)
+			t.Context(), []string{sessionA}, db.AnalyticsFilter{}, false)
 		require.NoError(t, err)
 		assert.Nil(t, scope)
 	})
 
 	t.Run("selected model pairs user+assistant; other model yields none", func(t *testing.T) {
 		scope, err := store.resolveAnalyticsMessageScope(
-			context.Background(), []string{sessionA, sessionB},
+			t.Context(), []string{sessionA, sessionB},
 			db.AnalyticsFilter{Model: model}, false)
 		require.NoError(t, err)
 		require.NotNil(t, scope)
@@ -74,7 +73,7 @@ func TestResolveAnalyticsMessageScope(t *testing.T) {
 
 	t.Run("TimingBySession returns one entry per matched row", func(t *testing.T) {
 		scope, err := store.resolveAnalyticsMessageScope(
-			context.Background(), []string{sessionA}, db.AnalyticsFilter{Model: model}, false)
+			t.Context(), []string{sessionA}, db.AnalyticsFilter{Model: model}, false)
 		require.NoError(t, err)
 		require.NotNil(t, scope)
 		assert.Len(t, scope.TimingBySession()[sessionA], 2)
@@ -82,7 +81,7 @@ func TestResolveAnalyticsMessageScope(t *testing.T) {
 
 	t.Run("deduplicates sessionIDs", func(t *testing.T) {
 		scope, err := store.resolveAnalyticsMessageScope(
-			context.Background(), []string{sessionA, sessionA},
+			t.Context(), []string{sessionA, sessionA},
 			db.AnalyticsFilter{Model: model}, false)
 		require.NoError(t, err)
 		require.NotNil(t, scope)
@@ -92,7 +91,7 @@ func TestResolveAnalyticsMessageScope(t *testing.T) {
 	t.Run("hour filter drops non-matching rows", func(t *testing.T) {
 		h := 14 // rows are at 09:00 UTC
 		scope, err := store.resolveAnalyticsMessageScope(
-			context.Background(), []string{sessionA},
+			t.Context(), []string{sessionA},
 			db.AnalyticsFilter{Model: model, Hour: &h, Timezone: "UTC"}, false)
 		require.NoError(t, err)
 		require.NotNil(t, scope)
@@ -101,10 +100,10 @@ func TestResolveAnalyticsMessageScope(t *testing.T) {
 
 	t.Run("includeContent=false leaves content empty", func(t *testing.T) {
 		scope, err := store.resolveAnalyticsMessageScope(
-			context.Background(), []string{sessionA}, db.AnalyticsFilter{Model: model}, false)
+			t.Context(), []string{sessionA}, db.AnalyticsFilter{Model: model}, false)
 		require.NoError(t, err)
 		require.NotNil(t, scope)
-		rows := scope.MessagesBySession()[sessionA]
+		rows := scope[sessionA]
 		require.Len(t, rows, 2)
 		for _, r := range rows {
 			assert.Empty(t, r.Content)
@@ -113,10 +112,10 @@ func TestResolveAnalyticsMessageScope(t *testing.T) {
 
 	t.Run("includeContent=true populates content", func(t *testing.T) {
 		scope, err := store.resolveAnalyticsMessageScope(
-			context.Background(), []string{sessionA}, db.AnalyticsFilter{Model: model}, true)
+			t.Context(), []string{sessionA}, db.AnalyticsFilter{Model: model}, true)
 		require.NoError(t, err)
 		require.NotNil(t, scope)
-		rows := scope.MessagesBySession()[sessionA]
+		rows := scope[sessionA]
 		require.Len(t, rows, 2)
 		assert.Equal(t, "hello", rows[0].Content)
 		assert.Equal(t, "world", rows[1].Content)

@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"log"
 	"net/http"
 	"strconv"
 	"strings"
@@ -11,10 +12,14 @@ import (
 	"go.kenn.io/agentsview/internal/config"
 	"go.kenn.io/agentsview/internal/db"
 	"go.kenn.io/agentsview/internal/parser"
+	syncpkg "go.kenn.io/agentsview/internal/sync"
+
+	"github.com/danielgtaylor/huma/v2"
 )
 
 func (s *Server) registerSettingsRoutes() {
-	group := newRouteGroup(s.api, "/api/v1/settings", "Settings")
+	group := huma.NewGroup(s.api, "/api/v1/settings")
+	configureRouteGroup(group, "Settings")
 
 	s.get(group, "", "Get settings", s.humaGetSettings)
 	s.put(group, "", "Update settings", s.humaUpdateSettings)
@@ -27,6 +32,11 @@ func (s *Server) registerSettingsRoutes() {
 		"Preview worktree project reclassification", s.humaPreviewWorktreeReclassification)
 	s.post(group, "/worktree-mappings/reclassify",
 		"Apply worktree project reclassification", s.humaReclassifyWorktreeProject)
+	s.put(group, "/session-project-assignments/{session_id}",
+		"Assign one session to a project", s.humaAssignSessionProject)
+	s.deleteRoute(group, "/session-project-assignments/{session_id}",
+		"Use automatic project assignment for one session",
+		s.humaClearSessionProjectAssignment)
 }
 
 type settingsInput struct {
@@ -105,13 +115,14 @@ func (s *Server) humaGetSettings(
 			CustomBin:  tc.CustomBin,
 			CustomArgs: tc.CustomArgs,
 		},
-		Host:             s.cfg.Host,
-		Port:             s.cfg.Port,
-		ChartPalette:     s.cfg.ResolvedChartPalette(),
-		ZoomLevel:        s.cfg.ZoomLevel,
-		ToolResultImages: toolResultImagesValue(s.cfg.ToolResultImages),
-		RequireAuth:      s.cfg.RequireAuth,
-		ReadOnly:         s.db.ReadOnly(),
+		Host:                s.cfg.Host,
+		Port:                s.cfg.Port,
+		ChartPalette:        s.cfg.ResolvedChartPalette(),
+		ZoomLevel:           s.cfg.ZoomLevel,
+		ToolResultImages:    toolResultImagesValue(s.cfg.ToolResultImages),
+		InsightDefaultAgent: resolvedInsightDefaultAgent(s.cfg),
+		RequireAuth:         s.cfg.RequireAuth,
+		ReadOnly:            s.db.ReadOnly(),
 	}
 	if isLocalhostContext(ctx) {
 		resp.AuthToken = s.cfg.AuthToken
@@ -145,10 +156,7 @@ func (s *Server) humaUpdateSettings(
 		patch["zoom_level"] = *in.Body.ZoomLevel
 	}
 	if in.Body.ToolResultImages != nil {
-		// The enum tag already constrained this to "keep" or "drop" before
-		// the handler ran, and those are the two spellings the configuration
-		// reference documents, so the value is persisted as sent. SaveSettings
-		// re-validates it for callers that bypass the HTTP layer.
+		// SaveSettings revalidates values for callers that bypass the HTTP enum.
 		patch["tool_result_images"] = config.ToolResultImages(*in.Body.ToolResultImages)
 	}
 	if in.Body.DisabledAgents != nil {
@@ -172,7 +180,10 @@ func (s *Server) humaUpdateSettings(
 		patch["require_auth"] = *in.Body.RequireAuth
 	}
 	if len(patch) > 0 {
+		s.settingsApplyMu.Lock()
+		defer s.settingsApplyMu.Unlock()
 		s.mu.Lock()
+		rollback := s.ingestionRollbackLocked(patch)
 		err := s.cfg.SaveSettings(patch)
 		if err == nil && s.cfg.RequireAuth {
 			err = s.cfg.EnsureAuthToken()
@@ -181,18 +192,92 @@ func (s *Server) humaUpdateSettings(
 		if err != nil {
 			return nil, internalError("save settings", err)
 		}
+		if err := s.applyIngestionSettings(ctx, rollback); err != nil {
+			return nil, err
+		}
 	}
 	return s.humaGetSettings(ctx, &emptyInput{})
 }
 
+// applyIngestionSettings hands saved provider settings to the running daemon
+// so enabling a provider or adding a home takes effect without a restart. If
+// the daemon cannot apply them, it restores the previous provider settings so
+// the saved file, the response, and the running engine agree.
+func (s *Server) applyIngestionSettings(
+	ctx context.Context, rollback map[string]any,
+) error {
+	if s.ingestionReloader == nil || len(rollback) == 0 {
+		return nil
+	}
+	reloaded, err := s.ingestionReloader(ctx)
+	if err != nil {
+		s.mu.Lock()
+		restoreErr := s.cfg.SaveSettings(rollback)
+		s.mu.Unlock()
+		if restoreErr != nil {
+			log.Printf("restore session provider settings: %v", restoreErr)
+		}
+		return internalError("apply session provider settings", err)
+	}
+	s.mu.Lock()
+	s.cfg.AdoptSessionSources(reloaded)
+	s.activeDisabledAgents = append(
+		[]parser.AgentType(nil), reloaded.DisabledAgents...,
+	)
+	onDemand := s.onDemandEngine
+	s.mu.Unlock()
+	if onDemand != nil {
+		// Reconfiguring waits for an in-flight manual sync, so it runs in the
+		// background. Each update reads the latest adopted settings, so the
+		// last one to run applies the newest selection.
+		go func() {
+			s.onDemandReconfigureMu.Lock()
+			defer s.onDemandReconfigureMu.Unlock()
+			cfg := s.ingestionConfig()
+			onDemand.ReconfigureSources(syncpkg.SourceConfig{
+				AgentDirs:        cfg.AgentDirs,
+				SourceMachines:   cfg.SourceMachines,
+				ProviderMetadata: cfg.ProviderMetadata,
+				DisabledAgents:   cfg.DisabledAgents,
+			})
+		}()
+	}
+	return nil
+}
+
+// ingestionRollbackLocked returns the settings patch that restores the
+// current provider selection for the provider keys patch changes, or nil when
+// patch changes none. Callers hold s.mu.
+func (s *Server) ingestionRollbackLocked(patch map[string]any) map[string]any {
+	rollback := make(map[string]any)
+	if _, ok := patch["disabled_agents"]; ok {
+		rollback["disabled_agents"] = append(
+			[]parser.AgentType{}, s.cfg.DisabledAgents...,
+		)
+	}
+	if homes, ok := patch["agent_homes"].(map[parser.AgentType][]string); ok {
+		previous := make(map[parser.AgentType][]string, len(homes))
+		for agent := range homes {
+			previous[agent] = append([]string{}, s.cfg.ConfiguredAgentHomes(agent)...)
+		}
+		rollback["agent_homes"] = previous
+	}
+	if len(rollback) == 0 {
+		return nil
+	}
+	return rollback
+}
+
 func (s *Server) localWorktreeMappingHumaDB() (*db.DB, string, error) {
 	localDB, ok := s.db.(*db.DB)
-	if !ok || localDB == nil || localDB.ReadOnly() || s.engine == nil {
+	if !ok || localDB == nil || localDB.ReadOnly() {
 		return nil, "", apiError(http.StatusNotImplemented, "not available in remote mode")
 	}
-	machine := strings.TrimSpace(s.engine.Machine())
-	if machine == "" {
-		machine = s.cfg.InstallationID
+	machine := strings.TrimSpace(s.cfg.InstallationID)
+	if s.engine != nil {
+		if engineMachine := strings.TrimSpace(s.engine.Machine()); engineMachine != "" {
+			machine = engineMachine
+		}
 	}
 	return localDB, machine, nil
 }
@@ -338,14 +423,14 @@ func (s *Server) humaApplyWorktreeMappings(
 	ctx context.Context,
 	in *worktreeMappingApplyInput,
 ) (*jsonOutput[applyWorktreeMappingsResponse], error) {
-	_, machine, err := s.localWorktreeMappingHumaDB()
+	localDB, machine, err := s.localWorktreeMappingHumaDB()
 	if err != nil {
 		return nil, err
 	}
 	if in.Body.Machine != nil && strings.TrimSpace(*in.Body.Machine) != "" {
 		machine = strings.TrimSpace(*in.Body.Machine)
 	}
-	result, err := s.engine.ApplyWorktreeProjectMappings(ctx, machine)
+	result, err := s.syncEngineForLocal(ctx, localDB).ApplyWorktreeProjectMappings(ctx, machine)
 	if err != nil {
 		return nil, internalError("apply worktree mappings", err)
 	}
@@ -369,6 +454,13 @@ func (s *Server) humaPreviewWorktreeReclassification(
 	if err != nil {
 		return nil, humaWorktreeReclassificationError(err)
 	}
+	projects, err := localDB.BuildProjectIdentityMap(ctx, preview.MatchedProjects)
+	if err != nil {
+		return nil, internalError("resolve preview project identities", err)
+	}
+	for _, label := range preview.MatchedProjects {
+		preview.MatchedProjectKeys = append(preview.MatchedProjectKeys, projects[label].ProjectKey)
+	}
 	return &jsonOutput[db.WorktreeReclassificationPreview]{Body: preview}, nil
 }
 
@@ -391,7 +483,7 @@ func (s *Server) humaReclassifyWorktreeProject(
 	if err != nil {
 		return nil, humaWorktreeReclassificationError(err)
 	}
-	mapping, result, err := s.engine.ApplyWorktreeReclassification(
+	mapping, result, err := s.syncEngineForLocal(ctx, localDB).ApplyWorktreeReclassification(
 		ctx, draft, in.Body.MappingToken, current.ExistingMappingID,
 	)
 	if err != nil {
@@ -402,13 +494,59 @@ func (s *Server) humaReclassifyWorktreeProject(
 	}, nil
 }
 
+func (s *Server) humaAssignSessionProject(
+	ctx context.Context,
+	in *sessionProjectAssignmentInput,
+) (*jsonOutput[db.SessionProjectAssignment], error) {
+	localDB, _, err := s.localWorktreeMappingHumaDB()
+	if err != nil {
+		return nil, err
+	}
+	assignment, err := s.syncEngineForLocal(ctx, localDB).AssignSessionProject(
+		ctx, in.SessionID, in.Body.Project,
+	)
+	if err != nil {
+		switch {
+		case errors.Is(err, sql.ErrNoRows):
+			return nil, apiError(http.StatusNotFound, "session not found")
+		case errors.Is(err, db.ErrSessionProjectAssignmentInvalid):
+			return nil, apiError(http.StatusBadRequest, err.Error())
+		default:
+			return nil, internalError("assign session project", err)
+		}
+	}
+	return &jsonOutput[db.SessionProjectAssignment]{Body: assignment}, nil
+}
+
+func (s *Server) humaClearSessionProjectAssignment(
+	ctx context.Context,
+	in *sessionProjectAssignmentPathInput,
+) (*jsonOutput[db.ClearedSessionProjectAssignment], error) {
+	localDB, _, err := s.localWorktreeMappingHumaDB()
+	if err != nil {
+		return nil, err
+	}
+	cleared, err := s.syncEngineForLocal(ctx, localDB).ClearSessionProjectAssignment(
+		ctx, in.SessionID,
+	)
+	if err != nil {
+		switch {
+		case errors.Is(err, sql.ErrNoRows):
+			return nil, apiError(http.StatusNotFound, "session assignment not found")
+		case errors.Is(err, db.ErrSessionProjectAssignmentInvalid):
+			return nil, apiError(http.StatusBadRequest, err.Error())
+		default:
+			return nil, internalError("clear session project assignment", err)
+		}
+	}
+	return &jsonOutput[db.ClearedSessionProjectAssignment]{Body: cleared}, nil
+}
+
 func humaWorktreeReclassificationError(err error) error {
 	switch {
 	case errors.Is(err, db.ErrWorktreeMappingSetChanged):
 		return apiError(http.StatusConflict, err.Error())
 	case errors.Is(err, db.ErrWorktreeMappingInvalid):
-		return apiError(http.StatusBadRequest, err.Error())
-	case strings.Contains(err.Error(), "required"):
 		return apiError(http.StatusBadRequest, err.Error())
 	default:
 		return internalError("worktree reclassification", err)
@@ -418,8 +556,6 @@ func humaWorktreeReclassificationError(err error) error {
 func humaWorktreeMappingError(err error) error {
 	switch {
 	case errors.Is(err, db.ErrWorktreeMappingInvalid):
-		return apiError(http.StatusBadRequest, err.Error())
-	case strings.Contains(err.Error(), "required"):
 		return apiError(http.StatusBadRequest, err.Error())
 	case errors.Is(err, db.ErrWorktreeMappingDuplicate):
 		return apiError(http.StatusConflict, "worktree mapping already exists")

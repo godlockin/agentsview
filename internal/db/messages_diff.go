@@ -275,6 +275,14 @@ func messageSourceUUIDCounts(msgs []Message) map[string]int {
 	return counts
 }
 
+// IsTextExtension reports whether incoming completes stored: stored is a
+// non-empty strict prefix of incoming. An empty stored text never qualifies,
+// so a placeholder or policy-blanked row cannot claim arbitrary text.
+func IsTextExtension(stored, incoming string) bool {
+	return stored != "" && len(incoming) > len(stored) &&
+		strings.HasPrefix(incoming, stored)
+}
+
 func messagePinIdentityStable(
 	old, incoming Message,
 	oldUUIDCounts, incomingUUIDCounts map[string]int,
@@ -294,11 +302,8 @@ func messagePinIdentityStable(
 	// A content extension is the same message completed by a later
 	// parse (e.g. a streamed partial response): the row keeps its
 	// ordinal, role, and source uuid (the caller refuses uuid
-	// changes), so the in-place update may retain the pin. The old
-	// content must be a non-empty prefix so an empty placeholder
-	// cannot claim an arbitrary replacement as its completion.
-	return old.Content != "" &&
-		strings.HasPrefix(incoming.Content, old.Content)
+	// changes), so the in-place update may retain the pin.
+	return IsTextExtension(old.Content, incoming.Content)
 }
 
 // messageDiffNeedsPinRemapTx reports whether an in-place update would
@@ -306,7 +311,7 @@ func messagePinIdentityStable(
 // can then use the full replacement path, which drops or remaps the pin
 // through the guarded identity rules. Unpinned streaming updates retain
 // the in-place path.
-func messageDiffNeedsPinRemapTx(
+func messageDiffNeedsPinRemapTx(ctx context.Context,
 	tx *sql.Tx, plan messageDiffPlan,
 ) (bool, error) {
 	for start := 0; start < len(plan.unsafePinUpdateIDs); start += diffDeleteChunkSize {
@@ -316,7 +321,7 @@ func messageDiffNeedsPinRemapTx(
 			args = append(args, id)
 		}
 		var exists int
-		if err := tx.QueryRow(
+		if err := tx.QueryRowContext(ctx,
 			"SELECT EXISTS (SELECT 1 FROM pinned_messages "+
 				"WHERE message_id IN ("+placeholderList(len(args))+"))",
 			args...,
@@ -334,7 +339,7 @@ func messageDiffNeedsPinRemapTx(
 // are updated in place (keeping rowids, so pins survive and the FTS
 // triggers reindex only those rows), their tool rows are rebuilt,
 // and new ordinals are inserted through the normal insert path.
-func applySessionMessageDiffTx(
+func applySessionMessageDiffTx(ctx context.Context,
 	tx *sql.Tx, sessionID string, plan messageDiffPlan,
 ) error {
 	if len(plan.updates) > 0 {
@@ -345,7 +350,7 @@ func applySessionMessageDiffTx(
 		msgs := make([]Message, 0, len(plan.updates))
 		for _, u := range plan.updates {
 			args := append(messageInsertArgs(u.msg), u.id)
-			if _, err := tx.Exec(updateSQL, args...); err != nil {
+			if _, err := tx.ExecContext(ctx, updateSQL, args...); err != nil {
 				return fmt.Errorf(
 					"updating message ord=%d: %w",
 					u.msg.Ordinal, err,
@@ -355,7 +360,7 @@ func applySessionMessageDiffTx(
 			ordinals = append(ordinals, u.msg.Ordinal)
 			msgs = append(msgs, u.msg)
 		}
-		if err := deleteToolRowsForMessagesTx(
+		if err := deleteToolRowsForMessagesTx(ctx,
 			tx, sessionID, ids, ordinals,
 		); err != nil {
 			return err
@@ -394,7 +399,7 @@ func applySessionMessageDiffTx(
 // deleteToolRowsForMessagesTx clears tool_calls and
 // tool_result_events for the updated messages so their rebuilt rows
 // cannot duplicate the stale ones.
-func deleteToolRowsForMessagesTx(
+func deleteToolRowsForMessagesTx(ctx context.Context,
 	tx *sql.Tx, sessionID string, ids []int64, ordinals []int,
 ) error {
 	for start := 0; start < len(ids); start += diffDeleteChunkSize {
@@ -407,7 +412,7 @@ func deleteToolRowsForMessagesTx(
 		// Agent-state rows use stable message/call coordinates. Clear every
 		// occurrence owned by the messages being rebuilt so removed agents and
 		// reused provider IDs cannot leave stale summary state.
-		if _, err := tx.Exec(
+		if _, err := tx.ExecContext(ctx,
 			"DELETE FROM tool_call_occurrence_agent_state WHERE session_id = ?"+
 				" AND message_ordinal IN ("+
 				"SELECT ordinal FROM messages WHERE id IN ("+
@@ -418,7 +423,7 @@ func deleteToolRowsForMessagesTx(
 				"deleting stale tool-call occurrence state: %w", err,
 			)
 		}
-		if _, err := tx.Exec(
+		if _, err := tx.ExecContext(ctx,
 			"DELETE FROM tool_calls WHERE message_id IN ("+
 				placeholderList(len(idArgs))+")",
 			idArgs...,
@@ -431,7 +436,7 @@ func deleteToolRowsForMessagesTx(
 		for _, ord := range ordinals[start:end] {
 			ordArgs = append(ordArgs, ord)
 		}
-		if _, err := tx.Exec(
+		if _, err := tx.ExecContext(ctx,
 			"DELETE FROM tool_result_events WHERE session_id = ?"+
 				" AND tool_call_message_ordinal IN ("+
 				placeholderList(len(ordArgs)-1)+")",

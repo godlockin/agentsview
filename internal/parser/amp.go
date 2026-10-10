@@ -97,8 +97,7 @@ func parseAmpSession(
 			role = RoleAssistant
 		}
 
-		content, thinkingText, hasThinking, hasToolUse, tcs, trs :=
-			ExtractTextContent(context.Background(), msg.Get("content"))
+		content, thinkingText, hasThinking, hasToolUse, tcs, trs := ExtractTextContent(context.Background(), msg.Get("content"))
 		trs = append(trs, extractAmpToolResults(msg.Get("content"))...)
 		usage := msg.Get("usage")
 		if strings.TrimSpace(content) == "" && len(trs) == 0 &&
@@ -136,9 +135,12 @@ func parseAmpSession(
 		return nil, nil, nil
 	}
 
-	// Use title as FirstMessage when available.
-	if title != "" {
-		firstMessage = title
+	// The thread title is the session name; Amp generates it and
+	// Rename replaces it. It stands in for the first message only when
+	// the thread has no user text.
+	sessionName := strings.TrimSpace(title)
+	if firstMessage == "" {
+		firstMessage = truncate(sessionName, 300)
 	}
 
 	userCount := 0
@@ -154,6 +156,7 @@ func parseAmpSession(
 		Machine:          machine,
 		Agent:            AgentAmp,
 		FirstMessage:     firstMessage,
+		SessionName:      sessionName,
 		StartedAt:        startTime,
 		EndedAt:          endTime,
 		MessageCount:     len(messages),
@@ -177,12 +180,13 @@ func ampUsageHasTokenCounters(usage gjson.Result) bool {
 		usage.Get("cacheReadInputTokens").Exists()
 }
 
-// ampFoldsCacheCreationIntoInput reports whether an Amp usage model
-// bills cache writes. Amp routes every prompt token into one of its
-// three input buckets, but only Anthropic-family models are billed a
-// cache-write premium. OpenAI-family threads report inputTokens as 0
-// and classify the whole uncached prompt as cacheCreationInputTokens,
-// so that portion is uncached input rather than a cache write.
+// ampFoldsCacheCreationIntoInput reports whether Amp's
+// cacheCreationInputTokens for a model holds uncached input rather
+// than cache writes. Amp routes every prompt token into one of its
+// three input buckets. Anthropic-family threads use Anthropic's
+// cache-write semantics, while OpenAI-family threads report
+// inputTokens as 0 and put the whole uncached prompt in
+// cacheCreationInputTokens, so that portion is uncached input.
 //
 // Only gpt-prefixed names are folded. An unrecognized or absent model
 // keeps Amp's own bucket labels: without a known provider there is no
@@ -202,9 +206,9 @@ func ampFoldsCacheCreationIntoInput(model string) bool {
 //
 // Anthropic-family threads already carry Anthropic semantics and pass
 // through unchanged. OpenAI-family threads fold cache creation into
-// uncached input and emit no cache-creation bucket, mirroring
-// applyCodexTokenUsage: the cost formula treats input_tokens as the
-// uncached remainder, and OpenAI does not bill cache writes.
+// uncached input and emit no cache-creation bucket: Amp's OpenAI
+// cache-creation count is the whole uncached prompt, not a reported
+// cache write.
 //
 //	inputTokens (+ cacheCreationInputTokens for gpt-*) → input_tokens
 //	outputTokens                                       → output_tokens
@@ -375,9 +379,20 @@ func extractAmpToolResults(content gjson.Result) []ParsedToolResult {
 			continue
 		}
 
-		var text string
+		var text, status string
+		switch block.Get("run.status").Str {
+		case "done":
+			status = "completed"
+		case "error":
+			status = "errored"
+		case "cancelled":
+			status = "cancelled"
+		}
 		hasResult := false
 		result := block.Get("run.result")
+		if result.Get("success").Type == gjson.False {
+			status = "errored"
+		}
 		if result.Exists() && result.Type != gjson.Null {
 			text = serializeAmpResult(result)
 			hasResult = true
@@ -406,6 +421,8 @@ func extractAmpToolResults(content gjson.Result) []ParsedToolResult {
 
 		results = append(results, ParsedToolResult{
 			ToolUseID:     toolUseID,
+			Source:        "tool_result",
+			Status:        status,
 			ContentRaw:    string(quoted),
 			ContentLength: len(text),
 		})

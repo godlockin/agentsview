@@ -140,27 +140,54 @@ func (s *Store) FinalizeNextManifest(
 	ctx context.Context,
 	deviceID string,
 ) (rawsync.Manifest, bool, error) {
+	return s.finalizeNextManifest(ctx, deviceID, "")
+}
+
+// FinalizeNextManifestForBackfill selects pending members and their predecessor
+// closure only, excluding later watch captures even on the same source chain.
+func (s *Store) FinalizeNextManifestForBackfill(ctx context.Context, deviceID, runID string) (rawsync.Manifest, bool, error) {
+	if runID == "" {
+		return rawsync.Manifest{}, false, ErrBackfillConflict
+	}
+	return s.finalizeNextManifest(ctx, deviceID, runID)
+}
+
+func (s *Store) finalizeNextManifest(ctx context.Context, deviceID, runID string) (rawsync.Manifest, bool, error) {
 	var manifest rawsync.Manifest
 	found := false
 	err := s.withImmediateWrite(ctx, "finalize next manifest", func(conn *sql.Conn) error {
 		if err := requireConfiguredDeviceConn(ctx, conn, deviceID); err != nil {
 			return err
 		}
+		if runID != "" {
+			if _, err := requireBackfillConn(ctx, conn, runID); err != nil {
+				return err
+			}
+		}
+		prefix := ""
+		scope := ""
+		args := []any{}
+		if runID != "" {
+			prefix = backfillPendingClosure
+			scope = " AND generation.capture_id IN (SELECT capture_id FROM backfill_pending) "
+			args = append(args, runID)
+		}
+		args = append(args, checkpointTimestamp(s.now()))
 		var provider, capturedAt, kind, state, expectedParent string
-		err := conn.QueryRowContext(ctx, `SELECT generation.capture_id,
+		err := conn.QueryRowContext(ctx, prefix+`SELECT generation.capture_id,
 			generation.provider, generation.configured_root_id,
 			generation.source_key, generation.captured_at, generation.kind,
 			generation.state, generation.expected_parent_receipt
 			FROM outbox_generations AS generation
 			LEFT JOIN outbox_generations AS predecessor
 				ON predecessor.capture_id = generation.predecessor_capture_id
-			WHERE generation.state IN ('queued', 'finalized')
+			WHERE generation.state IN ('queued', 'finalized') `+scope+`
 			AND generation.blocked = 0
 			AND (generation.retry_at = '' OR generation.retry_at <= ?)
 			AND (generation.predecessor_capture_id IS NULL
 				OR predecessor.state = 'acknowledged')
 			ORDER BY generation.captured_at, generation.capture_id LIMIT 1`,
-			checkpointTimestamp(s.now()),
+			args...,
 		).Scan(&manifest.CaptureID, &provider, &manifest.ConfiguredRootID,
 			&manifest.SourceKey, &capturedAt, &kind, &state, &expectedParent)
 		if errors.Is(err, sql.ErrNoRows) {
@@ -317,6 +344,7 @@ func discardRejectedGenerationConn(
 	if err != nil {
 		return fmt.Errorf("rawcheckpoint: discard rejected generation: %w", err)
 	}
+	defer rows.Close()
 	var discarded []string
 	for rows.Next() {
 		var current string
@@ -452,6 +480,15 @@ func validateReconciledSourceHead(head SourceHead) error {
 	})
 }
 
+// pruneUnreferencedRemoteObjectsSQL forgets uploaded objects that no
+// acknowledged base references any longer.
+const pruneUnreferencedRemoteObjectsSQL = `DELETE FROM outbox_objects
+	WHERE state = 'remote' AND ref_count = 0 AND NOT EXISTS (
+		SELECT 1 FROM raw_source_base_objects AS base
+		WHERE base.sha256 = outbox_objects.sha256
+		AND base.length = outbox_objects.length
+	)`
+
 // AcknowledgeGeneration atomically fences a durable server result to the
 // finalized local generation, advances its source head, and releases local
 // object references while retaining the acknowledged append base metadata.
@@ -530,12 +567,7 @@ func (s *Store) AcknowledgeGeneration(
 		if err := releaseGenerationObjectsConn(ctx, conn, captureID); err != nil {
 			return err
 		}
-		if _, err := conn.ExecContext(ctx, `DELETE FROM outbox_objects
-			WHERE state = 'remote' AND ref_count = 0 AND NOT EXISTS (
-				SELECT 1 FROM raw_source_base_objects AS base
-				WHERE base.sha256 = outbox_objects.sha256
-				AND base.length = outbox_objects.length
-			)`); err != nil {
+		if _, err := conn.ExecContext(ctx, pruneUnreferencedRemoteObjectsSQL); err != nil {
 			return fmt.Errorf("rawcheckpoint: acknowledge generation: prune remote objects: %w", err)
 		}
 		now := s.now().UTC().Format(time.RFC3339Nano)
@@ -555,6 +587,9 @@ func (s *Store) AcknowledgeGeneration(
 			SET predecessor_capture_id = NULL, updated_at = ?
 			WHERE predecessor_capture_id = ?`, now, captureID); err != nil {
 			return fmt.Errorf("rawcheckpoint: acknowledge generation: detach successor: %w", err)
+		}
+		if _, err := conn.ExecContext(ctx, `UPDATE backfill_members SET status='acknowledged',manifest_id=?,receipt=?,generation=?,error_class='' WHERE capture_id=? AND status='pending'`, commit.ManifestID, commit.Receipt, commit.Generation, captureID); err != nil {
+			return err
 		}
 		if _, err := conn.ExecContext(ctx,
 			`DELETE FROM outbox_generations WHERE capture_id = ?`, captureID); err != nil {
@@ -639,26 +674,33 @@ func loadCapturedEntriesConn(
 	}
 	rows.Close()
 	for i, ordinal := range ordinals {
-		objectRows, err := conn.QueryContext(ctx, `SELECT sha256, length
+		if err := func() error {
+			objectRows, err := conn.QueryContext(ctx, `SELECT sha256, length
 			FROM outbox_entry_objects WHERE capture_id = ? AND entry_ordinal = ?
 			ORDER BY object_ordinal`, captureID, ordinal)
-		if err != nil {
-			return nil, fmt.Errorf("rawcheckpoint: load captured objects: %w", err)
-		}
-		for objectRows.Next() {
-			var ref rawsync.ObjectRef
-			if err := objectRows.Scan(&ref.SHA256, &ref.Length); err != nil {
-				objectRows.Close()
-				return nil, fmt.Errorf("rawcheckpoint: load captured objects: %w", err)
+			if err != nil {
+				return fmt.Errorf("rawcheckpoint: load captured objects: %w", err)
 			}
-			entries[i].Objects = append(entries[i].Objects, ref)
-		}
-		if err := objectRows.Err(); err != nil {
-			objectRows.Close()
-			return nil, fmt.Errorf("rawcheckpoint: load captured objects: %w", err)
-		}
-		if err := objectRows.Close(); err != nil {
-			return nil, fmt.Errorf("rawcheckpoint: load captured objects: %w", err)
+			defer objectRows.Close()
+			for objectRows.Next() {
+				var ref rawsync.ObjectRef
+				if err := objectRows.Scan(&ref.SHA256, &ref.Length); err != nil {
+					objectRows.Close()
+					return fmt.Errorf("rawcheckpoint: load captured objects: %w", err)
+				}
+				entries[i].Objects = append(entries[i].Objects, ref)
+			}
+			if err := objectRows.Err(); err != nil {
+				objectRows.Close()
+				return fmt.Errorf("rawcheckpoint: load captured objects: %w", err)
+			}
+			if err := objectRows.Close(); err != nil {
+				return fmt.Errorf("rawcheckpoint: load captured objects: %w", err)
+			}
+
+			return nil
+		}(); err != nil {
+			return nil, err
 		}
 	}
 	return entries, nil
@@ -704,6 +746,7 @@ func releaseGenerationObjectsConn(ctx context.Context, conn *sql.Conn, captureID
 	if err != nil {
 		return fmt.Errorf("rawcheckpoint: release generation objects: %w", err)
 	}
+	defer rows.Close()
 	type referenced struct {
 		ref   rawsync.ObjectRef
 		count int64
@@ -734,7 +777,7 @@ func releaseGenerationObjectsConn(ctx context.Context, conn *sql.Conn, captureID
 		}
 		changed, err := result.RowsAffected()
 		if err != nil || changed != 1 {
-			return fmt.Errorf("rawcheckpoint: release generation object reference mismatch")
+			return errors.New("rawcheckpoint: release generation object reference mismatch")
 		}
 	}
 	return nil

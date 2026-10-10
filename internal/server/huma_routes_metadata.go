@@ -8,18 +8,22 @@ import (
 	"go.kenn.io/agentsview/internal/db"
 	"go.kenn.io/agentsview/internal/service"
 	"go.kenn.io/agentsview/internal/update"
+
+	"github.com/danielgtaylor/huma/v2"
 )
 
 func (s *Server) registerMetadataRoutes() {
-	group := newRouteGroup(s.api, "/api/v1", "Metadata")
+	group := huma.NewGroup(s.api, "/api/v1")
+	configureRouteGroup(group, "Metadata")
 
 	s.get(group, "/projects", "List projects", s.humaListProjects)
 	s.get(group, "/machines", "List machines", s.humaListMachines)
 	s.get(group, "/branches", "List branches", s.humaListBranches)
 	s.get(group, "/agents", "List agents", s.humaListAgents)
 	s.get(group, "/stats", "Get stats", s.humaGetStats)
-	s.get(group, "/session-stats", "Get session stats", s.humaGetSessionStats)
+	s.getLong(group, "/session-stats", "Get session stats", s.humaGetSessionStats)
 	s.get(group, "/version", "Get server version", s.humaGetVersion)
+	s.get(group, "/memory/status", "Get memory readiness", s.humaGetMemoryStatus)
 	s.get(group, "/update/check", "Check for updates", s.humaCheckUpdate)
 }
 
@@ -175,11 +179,27 @@ func (s *Server) humaGetVersion(
 ) (*jsonOutput[VersionInfo], error) {
 	version := s.version
 	version.InsightGenerationAvailable = supportsInsightGeneration(s.db)
+	_, version.SessionStatsAvailable = s.db.(*db.DB)
 	return &jsonOutput[VersionInfo]{Body: version}, nil
 }
 
+func (s *Server) humaGetMemoryStatus(
+	ctx context.Context,
+	_ *emptyInput,
+) (*jsonOutput[service.MemoryStatus], error) {
+	status, err := service.GetMemoryStatus(ctx, s.sessions)
+	if err != nil {
+		return nil, internalError("memory status error", err)
+	}
+	status.ServerVersion = s.version.Version
+	if _, local := s.db.(*db.DB); local && status.Archive.Identity == "" {
+		status.Archive.Identity = s.cfg.InstallationID
+	}
+	return &jsonOutput[service.MemoryStatus]{Body: status}, nil
+}
+
 func (s *Server) humaCheckUpdate(
-	_ context.Context,
+	ctx context.Context,
 	_ *emptyInput,
 ) (*jsonOutput[updateCheckResponse], error) {
 	if s.cfg.DisableUpdateCheck {
@@ -191,9 +211,9 @@ func (s *Server) humaCheckUpdate(
 	if checkFn == nil {
 		checkFn = update.CheckForUpdate
 	}
-	info, err := checkFn(s.version.Version, false, s.dataDir)
+	info, err := checkFn(ctx, s.version.Version, false, s.dataDir)
 	if err != nil || info == nil {
-		return &jsonOutput[updateCheckResponse]{
+		return &jsonOutput[updateCheckResponse]{ //nolint:nilerr // Optional update metadata falls back to the installed version.
 			Body: updateCheckResponse{CurrentVersion: s.version.Version},
 		}, nil
 	}

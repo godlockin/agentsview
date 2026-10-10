@@ -4,17 +4,20 @@ import { mount, tick, unmount } from "svelte";
 import { trends } from "../../stores/trends.svelte.js";
 import { settings } from "../../stores/settings.svelte.js";
 import { yokedDates } from "../../stores/yokedDates.svelte.js";
-import type { TrendsTermsResponse } from "../../api/types.js";
+import type { DbTrendsTermsResponse as TrendsTermsResponse } from "../../api/generated/index.js";
 import source from "./TrendsPage.svelte?raw";
 
 const mocks = vi.hoisted(() => ({
   getApiV1TrendsTerms: vi.fn(),
 }));
 
-vi.mock("../../api/runtime.js", () => ({
-  callGenerated: vi.fn((request: () => Promise<unknown>) => request()),
-  isAbortError: vi.fn(() => false),
-}));
+vi.mock("../../api/runtime.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../../api/runtime.js")>();
+  return {
+    ...actual,
+    isAbortError: vi.fn(() => false),
+  };
+});
 
 vi.mock("../../api/generated/index", () => ({
   TrendsService: {

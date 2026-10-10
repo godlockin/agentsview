@@ -53,7 +53,7 @@ func (s *Server) humaTrashSource(
 		return nil, internalError("trashing session source", err)
 	}
 
-	if err := s.db.SoftDeleteSession(in.ID); err != nil {
+	if err := s.db.SoftDeleteSession(ctx, in.ID); err != nil {
 		if handled := handleHumaReadOnly(err); handled != nil {
 			return nil, handled
 		}

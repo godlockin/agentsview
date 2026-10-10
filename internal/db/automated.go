@@ -68,9 +68,13 @@ const AutomationEvidencePrefixBytes = userPatternMaxLen
 
 // IsAutomatedSessionMetadata classifies durable provider-owned session
 // metadata that explicitly identifies an automated invocation.
-func IsAutomatedSessionMetadata(agent, sessionKind string) bool {
-	return agent == string(parser.AgentGrok) &&
-		sessionKind == parser.SessionKindNonInteractive
+func IsAutomatedSessionMetadata(sessionKind string) bool {
+	switch sessionKind {
+	case parser.SessionKindRoborev:
+		return true
+	default:
+		return false
+	}
 }
 
 var (

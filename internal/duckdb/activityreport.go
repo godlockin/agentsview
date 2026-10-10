@@ -13,17 +13,6 @@ import (
 	"go.kenn.io/agentsview/internal/money"
 )
 
-// activityReportRangeBoundsUTC returns the exact [start, end) UTC bounds
-// of the resolved range `q` as RFC3339 strings. It mirrors the SQLite and
-// PostgreSQL backends so the candidate-session predicate selects exactly
-// the sessions whose window intersects the range, with no padding slop.
-// DuckDB compares parsed instants (the bounds are cast to TIMESTAMP), so
-// it keeps the zone suffix, unlike SQLite's zone-less TEXT comparison.
-func activityReportRangeBoundsUTC(q activity.Query) (string, string) {
-	return q.RangeStart.UTC().Format(time.RFC3339),
-		q.RangeEnd.UTC().Format(time.RFC3339)
-}
-
 // GetActivityReport assembles a concurrency- and usage-oriented report
 // for the resolved range `q`, reading from the DuckDB store. It mirrors
 // the SQLite (*DB).GetActivityReport and PostgreSQL
@@ -58,10 +47,10 @@ func (s *Store) BuildActivityReportArtifacts(
 	q activity.Query,
 	onProgress activity.ProgressFunc,
 ) (activity.CandidateArtifacts, error) {
-	duckReportProgress(onProgress, activity.Progress{Phase: activity.ProgressLoadingSessions})
+	db.ReportProgress(onProgress, activity.Progress{Phase: activity.ProgressLoadingSessions})
 	f.IncludeSubagents = true
 	f.IncludeForks = true
-	rangeStartUTC, rangeEndUTC := activityReportRangeBoundsUTC(q)
+	rangeStartUTC, rangeEndUTC := db.ActivityReportInstantBoundsUTC(q)
 	lowerBound := duckUsagePaddedUTCBound(q.RangeStart.UTC().Format(time.RFC3339), -14)
 	upperBound := duckUsagePaddedUTCBound(q.RangeEnd.UTC().Format(time.RFC3339), 14)
 
@@ -70,7 +59,7 @@ func (s *Store) BuildActivityReportArtifacts(
 	if err != nil {
 		return activity.CandidateArtifacts{}, err
 	}
-	duckReportProgress(onProgress, activity.Progress{
+	db.ReportProgress(onProgress, activity.Progress{
 		Phase: activity.ProgressLoadingUsage, SessionsTotal: len(sessions),
 	})
 
@@ -93,12 +82,12 @@ func (s *Store) BuildActivityReportArtifacts(
 	}, sessions, func(
 		ctx context.Context, yield func(activity.IntervalCandidate) error,
 	) error {
-		duckReportProgress(onProgress, activity.Progress{
+		db.ReportProgress(onProgress, activity.Progress{
 			Phase: activity.ProgressScanningActivity, SessionsTotal: len(sessions),
 		})
 		return source(ctx, func(candidate activity.IntervalCandidate) error {
 			rowsProcessed++
-			duckReportProgress(onProgress, activity.Progress{
+			db.ReportProgress(onProgress, activity.Progress{
 				Phase:         activity.ProgressScanningActivity,
 				SessionsTotal: len(sessions), RowsProcessed: rowsProcessed,
 			})
@@ -108,14 +97,17 @@ func (s *Store) BuildActivityReportArtifacts(
 	if err != nil {
 		return activity.CandidateArtifacts{}, fmt.Errorf("aggregating duckdb activity report: %w", err)
 	}
-	duckReportProgress(onProgress, activity.Progress{
+	if err := s.activityReportMessageCounts(ctx, ids, q, &artifacts); err != nil {
+		return activity.CandidateArtifacts{}, err
+	}
+	db.ReportProgress(onProgress, activity.Progress{
 		Phase: activity.ProgressFinalizing, SessionsTotal: len(sessions),
 		SessionsProcessed: len(sessions), RowsProcessed: rowsProcessed,
 	})
 	artifacts.Report.SchemaVersion = export.ActivityReportSchemaVersion
 	artifacts.Report.Pricing = pricing
 	projects, err := s.BuildProjectIdentityMap(ctx,
-		activityReportProjectLabels(sessions))
+		db.ActivityReportProjectLabels(sessions))
 	if err != nil {
 		return activity.CandidateArtifacts{}, err
 	}
@@ -124,17 +116,40 @@ func (s *Store) BuildActivityReportArtifacts(
 	artifacts.Sessions = artifacts.Report.BySession
 	artifacts.Report.BySession = []activity.SessionRow{}
 	artifacts.Report.Projects = export.ProjectMapForWire(projects)
-	duckReportProgress(onProgress, activity.Progress{
+	db.ReportProgress(onProgress, activity.Progress{
 		Phase: activity.ProgressDone, SessionsTotal: len(sessions),
 		SessionsProcessed: len(sessions), RowsProcessed: rowsProcessed,
 	})
 	return artifacts, nil
 }
 
-func duckReportProgress(callback activity.ProgressFunc, progress activity.Progress) {
-	if callback != nil {
-		callback(progress)
+func (s *Store) activityReportMessageCounts(
+	ctx context.Context, ids []string, q activity.Query, artifacts *activity.CandidateArtifacts,
+) error {
+	if len(ids) == 0 {
+		return nil
 	}
+	rows, err := s.queryContext(ctx, `
+		SELECT session_id, role, timestamp FROM messages
+		WHERE session_id IN (SELECT unnest(?))
+			AND role IN ('user', 'assistant') AND is_system = false
+			AND COALESCE(source_subtype, '') <> 'tool_result'
+			AND timestamp >= CAST(? AS TIMESTAMP) AND timestamp < CAST(? AS TIMESTAMP)`,
+		ids, q.RangeStart.UTC().Format(time.RFC3339Nano), q.EffectiveEnd.UTC().Format(time.RFC3339Nano))
+	if err != nil {
+		return fmt.Errorf("querying duckdb activity message counts: %w", err)
+	}
+	defer rows.Close()
+	counts := activity.NewMessageAccumulator(q, artifacts)
+	for rows.Next() {
+		var sessionID, role string
+		var timestamp time.Time
+		if err := rows.Scan(&sessionID, &role, &timestamp); err != nil {
+			return fmt.Errorf("scanning duckdb activity message counts: %w", err)
+		}
+		counts.Add(sessionID, role, timestamp)
+	}
+	return rows.Err()
 }
 
 // GetSessionUsageRows returns the backend-priced usage rows for the supplied
@@ -293,21 +308,18 @@ func (s *Store) GetSessionUsageRows(
 			o.scan.webSearchRequests)
 		rawOutputTokensBySession[o.scan.sessionID] += o.scan.outputTok
 	}
-	canonicalTokenCoverageBySession, err :=
-		activity.CanonicalSessionTokenCoverageContext(ctx, snapshotRows)
+	canonicalTokenCoverageBySession, err := activity.CanonicalSessionTokenCoverageContext(ctx, snapshotRows)
 	if err != nil {
 		return nil, err
 	}
-	snapshotMask, snapshotAttribution, snapshotWebSearchRequests :=
-		activity.ClaudeSnapshotSurvivorSelection(snapshotRows)
+	snapshotMask, snapshotAttribution, snapshotWebSearchRequests := activity.ClaudeSnapshotSurvivorSelection(snapshotRows)
 	seen := make(map[string]struct{})
 	deduplicatedOutputTokens := make(map[string]int)
 	discardedContributingSessions := make(map[string]struct{})
 	out := make([]activity.UsageRow, 0, len(rowsAcc))
 	for i, o := range rowsAcc {
 		if !snapshotMask[i] {
-			deduplicatedOutputTokens[o.scan.sessionID] +=
-				snapshotRows[i].OutputTokens
+			deduplicatedOutputTokens[o.scan.sessionID] += snapshotRows[i].OutputTokens
 			if rowContributes[i] {
 				discardedContributingSessions[o.scan.sessionID] = struct{}{}
 			}
@@ -332,8 +344,7 @@ func (s *Store) GetSessionUsageRows(
 			}
 			seen[key] = struct{}{}
 		}
-		cost, costSource, priced, contributes, sessionCost, priceErr :=
-			duckActivityUsageCost(r, rateResolver)
+		cost, costSource, priced, contributes, sessionCost, priceErr := duckActivityUsageCost(r, rateResolver)
 		if priceErr != nil {
 			return nil, priceErr
 		}
@@ -424,14 +435,6 @@ func duckSessionUsageRowLess(
 		return a.scan.usageDedupKey < b.scan.usageDedupKey
 	}
 	return !a.validTS && a.scan.ts < b.scan.ts
-}
-
-func activityReportProjectLabels(sessions []activity.SessionMeta) []string {
-	set := make(map[string]bool, len(sessions))
-	for _, session := range sessions {
-		set[session.Project] = true
-	}
-	return sortedBoolKeys(set)
 }
 
 // activityReportSessions returns the candidate sessions whose window
@@ -690,6 +693,7 @@ func (s *Store) activityReportCandidateSource(
 		if err != nil {
 			return fmt.Errorf("querying duckdb activity report terminal candidates: %w", err)
 		}
+		defer terminalRows.Close()
 		var terminal []activity.IntervalCandidate
 		for terminalRows.Next() {
 			candidate, scanErr := scanCandidate(terminalRows)
@@ -922,10 +926,9 @@ func (s *Store) activityReportUsage(
 	for i, o := range rowsAcc {
 		baseRows[i] = o.row
 	}
-	mask, attribution, webSearchRequests :=
-		activity.UsageSurvivorSelectionForSessions(
-			q.RangeStart, q.RangeEnd, q.EffectiveEnd, baseRows, ids,
-		)
+	mask, attribution, webSearchRequests := activity.UsageSurvivorSelectionForSessions(
+		q.RangeStart, q.RangeEnd, q.EffectiveEnd, baseRows, ids,
+	)
 	out = make([]activity.UsageRow, 0, len(rowsAcc))
 	for i, o := range rowsAcc {
 		if !mask[i] {
@@ -933,8 +936,7 @@ func (s *Store) activityReportUsage(
 		}
 		costRow := o.scan
 		costRow.webSearchRequests = webSearchRequests[i]
-		cost, costSource, priced, contributes, sessionCost, priceErr :=
-			duckActivityUsageCost(costRow, rateResolver)
+		cost, costSource, priced, contributes, sessionCost, priceErr := duckActivityUsageCost(costRow, rateResolver)
 		if priceErr != nil {
 			return nil, nil, priceErr
 		}
@@ -1183,7 +1185,8 @@ func duckActivityUsageHasOrdinal(v any) bool {
 func duckActivityUsageCost(
 	r duckActivityReportUsageRow, pricing *export.PricingResolver,
 ) (cost money.Money, costSource export.CostSource, priced, contributes bool,
-	sessionCost *money.Money, err error) {
+	sessionCost *money.Money, err error,
+) {
 	costRow := r
 	if r.costSource == db.CopilotReportedCostSource && r.cost != nil {
 		v := money.Money{Microdollars: *r.cost}
@@ -1191,8 +1194,7 @@ func duckActivityUsageCost(
 		costRow.cost = nil
 		pricing.RecordUnattributedReported()
 	}
-	_, cost, priced, contributes, err =
-		duckActivityReportRowStatus(costRow, pricing)
+	_, cost, priced, contributes, err = duckActivityReportRowStatus(costRow, pricing)
 	costSource = export.CostSourceComputed
 	if costRow.cost != nil {
 		costSource = export.CostSourceReported

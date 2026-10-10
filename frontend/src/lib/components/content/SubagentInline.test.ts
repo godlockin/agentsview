@@ -1,4 +1,5 @@
 // @vitest-environment jsdom
+import { SessionsService } from "../../api/generated/index";
 import { afterEach, describe, expect, it, vi } from "vite-plus/test";
 import { mount, tick, unmount } from "svelte";
 import type { Session } from "../../api/types.js";
@@ -6,17 +7,19 @@ import { setLocale } from "../../i18n/index.js";
 // @ts-ignore
 import SubagentInline from "./SubagentInline.svelte";
 
-const { getMessages, getSession, childSessions, callGenerated } = vi.hoisted(() => ({
+const { getMessages, getSession, childSessions } = vi.hoisted(() => ({
   getMessages: vi.fn(),
   getSession: vi.fn(),
   childSessions: new Map<string, Session>(),
-  callGenerated: vi.fn((request: () => Promise<unknown>, _signal?: AbortSignal) => request()),
 }));
 
-vi.mock("../../api/runtime.js", () => ({
-  callGenerated,
-  isAbortError: vi.fn(() => false),
-}));
+vi.mock("../../api/runtime.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../../api/runtime.js")>();
+  return {
+    ...actual,
+    isAbortError: vi.fn(() => false),
+  };
+});
 
 vi.mock("../../api/generated/index", () => ({
   SessionsService: {
@@ -43,6 +46,17 @@ vi.mock("../../stores/router.svelte.js", () => ({
 
 function makeSession(overrides: Partial<Session> = {}): Session {
   return {
+    compaction_count: 0,
+    consecutive_failure_max: 0,
+    edit_churn_count: 0,
+    ended_with_role: "",
+    final_failure_streak: 0,
+    mid_task_compaction_count: 0,
+    outcome: "",
+    outcome_confidence: "",
+    secret_leak_count: 0,
+    tool_failure_signal_count: 0,
+    tool_retry_count: 0,
     id: "subagent-session-id",
     project: "proj-a",
     machine: "mac",
@@ -67,20 +81,12 @@ afterEach(() => {
   childSessions.clear();
   getMessages.mockReset();
   getSession.mockReset();
-  callGenerated.mockReset();
-  callGenerated.mockImplementation((request: () => Promise<unknown>, _signal?: AbortSignal) =>
-    request(),
-  );
+
   document.body.innerHTML = "";
 });
 
 describe("SubagentInline", () => {
   it("aborts the nested read when collapsed", async () => {
-    const signals: AbortSignal[] = [];
-    callGenerated.mockImplementation((request, signal) => {
-      signals.push(signal as AbortSignal);
-      return request();
-    });
     getMessages.mockImplementationOnce(() => new Promise(() => {}));
     getSession.mockImplementationOnce(() => new Promise(() => {}));
     const component = mount(SubagentInline, {
@@ -95,8 +101,22 @@ describe("SubagentInline", () => {
     toggle.click();
     await tick();
 
-    expect(signals).toHaveLength(2);
-    expect(signals.every((signal) => signal.aborted)).toBe(true);
+    expect([
+      ...vi
+        .mocked(SessionsService.getApiV1SessionsByIdMessages)
+        .mock.calls.map((call) => call[2]?.signal),
+      ...vi.mocked(SessionsService.getApiV1SessionsById).mock.calls.map((call) => call[1]?.signal),
+    ]).toHaveLength(2);
+    expect(
+      [
+        ...vi
+          .mocked(SessionsService.getApiV1SessionsByIdMessages)
+          .mock.calls.map((call) => call[2]?.signal),
+        ...vi
+          .mocked(SessionsService.getApiV1SessionsById)
+          .mock.calls.map((call) => call[1]?.signal),
+      ].every((signal) => signal?.aborted),
+    ).toBe(true);
     unmount(component);
   });
 

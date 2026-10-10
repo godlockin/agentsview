@@ -3,6 +3,7 @@ package parser
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -209,7 +210,7 @@ func zcodeSessionMeta(
 	}
 	defer db.Close()
 	row, err := loadZCodeSessionRow(ctx, db, sessionID)
-	if err == sql.ErrNoRows {
+	if errors.Is(err, sql.ErrNoRows) {
 		return dbBackedSessionMeta{}, false, nil
 	}
 	if err != nil {
@@ -249,12 +250,10 @@ func parseZCodeSession(
 }
 
 func openZCodeDB(dbPath string, stableSnapshot bool) (*sql.DB, error) {
-	immutable := "0"
-	if stableSnapshot {
-		immutable = "1"
-	}
-	dsn := "file:" + sqliteURIPath(dbPath) + "?mode=ro&immutable=" + immutable + "&_busy_timeout=3000"
-	db, err := sql.Open("sqlite3", dsn)
+	db, err := openSQLiteReadOnly(dbPath, sqliteReadOptions{
+		stableSnapshot: stableSnapshot,
+		busyTimeoutMS:  3000,
+	})
 	if err != nil {
 		return nil, fmt.Errorf("opening zcode db %s: %w", dbPath, err)
 	}
@@ -789,6 +788,15 @@ func listZCodeUsageEvents(
 	sessionID string,
 	startedAt, endedAt time.Time,
 ) ([]ParsedUsageEvent, error) {
+	var hasUsage bool
+	if err := db.QueryRowContext(ctx,
+		`SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = 'model_usage')`,
+	).Scan(&hasUsage); err != nil {
+		return nil, fmt.Errorf("checking zcode usage table: %w", err)
+	}
+	if !hasUsage {
+		return nil, nil
+	}
 	rows, err := db.QueryContext(ctx, `
 		SELECT session_id,
 		       CAST(turn_id AS TEXT),
@@ -824,9 +832,6 @@ func listZCodeUsageEvents(
 		       COALESCE(tool_call_count, 0)
 	`, sessionID)
 	if err != nil {
-		if strings.Contains(err.Error(), "no such table: model_usage") {
-			return nil, nil
-		}
 		return nil, fmt.Errorf("listing zcode usage rows for %s: %w", sessionID, err)
 	}
 	defer rows.Close()
@@ -955,10 +960,8 @@ func zcodeSessionFileMtime(
 	// provider's own read connection included, so folding its mtime into the
 	// fingerprint made every scan report the whole container as changed.
 	// Content changes always touch the main file or the -wal sibling.
-	for _, path := range []string{dbPath, dbPath + "-wal"} {
-		if info, err := os.Stat(path); err == nil {
-			maxMtime = max(maxMtime, info.ModTime().UnixNano())
-		}
+	if physicalMtime, err := sqliteDBCompositeMtime(dbPath, sqliteDBJournalSuffixes); err == nil {
+		maxMtime = max(maxMtime, physicalMtime)
 	}
 	return maxMtime, nil
 }

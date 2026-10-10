@@ -11,6 +11,7 @@ import (
 	"go.kenn.io/agentsview/internal/db"
 	"go.kenn.io/agentsview/internal/parser"
 	"go.kenn.io/agentsview/internal/timeutil"
+	"go.kenn.io/kit/atomicfile"
 )
 
 type stagedUpload struct {
@@ -86,9 +87,7 @@ func commitUpload(upload stagedUpload) (committedUpload, error) {
 	switch {
 	case err == nil:
 		if !info.Mode().IsRegular() {
-			return state, fmt.Errorf(
-				"committing upload: destination is not a regular file",
-			)
+			return state, errors.New("committing upload: destination is not a regular file")
 		}
 		backupPath, err := createUploadBackupPath(upload.finalPath)
 		if err != nil {
@@ -96,7 +95,7 @@ func commitUpload(upload stagedUpload) (committedUpload, error) {
 		}
 		state.backupPath = backupPath
 		state.hadPrevious = true
-		if err := os.Rename(upload.finalPath, backupPath); err != nil {
+		if err := atomicfile.Replace(upload.finalPath, backupPath); err != nil {
 			return state, fmt.Errorf(
 				"backing up existing upload: %w", err,
 			)
@@ -108,11 +107,11 @@ func commitUpload(upload stagedUpload) (committedUpload, error) {
 		)
 	}
 
-	if err := os.Rename(upload.tempPath, upload.finalPath); err != nil {
+	if err := atomicfile.Replace(upload.tempPath, upload.finalPath); err != nil {
 		if state.hadPrevious {
-			if rbErr := os.Rename(state.backupPath, upload.finalPath); rbErr != nil {
+			if rbErr := atomicfile.Replace(state.backupPath, upload.finalPath); rbErr != nil {
 				return state, fmt.Errorf(
-					"committing upload: %w (restore previous upload failed: %v)",
+					"committing upload: %w (restore previous upload failed: %w)",
 					err, rbErr,
 				)
 			}
@@ -153,7 +152,7 @@ func rollbackCommittedUpload(upload committedUpload) error {
 		return fmt.Errorf("removing committed upload: %w", err)
 	}
 	if upload.hadPrevious {
-		if err := os.Rename(upload.backupPath, upload.finalPath); err != nil {
+		if err := atomicfile.Replace(upload.backupPath, upload.finalPath); err != nil {
 			return fmt.Errorf("restoring previous upload: %w", err)
 		}
 	}

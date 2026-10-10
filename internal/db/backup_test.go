@@ -36,7 +36,7 @@ func TestBackupArchiveToProducesOpenableSnapshot(t *testing.T) {
 	require.NoError(t, err)
 	assert.Greater(t, info.Size(), int64(0))
 
-	restored, err := OpenReadOnly(snapshot)
+	restored, err := OpenReadOnly(ctx, snapshot)
 	require.NoError(t, err)
 	defer restored.Close()
 

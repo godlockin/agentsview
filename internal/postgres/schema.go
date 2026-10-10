@@ -15,10 +15,12 @@ import (
 	"go.kenn.io/agentsview/internal/parser"
 )
 
-const tokenCoverageRepairMetadataKey = "token_coverage_repair_v1"
-const sourceCurationBackfillMetadataKey = "source_curation_baseline_backfill_v1"
-const projectIdentityRemoteScrubMetadataKey = "git_remote_credentials_scrub_v1"
-const tokenCoverageBackfillBatchSize = 1000
+const (
+	tokenCoverageRepairMetadataKey        = "token_coverage_repair_v1"
+	sourceCurationBackfillMetadataKey     = "source_curation_baseline_backfill_v1"
+	projectIdentityRemoteScrubMetadataKey = "git_remote_credentials_scrub_v1"
+	tokenCoverageBackfillBatchSize        = 1000
+)
 
 type columnMigration struct {
 	table  string
@@ -136,6 +138,7 @@ CREATE TABLE IF NOT EXISTS sessions (
     machine            TEXT NOT NULL,
     owner_marker       TEXT NOT NULL DEFAULT '',
     project            TEXT NOT NULL,
+    project_assigned   BOOLEAN NOT NULL DEFAULT FALSE,
     agent              TEXT NOT NULL,
     agent_label        TEXT NOT NULL DEFAULT '',
     entrypoint         TEXT NOT NULL DEFAULT '',
@@ -350,7 +353,7 @@ CREATE TABLE IF NOT EXISTS model_pricing (
 CREATE TABLE IF NOT EXISTS model_pricing_bands (
     model_pattern TEXT NOT NULL
         REFERENCES model_pricing(model_pattern) ON DELETE CASCADE,
-    above_input_tokens BIGINT NOT NULL CHECK (above_input_tokens > 0),
+    above_input_tokens BIGINT NOT NULL,
     input_microdollars_per_mtok BIGINT NOT NULL,
     output_microdollars_per_mtok BIGINT NOT NULL,
     cache_creation_microdollars_per_mtok BIGINT NOT NULL,
@@ -361,10 +364,10 @@ CREATE TABLE IF NOT EXISTS model_pricing_bands (
 );
 
 CREATE TABLE IF NOT EXISTS genai_pricing (
-    singleton SMALLINT PRIMARY KEY CHECK (singleton = 1),
+    singleton SMALLINT PRIMARY KEY,
     version TEXT NOT NULL,
     source_ref TEXT NOT NULL DEFAULT '',
-    source TEXT NOT NULL CHECK (source IN ('embedded', 'fetched')),
+    source TEXT NOT NULL,
     data_json BYTEA NOT NULL,
     updated_at TEXT NOT NULL DEFAULT ''
 );
@@ -780,7 +783,8 @@ func rekeyMigratedCursorUsageEventsPG(ctx context.Context, tx *sql.Tx) error {
 	}
 	var lastID int64
 	for {
-		rows, err := tx.QueryContext(ctx, `
+		updates, err := func() ([]keyUpdate, error) {
+			rows, err := tx.QueryContext(ctx, `
 			SELECT id, occurred_at, model, kind,
 				input_tokens, output_tokens, cache_write_tokens, cache_read_tokens,
 				charged_microdollars, cursor_token_fee_microdollars,
@@ -789,35 +793,41 @@ func rekeyMigratedCursorUsageEventsPG(ctx context.Context, tx *sql.Tx) error {
 			WHERE id > $1
 			ORDER BY id
 			LIMIT 1000`, lastID)
-		if err != nil {
-			return fmt.Errorf("querying migrated PG cursor usage keys: %w", err)
-		}
-		updates := make([]keyUpdate, 0, 1000)
-		for rows.Next() {
-			var id int64
-			var occurredAt time.Time
-			var ev db.CursorUsageEvent
-			if err := rows.Scan(
-				&id, &occurredAt, &ev.Model, &ev.Kind,
-				&ev.InputTokens, &ev.OutputTokens,
-				&ev.CacheWriteTokens, &ev.CacheReadTokens,
-				&ev.Charged.Microdollars, &ev.CursorTokenFee.Microdollars,
-				&ev.UserID, &ev.UserEmail, &ev.IsHeadless,
-			); err != nil {
-				rows.Close()
-				return fmt.Errorf("scanning migrated PG cursor usage key: %w", err)
+			if err != nil {
+				return nil, fmt.Errorf("querying migrated PG cursor usage keys: %w", err)
 			}
-			ev.OccurredAt = occurredAt.UTC().Format(time.RFC3339Nano)
-			updates = append(updates, keyUpdate{
-				id: id, key: db.CursorUsageEventDedupKey(ev),
-			})
-		}
-		if err := rows.Err(); err != nil {
-			rows.Close()
-			return fmt.Errorf("iterating migrated PG cursor usage keys: %w", err)
-		}
-		if err := rows.Close(); err != nil {
-			return fmt.Errorf("closing migrated PG cursor usage keys: %w", err)
+			defer rows.Close()
+			updates := make([]keyUpdate, 0, 1000)
+			for rows.Next() {
+				var id int64
+				var occurredAt time.Time
+				var ev db.CursorUsageEvent
+				if err := rows.Scan(
+					&id, &occurredAt, &ev.Model, &ev.Kind,
+					&ev.InputTokens, &ev.OutputTokens,
+					&ev.CacheWriteTokens, &ev.CacheReadTokens,
+					&ev.Charged.Microdollars, &ev.CursorTokenFee.Microdollars,
+					&ev.UserID, &ev.UserEmail, &ev.IsHeadless,
+				); err != nil {
+					rows.Close()
+					return nil, fmt.Errorf("scanning migrated PG cursor usage key: %w", err)
+				}
+				ev.OccurredAt = occurredAt.UTC().Format(time.RFC3339Nano)
+				updates = append(updates, keyUpdate{
+					id: id, key: db.CursorUsageEventDedupKey(ev),
+				})
+			}
+			if err := rows.Err(); err != nil {
+				rows.Close()
+				return nil, fmt.Errorf("iterating migrated PG cursor usage keys: %w", err)
+			}
+			if err := rows.Close(); err != nil {
+				return nil, fmt.Errorf("closing migrated PG cursor usage keys: %w", err)
+			}
+			return updates, nil
+		}()
+		if err != nil {
+			return err
 		}
 		if len(updates) == 0 {
 			break
@@ -906,6 +916,28 @@ func ensureUsageJSONHelper(ctx context.Context, db *sql.DB) error {
 	return nil
 }
 
+// lockSyncMetadataRow holds a row lock on the sync_metadata row named key
+// until tx ends, creating the row first if needed. A row lock is used instead
+// of pg_advisory_xact_lock because supported CockroachDB versions do not
+// implement advisory locks, and sync_metadata lives in the target schema, so
+// the lock is schema-scoped.
+func lockSyncMetadataRow(ctx context.Context, tx *sql.Tx, key string) error {
+	if _, err := tx.ExecContext(ctx,
+		`INSERT INTO sync_metadata (key, value) VALUES ($1, '')
+		 ON CONFLICT (key) DO NOTHING`,
+		key,
+	); err != nil {
+		return fmt.Errorf("creating sync_metadata lock row %q: %w", key, err)
+	}
+	if _, err := tx.ExecContext(ctx,
+		`SELECT value FROM sync_metadata WHERE key = $1 FOR UPDATE`,
+		key,
+	); err != nil {
+		return fmt.Errorf("locking sync_metadata row %q: %w", key, err)
+	}
+	return nil
+}
+
 // EnsureSchema creates the schema (if needed), then runs
 // idempotent CREATE TABLE / ALTER TABLE statements. The schema
 // parameter is the unquoted schema name (e.g. "agentsview").
@@ -954,443 +986,7 @@ func EnsureSchema(
 	)
 
 	// Idempotent column additions for forward compatibility.
-	alters := []columnMigration{
-		{
-			"model_pricing", "cache_creation_1h_microdollars_per_mtok",
-			`cache_creation_1h_microdollars_per_mtok BIGINT NOT NULL DEFAULT 0`,
-			"adding model_pricing.cache_creation_1h_microdollars_per_mtok",
-		},
-		{
-			"model_pricing_bands", "cache_creation_1h_microdollars_per_mtok",
-			`cache_creation_1h_microdollars_per_mtok BIGINT NOT NULL DEFAULT 0`,
-			"adding model_pricing_bands.cache_creation_1h_microdollars_per_mtok",
-		},
-		{
-			"sessions", "transcript_revision",
-			`transcript_revision TEXT NOT NULL DEFAULT '0'`,
-			"adding sessions.transcript_revision",
-		},
-		{
-			"sessions", "owner_marker",
-			`owner_marker TEXT NOT NULL DEFAULT ''`,
-			"adding sessions.owner_marker",
-		},
-		{
-			"sessions", "deleted_at",
-			`deleted_at TIMESTAMPTZ`,
-			"adding sessions.deleted_at",
-		},
-		{
-			"sessions", "created_at",
-			`created_at TIMESTAMPTZ`,
-			"adding sessions.created_at",
-		},
-		{
-			"sessions", "source_display_name",
-			`source_display_name TEXT`,
-			"adding sessions.source_display_name",
-		},
-		{
-			"sessions", "source_deleted_at",
-			`source_deleted_at TIMESTAMPTZ`,
-			"adding sessions.source_deleted_at",
-		},
-		{
-			"sessions", "deletion_cause",
-			`deletion_cause TEXT`,
-			"adding sessions.deletion_cause",
-		},
-		{
-			"sessions", "parser_parent_session_id",
-			`parser_parent_session_id TEXT`,
-			"adding sessions.parser_parent_session_id",
-		},
-		{
-			"sessions", "total_output_tokens",
-			`total_output_tokens INT NOT NULL DEFAULT 0`,
-			"adding sessions.total_output_tokens",
-		},
-		{
-			"sessions", "peak_context_tokens",
-			`peak_context_tokens INT NOT NULL DEFAULT 0`,
-			"adding sessions.peak_context_tokens",
-		},
-		{
-			"sessions", "has_total_output_tokens",
-			`has_total_output_tokens BOOLEAN NOT NULL DEFAULT FALSE`,
-			"adding sessions.has_total_output_tokens",
-		},
-		{
-			"sessions", "has_peak_context_tokens",
-			`has_peak_context_tokens BOOLEAN NOT NULL DEFAULT FALSE`,
-			"adding sessions.has_peak_context_tokens",
-		},
-		{
-			"messages", "model",
-			`model TEXT NOT NULL DEFAULT ''`,
-			"adding messages.model",
-		},
-		{
-			"messages", "reasoning_effort",
-			`reasoning_effort TEXT NOT NULL DEFAULT ''`,
-			"adding messages.reasoning_effort",
-		},
-		{
-			"messages", "token_usage",
-			`token_usage TEXT NOT NULL DEFAULT ''`,
-			"adding messages.token_usage",
-		},
-		{
-			"messages", "context_tokens",
-			`context_tokens INT NOT NULL DEFAULT 0`,
-			"adding messages.context_tokens",
-		},
-		{
-			"messages", "output_tokens",
-			`output_tokens INT NOT NULL DEFAULT 0`,
-			"adding messages.output_tokens",
-		},
-		{
-			"messages", "provider_id",
-			`provider_id TEXT NOT NULL DEFAULT ''`,
-			"adding messages.provider_id",
-		},
-		{
-			"usage_events", "provider_id",
-			`provider_id TEXT NOT NULL DEFAULT ''`,
-			"adding usage_events.provider_id",
-		},
-		{
-			"messages", "has_context_tokens",
-			`has_context_tokens BOOLEAN NOT NULL DEFAULT FALSE`,
-			"adding messages.has_context_tokens",
-		},
-		{
-			"messages", "has_output_tokens",
-			`has_output_tokens BOOLEAN NOT NULL DEFAULT FALSE`,
-			"adding messages.has_output_tokens",
-		},
-		{
-			"messages", "claude_message_id",
-			`claude_message_id TEXT NOT NULL DEFAULT ''`,
-			"adding messages.claude_message_id",
-		},
-		{
-			"messages", "claude_request_id",
-			`claude_request_id TEXT NOT NULL DEFAULT ''`,
-			"adding messages.claude_request_id",
-		},
-		{
-			"tool_calls", "call_index",
-			`call_index INT NOT NULL DEFAULT 0`,
-			"adding tool_calls.call_index",
-		},
-		{
-			"tool_calls", "file_path",
-			`file_path TEXT`,
-			"adding tool_calls.file_path",
-		},
-		{
-			"sessions", "prompt_evidence_discarded",
-			`prompt_evidence_discarded BOOLEAN NOT NULL DEFAULT FALSE`,
-			"adding sessions.prompt_evidence_discarded",
-		},
-		{
-			"sessions", "is_automated",
-			`is_automated BOOLEAN NOT NULL DEFAULT FALSE`,
-			"adding sessions.is_automated",
-		},
-		{
-			"sessions", "tool_failure_signal_count",
-			`tool_failure_signal_count INT NOT NULL DEFAULT 0`,
-			"adding sessions.tool_failure_signal_count",
-		},
-		{
-			"sessions", "tool_retry_count",
-			`tool_retry_count INT NOT NULL DEFAULT 0`,
-			"adding sessions.tool_retry_count",
-		},
-		{
-			"sessions", "edit_churn_count",
-			`edit_churn_count INT NOT NULL DEFAULT 0`,
-			"adding sessions.edit_churn_count",
-		},
-		{
-			"sessions", "consecutive_failure_max",
-			`consecutive_failure_max INT NOT NULL DEFAULT 0`,
-			"adding sessions.consecutive_failure_max",
-		},
-		{
-			"sessions", "outcome",
-			`outcome TEXT NOT NULL DEFAULT 'unknown'`,
-			"adding sessions.outcome",
-		},
-		{
-			"sessions", "outcome_confidence",
-			`outcome_confidence TEXT NOT NULL DEFAULT 'low'`,
-			"adding sessions.outcome_confidence",
-		},
-		{
-			"sessions", "ended_with_role",
-			`ended_with_role TEXT NOT NULL DEFAULT ''`,
-			"adding sessions.ended_with_role",
-		},
-		{
-			"sessions", "final_failure_streak",
-			`final_failure_streak INT NOT NULL DEFAULT 0`,
-			"adding sessions.final_failure_streak",
-		},
-		{
-			"sessions", "signals_pending_since",
-			`signals_pending_since TEXT`,
-			"adding sessions.signals_pending_since",
-		},
-		{
-			"sessions", "compaction_count",
-			`compaction_count INT NOT NULL DEFAULT 0`,
-			"adding sessions.compaction_count",
-		},
-		{
-			"sessions", "mid_task_compaction_count",
-			`mid_task_compaction_count INT NOT NULL DEFAULT 0`,
-			"adding sessions.mid_task_compaction_count",
-		},
-		{
-			"sessions", "context_pressure_max",
-			`context_pressure_max DOUBLE PRECISION`,
-			"adding sessions.context_pressure_max",
-		},
-		{
-			"sessions", "health_score",
-			`health_score INT`,
-			"adding sessions.health_score",
-		},
-		{
-			"sessions", "health_grade",
-			`health_grade TEXT`,
-			"adding sessions.health_grade",
-		},
-		{
-			"sessions", "has_tool_calls",
-			`has_tool_calls BOOLEAN NOT NULL DEFAULT FALSE`,
-			"adding sessions.has_tool_calls",
-		},
-		{
-			"sessions", "has_context_data",
-			`has_context_data BOOLEAN NOT NULL DEFAULT FALSE`,
-			"adding sessions.has_context_data",
-		},
-		{
-			"sessions", "quality_signal_version",
-			`quality_signal_version INT NOT NULL DEFAULT 0`,
-			"adding sessions.quality_signal_version",
-		},
-		{
-			"sessions", "short_prompt_count",
-			`short_prompt_count INT NOT NULL DEFAULT 0`,
-			"adding sessions.short_prompt_count",
-		},
-		{
-			"sessions", "unstructured_start",
-			`unstructured_start BOOLEAN NOT NULL DEFAULT FALSE`,
-			"adding sessions.unstructured_start",
-		},
-		{
-			"sessions", "missing_success_criteria_count",
-			`missing_success_criteria_count INT NOT NULL DEFAULT 0`,
-			"adding sessions.missing_success_criteria_count",
-		},
-		{
-			"sessions", "missing_verification_count",
-			`missing_verification_count INT NOT NULL DEFAULT 0`,
-			"adding sessions.missing_verification_count",
-		},
-		{
-			"sessions", "duplicate_prompt_count",
-			`duplicate_prompt_count INT NOT NULL DEFAULT 0`,
-			"adding sessions.duplicate_prompt_count",
-		},
-		{
-			"sessions", "no_code_context_count",
-			`no_code_context_count INT NOT NULL DEFAULT 0`,
-			"adding sessions.no_code_context_count",
-		},
-		{
-			"sessions", "runaway_tool_loop_count",
-			`runaway_tool_loop_count INT NOT NULL DEFAULT 0`,
-			"adding sessions.runaway_tool_loop_count",
-		},
-		{
-			"sessions", "data_version",
-			`data_version INT NOT NULL DEFAULT 0`,
-			"adding sessions.data_version",
-		},
-		{
-			"sessions", "cwd",
-			`cwd TEXT NOT NULL DEFAULT ''`,
-			"adding sessions.cwd",
-		},
-		{
-			"sessions", "git_branch",
-			`git_branch TEXT NOT NULL DEFAULT ''`,
-			"adding sessions.git_branch",
-		},
-		{
-			"sessions", "source_session_id",
-			`source_session_id TEXT NOT NULL DEFAULT ''`,
-			"adding sessions.source_session_id",
-		},
-		{
-			"sessions", "source_version",
-			`source_version TEXT NOT NULL DEFAULT ''`,
-			"adding sessions.source_version",
-		},
-		{
-			"sessions", "transcript_fidelity",
-			`transcript_fidelity TEXT NOT NULL DEFAULT ''`,
-			"adding sessions.transcript_fidelity",
-		},
-		{
-			"sessions", "parser_malformed_lines",
-			`parser_malformed_lines INT NOT NULL DEFAULT 0`,
-			"adding sessions.parser_malformed_lines",
-		},
-		{
-			"sessions", "is_truncated",
-			`is_truncated BOOLEAN NOT NULL DEFAULT FALSE`,
-			"adding sessions.is_truncated",
-		},
-		{
-			"messages", "source_type",
-			`source_type TEXT NOT NULL DEFAULT ''`,
-			"adding messages.source_type",
-		},
-		{
-			"messages", "source_subtype",
-			`source_subtype TEXT NOT NULL DEFAULT ''`,
-			"adding messages.source_subtype",
-		},
-		{
-			"messages", "prompt_source",
-			`prompt_source TEXT NOT NULL DEFAULT ''`,
-			"adding messages.prompt_source",
-		},
-		{
-			"messages", "source_uuid",
-			`source_uuid TEXT NOT NULL DEFAULT ''`,
-			"adding messages.source_uuid",
-		},
-		{
-			"messages", "source_parent_uuid",
-			`source_parent_uuid TEXT NOT NULL DEFAULT ''`,
-			"adding messages.source_parent_uuid",
-		},
-		{
-			"messages", "is_sidechain",
-			`is_sidechain BOOLEAN NOT NULL DEFAULT FALSE`,
-			"adding messages.is_sidechain",
-		},
-		{
-			"messages", "is_compact_boundary",
-			`is_compact_boundary BOOLEAN NOT NULL DEFAULT FALSE`,
-			"adding messages.is_compact_boundary",
-		},
-		{
-			"messages", "thinking_text",
-			`thinking_text TEXT NOT NULL DEFAULT ''`,
-			"adding messages.thinking_text",
-		},
-		{
-			"sessions", "termination_status",
-			`termination_status TEXT`,
-			"adding sessions.termination_status",
-		},
-		{
-			"sessions", "secret_leak_count",
-			`secret_leak_count INTEGER NOT NULL DEFAULT 0`,
-			"adding sessions.secret_leak_count",
-		},
-		{
-			"sessions", "secrets_rules_version",
-			`secrets_rules_version TEXT NOT NULL DEFAULT ''`,
-			"adding sessions.secrets_rules_version",
-		},
-		{
-			"sessions", "session_name",
-			`session_name TEXT`,
-			"adding sessions.session_name",
-		},
-		{
-			"sessions", "agent_label",
-			`agent_label TEXT NOT NULL DEFAULT ''`,
-			"adding sessions.agent_label",
-		},
-		{
-			"sessions", "entrypoint",
-			`entrypoint TEXT NOT NULL DEFAULT ''`,
-			"adding sessions.entrypoint",
-		},
-		{
-			"sessions", "session_kind",
-			`session_kind TEXT NOT NULL DEFAULT ''`,
-			"adding sessions.session_kind",
-		},
-		{
-			"source_project_identity_observations", "source_archive_id",
-			`source_archive_id TEXT NOT NULL DEFAULT ''`,
-			"adding source_project_identity_observations.source_archive_id",
-		},
-		{
-			"source_project_identity_observations", "source_archive_salt",
-			`source_archive_salt TEXT NOT NULL DEFAULT ''`,
-			"adding source_project_identity_observations.source_archive_salt",
-		},
-		{
-			"source_project_identity_observations", "repository_path",
-			`repository_path TEXT NOT NULL DEFAULT ''`,
-			"adding source_project_identity_observations.repository_path",
-		},
-		{
-			"source_project_identity_observations", "worktree_relationship",
-			`worktree_relationship TEXT NOT NULL DEFAULT 'unknown'`,
-			"adding source_project_identity_observations.worktree_relationship",
-		},
-		{
-			"source_project_identity_observations", "checkout_state",
-			`checkout_state TEXT NOT NULL DEFAULT 'unknown'`,
-			"adding source_project_identity_observations.checkout_state",
-		},
-		{
-			"source_project_identity_observations", "git_branch",
-			`git_branch TEXT NOT NULL DEFAULT ''`,
-			"adding source_project_identity_observations.git_branch",
-		},
-		{
-			"source_project_identity_observations", "remote_resolution",
-			`remote_resolution TEXT NOT NULL DEFAULT 'unknown'`,
-			"adding source_project_identity_observations.remote_resolution",
-		},
-		{
-			"source_project_identity_observations", "remote_candidate_count",
-			`remote_candidate_count INT NOT NULL DEFAULT 0`,
-			"adding source_project_identity_observations.remote_candidate_count",
-		},
-		{
-			"sessions", "source_archive_id",
-			`source_archive_id TEXT NOT NULL DEFAULT ''`,
-			"adding sessions.source_archive_id",
-		},
-		{
-			"sessions", "source_database_generation",
-			`source_database_generation TEXT NOT NULL DEFAULT ''`,
-			"adding sessions.source_database_generation",
-		},
-		{
-			"sessions", "file_path",
-			`file_path TEXT`,
-			"adding sessions.file_path",
-		},
-	}
+	alters := schemaColumnMigrations()
 	step = time.Now()
 	existingColumns, err := loadExistingColumns(
 		ctx, db, alters,
@@ -1551,8 +1147,9 @@ func EnsureSchema(
 
 // createPartialIndexesPG creates partial indexes on the PG schema.
 // Idempotent via IF NOT EXISTS.
-func createPartialIndexesPG(ctx context.Context, db *sql.DB) error {
+func createPartialIndexesPG(ctx context.Context, db pgSessionExecer) error {
 	indexes := []string{
+		`CREATE INDEX IF NOT EXISTS idx_sessions_raw_group ON sessions(raw_group_id) WHERE raw_group_id <> ''`,
 		// Match SQLite's bounded Activity terminal-event lookup, including
 		// completions that outlive a session's ended_at metadata.
 		`CREATE INDEX IF NOT EXISTS idx_tool_result_events_terminal
@@ -1847,6 +1444,7 @@ func scrubProjectIdentityGitRemoteCredentialsPG(
 			"listing pg project identity remotes for scrub: %w", err,
 		)
 	}
+	defer rows.Close()
 
 	type pendingScrub struct {
 		obs       export.ProjectIdentityObservation
@@ -1977,12 +1575,8 @@ func batchUpdateAutomatedPG(
 	return nil
 }
 
-type columnQueryer interface {
-	QueryContext(context.Context, string, ...any) (*sql.Rows, error)
-}
-
 func loadExistingColumns(
-	ctx context.Context, db columnQueryer, alters []columnMigration,
+	ctx context.Context, db pgSessionQueryer, alters []columnMigration,
 	extraTables ...string,
 ) (map[string]map[string]bool, error) {
 	tablesSeen := map[string]bool{}
@@ -2047,7 +1641,7 @@ func loadExistingColumns(
 }
 
 func ensureColumns(
-	ctx context.Context, db *sql.DB,
+	ctx context.Context, db pgSessionExecer,
 	existing map[string]map[string]bool,
 	migrations []columnMigration,
 ) ([]string, error) {
@@ -2329,51 +1923,58 @@ func batchLoadPGMessageCoverage(
 ) (map[string][2]bool, error) {
 	coverage := map[string][2]bool{}
 	for start := 0; start < len(candidates); start += tokenCoverageBackfillBatchSize {
-		end := min(
-			start+tokenCoverageBackfillBatchSize,
-			len(candidates),
-		)
-		batch := candidates[start:end]
-		args := make([]any, len(batch))
-		placeholders := make([]string, len(batch))
-		for i, c := range batch {
-			args[i] = c.ID
-			placeholders[i] = fmt.Sprintf("$%d", i+1)
-		}
-		rows, err := conn.QueryContext(ctx,
-			`SELECT session_id, has_context_tokens,
+		if err := func() error {
+			end := min(
+				start+tokenCoverageBackfillBatchSize,
+				len(candidates),
+			)
+			batch := candidates[start:end]
+			args := make([]any, len(batch))
+			placeholders := make([]string, len(batch))
+			for i, c := range batch {
+				args[i] = c.ID
+				placeholders[i] = fmt.Sprintf("$%d", i+1)
+			}
+			rows, err := conn.QueryContext(ctx,
+				`SELECT session_id, has_context_tokens,
 				has_output_tokens
 			 FROM messages
 			 WHERE session_id IN (`+strings.Join(placeholders, ",")+`)`,
-			args...,
-		)
-		if err != nil {
-			return nil, fmt.Errorf(
-				"querying pg session message coverage: %w", err,
+				args...,
 			)
-		}
-		for rows.Next() {
-			var sessionID string
-			var hasContext, hasOutput bool
-			if err := rows.Scan(
-				&sessionID, &hasContext, &hasOutput,
-			); err != nil {
-				rows.Close()
-				return nil, fmt.Errorf(
-					"scanning pg session message coverage: %w",
-					err,
+			if err != nil {
+				return fmt.Errorf(
+					"querying pg session message coverage: %w", err,
 				)
 			}
-			entry := coverage[sessionID]
-			entry[0] = entry[0] || hasContext
-			entry[1] = entry[1] || hasOutput
-			coverage[sessionID] = entry
-		}
-		if err := rows.Err(); err != nil {
-			rows.Close()
-			return nil, err
-		}
-		if err := rows.Close(); err != nil {
+			defer rows.Close()
+			for rows.Next() {
+				var sessionID string
+				var hasContext, hasOutput bool
+				if err := rows.Scan(
+					&sessionID, &hasContext, &hasOutput,
+				); err != nil {
+					rows.Close()
+					return fmt.Errorf(
+						"scanning pg session message coverage: %w",
+						err,
+					)
+				}
+				entry := coverage[sessionID]
+				entry[0] = entry[0] || hasContext
+				entry[1] = entry[1] || hasOutput
+				coverage[sessionID] = entry
+			}
+			if err := rows.Err(); err != nil {
+				rows.Close()
+				return err
+			}
+			if err := rows.Close(); err != nil {
+				return err
+			}
+
+			return nil
+		}(); err != nil {
 			return nil, err
 		}
 	}
@@ -2473,7 +2074,7 @@ func CheckSchemaCompat(
 		)
 	}
 
-	rows, err := db.QueryContext(ctx,
+	_, err := db.ExecContext(ctx,
 		`SELECT updated_at, `+pgSessionCols+`
 		 FROM sessions LIMIT 0`)
 	if err != nil {
@@ -2482,9 +2083,8 @@ func CheckSchemaCompat(
 			err,
 		)
 	}
-	rows.Close()
 
-	rows, err = db.QueryContext(ctx,
+	_, err = db.ExecContext(ctx,
 		`SELECT source_display_name, source_deleted_at, deletion_cause
 		 FROM sessions LIMIT 0`)
 	if err != nil {
@@ -2492,27 +2092,24 @@ func CheckSchemaCompat(
 			"sessions table missing curation columns: %w", err,
 		)
 	}
-	rows.Close()
 
-	rows, err = db.QueryContext(ctx,
+	_, err = db.ExecContext(ctx,
 		`SELECT id FROM excluded_sessions LIMIT 0`)
 	if err != nil {
 		return fmt.Errorf(
 			"excluded_sessions table missing required columns: %w", err,
 		)
 	}
-	rows.Close()
 
-	rows, err = db.QueryContext(ctx,
+	_, err = db.ExecContext(ctx,
 		`SELECT session_id, alias_id FROM session_aliases LIMIT 0`)
 	if err != nil {
 		return fmt.Errorf(
 			"session_aliases table missing required columns: %w", err,
 		)
 	}
-	rows.Close()
 
-	rows, err = db.QueryContext(ctx,
+	_, err = db.ExecContext(ctx,
 		`SELECT call_index, file_path FROM tool_calls LIMIT 0`)
 	if err != nil {
 		return fmt.Errorf(
@@ -2520,9 +2117,8 @@ func CheckSchemaCompat(
 			err,
 		)
 	}
-	rows.Close()
 
-	rows, err = db.QueryContext(ctx,
+	_, err = db.ExecContext(ctx,
 		`SELECT session_id, ordinal, role, content, thinking_text,
 			timestamp, has_thinking, has_tool_use,
 			content_length, is_system, model, reasoning_effort, token_usage,
@@ -2539,8 +2135,7 @@ func CheckSchemaCompat(
 			err,
 		)
 	}
-	rows.Close()
-	rows, err = db.QueryContext(ctx,
+	_, err = db.ExecContext(ctx,
 		`SELECT source_archive_id, source_archive_salt
 		 FROM source_archives LIMIT 0`)
 	if err != nil {
@@ -2548,8 +2143,7 @@ func CheckSchemaCompat(
 			"source_archives table missing required columns: %w", err,
 		)
 	}
-	rows.Close()
-	rows, err = db.QueryContext(ctx,
+	_, err = db.ExecContext(ctx,
 		`SELECT session_id, created_at
 		 FROM starred_sessions LIMIT 0`)
 	if err != nil {
@@ -2558,8 +2152,7 @@ func CheckSchemaCompat(
 			err,
 		)
 	}
-	rows.Close()
-	rows, err = db.QueryContext(ctx,
+	_, err = db.ExecContext(ctx,
 		`SELECT id, session_id, message_id, ordinal,
 			source_uuid, note, created_at
 		 FROM pinned_messages LIMIT 0`)
@@ -2569,8 +2162,7 @@ func CheckSchemaCompat(
 			err,
 		)
 	}
-	rows.Close()
-	rows, err = db.QueryContext(ctx,
+	_, err = db.ExecContext(ctx,
 		`SELECT total_output_tokens, peak_context_tokens,
 			has_total_output_tokens, has_peak_context_tokens
 		 FROM sessions LIMIT 0`)
@@ -2580,9 +2172,8 @@ func CheckSchemaCompat(
 			err,
 		)
 	}
-	rows.Close()
 
-	rows, err = db.QueryContext(ctx,
+	_, err = db.ExecContext(ctx,
 		`SELECT quality_signal_version, short_prompt_count,
 			unstructured_start, missing_success_criteria_count,
 			missing_verification_count, duplicate_prompt_count,
@@ -2594,9 +2185,8 @@ func CheckSchemaCompat(
 			err,
 		)
 	}
-	rows.Close()
 
-	rows, err = db.QueryContext(ctx,
+	_, err = db.ExecContext(ctx,
 		`SELECT event_index FROM tool_result_events LIMIT 0`)
 	if err != nil {
 		return fmt.Errorf(
@@ -2604,9 +2194,8 @@ func CheckSchemaCompat(
 			err,
 		)
 	}
-	rows.Close()
 
-	rows, err = db.QueryContext(ctx,
+	_, err = db.ExecContext(ctx,
 		`SELECT id, provider_id, cost_microdollars FROM usage_events LIMIT 0`)
 	if err != nil {
 		return fmt.Errorf(
@@ -2614,10 +2203,9 @@ func CheckSchemaCompat(
 			err,
 		)
 	}
-	rows.Close()
 
 	hasModelPricing := true
-	rows, err = db.QueryContext(ctx,
+	_, err = db.ExecContext(ctx,
 		`SELECT input_microdollars_per_mtok,
 			output_microdollars_per_mtok,
 			cache_creation_microdollars_per_mtok,
@@ -2632,12 +2220,10 @@ func CheckSchemaCompat(
 			)
 		}
 		hasModelPricing = false
-	} else {
-		rows.Close()
 	}
 
 	if hasModelPricing {
-		rows, err = db.QueryContext(ctx,
+		_, err = db.ExecContext(ctx,
 			`SELECT model_pattern, above_input_tokens,
 				input_microdollars_per_mtok, output_microdollars_per_mtok,
 				cache_creation_microdollars_per_mtok,
@@ -2650,9 +2236,8 @@ func CheckSchemaCompat(
 				err,
 			)
 		}
-		rows.Close()
 
-		rows, err = db.QueryContext(ctx,
+		_, err = db.ExecContext(ctx,
 			`SELECT singleton, version, source_ref, source, data_json, updated_at
 			 FROM genai_pricing LIMIT 0`)
 		if err != nil {
@@ -2661,10 +2246,9 @@ func CheckSchemaCompat(
 				err,
 			)
 		}
-		rows.Close()
 	}
 
-	rows, err = db.QueryContext(ctx,
+	_, err = db.ExecContext(ctx,
 		`SELECT id, type, date_from, date_to, project, agent,
 			model, prompt, content, kind, schema_version,
 			template_id, template_version, aggregate_hash,
@@ -2674,10 +2258,9 @@ func CheckSchemaCompat(
 	if err != nil {
 		return fmt.Errorf("insights table missing required columns: %w", err)
 	}
-	rows.Close()
 
 	if pgHasTable(ctx, db, "cursor_usage_events") {
-		rows, err = db.QueryContext(ctx,
+		_, err = db.ExecContext(ctx,
 			`SELECT id, occurred_at, model, kind,
 				input_tokens, output_tokens,
 				cache_write_tokens, cache_read_tokens,
@@ -2690,10 +2273,9 @@ func CheckSchemaCompat(
 				err,
 			)
 		}
-		rows.Close()
 	}
 
-	rows, err = db.QueryContext(ctx,
+	_, err = db.ExecContext(ctx,
 		`SELECT id, session_id, rule_name, confidence, location_kind,
 			message_ordinal, call_index, event_index,
 			match_start, match_end, match_index,
@@ -2702,8 +2284,7 @@ func CheckSchemaCompat(
 	if err != nil {
 		return fmt.Errorf("secret_findings table missing required columns: %w", err)
 	}
-	rows.Close()
-	rows, err = db.QueryContext(ctx,
+	_, err = db.ExecContext(ctx,
 		`SELECT source_archive_id, source_archive_salt,
 			project, machine, root_path, git_remote, git_remote_name,
 			repository_path, worktree_name, worktree_root_path,
@@ -2717,8 +2298,7 @@ func CheckSchemaCompat(
 			err,
 		)
 	}
-	rows.Close()
-	rows, err = db.QueryContext(ctx,
+	_, err = db.ExecContext(ctx,
 		`SELECT source_archive_id, source_database_generation,
 			source_session_id, project, machine, root_path, git_remote,
 			git_remote_name, repository_path, worktree_name,
@@ -2732,8 +2312,7 @@ func CheckSchemaCompat(
 			err,
 		)
 	}
-	rows.Close()
-	rows, err = db.QueryContext(ctx,
+	_, err = db.ExecContext(ctx,
 		`SELECT source_archive_id, source_database_generation, file_path
 		 FROM sessions LIMIT 0`)
 	if err != nil {
@@ -2741,8 +2320,7 @@ func CheckSchemaCompat(
 			"sessions table missing provenance columns: %w", err,
 		)
 	}
-	rows.Close()
-	rows, err = db.QueryContext(ctx,
+	_, err = db.ExecContext(ctx,
 		`SELECT source_archive_id, machine, path_prefix, layout, project,
 			original_project, enabled, updated_at
 		 FROM source_worktree_project_mappings LIMIT 0`)
@@ -2752,14 +2330,12 @@ func CheckSchemaCompat(
 			err,
 		)
 	}
-	rows.Close()
-	rows, err = db.QueryContext(ctx,
+	_, err = db.ExecContext(ctx,
 		`SELECT key, value FROM sync_metadata LIMIT 0`)
 	if err != nil {
 		return fmt.Errorf(
 			"sync_metadata table missing required columns: %w", err)
 	}
-	rows.Close()
 	return nil
 }
 
@@ -2767,13 +2343,12 @@ func CheckSchemaCompat(
 // CheckSchemaCompat also checks sync_metadata because PG serve reads machine
 // display labels from it.
 func checkPushSchemaCompat(ctx context.Context, db *sql.DB) error {
-	rows, err := db.QueryContext(ctx,
+	_, err := db.ExecContext(ctx,
 		`SELECT owner_marker, prompt_evidence_discarded FROM sessions LIMIT 0`)
 	if err != nil {
 		return fmt.Errorf(
 			"sessions table missing push ownership columns: %w", err)
 	}
-	rows.Close()
 	return nil
 }
 

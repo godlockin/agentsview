@@ -3,8 +3,10 @@ package vector
 import (
 	"context"
 	"database/sql"
+	"encoding/binary"
 	"errors"
 	"fmt"
+	"math"
 	"strings"
 	"sync"
 
@@ -179,6 +181,7 @@ SELECT d.doc_key, d.content
 	if err != nil {
 		return nil, fmt.Errorf("read repair document content: %w", err)
 	}
+	defer contentRows.Close()
 	for contentRows.Next() {
 		var docKey, content string
 		if err := contentRows.Scan(&docKey, &content); err != nil {
@@ -320,6 +323,23 @@ UPDATE `+ix.spec.DocsTable+` AS d
 	return stats, nil
 }
 
+// decodeFloat32Blob decodes sqlite-vec's raw little-endian float32 blob. A
+// nil or empty blob decodes to an empty (non-nil) slice; the guard also proves
+// b is non-nil to NilAway before the slice expression below.
+func decodeFloat32Blob(b []byte) ([]float32, error) {
+	if len(b)%4 != 0 {
+		return nil, fmt.Errorf("embedding blob length %d not a multiple of 4", len(b))
+	}
+	if len(b) == 0 {
+		return []float32{}, nil
+	}
+	out := make([]float32, len(b)/4)
+	for i := range out {
+		out[i] = math.Float32frombits(binary.LittleEndian.Uint32(b[i*4:]))
+	}
+	return out, nil
+}
+
 func validateStoredEmbeddingBlob(blob []byte, dimension int) error {
 	vector, err := decodeFloat32Blob(blob)
 	if err != nil {
@@ -328,7 +348,18 @@ func validateStoredEmbeddingBlob(blob []byte, dimension int) error {
 	if len(vector) != dimension {
 		return fmt.Errorf("invalid embedding dimension: got %d, want %d", len(vector), dimension)
 	}
-	return validateEmbedding(vector, 0)
+	var squaredNorm float64
+	for component, value := range vector {
+		f := float64(value)
+		if math.IsNaN(f) || math.IsInf(f, 0) {
+			return fmt.Errorf("invalid embedding: non-finite component %d", component)
+		}
+		squaredNorm += f * f
+	}
+	if squaredNorm == 0 {
+		return errors.New("invalid embedding: zero norm")
+	}
+	return nil
 }
 
 // repairStore restricts kit's fill loop to the documents found by the repair
@@ -394,6 +425,7 @@ SELECT d.doc_key, d.content, d.content_hash
 	if err != nil {
 		return nil, fmt.Errorf("scan repair documents: %w", err)
 	}
+	defer rows.Close()
 	var pending []kitvec.Pending[string]
 	for rows.Next() {
 		var p kitvec.Pending[string]

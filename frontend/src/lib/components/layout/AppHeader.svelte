@@ -45,6 +45,7 @@
     getMarkdownExportUrl,
   } from "../../api/client.js";
   import { copyToClipboard } from "../../utils/clipboard.js";
+  import { reportTelemetry } from "../../utils/telemetry.js";
   import ProjectTypeahead from "./ProjectTypeahead.svelte";
   import ImportModal from "../import/ImportModal.svelte";
 
@@ -149,6 +150,7 @@
     ).toString();
     const ok = await copyToClipboard(url);
     if (!ok) return;
+    reportTelemetry("export_run", { format: "markdown_link" });
     copiedMarkdownLink = true;
     clearTimeout(copiedMarkdownLinkTimer);
     copiedMarkdownLinkTimer = setTimeout(() => {
@@ -999,7 +1001,7 @@
   }
 
   .header-btn:disabled {
-    opacity: 0.55;
+    opacity: var(--opacity-disabled);
     cursor: default;
   }
 
@@ -1053,7 +1055,7 @@
   }
 
   .import-btn:disabled {
-    opacity: 0.55;
+    opacity: var(--opacity-disabled);
     cursor: default;
   }
 

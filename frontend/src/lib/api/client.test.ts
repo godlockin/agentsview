@@ -1,3 +1,4 @@
+import { EventSource, type EventSourceInit } from "eventsource";
 import { describe, it, expect, vi, beforeEach, afterEach } from "vite-plus/test";
 import {
   triggerSync,
@@ -8,7 +9,10 @@ import {
 } from "./client.js";
 import type { SyncHandle } from "./client.js";
 import { ApiError } from "./runtime.js";
-import type { SyncProgress } from "./types.js";
+import type { SyncProgress } from "./generated/index.js";
+import * as telemetry from "../utils/telemetry.js";
+
+vi.mock("../utils/telemetry.js", () => ({ reportTelemetry: vi.fn() }));
 
 /**
  * Create a ReadableStream that yields the given chunks as
@@ -133,14 +137,7 @@ describe("triggerSync SSE parsing", () => {
   });
 
   it("should reject for non-ok responses", async () => {
-    vi.stubGlobal(
-      "fetch",
-      vi.fn().mockResolvedValue({
-        ok: false,
-        status: 500,
-        body: null,
-      }),
-    );
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(new Response(null, { status: 500 })));
 
     const handle = triggerSync();
     activeHandles.push(handle);
@@ -312,15 +309,7 @@ describe("generateInsight SSE parsing", () => {
   });
 
   it("rejects for non-ok response", async () => {
-    vi.stubGlobal(
-      "fetch",
-      vi.fn().mockResolvedValue({
-        ok: false,
-        status: 500,
-        body: null,
-        text: () => Promise.resolve(""),
-      }),
-    );
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(new Response(null, { status: 500 })));
 
     const { generateInsight } = await import("./client.js");
     const handle = generateInsight({
@@ -369,6 +358,8 @@ describe("generateInsight SSE parsing", () => {
   });
 });
 
+vi.mock("eventsource", () => ({ EventSource: vi.fn() }));
+
 describe("watchEvents", () => {
   class FakeEventSource {
     static instances: FakeEventSource[] = [];
@@ -378,8 +369,11 @@ describe("watchEvents", () => {
     public onerror: ((ev: Event) => void) | null = null;
     public closed = false;
 
-    constructor(url: string) {
-      this.url = url;
+    constructor(
+      url: URL,
+      public options: EventSourceInit,
+    ) {
+      this.url = url.toString();
       FakeEventSource.instances.push(this);
     }
 
@@ -414,7 +408,9 @@ describe("watchEvents", () => {
 
   beforeEach(() => {
     FakeEventSource.reset();
-    vi.stubGlobal("EventSource", FakeEventSource);
+    vi.mocked(EventSource).mockImplementation(function (url, options) {
+      return new FakeEventSource(new URL(url), options!) as unknown as EventSource;
+    });
     localStorage.clear();
   });
 
@@ -426,13 +422,32 @@ describe("watchEvents", () => {
   it("opens /api/v1/events locally without a token", () => {
     watchEvents(() => {});
     expect(FakeEventSource.instances).toHaveLength(1);
-    expect(FakeEventSource.instances[0]!.url).toBe("/api/v1/events");
+    expect(FakeEventSource.instances[0]!.url).toBe(`${window.location.origin}/api/v1/events`);
   });
 
-  it("appends ?token= when an auth token is set", () => {
+  it("sends authentication through the generated request", async () => {
     localStorage.setItem("agentsview-auth-token", "secret");
     watchEvents(() => {});
-    expect(FakeEventSource.instances[0]!.url).toBe("/api/v1/events?token=secret");
+    const source = FakeEventSource.instances[0]!;
+    expect(source.url).toBe(`${window.location.origin}/api/v1/events`);
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValue(new Response(null, { headers: { "Content-Type": "text/event-stream" } }));
+    vi.stubGlobal("fetch", fetchMock);
+    await source.options.fetch!(source.url, {
+      signal: new AbortController().signal,
+      headers: { Accept: "text/event-stream" },
+      mode: "cors",
+      cache: "no-store",
+      redirect: "follow",
+    });
+    expect(fetchMock).toHaveBeenCalledWith(
+      "/api/v1/events",
+      expect.objectContaining({ method: "GET" }),
+    );
+    expect(new Headers(fetchMock.mock.calls[0]![1].headers).get("Authorization")).toBe(
+      "Bearer secret",
+    );
   });
 
   it("invokes onEvent with parsed scope for valid data_changed frames", () => {
@@ -469,16 +484,14 @@ describe("watchEvents", () => {
     localStorage.setItem("agentsview-server-url", server);
     localStorage.setItem(`agentsview-auth-token::${server}`, "remote-token");
     watchEvents(() => {});
-    expect(FakeEventSource.instances[0]!.url).toBe(`${server}/api/v1/events?token=remote-token`);
+    expect(FakeEventSource.instances[0]!.url).toBe(`${server}/api/v1/events`);
   });
 
-  it("URL-encodes reserved characters in the token query parameter", () => {
+  it("keeps token characters out of the stream URL", () => {
     const rawToken = "a b&c?d=e/f+g";
     localStorage.setItem("agentsview-auth-token", rawToken);
     watchEvents(() => {});
-    expect(FakeEventSource.instances[0]!.url).toBe(
-      `/api/v1/events?token=${encodeURIComponent(rawToken)}`,
-    );
+    expect(FakeEventSource.instances[0]!.url).toBe(`${window.location.origin}/api/v1/events`);
   });
 
   it("closes the EventSource after N consecutive errors without a successful event", () => {
@@ -535,8 +548,11 @@ describe("watchSession", () => {
     public onerror: ((ev: Event) => void) | null = null;
     public closed = false;
 
-    constructor(url: string) {
-      this.url = url;
+    constructor(
+      url: URL,
+      public options: EventSourceInit,
+    ) {
+      this.url = url.toString();
       FakeEventSource.instances.push(this);
     }
 
@@ -569,7 +585,9 @@ describe("watchSession", () => {
 
   beforeEach(() => {
     FakeEventSource.reset();
-    vi.stubGlobal("EventSource", FakeEventSource);
+    vi.mocked(EventSource).mockImplementation(function (url, options) {
+      return new FakeEventSource(new URL(url), options!) as unknown as EventSource;
+    });
     localStorage.clear();
   });
 
@@ -617,7 +635,57 @@ describe("watchSession", () => {
     watchSession("deepseek-harness:child%7E/%25?#", () => {});
 
     expect(FakeEventSource.instances[0]?.url).toBe(
-      "/api/v1/sessions/deepseek-harness%3Achild%257E%2F%2525%3F%23/watch",
+      `${window.location.origin}/api/v1/sessions/deepseek-harness%3Achild%257E%2F%2525%3F%23/watch`,
     );
+  });
+});
+
+describe("core action telemetry", () => {
+  beforeEach(() => {
+    vi.mocked(telemetry.reportTelemetry).mockClear();
+  });
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    vi.restoreAllMocks();
+  });
+
+  it.each([
+    ["downloadExport", "html"],
+    ["downloadInsightExport", "insight_html"],
+  ] as const)("%s reports export_run %s", async (fn, format) => {
+    vi.spyOn(window, "open").mockReturnValue(null);
+    const client = await import("./client.js");
+
+    await (fn === "downloadExport"
+      ? client.downloadExport("session-1")
+      : client.downloadInsightExport(7));
+
+    expect(telemetry.reportTelemetry).toHaveBeenCalledExactlyOnceWith("export_run", { format });
+  });
+
+  it("generateInsight reports insight_generated only after the insight is done", async () => {
+    const req = {
+      type: "llm_canned",
+      kind: "prompt_maturity_review",
+      date_from: "2025-01-15",
+      date_to: "2025-01-15",
+    } as const;
+    mockFetchWithStream(['event: error\ndata: {"message":"boom"}\n\n']);
+    const { generateInsight } = await import("./client.js");
+    await expect(generateInsight(req).done).rejects.toThrow("boom");
+    expect(telemetry.reportTelemetry).not.toHaveBeenCalled();
+
+    mockFetchWithStream([`event: done\ndata: ${JSON.stringify({ id: 1 })}\n\n`]);
+    await generateInsight(req).done;
+    expect(telemetry.reportTelemetry).toHaveBeenCalledExactlyOnceWith("insight_generated", {
+      kind: "prompt_maturity_review",
+    });
+
+    mockFetchWithStream([
+      `event: done\ndata: ${JSON.stringify({ id: 1, cache_status: "hit" })}\n\n`,
+    ]);
+    await generateInsight(req).done;
+    expect(telemetry.reportTelemetry).toHaveBeenCalledTimes(1);
   });
 });

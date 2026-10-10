@@ -51,6 +51,7 @@
   import { sessionTiming } from "./lib/stores/sessionTiming.svelte.js";
   import CommandPalette from "./lib/components/command-palette/CommandPalette.svelte";
   import AboutModal from "./lib/components/modals/AboutModal.svelte";
+  import GoToSessionModal from "./lib/components/modals/GoToSessionModal.svelte";
   import ShortcutsModal from "./lib/components/modals/ShortcutsModal.svelte";
   import PublishModal from "./lib/components/modals/PublishModal.svelte";
   import ResyncModal from "./lib/components/modals/ResyncModal.svelte";
@@ -71,7 +72,7 @@
   import { sessions, filtersToParams } from "./lib/stores/sessions.svelte.js";
   import { messages } from "./lib/stores/messages.svelte.js";
   import { sync } from "./lib/stores/sync.svelte.js";
-  import { ui } from "./lib/stores/ui.svelte.js";
+  import { parseScrollCall, ui, type ScrollCall } from "./lib/stores/ui.svelte.js";
   import { router } from "./lib/stores/router.svelte.js";
   import { starred } from "./lib/stores/starred.svelte.js";
   import { pins } from "./lib/stores/pins.svelte.js";
@@ -85,8 +86,11 @@
     type PanelDateState,
   } from "./lib/stores/yokedDates.svelte.js";
   import { m } from "./lib/i18n/index.js";
-  import { setAuthToken, getAuthToken, setServerUrl, getBase } from "./lib/api/runtime.js";
+  import { setAuthToken, getAuthToken, setServerUrl } from "./lib/api/runtime.js";
   import { setupVisibilityHealthCheck } from "./lib/utils/health.js";
+  import { setupAppOpenedReporting } from "./lib/utils/app-opened.js";
+  import { reportTelemetry } from "./lib/utils/telemetry.js";
+  import { setupVisitEndedReporting } from "./lib/utils/visit-ended.js";
   import { registerShortcuts } from "./lib/utils/keyboard.js";
   import { shouldAutoSwitchTranscriptModeToNormal } from "./lib/utils/transcript-mode.js";
   import {
@@ -116,7 +120,7 @@
 
   let messageListRef:
     | {
-        scrollToOrdinal: (o: number) => void;
+        scrollToOrdinal: (o: number, call?: ScrollCall) => void;
         getDisplayItems: () => DisplayItem[];
         getNormalDisplayItems: () => DisplayItem[];
       }
@@ -266,12 +270,15 @@
         }
       }
 
-      messageListRef.scrollToOrdinal(ordinal);
-      // Ensure highlight is set (the session-change effect
-      // may have cleared it before this effect ran).
-      ui.selectedOrdinal = ordinal;
+      const call = ui.pendingScrollCall;
       ui.pendingScrollOrdinal = null;
       ui.pendingScrollSession = null;
+      ui.pendingScrollCall = null;
+      // Ensure highlight is set (the session-change effect
+      // may have cleared it before this effect ran). The list clears it
+      // again when the message no longer holds the expected call.
+      ui.selectedOrdinal = ordinal;
+      messageListRef.scrollToOrdinal(ordinal, call ?? undefined);
     });
   });
 
@@ -583,6 +590,61 @@
     });
   });
 
+  // Telemetry: one session_viewed per transcript visit, sent once the
+  // session's metadata hydrates. The store keeps the active id while
+  // another page shows, so leaving the transcript resets the visit.
+  let viewedSessionId: string | null = null;
+  let selectedSessionId: string | null = null;
+  $effect(() => {
+    const route = router.route;
+    const activeId = sessions.activeSessionId;
+    const session = sessions.activeSession;
+    const routedId = router.sessionId;
+    untrack(() => {
+      if (activeId !== selectedSessionId) {
+        selectedSessionId = activeId;
+        viewedSessionId = null;
+      }
+      if (route !== "sessions" || activeId === null) {
+        viewedSessionId = null;
+        return;
+      }
+      // Wait for the URL to name the session, so a stale selection left from another page is not counted.
+      if (session && session.id === activeId && routedId === activeId && activeId !== viewedSessionId) {
+        viewedSessionId = activeId;
+        reportTelemetry("session_viewed", { agent: session.agent });
+      }
+    });
+  });
+
+  function reportScreenView(): void {
+    if (settings.needsAuth && router.route !== "settings") return;
+    const screen = router.route === "token-usage" ? "usage" : router.route;
+    reportTelemetry("screen_viewed", { screen, surface: "web" });
+  }
+
+  $effect(() => {
+    reportScreenView();
+  });
+
+  // Telemetry: one analytics_viewed per analytics page visit; token-usage is the usage page.
+  let lastAnalyticsPage: string | null = null;
+  $effect(() => {
+    const route = router.route;
+    let page: string | null = null;
+    if (route === "usage" || route === "token-usage") {
+      page = "usage";
+    } else if (route === "activity" || route === "trends" || route === "quality") {
+      page = route;
+    }
+    untrack(() => {
+      if (page !== null && page !== lastAnalyticsPage) {
+        reportTelemetry("analytics_viewed", { page });
+      }
+      lastAnalyticsPage = page;
+    });
+  });
+
   // Deep-link: clear the selection when the URL drops its session.
   // Tracks the route alongside the session id: entering bare /sessions
   // from a non-session page leaves the id null both sides, so a
@@ -609,6 +671,11 @@
   $effect(() => {
     const sid = router.sessionId;
     const msgParam = router.params["msg"] ?? null;
+    const call = parseScrollCall(
+      router.params["call"],
+      router.params["tool_use_id"],
+      router.params["rev"],
+    );
     untrack(() => {
       if (!sid || !msgParam) return;
       if (msgParam === "last") {
@@ -617,7 +684,7 @@
       } else {
         const ordinal = parseInt(msgParam, 10);
         if (Number.isFinite(ordinal)) {
-          ui.scrollToOrdinal(ordinal, sid);
+          ui.scrollToOrdinal(ordinal, sid, call);
         }
       }
     });
@@ -745,8 +812,11 @@
     sync.loadVersion();
     sync.checkForUpdate();
     sync.startPolling();
+    const appOpenedCleanup = setupAppOpenedReporting();
+    const visitEndedCleanup = setupVisitEndedReporting();
+    window.addEventListener("focus", reportScreenView);
 
-    const healthCleanup = setupVisibilityHealthCheck(getBase, {
+    const healthCleanup = setupVisibilityHealthCheck({
       onBackendDegraded: () => sync.markBackendDegraded(),
     });
 
@@ -756,6 +826,9 @@
       navigateUserPrompt,
     });
     return () => {
+      appOpenedCleanup();
+      visitEndedCleanup();
+      window.removeEventListener("focus", reportScreenView);
       healthCleanup();
       cleanup();
       window.removeEventListener("show-about", showAbout);
@@ -841,7 +914,7 @@
     <RecentEditsPage />
   </div>
 {:else if router.route === "data"}
-  <div class="page-scroll">
+  <div class="page-scroll data-page-host">
     <DataPage />
   </div>
 {:else if router.route === "settings"}
@@ -895,6 +968,10 @@
 
 {#if ui.activeModal === "commandPalette"}
   <CommandPalette />
+{/if}
+
+{#if ui.activeModal === "goToSession"}
+  <GoToSessionModal />
 {/if}
 
 {#if ui.activeModal === "shortcuts"}
@@ -953,6 +1030,11 @@
   }
 
   .settings-page-host {
+    display: flex;
+    overflow: hidden;
+  }
+
+  .data-page-host {
     display: flex;
     overflow: hidden;
   }
@@ -1070,7 +1152,7 @@
   }
 
   .auth-card-btn:disabled {
-    opacity: 0.6;
+    opacity: var(--opacity-disabled);
     cursor: default;
   }
 
