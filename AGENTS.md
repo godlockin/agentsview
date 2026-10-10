@@ -90,21 +90,6 @@ discrepancy, consult `docs/internal/session-format-sources.md` and reverify or
 update its evidence entry in the same change. Grok remains temporarily excluded
 only until its separately owned format-alignment work lands.
 
-## Project Map
-
-agentsview syncs local AI agent sessions into SQLite, serves a Svelte 5 web UI,
-and can mirror data to PostgreSQL or DuckDB.
-
-- `cmd/agentsview/`: CLI and server entry points
-- `internal/db/`: SQLite archive and search
-- `internal/postgres/`: PostgreSQL sync and read store
-- `internal/duckdb/`: disposable DuckDB mirror and Quack reads
-- `internal/parser/`: agent session parsers
-- `internal/server/`: HTTP API and SSE
-- `internal/sync/`: discovery, file watching, and sync
-- `internal/vector/`: semantic and hybrid search
-- `frontend/`: Svelte 5 application
-
 ## Conventions
 
 - Prefer the standard library over new dependencies.
