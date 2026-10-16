@@ -74,6 +74,9 @@ type SourceCapabilities struct {
 	CompositeFingerprint CapabilitySupport
 	IncrementalAppend    CapabilitySupport
 	MultiSessionSource   CapabilitySupport
+	// SessionOwnedFile means each stored file_path names a file owned by that
+	// session that prune may delete. The zero value leaves the source in place.
+	SessionOwnedFile CapabilitySupport
 	// SharedContainerSource means streaming discovery emits multiple logical
 	// virtual members from one physical container and exact reconciliation
 	// rehydration is required to avoid reopening or rescanning that container.

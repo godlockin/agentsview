@@ -1213,6 +1213,12 @@ func SharesSessionIDs(agent AgentType) bool {
 	return ok && providerFactoryForDef(def).Capabilities().Source.SharedSessionIDs == CapabilitySupported
 }
 
+// OwnsSessionFile reports whether agent's provider allows pruning its source files.
+func OwnsSessionFile(agent AgentType) bool {
+	def, ok := AgentByType(agent)
+	return ok && providerFactoryForDef(def).Capabilities().Source.SessionOwnedFile == CapabilitySupported
+}
+
 func providerFactoryForDef(def AgentDef) ProviderFactory {
 	def = cloneAgentDef(def)
 	switch def.Type {

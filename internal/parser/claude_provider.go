@@ -1006,6 +1006,7 @@ func claudeProviderCapabilities() Capabilities {
 			CompositeFingerprint: CapabilitySupported,
 			IncrementalAppend:    CapabilitySupported,
 			MultiSessionSource:   CapabilitySupported,
+			SessionOwnedFile:     CapabilitySupported,
 			PerSessionErrors:     CapabilityNotApplicable,
 			ExcludedSessions:     CapabilitySupported,
 			ForceReplaceOnParse:  CapabilitySupported,

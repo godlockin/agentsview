@@ -64,6 +64,21 @@ func TestProviderCapabilitiesSharedSessionIDsOptIn(t *testing.T) {
 	}
 }
 
+func TestProviderCapabilitiesSessionOwnedFileOptIn(t *testing.T) {
+	assert.Equal(t, CapabilityUnsupported, (SourceCapabilities{}).SessionOwnedFile)
+	for _, factory := range ProviderFactories() {
+		agent := factory.Definition().Type
+		want := CapabilityUnsupported
+		if agent == AgentClaude || agent == AgentCodex || agent == AgentTraeX || agent == AgentAugureCode {
+			want = CapabilitySupported
+		}
+		assert.Equalf(t, want, factory.Capabilities().Source.SessionOwnedFile, "%s", agent)
+		assert.Equalf(t, want == CapabilitySupported, OwnsSessionFile(agent), "%s", agent)
+	}
+	assert.False(t, OwnsSessionFile("nope"))
+	assert.False(t, OwnsSessionFile(""))
+}
+
 func TestProviderCapabilitiesActivityHintsMatchConsumers(t *testing.T) {
 	assert.Equal(t, CapabilityUnsupported, (SourceCapabilities{}).ActivityHints,
 		"new providers must opt in explicitly")

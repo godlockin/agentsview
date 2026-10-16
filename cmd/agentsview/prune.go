@@ -15,6 +15,7 @@ import (
 
 	"go.kenn.io/agentsview/internal/config"
 	"go.kenn.io/agentsview/internal/db"
+	"go.kenn.io/agentsview/internal/parser"
 )
 
 // PruneConfig holds parsed CLI options for the prune command.
@@ -138,13 +139,17 @@ func (p *Pruner) Prune(ctx context.Context, cfg PruneConfig) error {
 		return fmt.Errorf("deleting sessions: %w", err)
 	}
 
-	filesRemoved, bytesReclaimed := deleteFiles(candidates)
+	filesRemoved, bytesReclaimed, filesKept := deleteFiles(candidates)
 
 	fmt.Fprintf(p.Out,
 		"\nDeleted %d sessions, removed %d files"+
-			" (%s reclaimed)\n",
+			" (%s reclaimed)",
 		deleted, filesRemoved, formatBytes(bytesReclaimed),
 	)
+	if filesKept > 0 {
+		fmt.Fprintf(p.Out, ", left %d source files in place", filesKept)
+	}
+	fmt.Fprintln(p.Out)
 	return nil
 }
 
@@ -173,9 +178,13 @@ func writeSummary(w io.Writer, sessions []db.Session) {
 	sort.Strings(projects)
 
 	fmt.Fprintf(w,
-		"Found %d sessions (%s on disk)\n",
+		"Found %d sessions (%s on disk)",
 		len(sessions), formatBytes(totalSize),
 	)
+	if kept := keptSourceFiles(sessions); kept > 0 {
+		fmt.Fprintf(w, ", left %d source files in place", kept)
+	}
+	fmt.Fprintln(w)
 	fmt.Fprintln(w, "\nBy project:")
 	for _, proj := range projects {
 		count := byProject[proj]
@@ -183,12 +192,29 @@ func writeSummary(w io.Writer, sessions []db.Session) {
 	}
 }
 
-func deleteFiles(sessions []db.Session) (int, int64) {
+func keptSourceFiles(sessions []db.Session) int {
+	kept := map[string]struct{}{}
+	for _, s := range sessions {
+		if s.FilePath == nil || parser.OwnsSessionFile(parser.AgentType(s.Agent)) {
+			continue
+		}
+		path := parser.ResolveSourceFilePath(*s.FilePath)
+		if container, _, ok := parser.ParseVirtualSourcePath(path); ok {
+			path = container
+		}
+		if _, err := os.Stat(path); err == nil {
+			kept[path] = struct{}{}
+		}
+	}
+	return len(kept)
+}
+
+func deleteFiles(sessions []db.Session) (int, int64, int) {
 	removed := 0
 	var reclaimed int64
 
 	for _, s := range sessions {
-		if s.FilePath == nil {
+		if s.FilePath == nil || !parser.OwnsSessionFile(parser.AgentType(s.Agent)) {
 			continue
 		}
 		path := *s.FilePath
@@ -217,7 +243,7 @@ func deleteFiles(sessions []db.Session) (int, int64) {
 			_ = os.Remove(dir)
 		}
 	}
-	return removed, reclaimed
+	return removed, reclaimed, keptSourceFiles(sessions)
 }
 
 func formatBytes(b int64) string {
