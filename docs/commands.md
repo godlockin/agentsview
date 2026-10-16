@@ -714,12 +714,11 @@ agentsview prune --first-message "test" --yes
 agentsview prune --project "old-project" --max-messages 5 --before 2025-06-01
 ```
 
-Prune may delete stored files for Claude, Codex, TraeX, and Augure Code when
-no surviving archived session references them. App stores such as Hermes's
-`state.db` and other agents' files stay in place. The summary counts the source
-files kept and disk space reclaimed. Pruned sessions stay excluded from future
-syncs either way. Use `--dry-run` first to preview the matching sessions and
-retained files.
+Prune leaves the shared database of apps such as Hermes and Augure Desktop in
+place and reports it in the summary, including with `--dry-run`. Only legacy
+rows storing a bare `state.db` path could lose the database; synced
+`state.db#id` rows never reached file deletion. The summary also reports sessions
+deleted and disk space reclaimed. Use `--dry-run` first to preview the matches.
 
 ______________________________________________________________________
 

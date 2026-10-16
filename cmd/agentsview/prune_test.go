@@ -15,76 +15,6 @@ import (
 	"go.kenn.io/agentsview/internal/dbtest"
 )
 
-func TestPrunerKeepsClaudeParentTranscript(t *testing.T) {
-	d := dbtest.OpenTestDB(t)
-	path := filepath.Join(t.TempDir(), "session.jsonl")
-	require.NoError(t, os.WriteFile(path, []byte("shared transcript"), 0o600))
-	dbtest.SeedSession(t, d, "parent", "test", func(s *db.Session) {
-		s.Agent, s.FilePath = "claude", new(path)
-	})
-	dbtest.SeedSession(t, d, "leaf", "test", func(s *db.Session) {
-		s.Agent, s.FilePath = "claude", new(path)
-		s.ParentSessionID, s.RelationshipType = new("parent"), "fork"
-		s.FileSize = new(int64(17))
-		s.FirstMessage = new("prune this fork")
-	})
-	pruner, out := newTestPruner(t, d, "")
-	require.NoError(t, pruner.Prune(t.Context(), PruneConfig{
-		Filter: db.PruneFilter{FirstMessage: "prune this fork"}, Yes: true,
-	}))
-	parent, err := d.GetSession(t.Context(), "parent")
-	require.NoError(t, err)
-	assert.NotNil(t, parent)
-	leaf, err := d.GetSession(t.Context(), "leaf")
-	require.NoError(t, err)
-	assert.Nil(t, leaf)
-	assert.FileExists(t, path)
-	assert.Contains(t, out.String(), "Found 1 sessions (0 B on disk), left 1 source file in place")
-	assert.Contains(t, out.String(), "removed 0 files (0 B reclaimed), left 1 source file in place")
-}
-
-func TestPrunerClaudeContinuationSources(t *testing.T) {
-	d := dbtest.OpenTestDB(t)
-	first := filepath.Join(t.TempDir(), "first.jsonl")
-	second := filepath.Join(t.TempDir(), "second.jsonl")
-	for _, path := range []string{first, second} {
-		require.NoError(t, os.WriteFile(path, []byte("transcript"), 0o600))
-	}
-	// Same layout as TestClaudeSubagentContinuationPreservesForks:
-	// the resumed session uses both files, and the fork uses the second.
-	result, err := d.WriteSessionBatchContext(t.Context(), []db.SessionBatchWrite{{
-		Session:               db.Session{ID: "main", Agent: "claude", Project: "test", Machine: "local", FilePath: new(first)},
-		ClaudeSubagentSources: []string{first, second}, ReplaceMessages: true,
-	}})
-	require.NoError(t, err)
-	require.Equal(t, 1, result.WrittenSessions)
-	dbtest.SeedSession(t, d, "fork", "test", func(s *db.Session) {
-		s.Agent, s.FilePath, s.FirstMessage = "claude", new(second), new("fork question")
-		s.ParentSessionID, s.RelationshipType = new("main"), "fork"
-	})
-	assert.Equal(t, first, d.GetSessionFilePath(t.Context(), "main"))
-	for _, path := range []string{first, second} {
-		count, err := d.CountSessionsByFilePath(t.Context(), path)
-		require.NoError(t, err)
-		assert.Equal(t, 1, count, "count primary paths separately from provenance")
-	}
-	pruner, out := newTestPruner(t, d, "")
-	require.NoError(t, pruner.Prune(t.Context(), PruneConfig{Filter: db.PruneFilter{FirstMessage: "fork question"}, Yes: true}))
-	fork, err := d.GetSession(t.Context(), "fork")
-	require.NoError(t, err)
-	assert.Nil(t, fork)
-	main, err := d.GetSession(t.Context(), "main")
-	require.NoError(t, err)
-	assert.NotNil(t, main)
-	assert.FileExists(t, first)
-	assert.FileExists(t, second)
-	assert.Contains(t, out.String(), "removed 0 files (0 B reclaimed), left 1 source file in place")
-	// The joined session's primary path also appears in its provenance.
-	// Once it is the only candidate, that duplicate mustn't keep its file.
-	require.NoError(t, pruner.Prune(t.Context(), PruneConfig{Filter: db.PruneFilter{Project: "test"}, Yes: true}))
-	assert.NoFileExists(t, first)
-}
-
 func TestPrunerKeepsSharedSourceFiles(t *testing.T) {
 	for _, mode := range []string{"delete", "dry run", "abort"} {
 		t.Run(mode, func(t *testing.T) {
@@ -94,8 +24,8 @@ func TestPrunerKeepsSharedSourceFiles(t *testing.T) {
 			for _, path := range []string{hermes, augure} {
 				require.NoError(t, os.WriteFile(path, []byte("app state"), 0o600))
 			}
-			// Only bare state.db paths can reach file deletion; synced rows
-			// hold state.db#id, which isn't a physical file path.
+			// Synced state.db#id rows never reached file deletion; only
+			// legacy rows with bare state.db paths could lose the database.
 			for _, row := range []struct{ id, agent, path string }{
 				{"hermes", "hermes", hermes},
 				{"augure", "augure-desktop", augure},
@@ -159,28 +89,6 @@ func TestPrunerRemovesClaudeAndKeepsHermes(t *testing.T) {
 	assert.Contains(t, out.String(), "Deleted 2 sessions, removed 1 files (11 B reclaimed), left 1 source file in place")
 }
 
-func TestPrunerKeepsUnownedAgentFile(t *testing.T) {
-	for _, agent := range []string{"nope", "gemini"} {
-		t.Run(agent, func(t *testing.T) {
-			d := dbtest.OpenTestDB(t)
-			path := filepath.Join(t.TempDir(), "session.jsonl")
-			require.NoError(t, os.WriteFile(path, []byte("transcript"), 0o600))
-			dbtest.SeedSession(t, d, "unknown", "test", func(s *db.Session) {
-				s.Agent, s.FilePath = agent, new(path)
-			})
-			pruner, out := newTestPruner(t, d, "")
-			require.NoError(t, pruner.Prune(t.Context(), PruneConfig{
-				Filter: db.PruneFilter{Project: "test"}, Yes: true,
-			}))
-			assert.FileExists(t, path)
-			session, err := d.GetSession(t.Context(), "unknown")
-			require.NoError(t, err)
-			assert.Nil(t, session)
-			assert.Contains(t, out.String(), "left 1 source file in place")
-		})
-	}
-}
-
 func TestDeleteFilesCountsExistingContainers(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "profile#one", "state.db")
 	require.NoError(t, os.MkdirAll(filepath.Dir(path), 0o700))
@@ -190,32 +98,23 @@ func TestDeleteFilesCountsExistingContainers(t *testing.T) {
 		{Agent: "hermes", FilePath: new(path + "#one")},
 		{Agent: "hermes", FilePath: new(path + "#two")},
 		{Agent: "hermes", FilePath: new(filepath.Join(t.TempDir(), "state.db") + "#three")},
-	}, nil)
+	})
 	assert.Equal(t, 0, removed)
 	assert.Zero(t, reclaimed)
 	assert.Equal(t, 1, kept)
 	assert.FileExists(t, path)
 }
 
-func TestPrunerCountsVirtualContainers(t *testing.T) {
-	for _, agent := range []string{"goose", "forge", "crush"} {
-		t.Run(agent, func(t *testing.T) {
-			d := dbtest.OpenTestDB(t)
-			path := filepath.Join(t.TempDir(), "profile#one", "sessions.db")
-			require.NoError(t, os.MkdirAll(filepath.Dir(path), 0o700))
-			require.NoError(t, os.WriteFile(path, []byte("app state"), 0o600))
-			for _, id := range []string{"one", "two"} {
-				dbtest.SeedSession(t, d, id, "test", func(s *db.Session) {
-					s.Agent, s.FilePath = agent, new(path+"#"+id)
-				})
-			}
-			pruner, out := newTestPruner(t, d, "")
-			require.NoError(t, pruner.Prune(t.Context(), PruneConfig{Filter: db.PruneFilter{Project: "test"}, Yes: true}))
-			assert.FileExists(t, path)
-			assert.Contains(t, out.String(), "Found 2 sessions (0 B on disk), left 1 source file in place")
-			assert.Contains(t, out.String(), "Deleted 2 sessions, removed 0 files (0 B reclaimed), left 1 source file in place")
-		})
-	}
+func TestDeleteFilesDoesNotSplitHashDirectory(t *testing.T) {
+	prefix := filepath.Join(t.TempDir(), "profile")
+	require.NoError(t, os.WriteFile(prefix, []byte("unrelated file"), 0o600))
+	removed, reclaimed, kept := deleteFiles([]db.Session{
+		{Agent: "hermes", FilePath: new(filepath.Join(prefix+"#one", "state.db"))},
+	})
+	assert.Zero(t, removed)
+	assert.Zero(t, reclaimed)
+	assert.Zero(t, kept)
+	assert.FileExists(t, prefix)
 }
 
 func TestParsePruneFlags(t *testing.T) {
@@ -338,7 +237,7 @@ func TestConfirm(t *testing.T) {
 	}
 }
 
-func TestWriteSummary(t *testing.T) {
+func TestPruneWriteSummary(t *testing.T) {
 	sessions := []db.Session{
 		{ID: "s1", Agent: "claude", FilePath: new("session.jsonl"), Project: "projA", FileSize: new(int64(1024))},
 		{ID: "s2", Agent: "hermes", Project: "projA", FileSize: new(int64(2048))},
@@ -346,7 +245,7 @@ func TestWriteSummary(t *testing.T) {
 	}
 
 	var buf bytes.Buffer
-	writeSummary(&buf, sessions, nil)
+	writeSummary(&buf, sessions)
 	out := buf.String()
 
 	want := `Found 3 sessions (1.0 KB on disk)
@@ -503,7 +402,7 @@ func TestPruner_PruneScenarios(t *testing.T) {
 func TestDeleteFilesRemovesFiles(t *testing.T) {
 	d := dbtest.OpenTestDB(t)
 	var paths []string
-	for _, agent := range []string{"claude", "codex", "traex", "augure-code"} {
+	for _, agent := range []string{"pi", "claude", "codex", "traex"} {
 		path := filepath.Join(t.TempDir(), agent, "session.jsonl")
 		require.NoError(t, os.MkdirAll(filepath.Dir(path), 0o700))
 		require.NoError(t, os.WriteFile(path, []byte("transcript"), 0o600))
@@ -529,7 +428,7 @@ func TestDeleteFilesMissingFile(t *testing.T) {
 		{ID: "s1", Agent: "claude", FilePath: new(filepath.Join(t.TempDir(), "missing.jsonl"))},
 	}
 
-	removed, reclaimed, kept := deleteFiles(sessions, nil)
+	removed, reclaimed, kept := deleteFiles(sessions)
 	assert.Equal(t, 0, removed)
 	assert.Equal(t, int64(0), reclaimed)
 	assert.Zero(t, kept)
@@ -540,7 +439,7 @@ func TestDeleteFilesNilPath(t *testing.T) {
 		{ID: "s1", FilePath: nil},
 	}
 
-	removed, reclaimed, kept := deleteFiles(sessions, nil)
+	removed, reclaimed, kept := deleteFiles(sessions)
 	assert.Equal(t, 0, removed)
 	assert.Equal(t, int64(0), reclaimed)
 	assert.Zero(t, kept)

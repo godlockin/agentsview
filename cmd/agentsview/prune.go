@@ -112,11 +112,7 @@ func (p *Pruner) Prune(ctx context.Context, cfg PruneConfig) error {
 		return nil
 	}
 
-	keptPaths, err := p.keptFilePaths(ctx, candidates)
-	if err != nil {
-		return err
-	}
-	writeSummary(p.Out, candidates, keptPaths)
+	writeSummary(p.Out, candidates)
 
 	if cfg.DryRun {
 		fmt.Fprintln(p.Out, "\nDry run: no changes made.")
@@ -143,7 +139,7 @@ func (p *Pruner) Prune(ctx context.Context, cfg PruneConfig) error {
 		return fmt.Errorf("deleting sessions: %w", err)
 	}
 
-	filesRemoved, bytesReclaimed, filesKept := deleteFiles(candidates, keptPaths)
+	filesRemoved, bytesReclaimed, filesKept := deleteFiles(candidates)
 
 	fmt.Fprintf(p.Out,
 		"\nDeleted %d sessions, removed %d files"+
@@ -165,7 +161,7 @@ func confirm(r io.Reader, w io.Writer, msg string) bool {
 	return ans == "y" || ans == "yes"
 }
 
-func writeSummary(w io.Writer, sessions []db.Session, keptPaths map[string]bool) {
+func writeSummary(w io.Writer, sessions []db.Session) {
 	var totalSize int64
 	byProject := map[string]int{}
 	var projects []string
@@ -174,7 +170,7 @@ func writeSummary(w io.Writer, sessions []db.Session, keptPaths map[string]bool)
 			projects = append(projects, s.Project)
 		}
 		byProject[s.Project]++
-		if shouldDeleteFile(s, keptPaths) && s.FileSize != nil {
+		if s.FilePath != nil && !parser.OwnsAppStore(parser.AgentType(s.Agent)) && s.FileSize != nil {
 			totalSize += *s.FileSize
 		}
 	}
@@ -185,7 +181,7 @@ func writeSummary(w io.Writer, sessions []db.Session, keptPaths map[string]bool)
 		"Found %d sessions (%s on disk)",
 		len(sessions), formatBytes(totalSize),
 	)
-	if kept := keptSourceFiles(sessions, keptPaths); kept > 0 {
+	if kept := keptSourceFiles(sessions); kept > 0 {
 		writeKeptFiles(w, kept)
 	}
 	fmt.Fprintln(w)
@@ -200,77 +196,26 @@ func writeKeptFiles(w io.Writer, count int) {
 	fmt.Fprintf(w, ", left %d source file%s in place", count, pluralSuffix(count))
 }
 
-func (p *Pruner) keptFilePaths(ctx context.Context, sessions []db.Session) (map[string]bool, error) {
-	candidateCounts := map[string]int{}
-	candidateIDs := map[string]bool{}
-	kept := map[string]bool{}
-	for _, s := range sessions {
-		candidateIDs[s.ID] = true
-		if s.FilePath != nil {
-			candidateCounts[*s.FilePath]++
-		}
-		if shouldDeleteFile(s, nil) {
-			kept[*s.FilePath] = false
-		}
-	}
-	owners, err := p.DB.GetClaudeSubagentSourceOwners(ctx)
-	if err != nil {
-		return nil, fmt.Errorf("checking source owners: %w", err)
-	}
-	for path := range kept {
-		count, err := p.DB.CountSessionsByFilePath(ctx, path)
-		if err != nil {
-			return nil, fmt.Errorf("checking retained source: %w", err)
-		}
-		kept[path] = count-candidateCounts[path] > 0
-		for _, id := range owners[path] {
-			if !candidateIDs[id] {
-				kept[path] = true
-				break
-			}
-		}
-	}
-	return kept, nil
-}
-
-func shouldDeleteFile(s db.Session, keptPaths map[string]bool) bool {
-	return s.FilePath != nil && parser.OwnsSessionFile(parser.AgentType(s.Agent)) && !keptPaths[*s.FilePath]
-}
-
-func keptSourceFiles(sessions []db.Session, keptPaths map[string]bool) int {
+func keptSourceFiles(sessions []db.Session) int {
 	kept := map[string]struct{}{}
 	for _, s := range sessions {
-		if s.FilePath == nil || shouldDeleteFile(s, keptPaths) {
+		if s.FilePath == nil || !parser.OwnsAppStore(parser.AgentType(s.Agent)) {
 			continue
 		}
-		if path := existingSourceFile(*s.FilePath); path != "" {
+		path := parser.ResolveSourceFilePath(*s.FilePath)
+		if _, err := os.Stat(path); err == nil {
 			kept[path] = struct{}{}
 		}
 	}
 	return len(kept)
 }
 
-func existingSourceFile(storedPath string) string {
-	path := parser.ResolveSourceFilePath(storedPath)
-	if _, err := os.Stat(path); err == nil {
-		return path
-	} else if !os.IsNotExist(err) {
-		return ""
-	}
-	if container, _, ok := parser.ParseVirtualSourcePath(storedPath); ok {
-		if _, err := os.Stat(container); err == nil {
-			return container
-		}
-	}
-	return ""
-}
-
-func deleteFiles(sessions []db.Session, keptPaths map[string]bool) (int, int64, int) {
+func deleteFiles(sessions []db.Session) (int, int64, int) {
 	removed := 0
 	var reclaimed int64
 
 	for _, s := range sessions {
-		if !shouldDeleteFile(s, keptPaths) {
+		if s.FilePath == nil || parser.OwnsAppStore(parser.AgentType(s.Agent)) {
 			continue
 		}
 		path := *s.FilePath
@@ -299,7 +244,7 @@ func deleteFiles(sessions []db.Session, keptPaths map[string]bool) (int, int64, 
 			_ = os.Remove(dir)
 		}
 	}
-	return removed, reclaimed, keptSourceFiles(sessions, keptPaths)
+	return removed, reclaimed, keptSourceFiles(sessions)
 }
 
 func formatBytes(b int64) string {

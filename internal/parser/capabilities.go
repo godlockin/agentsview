@@ -74,9 +74,9 @@ type SourceCapabilities struct {
 	CompositeFingerprint CapabilitySupport
 	IncrementalAppend    CapabilitySupport
 	MultiSessionSource   CapabilitySupport
-	// SessionOwnedFile means prune may delete the stored file when no surviving
-	// session references it. The zero value leaves the source in place.
-	SessionOwnedFile CapabilitySupport
+	// AppOwnedStore means the stored file_path can be the app's shared database,
+	// so prune leaves it in place.
+	AppOwnedStore CapabilitySupport
 	// SharedContainerSource means streaming discovery emits multiple logical
 	// virtual members from one physical container and exact reconciliation
 	// rehydration is required to avoid reopening or rescanning that container.

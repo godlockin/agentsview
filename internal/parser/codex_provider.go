@@ -1556,7 +1556,6 @@ func codexProviderCapabilities() Capabilities {
 			CompositeFingerprint: CapabilitySupported,
 			IncrementalAppend:    CapabilitySupported,
 			MultiSessionSource:   CapabilityNotApplicable,
-			SessionOwnedFile:     CapabilitySupported,
 			PerSessionErrors:     CapabilityNotApplicable,
 			ExcludedSessions:     CapabilityNotApplicable,
 			ForceReplaceOnParse:  CapabilitySupported,

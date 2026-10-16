@@ -161,7 +161,7 @@ The latest release is
 
 **Bug fixes**
 
-- Pruning keeps app-owned stores and transcripts still used by surviving sessions.
+- Pruning leaves the shared database of apps such as Hermes and Augure Desktop in place and reports it. Only legacy rows storing a bare `state.db` path could lose the database; synced `state.db#id` rows never reached file deletion.
 - A ClickHouse push that restores a wider project scope after a filtered push
   stopped with session errors now runs a full push, and pushes stay full until
   one finishes without errors. Sessions the filtered push removed from the
