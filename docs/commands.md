@@ -714,11 +714,10 @@ agentsview prune --first-message "test" --yes
 agentsview prune --project "old-project" --max-messages 5 --before 2025-06-01
 ```
 
-Prune leaves the shared database of apps such as Hermes and Augure Desktop in
-place and reports it in the summary, including with `--dry-run`. Only legacy
-rows storing a bare `state.db` path could lose the database; synced
-`state.db#id` rows never reached file deletion. The summary also reports sessions
-deleted and disk space reclaimed. Use `--dry-run` first to preview the matches.
+Prune deletes each matching session's source file, except the shared
+`state.db` of apps such as Hermes and Augure Desktop, which stays in place. The
+summary reports sessions deleted, disk space reclaimed, and how many source
+files stay in place. Use `--dry-run` first to preview the matches.
 
 ______________________________________________________________________
 

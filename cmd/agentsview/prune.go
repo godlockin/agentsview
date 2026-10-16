@@ -147,7 +147,7 @@ func (p *Pruner) Prune(ctx context.Context, cfg PruneConfig) error {
 		deleted, filesRemoved, formatBytes(bytesReclaimed),
 	)
 	if filesKept > 0 {
-		writeKeptFiles(p.Out, filesKept)
+		writeKeptFiles(p.Out, "left", filesKept)
 	}
 	fmt.Fprintln(p.Out)
 	return nil
@@ -186,7 +186,7 @@ func writeSummary(w io.Writer, sessions []db.Session) int {
 	)
 	kept := keptSourceFiles(sessions)
 	if kept > 0 {
-		writeKeptFiles(w, kept)
+		writeKeptFiles(w, "will leave", kept)
 	}
 	fmt.Fprintln(w)
 	fmt.Fprintln(w, "\nBy project:")
@@ -197,8 +197,8 @@ func writeSummary(w io.Writer, sessions []db.Session) int {
 	return kept
 }
 
-func writeKeptFiles(w io.Writer, count int) {
-	fmt.Fprintf(w, ", left %d source file%s in place", count, pluralSuffix(count))
+func writeKeptFiles(w io.Writer, verb string, count int) {
+	fmt.Fprintf(w, ", %s %d source file%s in place", verb, count, pluralSuffix(count))
 }
 
 func keptSourceFiles(sessions []db.Session) int {

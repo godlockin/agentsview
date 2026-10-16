@@ -161,7 +161,10 @@ The latest release is
 
 **Bug fixes**
 
-- Pruning leaves the shared database of apps such as Hermes and Augure Desktop in place and reports it. Only legacy rows storing a bare `state.db` path could lose the database; synced `state.db#id` rows never reached file deletion.
+- `agentsview prune` no longer deletes the shared `state.db` of Hermes or
+  Augure Desktop. Sessions synced by 0.45.0 or earlier record the bare
+  `state.db` path, and pruning one deleted the whole app database. The prune
+  summary now says how many source files stay in place.
 - A ClickHouse push that restores a wider project scope after a filtered push
   stopped with session errors now runs a full push, and pushes stay full until
   one finishes without errors. Sessions the filtered push removed from the

@@ -45,7 +45,7 @@ func TestPrunerKeepsSharedSourceFiles(t *testing.T) {
 				require.NoError(t, err)
 				assert.Equal(t, "app state", string(content))
 			}
-			assert.Contains(t, out.String(), "left 2 source files in place")
+			assert.Contains(t, out.String(), "Found 3 sessions (0 B on disk), will leave 2 source files in place")
 			if mode == "delete" {
 				assert.Contains(t, out.String(), "Deleted 3 sessions, removed 0 files (0 B reclaimed), left 2 source files in place")
 			}
@@ -85,7 +85,7 @@ func TestPrunerRemovesClaudeAndKeepsHermes(t *testing.T) {
 		require.NoError(t, err)
 		assert.Nil(t, session)
 	}
-	assert.Contains(t, out.String(), "Found 2 sessions (11 B on disk), left 1 source file in place")
+	assert.Contains(t, out.String(), "Found 2 sessions (11 B on disk), will leave 1 source file in place")
 	assert.Contains(t, out.String(), "Deleted 2 sessions, removed 1 files (11 B reclaimed), left 1 source file in place")
 }
 
@@ -118,7 +118,7 @@ func TestPrunerRemovesStandaloneTranscripts(t *testing.T) {
 				content, err := os.ReadFile(store)
 				require.NoError(t, err)
 				assert.Equal(t, "source data", string(content))
-				assert.Contains(t, out.String(), "Found 3 sessions (22 B on disk), left 1 source file in place")
+				assert.Contains(t, out.String(), "Found 3 sessions (22 B on disk), will leave 1 source file in place")
 				assert.Contains(t, out.String(), "Deleted 3 sessions, removed 2 files (22 B reclaimed), left 1 source file in place")
 			}
 		})
