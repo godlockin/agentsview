@@ -161,6 +161,7 @@ The latest release is
 
 **Bug fixes**
 
+- Pruning keeps app-owned stores and transcripts still used by surviving sessions.
 - A ClickHouse push that restores a wider project scope after a filtered push
   stopped with session errors now runs a full push, and pushes stay full until
   one finishes without errors. Sessions the filtered push removed from the

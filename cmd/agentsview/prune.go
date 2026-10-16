@@ -138,6 +138,10 @@ func (p *Pruner) Prune(ctx context.Context, cfg PruneConfig) error {
 		ids[i] = s.ID
 	}
 
+	keptPaths, err = p.keptFilePaths(ctx, candidates)
+	if err != nil {
+		return err
+	}
 	deleted, err := p.DB.DeleteSessions(ctx, ids)
 	if err != nil {
 		return fmt.Errorf("deleting sessions: %w", err)
@@ -174,7 +178,7 @@ func writeSummary(w io.Writer, sessions []db.Session, keptPaths map[string]bool)
 			projects = append(projects, s.Project)
 		}
 		byProject[s.Project]++
-		if s.FilePath != nil && parser.OwnsSessionFile(parser.AgentType(s.Agent)) && !keptPaths[*s.FilePath] && s.FileSize != nil {
+		if shouldDeleteFile(s, keptPaths) && s.FileSize != nil {
 			totalSize += *s.FileSize
 		}
 	}
@@ -207,8 +211,26 @@ func writeKeptFiles(w io.Writer, count int) {
 func (p *Pruner) keptFilePaths(ctx context.Context, sessions []db.Session) (map[string]bool, error) {
 	candidateCounts := map[string]int{}
 	for _, s := range sessions {
-		if s.FilePath != nil && parser.OwnsSessionFile(parser.AgentType(s.Agent)) {
-			candidateCounts[*s.FilePath]++
+		if shouldDeleteFile(s, nil) {
+			candidateCounts[*s.FilePath] = 0
+		}
+	}
+	for _, s := range sessions {
+		paths, err := p.DB.GetClaudeSubagentSources(ctx, s.ID)
+		if err != nil {
+			return nil, fmt.Errorf("checking candidate sources: %w", err)
+		}
+		references := map[string]bool{}
+		if s.FilePath != nil {
+			references[*s.FilePath] = true
+		}
+		for _, path := range paths {
+			references[path] = true
+		}
+		for path := range references {
+			if _, ok := candidateCounts[path]; ok {
+				candidateCounts[path]++
+			}
 		}
 	}
 	kept := map[string]bool{}
@@ -222,10 +244,14 @@ func (p *Pruner) keptFilePaths(ctx context.Context, sessions []db.Session) (map[
 	return kept, nil
 }
 
+func shouldDeleteFile(s db.Session, keptPaths map[string]bool) bool {
+	return s.FilePath != nil && parser.OwnsSessionFile(parser.AgentType(s.Agent)) && !keptPaths[*s.FilePath]
+}
+
 func keptSourceFiles(sessions []db.Session, keptPaths map[string]bool) int {
 	kept := map[string]struct{}{}
 	for _, s := range sessions {
-		if s.FilePath == nil || (parser.OwnsSessionFile(parser.AgentType(s.Agent)) && !keptPaths[*s.FilePath]) {
+		if s.FilePath == nil || shouldDeleteFile(s, keptPaths) {
 			continue
 		}
 		path := parser.ResolveSourceFilePath(*s.FilePath)
@@ -241,7 +267,7 @@ func deleteFiles(sessions []db.Session, keptPaths map[string]bool) (int, int64, 
 	var reclaimed int64
 
 	for _, s := range sessions {
-		if s.FilePath == nil || !parser.OwnsSessionFile(parser.AgentType(s.Agent)) || keptPaths[*s.FilePath] {
+		if !shouldDeleteFile(s, keptPaths) {
 			continue
 		}
 		path := *s.FilePath
