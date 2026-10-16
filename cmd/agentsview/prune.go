@@ -112,7 +112,7 @@ func (p *Pruner) Prune(ctx context.Context, cfg PruneConfig) error {
 		return nil
 	}
 
-	keptPaths, err := p.keptFilePaths(ctx, candidates, true)
+	keptPaths, err := p.keptFilePaths(ctx, candidates)
 	if err != nil {
 		return err
 	}
@@ -143,10 +143,6 @@ func (p *Pruner) Prune(ctx context.Context, cfg PruneConfig) error {
 		return fmt.Errorf("deleting sessions: %w", err)
 	}
 
-	keptPaths, err = p.keptFilePaths(ctx, candidates, false)
-	if err != nil {
-		return err
-	}
 	filesRemoved, bytesReclaimed, filesKept := deleteFiles(candidates, keptPaths)
 
 	fmt.Fprintf(p.Out,
@@ -208,7 +204,7 @@ func writeKeptFiles(w io.Writer, count int) {
 	fmt.Fprintf(w, ", left %d source file%s in place", count, suffix)
 }
 
-func (p *Pruner) keptFilePaths(ctx context.Context, sessions []db.Session, beforeDeletion bool) (map[string]bool, error) {
+func (p *Pruner) keptFilePaths(ctx context.Context, sessions []db.Session) (map[string]bool, error) {
 	candidateCounts := map[string]int{}
 	for _, s := range sessions {
 		if s.FilePath != nil && parser.OwnsSessionFile(parser.AgentType(s.Agent)) {
@@ -221,10 +217,7 @@ func (p *Pruner) keptFilePaths(ctx context.Context, sessions []db.Session, befor
 		if err != nil {
 			return nil, fmt.Errorf("checking retained source: %w", err)
 		}
-		if beforeDeletion {
-			count -= candidates
-		}
-		kept[path] = count > 0
+		kept[path] = count-candidates > 0
 	}
 	return kept, nil
 }
