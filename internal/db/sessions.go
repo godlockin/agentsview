@@ -5599,6 +5599,15 @@ func (db *DB) ListOwnedSessionIDsForExport(ctx context.Context) ([]string, error
 	return ids, nil
 }
 
+// CountSessionsByFilePath counts all archived sessions referencing a stored file.
+func (db *DB) CountSessionsByFilePath(ctx context.Context, path string) (int, error) {
+	var count int
+	err := db.getReader().QueryRow(ctx,
+		"SELECT COUNT(*) FROM sessions WHERE file_path = ?", path,
+	).Scan(&count)
+	return count, err
+}
+
 // GetDataVersionByPath returns the minimum data_version for non-source-missing
 // sessions matching a file_path. Returns 0 when no eligible session exists.
 func (db *DB) GetDataVersionByPath(ctx context.Context, path string) int {
