@@ -89,16 +89,54 @@ func TestPrunerRemovesClaudeAndKeepsHermes(t *testing.T) {
 	assert.Contains(t, out.String(), "Deleted 2 sessions, removed 1 files (11 B reclaimed), left 1 source file in place")
 }
 
+func TestPrunerRemovesStandaloneTranscripts(t *testing.T) {
+	for _, agent := range []string{"hermes", "augure-desktop", "pi"} {
+		t.Run(agent, func(t *testing.T) {
+			d := dbtest.OpenTestDB(t)
+			root := t.TempDir()
+			store := filepath.Join(root, "state.db")
+			jsonl := filepath.Join(root, "sessions", "one.jsonl")
+			json := filepath.Join(root, "session_two.json")
+			require.NoError(t, os.MkdirAll(filepath.Dir(jsonl), 0o700))
+			for i, path := range []string{store, jsonl, json} {
+				require.NoError(t, os.WriteFile(path, []byte("source data"), 0o600))
+				dbtest.SeedSession(t, d, fmt.Sprintf("s%d", i), "test", func(s *db.Session) {
+					s.Agent, s.FilePath, s.FileSize = agent, new(path), new(int64(11))
+				})
+			}
+			pruner, out := newTestPruner(t, d, "")
+			require.NoError(t, pruner.Prune(t.Context(), PruneConfig{
+				Filter: db.PruneFilter{Project: "test"}, Yes: true,
+			}))
+			assert.NoFileExists(t, jsonl)
+			assert.NoFileExists(t, json)
+			if agent == "pi" {
+				assert.NoFileExists(t, store)
+				assert.Contains(t, out.String(), "Found 3 sessions (33 B on disk)")
+				assert.Contains(t, out.String(), "Deleted 3 sessions, removed 3 files (33 B reclaimed)")
+			} else {
+				content, err := os.ReadFile(store)
+				require.NoError(t, err)
+				assert.Equal(t, "source data", string(content))
+				assert.Contains(t, out.String(), "Found 3 sessions (22 B on disk), left 1 source file in place")
+				assert.Contains(t, out.String(), "Deleted 3 sessions, removed 2 files (22 B reclaimed), left 1 source file in place")
+			}
+		})
+	}
+}
+
 func TestDeleteFilesCountsExistingContainers(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "profile#one", "state.db")
 	require.NoError(t, os.MkdirAll(filepath.Dir(path), 0o700))
 	require.NoError(t, os.WriteFile(path, []byte("app state"), 0o600))
-	removed, reclaimed, kept := deleteFiles([]db.Session{
+	sessions := []db.Session{
 		{Agent: "hermes", FilePath: new(path)},
 		{Agent: "hermes", FilePath: new(path + "#one")},
 		{Agent: "hermes", FilePath: new(path + "#two")},
 		{Agent: "hermes", FilePath: new(filepath.Join(t.TempDir(), "state.db") + "#three")},
-	})
+	}
+	kept := keptSourceFiles(sessions)
+	removed, reclaimed := deleteFiles(sessions)
 	assert.Equal(t, 0, removed)
 	assert.Zero(t, reclaimed)
 	assert.Equal(t, 1, kept)
@@ -108,9 +146,11 @@ func TestDeleteFilesCountsExistingContainers(t *testing.T) {
 func TestDeleteFilesDoesNotSplitHashDirectory(t *testing.T) {
 	prefix := filepath.Join(t.TempDir(), "profile")
 	require.NoError(t, os.WriteFile(prefix, []byte("unrelated file"), 0o600))
-	removed, reclaimed, kept := deleteFiles([]db.Session{
+	sessions := []db.Session{
 		{Agent: "hermes", FilePath: new(filepath.Join(prefix+"#one", "state.db"))},
-	})
+	}
+	kept := keptSourceFiles(sessions)
+	removed, reclaimed := deleteFiles(sessions)
 	assert.Zero(t, removed)
 	assert.Zero(t, reclaimed)
 	assert.Zero(t, kept)
@@ -239,8 +279,8 @@ func TestConfirm(t *testing.T) {
 
 func TestPruneWriteSummary(t *testing.T) {
 	sessions := []db.Session{
-		{ID: "s1", Agent: "claude", FilePath: new("session.jsonl"), Project: "projA", FileSize: new(int64(1024))},
-		{ID: "s2", Agent: "hermes", Project: "projA", FileSize: new(int64(2048))},
+		{ID: "s1", Project: "projA", FileSize: new(int64(1024))},
+		{ID: "s2", Project: "projA", FileSize: new(int64(2048))},
 		{ID: "s3", Project: "projB"},
 	}
 
@@ -248,7 +288,7 @@ func TestPruneWriteSummary(t *testing.T) {
 	writeSummary(&buf, sessions)
 	out := buf.String()
 
-	want := `Found 3 sessions (1.0 KB on disk)
+	want := `Found 3 sessions (3.0 KB on disk)
 
 By project:
   projA                                    2
@@ -400,38 +440,38 @@ func TestPruner_PruneScenarios(t *testing.T) {
 }
 
 func TestDeleteFilesRemovesFiles(t *testing.T) {
-	d := dbtest.OpenTestDB(t)
-	var paths []string
-	for _, agent := range []string{"pi", "claude", "codex", "traex"} {
-		path := filepath.Join(t.TempDir(), agent, "session.jsonl")
-		require.NoError(t, os.MkdirAll(filepath.Dir(path), 0o700))
-		require.NoError(t, os.WriteFile(path, []byte("transcript"), 0o600))
-		paths = append(paths, path)
-		dbtest.SeedSession(t, d, agent, "test", func(s *db.Session) {
-			s.Agent, s.FilePath = agent, new(path)
-		})
+	dir := t.TempDir()
+	subdir := filepath.Join(dir, "session1")
+	require.NoError(t, os.MkdirAll(subdir, 0o755))
+
+	f := filepath.Join(subdir, "data.jsonl")
+	require.NoError(t, os.WriteFile(f, []byte("test data"), 0o644))
+
+	sessions := []db.Session{
+		{ID: "s1", FilePath: new(f)},
 	}
-	pruner, out := newTestPruner(t, d, "")
-	require.NoError(t, pruner.Prune(t.Context(), PruneConfig{
-		Filter: db.PruneFilter{Project: "test"}, Yes: true,
-	}))
-	for _, path := range paths {
-		assert.NoFileExists(t, path)
-		assert.NoDirExists(t, filepath.Dir(path))
-	}
-	assert.Contains(t, out.String(), "Deleted 4 sessions, removed 4 files (40 B reclaimed)")
-	assert.NotContains(t, out.String(), "source files in place")
+
+	removed, reclaimed := deleteFiles(sessions)
+	assert.Equal(t, 1, removed)
+	assert.Equal(t, int64(9), reclaimed)
+
+	// File should be gone.
+	_, err := os.Stat(f)
+	assert.True(t, os.IsNotExist(err), "file still exists")
+
+	// Empty parent dir should be removed.
+	_, err = os.Stat(subdir)
+	assert.True(t, os.IsNotExist(err), "empty parent dir still exists")
 }
 
 func TestDeleteFilesMissingFile(t *testing.T) {
 	sessions := []db.Session{
-		{ID: "s1", Agent: "claude", FilePath: new(filepath.Join(t.TempDir(), "missing.jsonl"))},
+		{ID: "s1", FilePath: new("/nonexistent/path/file.jsonl")},
 	}
 
-	removed, reclaimed, kept := deleteFiles(sessions)
+	removed, reclaimed := deleteFiles(sessions)
 	assert.Equal(t, 0, removed)
 	assert.Equal(t, int64(0), reclaimed)
-	assert.Zero(t, kept)
 }
 
 func TestDeleteFilesNilPath(t *testing.T) {
@@ -439,10 +479,9 @@ func TestDeleteFilesNilPath(t *testing.T) {
 		{ID: "s1", FilePath: nil},
 	}
 
-	removed, reclaimed, kept := deleteFiles(sessions)
+	removed, reclaimed := deleteFiles(sessions)
 	assert.Equal(t, 0, removed)
 	assert.Equal(t, int64(0), reclaimed)
-	assert.Zero(t, kept)
 }
 
 func newTestPruner(t *testing.T, d *db.DB, input string) (*Pruner, *bytes.Buffer) {

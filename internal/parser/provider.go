@@ -1213,10 +1213,11 @@ func SharesSessionIDs(agent AgentType) bool {
 	return ok && providerFactoryForDef(def).Capabilities().Source.SharedSessionIDs == CapabilitySupported
 }
 
-// OwnsAppStore reports whether agent's provider owns a shared app store.
-func OwnsAppStore(agent AgentType) bool {
+// OwnsAppStore reports whether storedPath resolves to the provider's shared app database.
+func OwnsAppStore(agent AgentType, storedPath string) bool {
 	def, ok := AgentByType(agent)
-	return ok && providerFactoryForDef(def).Capabilities().Source.AppOwnedStore == CapabilitySupported
+	return ok && providerFactoryForDef(def).Capabilities().Source.AppOwnedStore == CapabilitySupported &&
+		HermesStoredPathIsAggregateArchive(ResolveSourceFilePath(storedPath))
 }
 
 func providerFactoryForDef(def AgentDef) ProviderFactory {
