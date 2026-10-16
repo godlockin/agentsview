@@ -277,7 +277,7 @@ func TestConfirm(t *testing.T) {
 	}
 }
 
-func TestPruneWriteSummary(t *testing.T) {
+func TestWriteSummary(t *testing.T) {
 	sessions := []db.Session{
 		{ID: "s1", Project: "projA", FileSize: new(int64(1024))},
 		{ID: "s2", Project: "projA", FileSize: new(int64(2048))},
