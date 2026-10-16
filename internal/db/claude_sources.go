@@ -5,6 +5,25 @@ import (
 	"database/sql"
 )
 
+// GetClaudeSubagentSourceOwners returns the sessions that depend on each contributing path.
+func (db *DB) GetClaudeSubagentSourceOwners(ctx context.Context) (map[string][]string, error) {
+	rows, err := db.getReader().Query(ctx,
+		`SELECT file_path, session_id FROM claude_subagent_sources`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	owners := map[string][]string{}
+	for rows.Next() {
+		var path, id string
+		if err := rows.Scan(&path, &id); err != nil {
+			return nil, err
+		}
+		owners[path] = append(owners[path], id)
+	}
+	return owners, rows.Err()
+}
+
 // GetClaudeSubagentSources reads the local files contributing archived messages.
 func (db *DB) GetClaudeSubagentSources(ctx context.Context, sessionID string) ([]string, error) {
 	rows, err := db.getReader().Query(ctx,

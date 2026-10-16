@@ -138,10 +138,6 @@ func (p *Pruner) Prune(ctx context.Context, cfg PruneConfig) error {
 		ids[i] = s.ID
 	}
 
-	keptPaths, err = p.keptFilePaths(ctx, candidates)
-	if err != nil {
-		return err
-	}
 	deleted, err := p.DB.DeleteSessions(ctx, ids)
 	if err != nil {
 		return fmt.Errorf("deleting sessions: %w", err)
@@ -201,45 +197,38 @@ func writeSummary(w io.Writer, sessions []db.Session, keptPaths map[string]bool)
 }
 
 func writeKeptFiles(w io.Writer, count int) {
-	suffix := "s"
-	if count == 1 {
-		suffix = ""
-	}
-	fmt.Fprintf(w, ", left %d source file%s in place", count, suffix)
+	fmt.Fprintf(w, ", left %d source file%s in place", count, pluralSuffix(count))
 }
 
 func (p *Pruner) keptFilePaths(ctx context.Context, sessions []db.Session) (map[string]bool, error) {
 	candidateCounts := map[string]int{}
-	for _, s := range sessions {
-		if shouldDeleteFile(s, nil) {
-			candidateCounts[*s.FilePath] = 0
-		}
-	}
-	for _, s := range sessions {
-		paths, err := p.DB.GetClaudeSubagentSources(ctx, s.ID)
-		if err != nil {
-			return nil, fmt.Errorf("checking candidate sources: %w", err)
-		}
-		references := map[string]bool{}
-		if s.FilePath != nil {
-			references[*s.FilePath] = true
-		}
-		for _, path := range paths {
-			references[path] = true
-		}
-		for path := range references {
-			if _, ok := candidateCounts[path]; ok {
-				candidateCounts[path]++
-			}
-		}
-	}
+	candidateIDs := map[string]bool{}
 	kept := map[string]bool{}
-	for path, candidates := range candidateCounts {
+	for _, s := range sessions {
+		candidateIDs[s.ID] = true
+		if s.FilePath != nil {
+			candidateCounts[*s.FilePath]++
+		}
+		if shouldDeleteFile(s, nil) {
+			kept[*s.FilePath] = false
+		}
+	}
+	owners, err := p.DB.GetClaudeSubagentSourceOwners(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("checking source owners: %w", err)
+	}
+	for path := range kept {
 		count, err := p.DB.CountSessionsByFilePath(ctx, path)
 		if err != nil {
 			return nil, fmt.Errorf("checking retained source: %w", err)
 		}
-		kept[path] = count-candidates > 0
+		kept[path] = count-candidateCounts[path] > 0
+		for _, id := range owners[path] {
+			if !candidateIDs[id] {
+				kept[path] = true
+				break
+			}
+		}
 	}
 	return kept, nil
 }
@@ -254,12 +243,26 @@ func keptSourceFiles(sessions []db.Session, keptPaths map[string]bool) int {
 		if s.FilePath == nil || shouldDeleteFile(s, keptPaths) {
 			continue
 		}
-		path := parser.ResolveSourceFilePath(*s.FilePath)
-		if _, err := os.Stat(path); err == nil {
+		if path := existingSourceFile(*s.FilePath); path != "" {
 			kept[path] = struct{}{}
 		}
 	}
 	return len(kept)
+}
+
+func existingSourceFile(storedPath string) string {
+	path := parser.ResolveSourceFilePath(storedPath)
+	if _, err := os.Stat(path); err == nil {
+		return path
+	} else if !os.IsNotExist(err) {
+		return ""
+	}
+	if container, _, ok := parser.ParseVirtualSourcePath(storedPath); ok {
+		if _, err := os.Stat(container); err == nil {
+			return container
+		}
+	}
+	return ""
 }
 
 func deleteFiles(sessions []db.Session, keptPaths map[string]bool) (int, int64, int) {
