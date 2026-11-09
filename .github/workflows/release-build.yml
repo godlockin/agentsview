@@ -22,7 +22,7 @@ env:
 
 jobs:
   build:
-    name: Build ${{ matrix.target }}
+    name: Build ${{ matrix.os }}/${{ matrix.arch }}
     runs-on: ${{ matrix.runs-on }}
     timeout-minutes: 40
     strategy:
@@ -36,7 +36,6 @@ jobs:
           - { os: windows, arch: amd64, goarch: amd64, runs-on: windows-latest }
     env:
       CGO_ENABLED: "1"
-      GOARCH: ${{ matrix.goarch }}
       PLATFORM: ${{ matrix.os }}_${{ matrix.arch }}
     steps:
       - uses: actions/checkout@v7.0.1
@@ -60,16 +59,18 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y gcc-aarch64-linux-gnu
-          echo "CC=aarch64-linux-gnu-gcc" >> "$GITHUB_ENV"
 
       - name: Stage SQLite amalgamation header
         run: make sqlite-vec-header
 
+      # GOARCH must NOT be set at job level: the snapshot tool is built and
+      # executed on the runner itself, so a cross-target GOARCH produces an
+      # arm64 binary that fails with "exec format error" on an amd64 host.
       - name: Restore pricing snapshot
         shell: bash
         run: |
           for attempt in 1 2 3; do
-            go run ./internal/pricing/cmd/litellm-snapshot && break
+            go run ./internal/pricing/cmd/litellm-snapshot -restore && break
             [ "$attempt" -lt 3 ] && sleep 10
           done
 
@@ -82,43 +83,69 @@ jobs:
       - name: Build agentsview (unix)
         if: runner.os != 'Windows'
         env:
+          GOARCH: ${{ matrix.goarch }}
           CGO_CFLAGS: ${{ matrix.cflags || '' }}
           CC: ${{ matrix.crosscc == '1' && 'aarch64-linux-gnu-gcc' || '' }}
         shell: bash
         run: |
+          set -euo pipefail
           mkdir -p dist
-          CGO_ENABLED=1 go build -tags fts5 -ldflags="$(LDFLAGS)" -trimpath \
+          VERSION="${GITHUB_REF_NAME#v}"
+          COMMIT="$(git rev-parse --short HEAD)"
+          BUILD_DATE="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          LDFLAGS="-X main.version=${VERSION} \
+            -X main.commit=${COMMIT} \
+            -X main.buildDate=${BUILD_DATE} \
+            -X main.distribution= \
+            -X go.kenn.io/kit/telemetry/posthog.distribution= \
+            -X go.kenn.io/kit/telemetry/posthog.projectKey=phc_AzHd9YvuHR7M5poKzC6eW654d3SgKyBdoQPuwkWhimUf \
+            -s -w"
+          CGO_ENABLED=1 go build -tags fts5 -ldflags="${LDFLAGS}" -trimpath \
             -o "dist/agentsview_${PLATFORM}" ./cmd/agentsview
 
       - name: Build agentsview (windows)
         if: runner.os == 'Windows'
         shell: bash
         run: |
+          set -euo pipefail
           mkdir -p dist
-          go build -tags fts5 -ldflags="$(LDFLAGS)" -trimpath \
+          VERSION="${GITHUB_REF_NAME#v}"
+          COMMIT="$(git rev-parse --short HEAD)"
+          BUILD_DATE="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          LDFLAGS="-X main.version=${VERSION} \
+            -X main.commit=${COMMIT} \
+            -X main.buildDate=${BUILD_DATE} \
+            -X main.distribution= \
+            -X go.kenn.io/kit/telemetry/posthog.distribution= \
+            -s -w"
+          go build -tags fts5 -ldflags="${LDFLAGS}" -trimpath \
             -o "dist/agentsview_windows_amd64.exe" ./cmd/agentsview
 
       - name: Package (unix tar.gz)
         if: runner.os != 'Windows'
         shell: bash
         run: |
+          set -euo pipefail
           VERSION="${GITHUB_REF_NAME#v}"
           STAGING="agentsview_${VERSION}_${PLATFORM}"
           mkdir -p "$STAGING"
           cp "dist/agentsview_${PLATFORM}" "$STAGING/agentsview"
-          tar -czf "agentsview_${VERSION}_${PLATFORM}.tar.gz" "$STAGING"
-          sha256sum "agentsview_${VERSION}_${PLATFORM}.tar.gz" > "asset.sha256"
+          tar -czf "agentsview_${VERSION}_${PLATFORM}.tar.gz" -C "$STAGING" agentsview
+          sha256sum "agentsview_${VERSION}_${PLATFORM}.tar.gz" > "sha256-${PLATFORM}.txt"
 
       - name: Package (windows zip)
         if: runner.os == 'Windows'
-        shell: bash
+        shell: pwsh
         run: |
-          VERSION="${GITHUB_REF_NAME#v}"
-          STAGING="agentsview_${VERSION}_windows_amd64"
-          mkdir -p "$STAGING"
-          cp "dist/agentsview_windows_amd64.exe" "$STAGING/agentsview.exe"
-          zip -r "agentsview_${VERSION}_windows_amd64.zip" "$STAGING"
-          sha256sum "agentsview_${VERSION}_windows_amd64.zip" > "asset.sha256"
+          $ErrorActionPreference = "Stop"
+          $version = $env:GITHUB_REF_NAME.TrimStart("v")
+          $staging = "agentsview_${version}_windows_amd64"
+          New-Item -ItemType Directory -Force -Path $staging | Out-Null
+          Copy-Item "dist/agentsview_windows_amd64.exe" "$staging/agentsview.exe"
+          $zip = "agentsview_${version}_windows_amd64.zip"
+          Compress-Archive -Path "$staging/agentsview.exe" -DestinationPath $zip
+          $hash = (Get-FileHash $zip -Algorithm SHA256).Hash.ToLower()
+          "$hash  $zip" | Out-File -Encoding ascii "sha256-windows_amd64.txt"
 
       - name: Upload build artifact
         uses: actions/upload-artifact@v4.6.2
@@ -127,7 +154,7 @@ jobs:
           path: |
             agentsview_*_*.tar.gz
             agentsview_*_windows_amd64.zip
-            asset.sha256
+            sha256-*.txt
           if-no-files-found: error
           retention-days: 1
 
@@ -144,17 +171,20 @@ jobs:
 
       - name: Merge checksums into SHA256SUMS
         run: |
-          cat assets/asset.sha256 > SHA256SUMS
-          rm assets/asset.sha256
+          set -euo pipefail
+          cat assets/sha256-*.txt | sort -k2 > SHA256SUMS
+          rm assets/sha256-*.txt
+          cat SHA256SUMS
 
       - name: Create or update release
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ github.ref_name }}
         run: |
+          set -euo pipefail
           gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1 \
-            || gh release create "$TAG" --repo "$GITHUB_REPOSITORY" \
-                 --title "$TAG" \
-                 --notes "Release assets built from tag $TAG by GitHub Actions."
+          || gh release create "$TAG" --repo "$GITHUB_REPOSITORY" \
+               --title "$TAG" \
+               --notes "Release assets built from tag $TAG by GitHub Actions."
           gh release upload "$TAG" --repo "$GITHUB_REPOSITORY" --clobber \
-            assets/SHA256SUMS assets/*
+            SHA256SUMS assets/*
