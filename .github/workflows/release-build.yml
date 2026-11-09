@@ -66,6 +66,7 @@ jobs:
         run: make sqlite-vec-header
 
       - name: Restore pricing snapshot
+        shell: bash
         run: |
           for attempt in 1 2 3; do
             go run ./internal/pricing/cmd/litellm-snapshot && break
