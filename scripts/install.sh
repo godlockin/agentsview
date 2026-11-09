@@ -4,7 +4,7 @@
 
 set -euo pipefail
 
-REPO="${REPO:-kenn-io/agentsview}"
+REPO="${REPO:-godlockin/agentsview}"
 BINARY_NAME="agentsview"
 
 RED='\033[0;31m'

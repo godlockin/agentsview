@@ -1,0 +1,159 @@
+name: Release build
+
+# Build agentsview release assets for every supported platform when a
+# version tag is pushed, then attach them (with SHA256SUMS) to a GitHub
+# release that install.sh can discover via /releases/latest.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  GOTRACEBACK: all
+  GOPROXY: "https://proxy.golang.org|direct"
+  GOFLAGS: -trimpath
+
+jobs:
+  build:
+    name: Build ${{ matrix.target }}
+    runs-on: ${{ matrix.runs-on }}
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: darwin, arch: arm64, goarch: arm64, runs-on: macos-latest }
+          - { os: darwin, arch: amd64, goarch: amd64, runs-on: macos-latest, cflags: "-arch x86_64" }
+          - { os: linux, arch: amd64, goarch: amd64, runs-on: ubuntu-latest }
+          - { os: linux, arch: arm64, goarch: arm64, runs-on: ubuntu-latest, crosscc: "1" }
+          - { os: windows, arch: amd64, goarch: amd64, runs-on: windows-latest }
+    env:
+      CGO_ENABLED: "1"
+      GOARCH: ${{ matrix.goarch }}
+      PLATFORM: ${{ matrix.os }}_${{ matrix.arch }}
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - uses: actions/setup-go@v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: false
+
+      - uses: actions/setup-node@v7.1.0
+        with:
+          node-version: "26.12.1"
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install cross linker (linux/arm64)
+        if: matrix.crosscc == '1'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu
+          echo "CC=aarch64-linux-gnu-gcc" >> "$GITHUB_ENV"
+
+      - name: Stage SQLite amalgamation header
+        run: make sqlite-vec-header
+
+      - name: Restore pricing snapshot
+        run: |
+          for attempt in 1 2 3; do
+            go run ./internal/pricing/cmd/litellm-snapshot && break
+            [ "$attempt" -lt 3 ] && sleep 10
+          done
+
+      - name: Build frontend
+        working-directory: frontend
+        run: |
+          npm ci --no-audit --no-fund
+          npm run build
+
+      - name: Build agentsview (unix)
+        if: runner.os != 'Windows'
+        env:
+          CGO_CFLAGS: ${{ matrix.cflags || '' }}
+          CC: ${{ matrix.crosscc == '1' && 'aarch64-linux-gnu-gcc' || '' }}
+        shell: bash
+        run: |
+          mkdir -p dist
+          CGO_ENABLED=1 go build -tags fts5 -ldflags="$(LDFLAGS)" -trimpath \
+            -o "dist/agentsview_${PLATFORM}" ./cmd/agentsview
+
+      - name: Build agentsview (windows)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          mkdir -p dist
+          go build -tags fts5 -ldflags="$(LDFLAGS)" -trimpath \
+            -o "dist/agentsview_windows_amd64.exe" ./cmd/agentsview
+
+      - name: Package (unix tar.gz)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          STAGING="agentsview_${VERSION}_${PLATFORM}"
+          mkdir -p "$STAGING"
+          cp "dist/agentsview_${PLATFORM}" "$STAGING/agentsview"
+          tar -czf "agentsview_${VERSION}_${PLATFORM}.tar.gz" "$STAGING"
+          sha256sum "agentsview_${VERSION}_${PLATFORM}.tar.gz" > "asset.sha256"
+
+      - name: Package (windows zip)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          STAGING="agentsview_${VERSION}_windows_amd64"
+          mkdir -p "$STAGING"
+          cp "dist/agentsview_windows_amd64.exe" "$STAGING/agentsview.exe"
+          zip -r "agentsview_${VERSION}_windows_amd64.zip" "$STAGING"
+          sha256sum "agentsview_${VERSION}_windows_amd64.zip" > "asset.sha256"
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4.6.2
+        with:
+          name: release-${{ matrix.os }}-${{ matrix.arch }}
+          path: |
+            agentsview_*_*.tar.gz
+            agentsview_*_windows_amd64.zip
+            asset.sha256
+          if-no-files-found: error
+          retention-days: 1
+
+  release:
+    name: Attach assets to release
+    runs-on: ubuntu-latest
+    needs: build
+    timeout-minutes: 15
+    steps:
+      - uses: actions/download-artifact@v4.1.9
+        with:
+          path: assets
+          merge-multiple: true
+
+      - name: Merge checksums into SHA256SUMS
+        run: |
+          cat assets/asset.sha256 > SHA256SUMS
+          rm assets/asset.sha256
+
+      - name: Create or update release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1 \
+            || gh release create "$TAG" --repo "$GITHUB_REPOSITORY" \
+                 --title "$TAG" \
+                 --notes "Release assets built from tag $TAG by GitHub Actions."
+          gh release upload "$TAG" --repo "$GITHUB_REPOSITORY" --clobber \
+            assets/SHA256SUMS assets/*
