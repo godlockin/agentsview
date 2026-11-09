@@ -44,13 +44,20 @@ find_install_dir() {
 download() {
     local url="$1"
     local output="$2"
-    if command -v curl &>/dev/null; then
-        curl -fsSL "$url" -o "$output"
-    elif command -v wget &>/dev/null; then
-        wget -q "$url" -O "$output"
-    else
-        error "Neither curl nor wget found"
-    fi
+    # Release assets are served through a CDN that can 504 while a fresh
+    # upload propagates, so retry a few times before giving up.
+    local attempt
+    for attempt in 1 2 3; do
+        if command -v curl &>/dev/null; then
+            curl -fsSL --retry 2 "$url" -o "$output" && return 0
+        elif command -v wget &>/dev/null; then
+            wget -q --tries=2 "$url" -O "$output" && return 0
+        else
+            error "Neither curl nor wget found"
+        fi
+        [ "$attempt" -lt 3 ] && sleep 5
+    done
+    return 1
 }
 
 get_latest_version() {
