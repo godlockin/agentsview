@@ -1,11 +1,13 @@
 package db
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"errors"
 	"fmt"
 	"log"
+	"runtime/pprof"
 	"time"
 )
 
@@ -103,6 +105,7 @@ func readerPoolWaitDelta(
 type walDiagnostics struct {
 	stall       walStallTracker
 	readerStats sql.DBStats
+	bulkStats   sql.DBStats
 }
 
 // walMaintenanceTick runs one periodic pass: it logs a WAL that is not
@@ -123,6 +126,12 @@ func (db *DB) walMaintenanceTick(ctx context.Context, diag *walDiagnostics) {
 					"holding the WAL",
 				stall.unmovedPages, stall.logPages, stall.attempts,
 			)
+			db.reads.logOpenReads()
+			if stall.attempts == walStallLogAttempts {
+				var stacks bytes.Buffer
+				_ = pprof.Lookup("goroutine").WriteTo(&stacks, 2)
+				log.Printf("sqlite wal goroutine dump:\n%s", stacks.String())
+			}
 		}
 	}
 
@@ -138,6 +147,22 @@ func (db *DB) walMaintenanceTick(ctx context.Context, diag *walDiagnostics) {
 				current.MaxOpenConnections, walCheckpointInterval,
 			)
 		}
+	}
+
+	db.bulkReads.waitMu.Lock()
+	current := sql.DBStats{
+		WaitCount:    db.bulkReads.waitCount,
+		WaitDuration: db.bulkReads.waitDuration,
+	}
+	db.bulkReads.waitMu.Unlock()
+	waits, waited := readerPoolWaitDelta(diag.bulkStats, current)
+	diag.bulkStats = current
+	if waited >= readerPoolWaitLogThreshold {
+		log.Printf(
+			"sqlite reader pool: %d requests waited %s in total for "+
+				"one of %d bulk read slots over the last %s",
+			waits, waited.Round(time.Millisecond), bulkReadSlots, walCheckpointInterval,
+		)
 	}
 
 	attempted, err := db.MaybeCheckpointLargeWAL(ctx)

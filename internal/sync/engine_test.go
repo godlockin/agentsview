@@ -20,6 +20,7 @@ import (
 	"time"
 
 	"github.com/google/go-cmp/cmp"
+	"github.com/mattn/go-sqlite3"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.kenn.io/agentsview/internal/db"
@@ -7496,65 +7497,6 @@ func TestProcessAntigravityWALOnlyUpdateNotSkipped(t *testing.T) {
 	assert.False(t, res.skip, "WAL-only update must trigger a reparse")
 }
 
-func TestProcessVibeMetaOnlyUpdateNotSkipped(t *testing.T) {
-	database := openTestDB(t)
-	ctx := t.Context()
-
-	root := t.TempDir()
-	e := NewEngine(ctx, database, EngineConfig{
-		AgentDirs: map[parser.AgentType][]string{
-			parser.AgentVibe: {root},
-		},
-	})
-
-	sessionDir := filepath.Join(root, "session_20260616_083518_0107f266")
-	require.NoError(t, os.MkdirAll(sessionDir, 0o755))
-
-	msgPath := filepath.Join(sessionDir, "messages.jsonl")
-	require.NoError(t, os.WriteFile(
-		msgPath,
-		[]byte(`{"role":"user","content":"hi"}`+"\n"),
-		0o644,
-	))
-
-	metaPath := filepath.Join(sessionDir, "meta.json")
-	require.NoError(t, os.WriteFile(
-		metaPath,
-		[]byte(`{"session_id":"abc","title":"Original title"}`+"\n"),
-		0o644,
-	))
-
-	canonicalID := "vibe:abc"
-
-	e.SyncPaths([]string{msgPath})
-	sess, err := database.GetSession(ctx, canonicalID)
-	require.NoError(t, err)
-	require.NotNil(t, sess)
-	require.NotNil(t, sess.DisplayName)
-	assert.Equal(t, "Original title", *sess.DisplayName)
-
-	// meta.json-only update: messages.jsonl is untouched, but the title
-	// (sourced from meta.json) changes. The Vibe provider's composite
-	// fingerprint folds the sibling meta.json mtime in, so the change busts
-	// the skip cache and triggers a reparse rather than a skip.
-	info, err := os.Stat(msgPath)
-	require.NoError(t, err)
-	metaTime := info.ModTime().Add(5 * time.Second)
-	require.NoError(t, os.WriteFile(
-		metaPath,
-		[]byte(`{"session_id":"abc","title":"Renamed title"}`+"\n"),
-		0o644,
-	))
-	require.NoError(t, os.Chtimes(metaPath, metaTime, metaTime))
-
-	e.SyncPaths([]string{msgPath})
-	sess, err = database.GetSession(ctx, canonicalID)
-	require.NoError(t, err)
-	require.NotNil(t, sess)
-	require.NotNil(t, sess.DisplayName)
-	assert.Equal(t, "Renamed title", *sess.DisplayName)
-}
-
 func TestProcessAntigravityBrainOnlyUpdateNotSkipped(t *testing.T) {
 	database := openTestDB(t)
 	ctx := t.Context()
@@ -8465,7 +8407,7 @@ func TestProviderProcessCacheKeyOmnigentContainerIncludesDataVersion(t *testing.
 
 	legacy := container + "?agent=omnigent?source_hash=container-content-hash"
 	assert.Equal(t,
-		legacy+"&data_version="+strconv.Itoa(db.CurrentDataVersion()),
+		legacy+"&data_version="+strconv.Itoa(db.AgentDataVersion(parser.AgentOmnigent)),
 		containerKey,
 		"whole-container cache identity must include the parser data version",
 	)
@@ -9075,23 +9017,6 @@ func (p *lookupSourceProvider) Parse(
 	parser.ParseRequest,
 ) (parser.ParseOutcome, error) {
 	return parser.ParseOutcome{}, nil
-}
-
-func TestToDBSessionStoresSessionName(t *testing.T) {
-	pw := pendingWrite{sess: parser.ParsedSession{
-		ID:           "commandcode:test",
-		Project:      "sample_project",
-		Machine:      "local",
-		Agent:        parser.AgentCommandCode,
-		SessionName:  "Startup investigation",
-		FirstMessage: "Inspect server logs",
-	}}
-
-	got := toDBSession(pw)
-	require.NotNil(t, got.SessionName)
-	assert.Equal(t, "Startup investigation", *got.SessionName)
-	require.NotNil(t, got.FirstMessage)
-	assert.Equal(t, "Inspect server logs", *got.FirstMessage)
 }
 
 func TestBlockedCategorySet(t *testing.T) {
@@ -11927,7 +11852,7 @@ func TestCodexIndexSessionNameChangedDetectsTitleRenameBelowStoredMtime(t *testi
 	f := seedCodexRenameCase(t, database)
 
 	// Control: nothing changed -> no rename reported, so the caller may skip.
-	assert.False(t, f.e.codexIndexSessionNameChanged(f.path),
+	assert.False(t, f.e.codexIndexSessionNameChanged(t.Context(), f.path),
 		"unchanged title must not report a change")
 
 	// Title-only rename whose index mtime lands at or below the stored
@@ -11942,7 +11867,7 @@ func TestCodexIndexSessionNameChangedDetectsTitleRenameBelowStoredMtime(t *testi
 		parser.LookupCodexThreadName(f.path, f.uuid),
 		"live index must report the renamed title")
 
-	assert.True(t, f.e.codexIndexSessionNameChanged(f.path),
+	assert.True(t, f.e.codexIndexSessionNameChanged(t.Context(), f.path),
 		"title-only rename at or below stored watermark must report a change")
 }
 
@@ -11960,7 +11885,7 @@ func TestCodexIndexSessionNameChangedIgnoresAbsentIndexEntry(t *testing.T) {
 		idxPath := filepath.Join(f.root, parser.CodexSessionIndexFilename)
 		require.NoError(t, os.Remove(idxPath))
 
-		assert.False(t, f.e.codexIndexSessionNameChanged(f.path),
+		assert.False(t, f.e.codexIndexSessionNameChanged(t.Context(), f.path),
 			"a missing index must not report a stored title as renamed")
 	})
 
@@ -11971,7 +11896,7 @@ func TestCodexIndexSessionNameChangedIgnoresAbsentIndexEntry(t *testing.T) {
 			"99999999-8888-7777-6666-555555555555", "Other Session",
 			time.Unix(0, f.effectiveMtime))
 
-		assert.False(t, f.e.codexIndexSessionNameChanged(f.path),
+		assert.False(t, f.e.codexIndexSessionNameChanged(t.Context(), f.path),
 			"an index without this session's entry must not report a rename")
 	})
 }
@@ -12019,7 +11944,7 @@ func TestCodexStoredNameDiffersPreservesMissingSemantics(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			assert.Equal(t, tt.want, e.codexStoredNameDiffersBySessionID(
-				tt.sessionID, tt.indexTitle, tt.missingDiffers,
+				t.Context(), tt.sessionID, tt.indexTitle, tt.missingDiffers,
 			))
 		})
 	}
@@ -12122,6 +12047,51 @@ func TestProviderChangedPathForceParseGeminiMetadata(t *testing.T) {
 	}
 }
 
+func TestProviderChangedPathForceParseHermesStateEvent(t *testing.T) {
+	home := filepath.Join("root", "profile#one")
+	stateDB := filepath.Join(home, "state.db")
+	tests := []struct {
+		name       string
+		sourcePath string
+		eventPath  string
+		eventKind  string
+		want       bool
+	}{
+		{
+			name:       "orphan transcript under a directory named with # is not forced",
+			sourcePath: filepath.Join(home, "sessions", "orphan.jsonl"),
+			eventPath:  stateDB,
+			eventKind:  "write",
+			want:       false,
+		},
+		{
+			// A transcript event resolves to the session's state.db member
+			// when the database owns that session.
+			name:       "transcript event resolving to its state.db member stays forced",
+			sourcePath: stateDB + "#member",
+			eventPath:  filepath.Join(home, "sessions", "member.jsonl"),
+			eventKind:  "write",
+			want:       true,
+		},
+		{
+			name:       "orphan transcript remove keeps the force",
+			sourcePath: filepath.Join(home, "sessions", "orphan.jsonl"),
+			eventPath:  stateDB,
+			eventKind:  "remove",
+			want:       true,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := providerChangedPathForceParse(
+				parser.AgentHermes, tt.sourcePath, tt.eventPath, tt.eventKind,
+				parser.ProviderMigrationProviderAuthoritative,
+			)
+			assert.Equal(t, tt.want, got)
+		})
+	}
+}
+
 func TestOpenCodeUsageOnlyArchiveRejectsOrdinalReuse(t *testing.T) {
 	// A source that lost a message and gained a later one can present a new
 	// row at the vanished ordinal with larger token counts. Identity comes
@@ -12182,4 +12152,79 @@ func TestReconcileWatchRootsAfterConstructorCancellation(t *testing.T) {
 	cancel()
 	require.NoError(t, engine.ReconcileWatchRoots(t.Context(), []string{root}, false))
 	assert.True(t, engine.LastReconciliationResult().Complete)
+}
+
+func TestProviderStoredFreshnessDecision(t *testing.T) {
+	for _, tc := range []struct {
+		name                         string
+		agent                        parser.AgentType
+		mtime                        int64
+		required, changedHash, stale bool
+		project                      string
+		want                         bool
+		wantReads                    int32
+	}{
+		{name: "optional hash with matching stats", agent: parser.AgentVibe, mtime: 100, want: true},
+		{name: "stat mismatch rejects before hash", agent: parser.AgentOpenCode, mtime: 200, required: true},
+		{name: "required matching hash", agent: parser.AgentOpenCode, mtime: 100, required: true, want: true, wantReads: 1},
+		{name: "required changed hash", agent: parser.AgentOpenCode, mtime: 100, required: true, changedHash: true, wantReads: 1},
+		{name: "hash overrides shared stat", agent: parser.AgentHermes, mtime: 200, want: true, wantReads: 1},
+		{name: "stale data version", agent: parser.AgentVibe, mtime: 100, stale: true},
+		{name: "project needs reparse", agent: parser.AgentVibe, mtime: 100, project: "_home_user_app"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			archive := openTestDB(t)
+			const path = "/data/source"
+			stored := db.VirtualContainerMemberFreshness{Agent: string(tc.agent), Project: "app", MTimeNS: 100, Hash: "digest", DataVersion: db.CurrentDataVersion()}
+			if tc.project != "" {
+				stored.Project = tc.project
+			}
+			if tc.stale {
+				stored.DataVersion = 0
+			}
+			require.NoError(t, archive.Update(t.Context(), func(tx *sql.Tx) error {
+				_, err := tx.ExecContext(t.Context(), `INSERT INTO sessions
+					(id, project, agent, file_path, file_size, file_mtime, file_hash, data_version)
+					VALUES ('session', ?, ?, ?, 0, ?, ?, ?)`, stored.Project, stored.Agent, path, stored.MTimeNS, stored.Hash, stored.DataVersion)
+				return err
+			}))
+			reads := countSessionFileHashReads(t, archive)
+			fp := parser.SourceFingerprint{MTimeNS: tc.mtime, Hash: "digest"}
+			if tc.changedHash {
+				fp.Hash = "changed"
+			}
+			e := &Engine{db: archive}
+			unchanged := e.providerSourceUnchangedInDB(t.Context(), parser.SourceRef{Provider: tc.agent, DisplayPath: path}, fp,
+				parser.ProviderSyncSemantics{FingerprintHashRequiredForFreshness: tc.required}, nil)
+			assert.Equal(t, tc.want, unchanged)
+			assert.Equal(t, tc.wantReads, reads.Load())
+		})
+	}
+}
+
+// countSessionFileHashReads counts statement compilations that read
+// sessions.file_hash. Serving readers cache prepared statements, so repeated
+// executions of the same SQL count once: use it to tell whether a path reads
+// the hash at all, not how many times it runs a query.
+func countSessionFileHashReads(t *testing.T, archive *db.DB) *atomic.Int32 {
+	t.Helper()
+	reads := &atomic.Int32{}
+	reader := archive.Reader().(interface {
+		Conn(context.Context) (*sql.Conn, error)
+	})
+	conn, err := reader.Conn(t.Context())
+	require.NoError(t, err)
+	require.NoError(t, conn.Raw(func(raw any) error {
+		raw.(interface {
+			RegisterAuthorizer(func(int, string, string, string) int)
+		}).RegisterAuthorizer(func(op int, table, column, _ string) int {
+			if op == sqlite3.SQLITE_READ && table == "sessions" && column == "file_hash" {
+				reads.Add(1)
+			}
+			return sqlite3.SQLITE_OK
+		})
+		return nil
+	}))
+	require.NoError(t, conn.Close())
+	return reads
 }

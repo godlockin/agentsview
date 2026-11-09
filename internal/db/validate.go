@@ -184,6 +184,7 @@ func SanitizeMessage(m *Message) ValidationStats {
 	sanitizeLengthTrackedString(
 		&m.Content, &m.ContentLength, &stats,
 	)
+	sanitizeStringPtrField(m.DialogueText, &stats)
 	origThinkingLen := len(m.ThinkingText)
 	sanitizeStringField(&m.ThinkingText, &stats)
 	if removed := origThinkingLen - len(m.ThinkingText); removed > 0 {
@@ -199,6 +200,9 @@ func SanitizeMessage(m *Message) ValidationStats {
 			m.ContentLength -= removed
 		}
 	}
+	// Keep the parser's classification even when dialogue equals Content.
+	// NULL also represents older or unclassified messages, so storage drops
+	// an equal copy only with a marker (see StoredDialogue).
 	sanitizeStringField(&m.ClaudeMessageID, &stats)
 	sanitizeStringField(&m.ClaudeRequestID, &stats)
 	sanitizeStringField(&m.SourceType, &stats)
@@ -329,6 +333,7 @@ func SanitizeSession(s *Session) ValidationStats {
 	var stats ValidationStats
 
 	sanitizeStringField(&s.Project, &stats)
+	sanitizeStringField(&s.GroupKey, &stats)
 	sanitizeStringField(&s.Machine, &stats)
 	sanitizeStringField(&s.Agent, &stats)
 	sanitizeStringField(&s.AgentLabel, &stats)
@@ -336,6 +341,11 @@ func SanitizeSession(s *Session) ValidationStats {
 	sanitizeStringField(&s.SessionKind, &stats)
 	sanitizeStringField(&s.Cwd, &stats)
 	sanitizeStringField(&s.GitBranch, &stats)
+	for i := range s.PRLinks {
+		sanitizeStringField(&s.PRLinks[i].URL, &stats)
+		sanitizeStringField(&s.PRLinks[i].Host, &stats)
+		sanitizeStringField(&s.PRLinks[i].Repository, &stats)
+	}
 	sanitizeStringField(&s.SourceSessionID, &stats)
 	sanitizeStringField(&s.SourceVersion, &stats)
 	sanitizeStringField(&s.TranscriptFidelity, &stats)

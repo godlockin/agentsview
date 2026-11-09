@@ -27,7 +27,8 @@ import (
 // PGPush, at loop exit in the watch path (which reuses one adapter across
 // reconnects) — since the pusher never closes its source.
 type vectorPushSource struct {
-	cfg config.Config
+	cfg     config.Config
+	adopted bool
 
 	mu sync.Mutex
 	ix *vector.Index
@@ -64,10 +65,11 @@ func closeVectorPushSource(src storage.VectorPushSource) {
 // call — a daemon push that starts before embeddings exist — reopens and picks
 // up a build that lands afterward. A nil index without error means the file is
 // absent ("nothing to push"); the pointer's own nil checks gate every
-// dereference.
+// dereference. The caller must hold s.mu.
 func (s *vectorPushSource) openIndex(ctx context.Context) (*vector.Index, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	if !s.cfg.Vector.Enabled {
+		return nil, nil
+	}
 	if s.ix != nil {
 		return s.ix, nil
 	}
@@ -100,9 +102,27 @@ func (s *vectorPushSource) Close() error {
 	return err
 }
 
+// reconfigure points later exports at cfg's vectors.db by dropping the
+// memoized handle. BeginExport holds s.mu until its snapshot exists; an export
+// already running keeps its own read transaction.
+func (s *vectorPushSource) reconfigure(cfg config.Config) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.cfg = cfg
+	if s.ix == nil {
+		return
+	}
+	if err := s.ix.Close(); err != nil {
+		log.Printf("closing vectors.db push source: %v", err)
+	}
+	s.ix = nil
+}
+
 func (s *vectorPushSource) BeginExport(
 	ctx context.Context, sessionIDs []string,
 ) (storage.VectorExport, bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	ix, err := s.openIndex(ctx)
 	if err != nil || ix == nil {
 		return nil, false, err
@@ -117,14 +137,43 @@ func (s *vectorPushSource) BeginExport(
 	if !ok {
 		return nil, false, nil
 	}
-	return &vectorPushExport{export: exp}, true, nil
+	// Publish the recipe only for the generation the configured recipe
+	// produces: params must rebuild the fingerprint they are stored with.
+	out := &vectorPushExport{export: exp}
+	if configured := s.configuredGeneration(); exp.Generation().Fingerprint ==
+		configured.Fingerprint {
+		out.params = configured.Params
+	}
+	return out, true, nil
 }
 
-type vectorPushExport struct{ export *vector.Export }
+// configuredGeneration is the generation the configured recipe builds. It
+// carries the recipe for publication unless the recipe was adopted from the
+// replica. Callers hold s.mu when the source can be reconfigured.
+func (s *vectorPushSource) configuredGeneration() storage.VectorGenerationInfo {
+	gen := vectorGeneration(s.cfg.Vector.Embeddings)
+	info := storage.VectorGenerationInfo{
+		Fingerprint: gen.Fingerprint(), Model: gen.Model, Dimension: gen.Dimensions,
+	}
+	if !s.adopted {
+		info.Params = gen.Params
+	}
+	return info
+}
+
+type vectorPushExport struct {
+	export *vector.Export
+	// params is the configured recipe when it produced the exported
+	// generation, else nil.
+	params map[string]string
+}
 
 func (e *vectorPushExport) Generation() storage.VectorGenerationInfo {
 	exp := e.export.Generation()
-	return storage.VectorGenerationInfo{Fingerprint: exp.Fingerprint, Model: exp.Model, Dimension: exp.Dimension}
+	return storage.VectorGenerationInfo{
+		Fingerprint: exp.Fingerprint, Model: exp.Model, Dimension: exp.Dimension,
+		Params: e.params,
+	}
 }
 
 func (e *vectorPushExport) SessionDocHashes(ctx context.Context, ids []string) (map[string]string, error) {

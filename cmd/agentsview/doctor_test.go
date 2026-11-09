@@ -94,6 +94,8 @@ func TestDoctorSyncStaleDatabaseReportsLikelyAbortedResync(t *testing.T) {
 	logPath := filepath.Join(dataDir, "debug.log")
 	require.NoError(t, os.WriteFile(logPath, []byte(
 		"2026/06/18 data version outdated; full resync required\n"+
+			"2026/06/18 sync: session needs retry: codex:child (child.jsonl): could not read the Codex session it was forked from (parent)\n"+
+			"2026/06/18 sync: 1 session needs retry: codex:child (child.jsonl): could not read the Codex session it was forked from (parent)\n"+
 			"2026/06/18 resync aborted: 0 synced, 3 failed\n",
 	), 0o644), "write debug log")
 
@@ -109,6 +111,8 @@ func TestDoctorSyncStaleDatabaseReportsLikelyAbortedResync(t *testing.T) {
 	assert.Contains(t, out, "version 0: 1")
 	assert.Contains(t, out, "Recent debug.log evidence:")
 	assert.Contains(t, out, "resync aborted: 0 synced, 3 failed")
+	assert.Contains(t, out, "sync: session needs retry: codex:child (child.jsonl): could not read the Codex session it was forked from (parent)")
+	assert.Contains(t, out, "sync: 1 session needs retry: codex:child")
 	assert.Contains(t, out,
 		"Likely cause: previous data-version resync likely aborted before completion")
 }
@@ -358,4 +362,17 @@ func TestDoctorSyncReportStatErrorDoesNotRenderAsMissingDatabase(t *testing.T) {
 		"Likely cause: database could not be inspected; check database path and permissions")
 	assert.NotContains(t, got, "database will be created")
 	assert.NotContains(t, got, "database does not exist yet")
+}
+
+func TestDoctorSyncArchiveOnlyReportsDecodedVersion(t *testing.T) {
+	dataDir := testDataDir(t)
+	database, err := db.Open(t.Context(), filepath.Join(dataDir, "sessions.db"))
+	require.NoError(t, err)
+	require.NoError(t, database.EnableArchiveOnly(t.Context()))
+	require.NoError(t, database.Close())
+	out, err := executeCommand(newRootCommand(), "doctor", "sync")
+	require.NoError(t, err)
+	assert.Contains(t, out, fmt.Sprintf("SQLite user_version: %d\n", db.CurrentDataVersion()))
+	assert.Contains(t, out, "Archive mode: archive-only")
+	assert.Contains(t, out, "Startup sync decision: archive-only; source sync is disabled")
 }

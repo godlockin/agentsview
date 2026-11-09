@@ -13,6 +13,11 @@ const DAY_MS = 24 * HOUR_MS;
  */
 export const DEFAULT_REFRESH_INTERVAL_MS = 5 * MINUTE_MS;
 
+// active_since follows the clock, so only whether it is set changes the scope.
+export function refreshScopeKey(params: { active_since?: string }): string {
+  return JSON.stringify({ ...params, active_since: params.active_since !== undefined });
+}
+
 export function formatRefreshAge(updatedAt: number | null | undefined, now = Date.now()): string {
   if (updatedAt == null) return m.shared_refresh_not_updated();
 
@@ -176,6 +181,9 @@ const STEP_LABELS: Record<string, () => string> = {
   skills: () => m.shared_refresh_step_skills(),
   topSessions: () => m.shared_refresh_step_top_sessions(),
   contextSummary: () => m.shared_refresh_step_context_summary(),
+  attributionSummary: () => m.shared_refresh_step_attribution_summary(),
+  referenceSummary: () => m.shared_refresh_step_reference_summary(),
+  zoom: () => m.shared_refresh_step_zoom(),
   signals: () => m.shared_refresh_step_signals(),
   comparison: () => m.shared_refresh_step_comparison(),
   pairwise: () => m.shared_refresh_step_pairwise(),

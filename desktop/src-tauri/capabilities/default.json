@@ -4,11 +4,16 @@
   "description": "Capability for the main window",
   "remote": {
     "urls": [
-      "http://127.0.0.1:*"
+      "http://127.0.0.1:*",
+      "http://localhost:*",
+      "http://[\\:\\:1]:*"
     ]
   },
   "windows": ["main"],
   "permissions": [
+    "allow-claude-auth-connect",
+    "allow-claude-auth-fetch",
+    "allow-claude-auth-close",
     "core:default",
     "core:webview:allow-set-webview-zoom"
   ]

@@ -4,17 +4,23 @@ package clickhouse
 
 import (
 	"context"
+	"database/sql"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"go.kenn.io/agentsview/internal/clickhouse/chtest"
 	"go.kenn.io/agentsview/internal/db"
+	"go.kenn.io/agentsview/internal/readbase"
+	"go.kenn.io/agentsview/internal/readbase/readbasetest"
 )
 
 func TestReadStatusHonorsProjectFilters(t *testing.T) {
+	t.Parallel()
 	_, syncer, local := newPushedStore(t)
-	ctx := context.Background()
+	ctx := t.Context()
 	archiveID, err := local.GetArchiveID(ctx)
 	require.NoError(t, err)
 
@@ -35,8 +41,9 @@ func TestReadStatusHonorsProjectFilters(t *testing.T) {
 }
 
 func TestStoreSessionsMessagesAndSearch(t *testing.T) {
+	t.Parallel()
 	store, _, _ := newPushedStore(t)
-	ctx := context.Background()
+	ctx := t.Context()
 
 	t.Run("list_sessions_default_sort_and_cursor", func(t *testing.T) {
 		page, err := store.ListSessions(ctx, db.SessionFilter{Limit: 1})
@@ -55,7 +62,7 @@ func TestStoreSessionsMessagesAndSearch(t *testing.T) {
 		assert.Equal(t, 2, next.Total)
 	})
 
-	t.Run("orphan_subagent_with_null_parent_is_sidebar_root", func(t *testing.T) {
+	t.Run("stats_counts_orphans_without_parented_continuation", func(t *testing.T) {
 		store, syncer, local := newPushedStore(t)
 		orphanID := "ch-orphan-child"
 		orphan := fixtureSession(orphanID, "alpha", "orphan first", "2026-01-10T00:06:00.000Z", 1)
@@ -70,11 +77,31 @@ func TestStoreSessionsMessagesAndSearch(t *testing.T) {
 			ReplaceMessages: true,
 		}})
 		require.NoError(t, err)
+
+		for _, row := range []struct{ id, relationship, parent string }{
+			{"ch-missing-parent", "subagent", "missing-parent"},
+			{"ch-continuation", "continuation", fixtureAlphaID},
+		} {
+			session := fixtureSession(row.id, "alpha", "child first", "2026-01-10T00:07:00.000Z", 1)
+			session.RelationshipType = row.relationship
+			session.ParentSessionID = &row.parent
+			_, err := local.WriteSessionBatchAtomic(ctx, []db.SessionBatchWrite{{
+				Session:     session,
+				Messages:    []db.Message{fixtureMessage(row.id, 0, "user", "child first", "2026-01-10T00:07:00.000Z")},
+				DataVersion: 1, ReplaceMessages: true,
+			}})
+			require.NoError(t, err)
+		}
 		_, err = syncer.Push(ctx, false, nil)
 		require.NoError(t, err)
-
-		index, err := store.GetSidebarSessionIndex(ctx, db.SessionFilter{Project: "alpha"})
+		stats, err := store.GetStats(ctx, false, false)
 		require.NoError(t, err)
+		assert.Equal(t, 4, stats.SessionCount)
+		assert.Equal(t, 4, stats.MessageCount)
+		assert.Equal(t, 2, stats.ProjectCount)
+		index, err := store.GetSidebarSessionIndex(ctx, db.SessionFilter{})
+		require.NoError(t, err)
+		assert.Equal(t, index.Total, stats.SessionCount)
 		ids := make([]string, len(index.Sessions))
 		for i, row := range index.Sessions {
 			ids[i] = row.ID
@@ -98,6 +125,11 @@ func TestStoreSessionsMessagesAndSearch(t *testing.T) {
 		require.NoError(t, err)
 		require.NotNil(t, sess)
 		assert.Equal(t, "alpha", sess.Project)
+
+		children, err := store.GetChildSessions(ctx, fixtureAlphaID)
+		require.NoError(t, err)
+		require.Len(t, children, 1)
+		assert.Equal(t, fixtureChildID, children[0].ID)
 
 		ids, err := store.FindSessionIDsByPartial(ctx, "ch-sync-alpha", 5)
 		require.NoError(t, err)
@@ -127,6 +159,20 @@ func TestStoreSessionsMessagesAndSearch(t *testing.T) {
 		require.NotEmpty(t, window)
 		assert.Equal(t, 1, window[len(window)-1].Ordinal)
 
+		recorder := &readbasetest.RecordingSessions{SessionsBackend: sessionsSQL{store}, T: t}
+		reader := readbase.NewSessions(recorder)
+		for _, tc := range []struct {
+			ordinal      int
+			toolOrdinals [][]int
+		}{{0, [][]int{{}, {}}}, {1, [][]int{{1, 1}, {1}}}} {
+			recorder.ToolOrdinals = nil
+			window, err := reader.GetMessagesWindow(ctx, fixtureAlphaID, db.MessageWindow{From: &tc.ordinal, Limit: 1, Asc: true})
+			require.NoError(t, err)
+			require.Len(t, window, 1)
+			assert.Equal(t, tc.ordinal, window[0].Ordinal)
+			assert.Equal(t, tc.toolOrdinals, recorder.ToolOrdinals)
+		}
+
 		counts, err := store.GetResumeModelCounts(ctx, fixtureAlphaID)
 		require.NoError(t, err)
 		assert.Equal(t, []db.ModelCount{{Model: "claude-test", Count: 1}}, counts)
@@ -134,6 +180,12 @@ func TestStoreSessionsMessagesAndSearch(t *testing.T) {
 		timing, err := store.GetSessionTiming(ctx, fixtureAlphaID)
 		require.NoError(t, err)
 		require.NotNil(t, timing)
+
+		activity, err := store.GetSessionActivity(ctx, fixtureAlphaID)
+		require.NoError(t, err)
+		require.NotNil(t, activity)
+		assert.Equal(t, 2, activity.TotalMessages)
+		assert.NotEmpty(t, activity.Buckets)
 	})
 
 	t.Run("search_and_secrets", func(t *testing.T) {
@@ -215,6 +267,13 @@ func TestStoreSessionsMessagesAndSearch(t *testing.T) {
 		require.Len(t, pins, 1)
 		require.NotNil(t, pins[0].Note)
 		assert.Equal(t, "pin alpha", *pins[0].Note)
+
+		projectPins, err := store.ListPinnedMessages(ctx, "", "alpha")
+		require.NoError(t, err)
+		require.Len(t, projectPins, 1)
+		assert.Equal(t, fixtureAlphaID, projectPins[0].SessionID)
+		require.NotNil(t, projectPins[0].Content)
+		assert.Equal(t, "alpha first", *projectPins[0].Content)
 	})
 
 	t.Run("writes_are_read_only", func(t *testing.T) {
@@ -240,9 +299,43 @@ func TestStoreSessionsMessagesAndSearch(t *testing.T) {
 	})
 }
 
+func TestSearchContentExcludeActiveSince(t *testing.T) {
+	t.Parallel()
+	store, _, _ := newPushedStore(t)
+	for _, mode := range []string{"substring", "regex", "fts"} {
+		t.Run(mode, func(t *testing.T) {
+			page, err := store.SearchContent(t.Context(), db.ContentSearchFilter{
+				Pattern: "first", Mode: mode, Limit: 1, IncludeOneShot: true,
+				ExcludeActiveSince: time.Date(2026, 1, 10, 0, 0, 0, 0, time.UTC),
+			})
+			require.NoError(t, err)
+			require.Len(t, page.Matches, 1)
+			assert.Equal(t, fixtureAlphaID, page.Matches[0].SessionID)
+		})
+	}
+	store.SetVectorSearcher(&activityVectorSearcher{hits: []db.VectorHit{
+		{SessionID: fixtureBetaID},
+		{SessionID: fixtureAlphaID},
+	}})
+	for _, mode := range []string{"semantic", "hybrid"} {
+		t.Run(mode, func(t *testing.T) {
+			filter := db.ContentSearchFilter{Pattern: "absent keyword", Mode: mode, Limit: 1, IncludeOneShot: true, ExcludeActiveSince: time.Date(2026, 1, 10, 0, 0, 0, 0, time.UTC)}
+			page, err := store.SearchContent(t.Context(), filter)
+			require.NoError(t, err)
+			require.Len(t, page.Matches, 1)
+			assert.Equal(t, fixtureAlphaID, page.Matches[0].SessionID)
+			filter.ExcludeActiveSince = time.Unix(0, 0)
+			page, err = store.SearchContent(t.Context(), filter)
+			require.NoError(t, err)
+			assert.Empty(t, page.Matches)
+		})
+	}
+}
+
 func TestSearchTreatsUnderscoreAsLiteral(t *testing.T) {
+	t.Parallel()
 	store, syncer, local := newPushedStore(t)
-	ctx := context.Background()
+	ctx := t.Context()
 	appendMessage(t, local, fixtureAlphaID, "hello_world unique token", "2026-01-10T00:04:00.000Z")
 	appendMessage(t, local, fixtureBetaID, "helloXworld unique token", "2026-01-11T00:04:00.000Z")
 	_, err := syncer.Push(ctx, false, nil)
@@ -256,8 +349,9 @@ func TestSearchTreatsUnderscoreAsLiteral(t *testing.T) {
 }
 
 func TestGetSessionFullReturnsFilePath(t *testing.T) {
+	t.Parallel()
 	store, _, local := newPushedStore(t)
-	ctx := context.Background()
+	ctx := t.Context()
 	want, err := local.GetSessionFull(ctx, fixtureAlphaID)
 	require.NoError(t, err)
 	require.NotNil(t, want)
@@ -278,7 +372,8 @@ func TestGetSessionFullReturnsFilePath(t *testing.T) {
 }
 
 func TestStoreGetSessionHidesTrash(t *testing.T) {
-	ctx := context.Background()
+	t.Parallel()
+	ctx := t.Context()
 	store, syncer, local := newPushedStore(t)
 	require.NoError(t, local.SoftDeleteSession(t.Context(), fixtureBetaID))
 	_, err := syncer.Push(ctx, false, nil)
@@ -293,10 +388,16 @@ func TestStoreGetSessionHidesTrash(t *testing.T) {
 	require.NotNil(t, full)
 	require.NotNil(t, full.DeletedAt)
 	assert.Equal(t, fixtureBetaID, full.ID)
+
+	trash, err := store.ListTrashedSessions(ctx)
+	require.NoError(t, err)
+	require.Len(t, trash, 1)
+	assert.Equal(t, fixtureBetaID, trash[0].ID)
 }
 
 func TestStoreGetSessionVersionChangesAfterPush(t *testing.T) {
-	ctx := context.Background()
+	t.Parallel()
+	ctx := t.Context()
 	store, syncer, local := newPushedStore(t)
 	count, version, ok := store.GetSessionVersion(t.Context(), fixtureAlphaID)
 	require.True(t, ok)
@@ -313,8 +414,9 @@ func TestStoreGetSessionVersionChangesAfterPush(t *testing.T) {
 }
 
 func TestStoreMessageWindowReportsRevisionWithRows(t *testing.T) {
+	t.Parallel()
 	store, _, _ := newPushedStore(t)
-	ctx := context.Background()
+	ctx := t.Context()
 
 	from := 0
 	revision := ""
@@ -347,4 +449,92 @@ func TestStoreMessageWindowReportsRevisionWithRows(t *testing.T) {
 	require.NoError(t, err)
 	assert.Empty(t, msgs)
 	assert.Empty(t, revision, "no rows means no revision to describe them")
+}
+
+type activityVectorSearcher struct {
+	hits []db.VectorHit
+}
+
+func (s *activityVectorSearcher) PrepareSemanticSearch(context.Context, string) (db.VectorSearchPage, int, error) {
+	return func(_ context.Context, k int) ([]db.VectorHit, bool, error) {
+		return s.hits[:min(k, len(s.hits))], len(s.hits) < k, nil
+	}, 0, nil
+}
+
+func (s *activityVectorSearcher) ResolveMessageUnits(_ context.Context, refs []db.MessageRef) ([]db.UnitRef, error) {
+	return make([]db.UnitRef, len(refs)), nil
+}
+
+func TestStoreSessionVersionTracksPushedAnnotations(t *testing.T) {
+	t.Parallel()
+	ctx := t.Context()
+	store, syncer, local := newPushedStore(t)
+	for _, tt := range []struct {
+		name  string
+		write func() error
+	}{
+		{"parent set", func() error { _, err := local.SetSessionExternalParent(ctx, fixtureBetaID, fixtureAlphaID); return err }},
+		{"parent clear", func() error { _, err := local.ClearSessionExternalParent(ctx, fixtureBetaID); return err }},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			require.NoError(t, local.Update(ctx, func(tx *sql.Tx) error {
+				_, err := tx.ExecContext(ctx, `UPDATE sessions SET sync_marker = '2000-01-01T00:00:00Z' WHERE id = ?`, fixtureBetaID)
+				return err
+			}))
+			_, err := syncer.Push(ctx, true, nil)
+			require.NoError(t, err)
+			count, before, ok := store.GetSessionVersion(ctx, fixtureBetaID)
+			require.True(t, ok)
+			require.NoError(t, tt.write())
+			res, err := syncer.Push(ctx, false, nil)
+			require.NoError(t, err)
+			assert.Equal(t, 1, res.SessionsPushed)
+			afterCount, after, ok := store.GetSessionVersion(ctx, fixtureBetaID)
+			require.True(t, ok)
+			assert.Equal(t, count, afterCount)
+			assert.NotEqual(t, before, after)
+		})
+	}
+}
+
+func TestMachineSelectorLookupIncludesUnmergedIdentity(t *testing.T) {
+	t.Parallel()
+	ctx := t.Context()
+	dsn, database := chtest.FreshDatabase(t)
+	conn := chtest.Open(t, dsn, database)
+	require.NoError(t, EnsureSchemaOn(ctx, conn))
+	// Keep both versions in separate parts to exercise FINAL semantics.
+	for _, query := range []string{
+		`SYSTEM STOP MERGES sessions`,
+		`INSERT INTO sessions (id, machine, push_version) VALUES ('updated', 'retired-host', 1)`,
+	} {
+		_, err := conn.ExecContext(ctx, query)
+		require.NoError(t, err)
+	}
+	// Only the newest version owns the session identity.
+	_, err := conn.ExecContext(ctx, `INSERT INTO sessions (id, machine, push_version) VALUES ('updated', 'current-host', 2)`)
+	require.NoError(t, err)
+	ids, err := NewStoreFromDB(conn).GetMatchingMachineIDs(ctx, []string{"retired-host"})
+	require.NoError(t, err)
+	assert.Empty(t, ids)
+	ids, err = NewStoreFromDB(conn).GetMatchingMachineIDs(ctx, []string{"current-host"})
+	require.NoError(t, err)
+	assert.Equal(t, []string{"current-host"}, ids)
+}
+
+func TestStorePoolsCapQueryThreads(t *testing.T) {
+	t.Parallel()
+	store, _, _ := newPushedStore(t)
+	ctx := t.Context()
+	require.NotSame(t, store.conn, store.pages, "serve keeps page reads on their own pool")
+	for name, row := range map[string]*sql.Row{
+		"scans": store.queryRowContext(ctx, `SELECT getSetting('max_threads')`),
+		"pages": store.pageQueryRowContext(ctx, `SELECT getSetting('max_threads')`),
+	} {
+		var threads uint64
+		require.NoError(t, row.Scan(&threads), name)
+		assert.Equal(t, uint64(8), threads, name)
+	}
+	assert.Equal(t, 4, store.pages.Stats().MaxOpenConnections)
+	assert.Equal(t, 12, store.conn.Stats().MaxOpenConnections)
 }

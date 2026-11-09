@@ -87,6 +87,30 @@ report under the same endpoint and model.
 Generated insights can also be listed, fetched, and generated from the CLI with
 `agentsview insight`; see the [CLI reference](/docs/commands/).
 
+### Tool effectiveness reports
+
+From a session's actions menu, **Analyze tool effectiveness** generates a report
+on that one session: which tool calls helped and which wasted turns. Conclusions
+are marked **Helped**, **Did not help**, or **Unclear**. Each conclusion names
+the calls it cites, and clicking one shows those calls with a link to their
+message. The session's observed tool sequences and a note on anything cut from
+the model's input follow the conclusions.
+
+The report sends each tool call's input and result to the insight agent, up to
+256 KiB of that text per run, so it costs more tokens than Agent Analysis and
+sends whatever the commands printed, secrets included. When a reply cites a
+message or call the model was never shown, the server asks once more and saves
+nothing if that reply fails too.
+
+![Analyze tool effectiveness in the session actions menu](/docs/assets/generated/screenshots/tool-effectiveness-action.png)
+
+![Tool effectiveness assessment with cited calls](/docs/assets/generated/screenshots/tool-effectiveness-report.png)
+
+Saved reports live under **Recall > Generated insights** and have shareable
+local links. If the transcript changes after generation, the report warns that
+its observed facts may differ from what the model assessed. For rates across
+projects and dates, use [Tool Usage](/docs/usage/#tool-usage).
+
 ### Configuring agent binaries
 
 AgentsView normally resolves `claude`, `codex`, `copilot`, `gemini`, and
@@ -173,7 +197,7 @@ Recall uses the same `[vector]` model and embeddings servers as session semantic
 search, but it has an independent index generation. Build it explicitly with:
 
 ```bash
-agentsview embeddings build --store recall
+agentsview index embeddings build --store recall
 ```
 
 Automatic Recall embedding requires separate consent because accepted entries
@@ -223,6 +247,10 @@ daemon schedules passes automatically: sync activity triggers incremental
 passes, and a periodic backstop revisits sessions whose transcripts changed
 after extraction. Entries produced this way are stored `unreviewed_auto` — they
 remain outside trusted Recall until promoted.
+
+On battery, scheduled model passes wait and resume within about a minute of AC
+power, or at the next daemon start if it exited while waiting. Retraction of
+entries from trashed, automated, or secret-bearing sessions continues on battery.
 
 ```toml
 [recall.extract]

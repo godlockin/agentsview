@@ -4,10 +4,13 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io/fs"
+	"maps"
 	"os"
 	"path/filepath"
 	"slices"
 	"strings"
+	"syscall"
 )
 
 var (
@@ -55,6 +58,50 @@ func (p *claudeProvider) Discover(ctx context.Context) ([]SourceRef, error) {
 
 func (p *claudeProvider) DiscoverEach(ctx context.Context, yield func(SourceRef) error) error {
 	return p.sources.DiscoverEach(ctx, yield)
+}
+
+func (p *claudeProvider) DiscoverScopesEach(ctx context.Context, scopes []ReconciliationScope, yield func(SourceRef) error) error {
+	paths := make(map[string][]string)
+	for _, scope := range scopes {
+		for _, root := range scope.TraversalRoots {
+			for _, proof := range scope.PhysicalProofScopes {
+				paths[root] = append(paths[root], filepath.Clean(proof.Path))
+			}
+		}
+	}
+	var incomplete error
+	emit := func(source SourceRef) error {
+		if err := yield(source); err != nil {
+			return discoveryYieldError{cause: err}
+		}
+		return nil
+	}
+	for _, root := range slices.Sorted(maps.Keys(paths)) {
+		slices.Sort(paths[root])
+		var covered []string
+		for _, path := range paths[root] {
+			if slices.ContainsFunc(covered, func(parent string) bool {
+				return reconciliationScopeWithinOrSame(path, parent)
+			}) {
+				continue
+			}
+			covered = append(covered, path)
+			var err error
+			if reconciliationScopeSamePath(cleanReconciliationScopeRoot(root), cleanReconciliationScopeRoot(path)) {
+				err = p.sources.discoverEachRoot(ctx, root, emit)
+			} else {
+				err = p.sources.streamLocalSubtree(ctx, root, path, true, yield)
+			}
+			if cause, ok := discoveryYieldCause(err); ok {
+				return cause
+			}
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+			incomplete = errors.Join(incomplete, err)
+		}
+	}
+	return incomplete
 }
 
 func (p *claudeProvider) DiscoverRawCaptureSourcesEach(
@@ -259,12 +306,11 @@ func (p *claudeProvider) Parse(
 		}
 	}
 	opts := claudeParseOptions{
-		ctx:                         ctx,
 		siblingLineage:              claudeSourceIsProjectLevel(req.Source, path),
 		persistedOutputPathResolver: persistedOutputPathResolver,
 		aiTitleFallback:             true,
 	}
-	results, excludedIDs, err := claudeParseFile(path, project, machine, opts)
+	results, excludedIDs, err := claudeParseFile(ctx, path, project, machine, opts)
 	if err != nil {
 		return ParseOutcome{}, err
 	}
@@ -315,14 +361,14 @@ type ClaudeUploadParser interface {
 	// the discovered-session Parse path, it is not overridden by any cwd
 	// recorded in the transcript, because an upload is filed under a
 	// user-chosen project rather than a workspace path on this machine.
-	ParseUploadedTranscript(path, project, machine string) ([]ParseResult, error)
+	ParseUploadedTranscript(ctx context.Context, path, project, machine string) ([]ParseResult, error)
 }
 
 func (p *claudeProvider) ParseUploadedTranscript(
-	path, project, machine string,
+	ctx context.Context, path, project, machine string,
 ) ([]ParseResult, error) {
 	machine = firstNonEmptyJSONLString(machine, p.Config.Machine)
-	results, _, err := claudeParseFile(path, project, machine, claudeParseOptions{
+	results, _, err := claudeParseFile(ctx, path, project, machine, claudeParseOptions{
 		uploadIdentity: true,
 	})
 	if err != nil {
@@ -366,6 +412,7 @@ func (p *claudeProvider) ParseIncremental(
 			IncrementalNeedsFullParse, nil
 	}
 	newMsgs, links, endedAt, consumed, err := claudeParseSessionFrom(
+		ctx,
 		path,
 		req.Offset,
 		claudeIncrementalScan{
@@ -378,7 +425,9 @@ func (p *claudeProvider) ParseIncremental(
 			},
 			storedLinearParse:         req.StoredClaudeLinearParse,
 			storedTailClaudeMessageID: req.StoredLastClaudeMessageID,
+			storedTailTimestamp:       req.StoredTailTimestamp,
 			storedSessionName:         req.StoredSessionName,
+			storedPRLinks:             req.StoredPRLinks,
 		},
 	)
 	if err != nil {
@@ -573,18 +622,7 @@ func (s claudeSourceSet) streamLocalRoot(
 			return nil
 		}
 		projectRoot := filepath.Join(root, project.Name())
-		err := streamDirectoryTreeRecursive(ctx, projectRoot, func(
-			path string, entry os.DirEntry,
-		) error {
-			if !strings.HasSuffix(entry.Name(), ".jsonl") {
-				return nil
-			}
-			source, ok := s.sourceRef(root, path)
-			if !ok {
-				return nil
-			}
-			return yield(source)
-		})
+		err := s.streamLocalSubtree(ctx, root, projectRoot, false, yield)
 		if err == nil {
 			return nil
 		}
@@ -601,6 +639,40 @@ func (s claudeSourceSet) streamLocalRoot(
 		return cause
 	}
 	return errors.Join(incomplete, err)
+}
+
+func (s claudeSourceSet) streamLocalSubtree(ctx context.Context, root, path string, allowMissing bool, yield func(SourceRef) error) error {
+	info, err := os.Stat(path)
+	if allowMissing && errors.Is(err, syscall.ENOTDIR) {
+		return nil
+	}
+	if allowMissing && errors.Is(err, os.ErrNotExist) {
+		if _, err := os.Lstat(path); errors.Is(err, os.ErrNotExist) {
+			return nil
+		}
+	}
+	if err != nil {
+		return incompleteDiscoveryError(s.spec.agent, "resolve "+s.spec.dirLabel+" "+path, err)
+	}
+	emit := func(path string, entry os.DirEntry) error {
+		if !strings.HasSuffix(entry.Name(), ".jsonl") {
+			return nil
+		}
+		if source, ok := s.sourceRef(root, path); ok {
+			return yield(source)
+		}
+		return nil
+	}
+	if !info.IsDir() {
+		if !allowMissing {
+			return incompleteDiscoveryError(s.spec.agent, "resolve "+s.spec.dirLabel+" "+path, syscall.ENOTDIR)
+		}
+		if err := emit(path, fs.FileInfoToDirEntry(info)); err != nil {
+			return discoveryYieldError{cause: err}
+		}
+		return nil
+	}
+	return streamDirectoryTreeRecursive(ctx, path, emit)
 }
 
 // discoveredSourceRef builds the SourceRef for one enumerated session file.

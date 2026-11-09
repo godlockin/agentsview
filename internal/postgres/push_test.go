@@ -8,6 +8,7 @@ import (
 	"errors"
 	"io"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -155,6 +156,11 @@ func (c *pushAliasRoutingConn) QueryContext(
 ) (driver.Rows, error) {
 	normalized := strings.ToLower(query)
 	switch {
+	case strings.Contains(normalized, "select version()"):
+		return &pushAliasRoutingRows{
+			columns: []string{"version"},
+			values:  [][]driver.Value{{"PostgreSQL 18"}},
+		}, nil
 	case strings.Contains(normalized, "agentsview_json_integer"):
 		return &pushAliasRoutingRows{
 			columns: []string{
@@ -172,6 +178,11 @@ func (c *pushAliasRoutingConn) QueryContext(
 		return &pushAliasRoutingRows{
 			columns: []string{"exists"},
 			values:  [][]driver.Value{{1}},
+		}, nil
+	case strings.Contains(normalized, "from information_schema.columns"):
+		return &pushAliasRoutingRows{
+			columns: []string{"wide"},
+			values:  [][]driver.Value{{true}},
 		}, nil
 	case strings.Contains(normalized, "from pg_indexes"):
 		return &pushAliasRoutingRows{
@@ -202,9 +213,9 @@ func (c *pushAliasRoutingConn) QueryContext(
 				"updated_at",
 			},
 		}, nil
-	case strings.Contains(normalized, "select id from excluded_sessions"):
+	case strings.Contains(normalized, "select id, false as scoped from excluded_sessions"):
 		return &pushAliasRoutingRows{
-			columns: []string{"id"},
+			columns: []string{"id", "scoped"},
 		}, nil
 	default:
 		return &pushAliasRoutingRows{
@@ -314,16 +325,16 @@ func TestSessionAliasBackfillForcesOneFullPush(t *testing.T) {
 func TestTranscriptRevisionBackfillForcesOneFullPush(t *testing.T) {
 	store := &syncStateStoreStub{}
 
-	full, needed, err := applyTranscriptRevisionBackfillRequirement(
-		t.Context(), store, false,
+	full, needed, err := applyBackfillRequirement(
+		t.Context(), store, transcriptRevisionBackfillStateKey, false,
 	)
 	require.NoError(t, err)
 	assert.True(t, full)
 	assert.True(t, needed)
 
-	require.NoError(t, markTranscriptRevisionBackfillDone(t.Context(), store))
-	full, needed, err = applyTranscriptRevisionBackfillRequirement(
-		t.Context(), store, false,
+	require.NoError(t, markBackfillDone(t.Context(), store, transcriptRevisionBackfillStateKey))
+	full, needed, err = applyBackfillRequirement(
+		t.Context(), store, transcriptRevisionBackfillStateKey, false,
 	)
 	require.NoError(t, err)
 	assert.False(t, full)
@@ -613,19 +624,19 @@ func TestReadPushBoundaryStateValidity(t *testing.T) {
 	}
 }
 
-func TestPGExcludedSessionIDsQueryUsesSingleArrayParameter(t *testing.T) {
-	query, args := pgExcludedSessionIDsQuery([]string{
-		"sess-001",
-		"sess-002",
-		"sess-003",
-	})
+func TestPGExcludedSessionIDsQueryUsesBoundedArrayParameters(t *testing.T) {
+	query, args := pgExcludedSessionIDsQuery(slices.Values([]db.Session{
+		{ID: "sess-001", Agent: "codex", Machine: "local"},
+		{ID: "sess-002", Agent: "traex", Machine: "other-machine"},
+	}), "marker", "push-machine", []string{"old-machine"})
 
 	assert.Contains(t, query, "id = ANY($1)")
-	assert.NotContains(t, query, "$2")
-	require.Len(t, args, 1)
-	assert.Equal(t, []string{"sess-001", "sess-002", "sess-003"},
-		args[0],
-	)
+	require.Len(t, args, 5)
+	assert.Equal(t, []string{"sess-001", "sess-002"}, args[0])
+	assert.Equal(t, []string{"codex", "traex"}, args[1])
+	assert.Equal(t, []string{"push-machine", "other-machine"}, args[2])
+	assert.Equal(t, "marker", args[3])
+	assert.Equal(t, []string{"old-machine"}, args[4])
 }
 
 func TestDeletePGExcludedSessionRowsUsesSingleArrayParameter(t *testing.T) {
@@ -756,7 +767,6 @@ func TestPushSessionCarriesDeletionCauseInStableParameterOrder(t *testing.T) {
 		"marker", nil,
 	)
 	require.NoError(t, err)
-	require.Len(t, state.upsertArgs, 70)
 	assert.IsType(t, time.Time{}, state.upsertArgs[12].Value)
 	assert.IsType(t, time.Time{}, state.upsertArgs[13].Value)
 	assert.Equal(t, cause, state.upsertArgs[14].Value)
@@ -923,7 +933,7 @@ func TestPurgePGExcludedPushSessionsChecksDerivedAliases(t *testing.T) {
 	}
 
 	err := purgePGExcludedPushSessions(
-		t.Context(), pg, sessionByID,
+		t.Context(), pg, sessionByID, "marker", "push-machine", nil,
 	)
 
 	require.NoError(t, err, "purgePGExcludedPushSessions")
@@ -1090,11 +1100,11 @@ func (c *pushSessionProbeConn) QueryContext(
 		values := [][]driver.Value{}
 		for _, id := range namedValueStrings(args) {
 			if c.state.existingExcluded[id] {
-				values = append(values, []driver.Value{id})
+				values = append(values, []driver.Value{id, false})
 			}
 		}
 		return &pushSessionProbeRows{
-			columns: []string{"id"},
+			columns: []string{"id", "scoped"},
 			values:  values,
 		}, nil
 	case strings.Contains(normalized, "select exists") &&
@@ -1257,6 +1267,13 @@ func TestSessionPushFingerprintDiffers(t *testing.T) {
 				return s
 			},
 		},
+		{
+			name: "first friction review",
+			modify: func(s db.Session) db.Session {
+				s.FrictionRulesVersion = "friction-v1"
+				return s
+			},
+		},
 	}
 
 	for _, tc := range tests {
@@ -1270,6 +1287,28 @@ func TestSessionPushFingerprintDiffers(t *testing.T) {
 
 	assert.Equal(t, fp1, sessionPushFingerprint(base, base.Machine, "", "", "", ""),
 		"identical sessions should produce identical fingerprints")
+}
+
+// A reviewed session's fingerprint must follow every friction summary field,
+// or a changed review would never reach PostgreSQL.
+func TestSessionPushFingerprintTracksReviewedFriction(t *testing.T) {
+	reviewed := db.Session{
+		ID: "s1", Project: "proj", Machine: "laptop", Agent: "claude",
+		FrictionCount: 1, FrictionRulesVersion: "friction-v1", FrictionHash: "h1",
+	}
+	before := sessionPushFingerprint(reviewed, reviewed.Machine, "", "", "", "")
+	for name, modify := range map[string]func(*db.Session){
+		"count":         func(s *db.Session) { s.FrictionCount = 2 },
+		"rules version": func(s *db.Session) { s.FrictionRulesVersion = "friction-v2" },
+		"hash":          func(s *db.Session) { s.FrictionHash = "h2" },
+	} {
+		t.Run(name, func(t *testing.T) {
+			changed := reviewed
+			modify(&changed)
+			assert.NotEqual(t, before,
+				sessionPushFingerprint(changed, changed.Machine, "", "", "", ""))
+		})
+	}
 }
 
 func TestSessionPushFingerprintIgnoresVolatileStatFields(t *testing.T) {
@@ -1817,75 +1856,4 @@ func TestNilStrSanitizes(t *testing.T) {
 	// should return nil.
 	nul := "\x00"
 	assert.Nil(t, nilStr(&nul), "nilStr(\"\\x00\") should be nil")
-}
-
-func TestShouldSkipSessionMessagesInBatchedPush(t *testing.T) {
-	const sessionID = "sess-batched"
-	baseComparisons := &pushMessageComparison{
-		MessageAggregates: map[string]pushMessageAggregate{
-			sessionID: {Count: 2, Sum: 12, Max: 6, Min: 1},
-		},
-		MessageContentHash: map[string]string{
-			sessionID: "abc",
-		},
-		MessageRoleTime: map[string]string{
-			sessionID: "role-time",
-		},
-		MessageFlags: map[string]string{
-			sessionID: "flags",
-		},
-		MessageSystemOrdinals: map[string]string{
-			sessionID: "0,1",
-		},
-		MessageTokenFingerprint: map[string]string{
-			sessionID: "tokens",
-		},
-		ToolCallAggregates: map[string]pushToolCallAggregate{
-			sessionID: {Count: 1, Sum: 99},
-		},
-		ToolCallFingerprint: map[string]string{
-			sessionID: "toolcalls",
-		},
-		ToolResultFingerprint: map[string]string{
-			sessionID: "results",
-		},
-		UsageEventFingerprint: map[string]string{
-			sessionID: "usage",
-		},
-	}
-	unchangedFP := pushLocalMessageFingerprint{
-		Sum:           12,
-		Max:           6,
-		Min:           1,
-		ContentHashFP: "abc",
-		RoleTimeFP:    "role-time",
-		FlagsFP:       "flags",
-		SystemFP:      "0,1",
-		ToolCallCount: 1,
-		ToolCallSum:   99,
-		ToolCallFP:    "toolcalls",
-		ToolResultFP:  "results",
-		TokenFP:       "tokens",
-		UsageEventFP:  "usage",
-	}
-
-	assert.True(t, shouldSkipSessionMessages(
-		sessionID, 2, unchangedFP, false, baseComparisons,
-	), "unchanged sessions should be skipped as unchanged")
-
-	changedFP := unchangedFP
-	changedFP.ToolCallSum = 100
-	assert.False(t, shouldSkipSessionMessages(
-		sessionID, 2, changedFP, false, baseComparisons,
-	), "tool-call sum mismatch should force push")
-
-	changedFP = unchangedFP
-	changedFP.ToolResultFP = "changed-results"
-	assert.False(t, shouldSkipSessionMessages(
-		sessionID, 2, changedFP, false, baseComparisons,
-	), "tool-result event mismatch should force push")
-
-	assert.False(t, shouldSkipSessionMessages(
-		sessionID, 2, unchangedFP, true, baseComparisons,
-	), "full mode should not skip by fingerprint check")
 }

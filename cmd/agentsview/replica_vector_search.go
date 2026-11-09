@@ -26,7 +26,7 @@ func replicaVectorUnavailableReason(
 		fps = append(fps, g.Fingerprint)
 	}
 	return fmt.Sprintf(
-		"semantic search: %s (present: %s); run 'agentsview %s push' from a "+
+		"semantic search: %s (present: %s); run 'agentsview replica %s push' from a "+
 			"machine with a matching [vector.embeddings] config",
 		unavailable, strings.Join(fps, ", "), backend.Name())
 }
@@ -70,11 +70,20 @@ func wireReplicaVectorSearch(
 			"vector search is unavailable for usage-only archives")
 		return nil
 	}
+	if !appCfg.Vector.Enabled && appCfg.DeploymentEmbeddings != nil {
+		adopted, err := adoptReplicaVectorConfig(ctx, appCfg, backend, store)
+		if err != nil {
+			vectorStore.SetSemanticUnavailableReason(err.Error())
+			log.Printf("%s: %v", label, err)
+			return nil
+		}
+		appCfg = adopted
+	}
 	if !appCfg.Vector.Enabled {
 		vectorStore.SetSemanticUnavailableReason(fmt.Sprintf(
 			"semantic search: %s requires [vector] enabled with a matching "+
 				"[vector.embeddings] config and a generation pushed by "+
-				"'agentsview %s push'", backend.DisplayName(), backend.Name()))
+				"'agentsview replica %s push'", backend.DisplayName(), backend.Name()))
 		return nil
 	}
 	gen := vectorGeneration(appCfg.Vector.Embeddings)
@@ -121,14 +130,14 @@ var wireReplicaReadVectorSearchFn = wireReplicaReadVectorSearch
 // db.ErrSemanticUnavailable. Stores that are not replica stores (test fakes
 // injected through the store opener) are left untouched.
 func wireReplicaReadVectorSearch(
-	cfg config.Config, backend storage.Replica, store db.Store,
+	ctx context.Context, cfg config.Config, backend storage.Replica, store db.Store,
 ) {
 	replicaStore, ok := store.(storage.ReplicaStore)
 	if !ok {
 		return
 	}
 	if err := wireReplicaVectorSearch(
-		context.Background(), cfg, backend, replicaStore, backend.Name()+" read",
+		ctx, cfg, backend, replicaStore, backend.Name()+" read",
 	); err != nil {
 		log.Printf(
 			"warning: wiring %s semantic search: %v; continuing without semantic search",

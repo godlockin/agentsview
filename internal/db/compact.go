@@ -375,12 +375,12 @@ func (db *DB) Compact(ctx context.Context, options CompactOptions) (result Compa
 	// the caller (an HTTP request, a Ctrl-C'd CLI) has gone away.
 	opCtx := context.WithoutCancel(ctx)
 	if err := db.verifyReopenedArchive(opCtx, op.verification); err != nil {
-		return result, db.rollbackCompactInstall(ctx,
+		return result, db.rollbackCompactInstall(opCtx,
 			fmt.Errorf("verify reopened archive: %w", err), op)
 	}
 	op.manifest.Phase = compactPhaseCommitted
 	if err := writeCompactManifest(op.manifestPath, op.manifest); err != nil {
-		return result, db.rollbackCompactInstall(ctx,
+		return result, db.rollbackCompactInstall(opCtx,
 			fmt.Errorf("record committed archive compaction: %w", err), op)
 	}
 	// Commit point: the compacted archive is authoritative from here on.
@@ -1155,6 +1155,15 @@ func removeCompactPath(path, installingPath string, keepBackup bool) error {
 
 func compactManifestPath(databasePath string) string {
 	return filepath.Join(filepath.Dir(databasePath), compactManifestName)
+}
+
+// CompactRecoveryPending reports whether startup must settle an interrupted swap.
+func CompactRecoveryPending(databasePath string) (bool, error) {
+	_, err := os.Lstat(compactManifestPath(databasePath))
+	if errors.Is(err, os.ErrNotExist) {
+		return false, nil
+	}
+	return err == nil, err
 }
 
 func writeCompactManifest(path string, manifest compactManifest) error {

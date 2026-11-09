@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"slices"
 	"strings"
 
 	"go.kenn.io/agentsview/internal/money"
@@ -29,6 +30,25 @@ type UsageEvent struct {
 	CostSource               string
 	OccurredAt               string
 	DedupKey                 string
+}
+
+type usageEventRow struct {
+	ordinal                                            sql.NullInt64
+	source, model, providerID                          string
+	input, output, cacheCreation, cacheRead, reasoning int
+	cost                                               sql.NullInt64
+	costStatus, costSource                             string
+	occurredAt                                         sql.NullString
+	dedupKey                                           string
+}
+
+func (r *usageEventRow) scan(rows *sql.Rows, id *int64, sessionID *string) error {
+	return rows.Scan(
+		id, sessionID, &r.ordinal, &r.source, &r.model,
+		&r.input, &r.output, &r.providerID,
+		&r.cacheCreation, &r.cacheRead, &r.reasoning,
+		&r.cost, &r.costStatus, &r.costSource, &r.occurredAt, &r.dedupKey,
+	)
 }
 
 func (db *DB) ensureUsageEventsSchemaLocked(ctx context.Context, w *writerHandle) error {
@@ -109,35 +129,71 @@ func replaceSessionUsageEventsTx(
 	events []UsageEvent,
 	enqueueArtifact bool,
 ) error {
-	if _, err := tx.Exec(
-		`DELETE FROM usage_events WHERE session_id = ?`,
-		sessionID,
-	); err != nil {
-		return fmt.Errorf("deleting usage events: %w", err)
+	// Compare raw persisted values in insertion order. Keeping the common
+	// prefix avoids journaling unchanged rows and preserves timestamp ties.
+	incoming := make([]usageEventRow, len(events))
+	for i, ev := range events {
+		if ev.SessionID != "" && ev.SessionID != sessionID {
+			return fmt.Errorf("usage event session_id %q does not match %q", ev.SessionID, sessionID)
+		}
+		r := usageEventRow{
+			source: ev.Source, model: ev.Model, providerID: ev.ProviderID,
+			input: ev.InputTokens, output: ev.OutputTokens,
+			cacheCreation: ev.CacheCreationInputTokens, cacheRead: ev.CacheReadInputTokens,
+			reasoning: ev.ReasoningTokens, costStatus: ev.CostStatus, costSource: ev.CostSource,
+			occurredAt: sql.NullString{String: ev.OccurredAt, Valid: ev.OccurredAt != ""}, dedupKey: ev.DedupKey,
+		}
+		if ev.MessageOrdinal != nil {
+			r.ordinal = sql.NullInt64{Int64: int64(*ev.MessageOrdinal), Valid: true}
+		}
+		if ev.Cost != nil {
+			r.cost = sql.NullInt64{Int64: ev.Cost.Microdollars, Valid: true}
+		}
+		incoming[i] = r
+	}
+	rows, err := tx.Query(`
+		SELECT id, session_id, message_ordinal, source, model,
+			input_tokens, output_tokens, provider_id, cache_creation_input_tokens,
+			cache_read_input_tokens, reasoning_tokens, cost_microdollars,
+			cost_status, cost_source, occurred_at, dedup_key
+		FROM usage_events WHERE session_id = ? ORDER BY id`, sessionID)
+	if err != nil {
+		return fmt.Errorf("reading usage events for replacement: %w", err)
+	}
+	defer rows.Close()
+	prefix := 0
+	var firstDifferentID sql.NullInt64
+	for rows.Next() {
+		var id int64
+		var storedSessionID string
+		var r usageEventRow
+		if err := r.scan(rows, &id, &storedSessionID); err != nil {
+			return fmt.Errorf("scanning usage events for replacement: %w", err)
+		}
+		if !firstDifferentID.Valid {
+			if prefix < len(incoming) && r == incoming[prefix] {
+				prefix++
+			} else {
+				firstDifferentID = sql.NullInt64{Int64: id, Valid: true}
+			}
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("iterating usage events for replacement: %w", err)
+	}
+	if err := rows.Close(); err != nil {
+		return fmt.Errorf("closing usage events for replacement: %w", err)
+	}
+	if !firstDifferentID.Valid && prefix == len(incoming) {
+		return nil
+	}
+	if firstDifferentID.Valid {
+		if _, err := tx.Exec(`DELETE FROM usage_events WHERE session_id = ? AND id >= ?`, sessionID, firstDifferentID.Int64); err != nil {
+			return fmt.Errorf("deleting usage events: %w", err)
+		}
 	}
 
-	for _, ev := range events {
-		if ev.SessionID == "" {
-			ev.SessionID = sessionID
-		}
-		if ev.SessionID != sessionID {
-			return fmt.Errorf(
-				"usage event session_id %q does not match %q",
-				ev.SessionID, sessionID,
-			)
-		}
-		var ordinal any
-		if ev.MessageOrdinal != nil {
-			ordinal = *ev.MessageOrdinal
-		}
-		var cost any
-		if ev.Cost != nil {
-			cost = ev.Cost.Microdollars
-		}
-		var occurredAt any
-		if ev.OccurredAt != "" {
-			occurredAt = ev.OccurredAt
-		}
+	for _, r := range incoming[prefix:] {
 		if _, err := tx.Exec(`
 			INSERT INTO usage_events (
 				session_id, message_ordinal, source, model,
@@ -146,11 +202,11 @@ func replaceSessionUsageEventsTx(
 				reasoning_tokens, cost_microdollars, cost_status, cost_source,
 				occurred_at, dedup_key
 			) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-			ev.SessionID, ordinal, ev.Source, ev.Model,
-			ev.InputTokens, ev.OutputTokens, ev.ProviderID,
-			ev.CacheCreationInputTokens, ev.CacheReadInputTokens,
-			ev.ReasoningTokens, cost, ev.CostStatus, ev.CostSource,
-			occurredAt, ev.DedupKey,
+			sessionID, r.ordinal, r.source, r.model,
+			r.input, r.output, r.providerID,
+			r.cacheCreation, r.cacheRead,
+			r.reasoning, r.cost, r.costStatus, r.costSource,
+			r.occurredAt, r.dedupKey,
 		); err != nil {
 			return fmt.Errorf("inserting usage event: %w", err)
 		}
@@ -161,16 +217,8 @@ func replaceSessionUsageEventsTx(
 	// a usage-only rewrite (e.g. a pricing-driven recompute) touches no
 	// other marker signal, so without this the change would never become
 	// an incremental push candidate (see updateSessionSignalsTx).
-	if _, err := tx.Exec(
-		`UPDATE sessions
-		    SET local_modified_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
-		  WHERE id = ?`,
-		sessionID,
-	); err != nil {
-		return fmt.Errorf(
-			"bumping local_modified_at for %s after usage replace: %w",
-			sessionID, err,
-		)
+	if err := bumpLocalModifiedTx(tx, sessionID, "usage replace"); err != nil {
+		return err
 	}
 	if enqueueArtifact {
 		if err := enqueueArtifactExportTx(tx, sessionID); err != nil {
@@ -180,20 +228,32 @@ func replaceSessionUsageEventsTx(
 	return nil
 }
 
-// GetUsageEvents returns usage events for one session in stable order.
 // UsageEventFingerprints returns exact ordered fingerprints of
-// stored usage events keyed by session ID. Used by PG push fast-paths
-// to detect usage-only changes without N+1 queries.
+// stored usage events keyed by session ID.
 func (db *DB) UsageEventFingerprints(
-	sessionIDs []string,
+	ctx context.Context, sessionIDs []string,
 ) (map[string]string, error) {
 	return usageEventFingerprintsWithQuerier(
-		context.Background(), db.getReader(), sessionIDs,
+		ctx, db.getReader(), sessionIDs, nil, false,
+	)
+}
+
+// SortedUsageEventFingerprints returns usage fingerprints keyed by session
+// ID after applying normalizeTimestamp to each occurred_at value. Normalized
+// timestamps no longer follow the stored text order, so the encoded records
+// are sorted and the fingerprint ignores row order.
+func (db *DB) SortedUsageEventFingerprints(
+	ctx context.Context, sessionIDs []string,
+	normalizeTimestamp func(string) string,
+) (map[string]string, error) {
+	return usageEventFingerprintsWithQuerier(
+		ctx, db.getReader(), sessionIDs, normalizeTimestamp, true,
 	)
 }
 
 func usageEventFingerprintsWithQuerier(
 	ctx context.Context, q messageRowsQuerier, sessionIDs []string,
+	normalizeTimestamp func(string) string, sorted bool,
 ) (map[string]string, error) {
 	out := make(map[string]string, len(sessionIDs))
 	if len(sessionIDs) == 0 {
@@ -207,7 +267,7 @@ func usageEventFingerprintsWithQuerier(
 	for start := 0; start < len(sessionIDs); start += batchSize {
 		end := min(start+batchSize, len(sessionIDs))
 		if err := appendUsageEventFingerprints(
-			ctx, q, out, sessionIDs[start:end],
+			ctx, q, out, sessionIDs[start:end], normalizeTimestamp, sorted,
 		); err != nil {
 			return nil, err
 		}
@@ -218,6 +278,7 @@ func usageEventFingerprintsWithQuerier(
 func appendUsageEventFingerprints(
 	ctx context.Context, q messageRowsQuerier,
 	out map[string]string, sessionIDs []string,
+	normalizeTimestamp func(string) string, sorted bool,
 ) error {
 	placeholders := make([]string, len(sessionIDs))
 	args := make([]any, len(sessionIDs))
@@ -241,7 +302,7 @@ func appendUsageEventFingerprints(
 	}
 	defer rows.Close()
 
-	builders := make(map[string]*strings.Builder)
+	records := make(map[string][]string)
 	for rows.Next() {
 		var sessionID string
 		var ordinal sql.NullInt64
@@ -260,14 +321,12 @@ func appendUsageEventFingerprints(
 		); err != nil {
 			return err
 		}
-		b := builders[sessionID]
-		if b == nil {
-			b = &strings.Builder{}
-			builders[sessionID] = b
-		}
 		occurred := ""
 		if occurredAt.Valid {
 			occurred = occurredAt.String
+		}
+		if normalizeTimestamp != nil {
+			occurred = normalizeTimestamp(occurred)
 		}
 		// Sanitize before measuring so fingerprints match the
 		// PG-readback fingerprint, whose values were sanitized
@@ -278,7 +337,7 @@ func appendUsageEventFingerprints(
 		costStatus = SanitizeUTF8(costStatus)
 		costSource = SanitizeUTF8(costSource)
 		dedupKey.String = SanitizeUTF8(dedupKey.String)
-		fmt.Fprintf(b,
+		records[sessionID] = append(records[sessionID], fmt.Sprintf(
 			"%t|%d|%d:%s|%d:%s|%d:%s|%d|%d|%d|%d|%d|%t|%d|%d:%s|%d:%s|%d:%s|%d:%s;",
 			ordinal.Valid,
 			ordinal.Int64,
@@ -296,26 +355,21 @@ func appendUsageEventFingerprints(
 			len(costSource), costSource,
 			len(occurred), occurred,
 			len(dedupKey.String), dedupKey.String,
-		)
+		))
 	}
 	if err := rows.Err(); err != nil {
 		return err
 	}
-	for id, b := range builders {
-		out[id] += b.String()
+	for id, sessionRecords := range records {
+		if sorted {
+			slices.Sort(sessionRecords)
+		}
+		out[id] += strings.Join(sessionRecords, "")
 	}
 	return nil
 }
 
-// UsageEventFingerprint returns exact ordered fingerprint for one session.
-func (db *DB) UsageEventFingerprint(sessionID string) (string, error) {
-	fps, err := db.UsageEventFingerprints([]string{sessionID})
-	if err != nil {
-		return "", err
-	}
-	return fps[sessionID], nil
-}
-
+// GetUsageEvents returns usage events for one session in stable order.
 func (db *DB) GetUsageEvents(
 	ctx context.Context, sessionID string,
 ) ([]UsageEvent, error) {
@@ -348,28 +402,25 @@ func usageEventsWithQuerier(
 	var out []UsageEvent
 	for rows.Next() {
 		var ev UsageEvent
-		var ordinal sql.NullInt64
-		var cost sql.NullInt64
-		var occurred sql.NullString
-		if err := rows.Scan(
-			&ev.ID, &ev.SessionID, &ordinal, &ev.Source, &ev.Model,
-			&ev.InputTokens, &ev.OutputTokens,
-			&ev.ProviderID, &ev.CacheCreationInputTokens, &ev.CacheReadInputTokens,
-			&ev.ReasoningTokens, &cost, &ev.CostStatus,
-			&ev.CostSource, &occurred, &ev.DedupKey,
-		); err != nil {
+		var r usageEventRow
+		if err := r.scan(rows, &ev.ID, &ev.SessionID); err != nil {
 			return nil, fmt.Errorf("scanning usage event: %w", err)
 		}
-		if ordinal.Valid {
-			v := int(ordinal.Int64)
+		ev.Source, ev.Model, ev.ProviderID = r.source, r.model, r.providerID
+		ev.InputTokens, ev.OutputTokens = r.input, r.output
+		ev.CacheCreationInputTokens, ev.CacheReadInputTokens = r.cacheCreation, r.cacheRead
+		ev.ReasoningTokens = r.reasoning
+		ev.CostStatus, ev.CostSource, ev.DedupKey = r.costStatus, r.costSource, r.dedupKey
+		if r.ordinal.Valid {
+			v := int(r.ordinal.Int64)
 			ev.MessageOrdinal = &v
 		}
-		if cost.Valid {
-			v := money.Money{Microdollars: cost.Int64}
+		if r.cost.Valid {
+			v := money.Money{Microdollars: r.cost.Int64}
 			ev.Cost = &v
 		}
-		if occurred.Valid {
-			ev.OccurredAt = occurred.String
+		if r.occurredAt.Valid {
+			ev.OccurredAt = r.occurredAt.String
 		}
 		out = append(out, ev)
 	}

@@ -212,6 +212,37 @@ func (s *recordingArtifactStore) Create(
 	return result, err
 }
 
+// memorySessionArtifactStore holds segment and manifest bodies in memory for a
+// test whose export never reads them back. Checkpoints and every other call go
+// to the real store, including reads, which cannot access the in-memory bodies.
+// Export writes sequentially, so the map needs no lock.
+type memorySessionArtifactStore struct {
+	ArtifactStore
+	bodies map[Ref][]byte
+}
+
+func (s *memorySessionArtifactStore) Create(
+	ctx context.Context,
+	ref Ref,
+	identity Identity,
+	mediaType string,
+	body io.Reader,
+) (CreateResult, error) {
+	if ref.Kind != KindSegments && ref.Kind != KindManifests {
+		return s.ArtifactStore.Create(ctx, ref, identity, mediaType, body)
+	}
+	data, err := io.ReadAll(body)
+	if err != nil {
+		return CreateResult{}, err
+	}
+	if hashHex(data) != identity.SHA256 || int64(len(data)) != identity.Size {
+		return CreateResult{}, ErrArtifactCorrupt
+	}
+	_, exists := s.bodies[ref]
+	s.bodies[ref] = data
+	return CreateResult{Entry: Entry{Ref: ref, Identity: identity}, Created: !exists}, nil
+}
+
 type checkpointReadCountingStore struct {
 	ArtifactStore
 	lists int
@@ -753,6 +784,30 @@ func TestExportToStorePublishesDependenciesBeforeCheckpointAndSkipsUnchanged(t *
 	assert.Equal(t, Kind(KindManifests), store.creates[1].Ref.Kind)
 	assert.False(t, store.creates[0].Created)
 	assert.False(t, store.creates[1].Created)
+}
+
+func TestExportManifestVersionTracksPRLinks(t *testing.T) {
+	for _, links := range [][]db.PRLink{nil, {{URL: "https://github.com/owner/repo/pull/7", Host: "github.com", Repository: "owner/repo", Number: 7}}} {
+		database := testExportDB(t)
+		store := newTestArtifactStore(t)
+		seedSession(t, database, "sess-1", "alpha", func(sess *db.Session) { sess.PRLinks = links })
+		result, err := ExportToStore(t.Context(), database, store, ExportOptions{Origin: contractOrigin})
+		require.NoError(t, err)
+		require.Equal(t, 1, result.ExportedSessions)
+		checkpoint := latestStoreCheckpointForTest(t, store, contractOrigin)
+		ref, err := NewRef(contractOrigin, KindManifests, checkpoint.Sessions[contractOrigin+"~sess-1"]+".json")
+		require.NoError(t, err)
+		data := readContractArtifact(t, store, ref)
+		published, err := decodeManifestWithLimits(data, productionArtifactLimits())
+		require.NoError(t, err)
+		if len(links) == 0 {
+			assert.Equal(t, 5, published.Version)
+			assert.NotContains(t, string(data), `"pr_links"`)
+		} else {
+			assert.Equal(t, 6, published.Version)
+			assert.Equal(t, links, published.Session.PRLinks)
+		}
+	}
 }
 
 func TestExportKeepsAgentSessionNameSeparateFromUserDisplayName(t *testing.T) {
@@ -1462,7 +1517,7 @@ func TestExportToStorePublicationRevisionRejectsPhysicallyCreatedStaleCheckpoint
 	usageA, err := first.GetUsageEvents(ctx, "session-a")
 	require.NoError(t, err)
 	manifestA, _, err := exportLoadedSessionToStore(
-		ctx, filesystem, contractOrigin, sessionA, messagesA, usageA, productionArtifactLimits(),
+		ctx, filesystem, contractOrigin, sessionA, messagesA, usageA, nil, productionArtifactLimits(),
 	)
 	require.NoError(t, err)
 	revisionA, changed, err := first.ApplyArtifactPublicationChanges(ctx, contractOrigin,
@@ -1488,7 +1543,7 @@ func TestExportToStorePublicationRevisionRejectsPhysicallyCreatedStaleCheckpoint
 	usageB, err := second.GetUsageEvents(ctx, "session-b")
 	require.NoError(t, err)
 	manifestB, _, err := exportLoadedSessionToStore(
-		ctx, filesystem, contractOrigin, sessionB, messagesB, usageB, productionArtifactLimits(),
+		ctx, filesystem, contractOrigin, sessionB, messagesB, usageB, nil, productionArtifactLimits(),
 	)
 	require.NoError(t, err)
 	revisionB, changed, err := second.ApplyArtifactPublicationChanges(ctx, contractOrigin,
@@ -1676,9 +1731,10 @@ func TestExportToStoreFullDrainsMoreThanOneClaimPage(t *testing.T) {
 		t, database, total, "session-%04d", "local",
 	)
 	counted := &countingCanonicalExportDB{DB: database}
-	filesystem, err := newProtocolTestStore(t.TempDir())
-	require.NoError(t, err)
-	t.Cleanup(func() { require.NoError(t, filesystem.Close()) })
+	filesystem := &memorySessionArtifactStore{
+		ArtifactStore: newTestArtifactStore(t),
+		bodies:        make(map[Ref][]byte),
+	}
 
 	result, err := ExportToStore(t.Context(), counted, filesystem, ExportOptions{
 		Origin: contractOrigin, Full: true,
@@ -1703,6 +1759,14 @@ func TestExportToStoreFullDrainsMoreThanOneClaimPage(t *testing.T) {
 	var published checkpoint
 	require.NoError(t, json.Unmarshal(body, &published))
 	assert.Len(t, published.Sessions, total)
+	for gid, hash := range published.Sessions {
+		ref := requireContractRef(t, contractOrigin, KindManifests, hash+".json")
+		data, ok := filesystem.bodies[ref]
+		require.True(t, ok, "checkpoint manifest for %s is stored", gid)
+		manifest, err := decodeManifestWithLimits(data, productionArtifactLimits())
+		require.NoError(t, err)
+		assert.Equal(t, strings.TrimPrefix(gid, contractOrigin+"~"), manifest.NativeSessionID)
+	}
 }
 
 func TestExportToStoreExplicitSessionIDsClaimBeyondOldestQueuePage(t *testing.T) {

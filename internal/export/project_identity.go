@@ -155,6 +155,23 @@ func SanitizeGitRemoteForStorage(raw string) string {
 	return sanitized
 }
 
+// WithRecordedGitRemote applies a repository URL that the session source
+// recorded at session time. The source names no git config remote.
+func WithRecordedGitRemote(
+	obs ProjectIdentityObservation, remote string,
+) ProjectIdentityObservation {
+	remote = SanitizeGitRemoteForStorage(remote)
+	if remote == "" {
+		return obs
+	}
+	obs.GitRemote = remote
+	obs.GitRemoteName = ""
+	obs.RemoteResolution = ProjectResolutionResolved
+	obs.RemoteCandidateCount = 1
+	obs.SourceRecorded = true
+	return obs
+}
+
 func SanitizeStoredProjectIdentityObservation(
 	obs ProjectIdentityObservation,
 ) ProjectIdentityObservation {
@@ -753,8 +770,7 @@ func looksWindowsDrivePath(path string) bool {
 }
 
 func splitSCPGitRemote(raw string) (host, repoPath string, ok bool) {
-	if at := strings.LastIndex(raw, "@"); at >= 0 {
-		rest := raw[at+1:]
+	if _, rest, found := strings.CutLast(raw, "@"); found {
 		colon := strings.Index(rest, ":")
 		if colon <= 0 || colon == len(rest)-1 {
 			return "", "", false

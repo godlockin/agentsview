@@ -3,6 +3,9 @@ package main
 import (
 	"context"
 	"errors"
+	"maps"
+	"runtime"
+	"sync"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -40,7 +43,7 @@ type fakePushUnitSource struct {
 }
 
 func (f fakePushUnitSource) ScanEmbeddableUnits(
-	_ context.Context, _ string, _ bool, fn func(db.EmbeddableUnit) error,
+	_ context.Context, _ string, _ bool, _ int, fn func(db.EmbeddableUnit) error,
 ) (string, error) {
 	for _, u := range f.units {
 		if err := fn(u); err != nil {
@@ -108,9 +111,18 @@ func closePushSource(t *testing.T, src storage.VectorPushSource) {
 	})
 }
 
-func TestNewVectorPushSourceDisabled(t *testing.T) {
+func TestVectorPushSourceDisabled(t *testing.T) {
 	cfg := config.Config{} // [vector] disabled
 	assert.Nil(t, newVectorPushSource(cfg))
+
+	cfg = enabledVectorConfig(t)
+	buildTestVectorsDB(t, cfg)
+	cfg.Vector.Enabled = false
+	source := &vectorPushSource{cfg: cfg}
+	t.Cleanup(func() { require.NoError(t, source.Close()) })
+	_, ok, err := source.BeginExport(t.Context(), nil)
+	require.NoError(t, err)
+	assert.False(t, ok, "disabled search must skip even an existing index")
 }
 
 func TestVectorPushSourceMissingFile(t *testing.T) {
@@ -328,4 +340,118 @@ func TestCloseVectorPushSource(t *testing.T) {
 	assert.True(t, ok, "a closed adapter reopens lazily")
 	require.NoError(t, export.Close())
 	closePushSource(t, src)
+}
+
+func TestVectorPushExportPublishesMatchingRecipe(t *testing.T) {
+	ctx := t.Context()
+	t.Run("matching generation publishes the configured recipe", func(t *testing.T) {
+		cfg := enabledVectorConfig(t)
+		cfg.Vector.Embeddings.QueryPrefix = "query: "
+		want := vectorGeneration(cfg.Vector.Embeddings)
+		ix, err := vector.Open(ctx, cfg.Vector.ResolvedDBPath(cfg.DataDir), false,
+			cfg.Vector.Embeddings.MaxInputChars)
+		require.NoError(t, err)
+		result, err := ix.Build(ctx, testPushUnitSource(), fakePushEncoder(), want,
+			vector.BuildOptions{})
+		require.NoError(t, err)
+		require.True(t, result.Activated)
+		require.NoError(t, ix.Close())
+
+		src := newVectorPushSource(cfg)
+		closePushSource(t, src)
+		export, ok, err := src.BeginExport(ctx, nil)
+		require.NoError(t, err)
+		require.True(t, ok)
+		defer export.Close()
+		got := export.Generation()
+		assert.Equal(t, want.Fingerprint(), got.Fingerprint)
+		assert.Equal(t, want.Params, got.Params)
+		require.NoError(t, export.Close())
+		src.(*vectorPushSource).adopted = true
+		adoptedExport, ok, err := src.BeginExport(ctx, nil)
+		require.NoError(t, err)
+		require.True(t, ok)
+		defer adoptedExport.Close()
+		assert.Equal(t, want.Fingerprint(), adoptedExport.Generation().Fingerprint)
+		assert.Nil(t, adoptedExport.Generation().Params)
+	})
+
+	t.Run("other generation publishes nothing", func(t *testing.T) {
+		cfg := enabledVectorConfig(t)
+		buildTestVectorsDB(t, cfg)
+		src := newVectorPushSource(cfg)
+		closePushSource(t, src)
+		export, ok, err := src.BeginExport(ctx, nil)
+		require.NoError(t, err)
+		require.True(t, ok)
+		defer export.Close()
+		got := export.Generation()
+		require.NotEqual(t, vectorGeneration(cfg.Vector.Embeddings).Fingerprint(), got.Fingerprint)
+		assert.Nil(t, got.Params)
+	})
+}
+
+func TestVectorPushSourceConcurrentSetupReloadSnapshot(t *testing.T) {
+	cfg := enabledVectorConfig(t)
+	cfg.Vector.Embeddings.QueryPrefix = "old query: "
+	next := cfg
+	next.DataDir = t.TempDir()
+	next.Vector.Embeddings.QueryPrefix = "new query: "
+	recipes := make(map[string]map[string]string)
+	for _, candidate := range []config.Config{cfg, next} {
+		gen := vectorGeneration(candidate.Vector.Embeddings)
+		recipes[gen.Fingerprint()] = gen.Params
+		ix, err := vector.Open(t.Context(), candidate.Vector.ResolvedDBPath(candidate.DataDir), false, candidate.Vector.Embeddings.MaxInputChars)
+		require.NoError(t, err)
+		result, err := ix.Build(t.Context(), testPushUnitSource(), fakePushEncoder(), gen, vector.BuildOptions{})
+		require.NoError(t, err)
+		require.True(t, result.Activated)
+		require.NoError(t, ix.Close())
+	}
+	require.Len(t, recipes, 2, "the reload must change the actual recipe fingerprint")
+	src := &vectorPushSource{cfg: cfg}
+	defer func() { require.NoError(t, src.Close()) }()
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+	var firstErr error
+	wg.Go(func() {
+		<-start
+		for range 10000 {
+			exp, ok, err := src.BeginExport(t.Context(), nil)
+			if err != nil {
+				firstErr = err
+				return
+			}
+			if !ok {
+				firstErr = errors.New("active index disappeared")
+				return
+			}
+			gen := exp.Generation()
+			want := recipes[gen.Fingerprint]
+			if len(want) == 0 || !maps.Equal(want, gen.Params) {
+				firstErr = errors.New("exported fingerprint " + gen.Fingerprint + " without its matching recipe")
+			}
+			_, err = exp.SessionDocHashes(t.Context(), nil)
+			if err := errors.Join(err, exp.Close()); err != nil {
+				firstErr = err
+			}
+			if firstErr != nil {
+				return
+			}
+		}
+	})
+	wg.Go(func() {
+		<-start
+		for i := range 100000 {
+			if i%2 == 0 {
+				src.reconfigure(next)
+			} else {
+				src.reconfigure(cfg)
+			}
+			runtime.Gosched()
+		}
+	})
+	close(start)
+	wg.Wait()
+	require.NoError(t, firstErr, "each real snapshot must retain the recipe captured with its index")
 }

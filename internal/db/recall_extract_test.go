@@ -331,7 +331,7 @@ func TestCopyRecallEntriesFromCarriesExtractState(t *testing.T) {
 	dst := testDB(t)
 	seedExtractSession(t, dst, "sess-1") // sess-gone not re-synced
 
-	require.NoError(t, dst.CopyRecallEntriesFrom(srcPath))
+	require.NoError(t, dst.CopyRecallEntriesFrom(t.Context(), srcPath))
 
 	generations, err := dst.ExtractGenerations(ctx)
 	require.NoError(t, err)
@@ -365,7 +365,7 @@ func TestCopyRecallEntriesFromToleratesSourceWithoutExtractTables(t *testing.T) 
 	conn.Close()
 
 	dst := testDB(t)
-	require.NoError(t, dst.CopyRecallEntriesFrom(srcPath),
+	require.NoError(t, dst.CopyRecallEntriesFrom(t.Context(), srcPath),
 		"archives from releases without extraction tables must still resync")
 }
 
@@ -688,6 +688,65 @@ func TestCommitExtractedUnitBindsEvidenceAndAdvances(t *testing.T) {
 	progress, _, err = d.ExtractProgress(ctx, "sess-1", "fp-a")
 	require.NoError(t, err)
 	assert.Equal(t, ExtractProgressDone, progress.State)
+}
+
+func TestSessionAnnotationsAdvanceSyncMarkerPreservingExtractedCoverage(t *testing.T) {
+	d := testDB(t)
+	ctx := t.Context()
+	seedCommitUnitSession(t, d, "sess-1")
+	insertSession(t, d, "manager", "proj")
+	_, err := d.getWriter().ExecContext(ctx,
+		"UPDATE sessions SET local_modified_at = '2000-01-01T00:00:00.000Z' WHERE id = 'sess-1'")
+	require.NoError(t, err)
+	session, err := d.GetSessionFull(ctx, "sess-1")
+	require.NoError(t, err)
+	_, err = d.EnsureExtractGeneration(ctx, ExtractGeneration{
+		Fingerprint: "fp-a", Model: "m", Segmenter: "turns-v1",
+	})
+	require.NoError(t, err)
+	_, err = d.UpsertExtractProgress(ctx, ExtractProgressUpsert{
+		SessionID: "sess-1", Fingerprint: "fp-a",
+		ContentDigest: "dg", UnitsTotal: 1, StampedAt: time.Now(),
+	})
+	require.NoError(t, err)
+	entry := commitUnitEntry("e-1", "sess-1", 0, 2)
+	entry.Status = "archived"
+	_, err = d.CommitExtractedUnit(ctx, ExtractUnitCommit{
+		SessionID: "sess-1", Fingerprint: "fp-a", Digest: "dg", Cursor: 0,
+		ScanVersions: []string{"rules-v1"}, MessageCount: session.MessageCount,
+		TranscriptRevision: session.TranscriptRevision, LocalModifiedAt: session.LocalModifiedAt,
+		EndedAt: session.EndedAt, Entries: []RecallEntry{entry},
+	})
+	require.NoError(t, err)
+	for _, annotation := range []string{"label", "parent set", "parent clear"} {
+		t.Run(annotation, func(t *testing.T) {
+			const oldMarker = "2000-01-01T00:00:00.000Z"
+			_, err := d.getWriter().ExecContext(ctx,
+				"UPDATE sessions SET sync_marker = ? WHERE id = 'sess-1'", oldMarker)
+			require.NoError(t, err)
+			switch annotation {
+			case "label":
+				_, err = d.SetSessionLabels(ctx, "sess-1", []string{"role=reviewer"})
+			case "parent set":
+				_, err = d.SetSessionExternalParent(ctx, "sess-1", "manager")
+			case "parent clear":
+				_, err = d.ClearSessionExternalParent(ctx, "sess-1")
+			}
+			require.NoError(t, err)
+			var modifiedAt string
+			require.NoError(t, d.getReader().QueryRowContext(ctx,
+				"SELECT local_modified_at FROM sessions WHERE id = 'sess-1'",
+			).Scan(&modifiedAt))
+			assert.Equal(t, "2000-01-01T00:00:00.000Z", modifiedAt)
+			ids, err := d.ExtractCandidates(ctx, ExtractCandidateQuery{
+				Fingerprint: "fp-a", QuietCutoff: time.Now(),
+				ScanVersions: []string{"rules-v1"}, IncludeDone: true,
+			})
+			require.NoError(t, err)
+			assert.NotContains(t, ids, "sess-1")
+			require.NoError(t, d.ActivateExtractGeneration(ctx, "fp-a", []string{"rules-v1"}, time.Now()))
+		})
+	}
 }
 
 func TestCommitExtractedUnitRefusesDriftAndIneligibility(t *testing.T) {
@@ -1225,7 +1284,7 @@ func TestExtractMutationsWaitForDBMutex(t *testing.T) {
 				d.mu.Unlock()
 				require.Fail(t, "mutation completed while db.mu was held; "+
 					"CloseConnections relies on db.mu to quiesce writes")
-			case <-time.After(100 * time.Millisecond): //nolint:kennlint // absence check; the held db.mu keeps the mutation waiting
+			case <-time.After(100 * time.Millisecond): //nolint:kennlint // deadlinetest: absence check; the held db.mu keeps the mutation waiting
 			}
 			d.mu.Unlock()
 			require.NoError(t, <-done)
@@ -2331,7 +2390,7 @@ func TestCopyRecallExtractStatePreservesContentStamp(t *testing.T) {
 	defer destDB.Close()
 	seedExtractSession(t, destDB, "s1")
 
-	require.NoError(t, destDB.CopyRecallEntriesFrom(filepath.Join(dir, "old.db")))
+	require.NoError(t, destDB.CopyRecallEntriesFrom(t.Context(), filepath.Join(dir, "old.db")))
 
 	// An empty stamp reads as "changed since coverage" for every completed
 	// session, so losing it across a resync would reload the whole
@@ -2371,7 +2430,7 @@ func TestCopyRecallExtractStateToleratesPreStampArchives(t *testing.T) {
 	defer destDB.Close()
 	seedExtractSession(t, destDB, "s1")
 
-	require.NoError(t, destDB.CopyRecallEntriesFrom(filepath.Join(dir, "old.db")))
+	require.NoError(t, destDB.CopyRecallEntriesFrom(t.Context(), filepath.Join(dir, "old.db")))
 	var state string
 	require.NoError(t, destDB.getReader().QueryRow(ctx,
 		"SELECT state FROM recall_extract_progress "+

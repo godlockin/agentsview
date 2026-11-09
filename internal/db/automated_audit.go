@@ -12,6 +12,11 @@ const automationAuditPrefixBytes = AutomationEvidencePrefixBytes
 const ParentlessWorkerSQL = `session_kind = 'non-interactive'
  AND COALESCE(parent_session_id, '') = '' AND COALESCE(relationship_type, '') = ''`
 
+const parentlessRelationshipSQL = `IIF(sessions.session_kind = 'non-interactive', 'subagent', '')`
+
+// parserRelationshipSQL restores parser provenance, falling back to kind for legacy rows.
+const parserRelationshipSQL = `COALESCE(sessions.parser_relationship_type, ` + parentlessRelationshipSQL + `)`
+
 func repairParentlessWorkers(ctx context.Context, w *writerHandle) error {
 	if _, err := w.Exec(ctx, `UPDATE sessions
 		SET relationship_type = 'subagent', local_modified_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
@@ -72,12 +77,7 @@ func auditAutomatedFull(ctx context.Context,
 	return setIDs, clearIDs, err
 }
 
-func auditAutomatedMatchingHash(ctx context.Context,
-	w *writerHandle,
-	patterns automationPatternSnapshot,
-) (setIDs, clearIDs []string, err error) {
-	rows, err := w.Query(ctx,
-		`SELECT
+const auditAutomatedMatchingHashSQL = `SELECT
 			s.id,
 			s.session_kind,
 			s.user_message_count,
@@ -107,7 +107,15 @@ func auditAutomatedMatchingHash(ctx context.Context,
 				  AND TRIM(m.content) <> ''
 				ORDER BY m.ordinal
 				LIMIT 1
-			) END`,
+			) END
+		 WHERE s.automation_audit = 1`
+
+func auditAutomatedMatchingHash(ctx context.Context,
+	w *writerHandle,
+	patterns automationPatternSnapshot,
+) (setIDs, clearIDs []string, err error) {
+	rows, err := w.Query(ctx,
+		auditAutomatedMatchingHashSQL,
 		automationAuditPrefixBytes,
 		automationAuditPrefixBytes,
 	)
@@ -170,7 +178,7 @@ func auditAutomatedMatchingHash(ctx context.Context,
 	}
 
 	err = queryChunked(unresolved, func(ids []string) error {
-		placeholders, args := inPlaceholders(ids)
+		placeholders, args := InPlaceholders(ids)
 		fullRows, err := w.Query(ctx,
 			`SELECT
 				s.id,

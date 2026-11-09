@@ -3,9 +3,7 @@ package clickhouse
 import (
 	"context"
 	"database/sql"
-	"errors"
 	"fmt"
-	"strconv"
 
 	"go.kenn.io/agentsview/internal/db"
 )
@@ -31,10 +29,11 @@ const sessionCols = `id, project, project_assigned, machine, agent,
 	missing_success_criteria_count, missing_verification_count,
 	duplicate_prompt_count, no_code_context_count, runaway_tool_loop_count,
 	data_version,
-	cwd, git_branch, source_session_id, source_version, transcript_fidelity,
+	cwd, git_branch, source_session_id, source_version, group_key, transcript_fidelity,
 	parser_malformed_lines, is_truncated,
 	secret_leak_count, secrets_rules_version,
-	deleted_at, deletion_cause, termination_status, transcript_revision`
+	deleted_at, deletion_cause, termination_status, transcript_revision,
+	pr_links, labels`
 
 // sessionFullCols retains the detail route's path-only source projection.
 const sessionFullCols = sessionCols + `, file_path`
@@ -57,6 +56,8 @@ func scanSessionProjection(
 ) (db.Session, error) {
 	var s db.Session
 	var createdAt, startedAt, endedAt, deletedAt, localModifiedAt any
+	var prLinks string
+	var labels []string
 	targets := []any{
 		&s.ID, &s.Project, &s.ProjectAssigned, &s.Machine, &s.Agent,
 		&s.AgentLabel, &s.Entrypoint, &s.SessionKind,
@@ -82,10 +83,11 @@ func scanSessionProjection(
 		&s.NoCodeContextCount, &s.RunawayToolLoopCount,
 		&s.DataVersion,
 		&s.Cwd, &s.GitBranch,
-		&s.SourceSessionID, &s.SourceVersion, &s.TranscriptFidelity,
+		&s.SourceSessionID, &s.SourceVersion, &s.GroupKey, &s.TranscriptFidelity,
 		&s.ParserMalformedLines, &s.IsTruncated,
 		&s.SecretLeakCount, &s.SecretsRulesVersion,
 		&deletedAt, &s.DeletionCause, &s.TerminationStatus, &s.TranscriptRevision,
+		&prLinks, &labels,
 	}
 	if includeSource {
 		targets = append(targets, &s.FilePath)
@@ -95,6 +97,12 @@ func scanSessionProjection(
 	}
 	if err := rs.Scan(targets...); err != nil {
 		return s, err
+	}
+	s.PRLinks = db.DecodePRLinks(prLinks)
+	// SQLite reports an unlabeled session as nil; match it so API output
+	// does not depend on the backend.
+	if len(labels) > 0 {
+		s.Labels = labels
 	}
 	s.CreatedAt = formatDBTime(createdAt)
 	if v := formatDBTime(localModifiedAt); v != "" {
@@ -112,10 +120,6 @@ func scanSessionProjection(
 	return s, nil
 }
 
-func scanSessionRows(rows *sql.Rows) ([]db.Session, error) {
-	return scanSessionRowsWithSource(rows, false)
-}
-
 func scanSessionRowsWithSource(rows *sql.Rows, includeSource bool) ([]db.Session, error) {
 	sessions := []db.Session{}
 	for rows.Next() {
@@ -128,210 +132,6 @@ func scanSessionRowsWithSource(rows *sql.Rows, includeSource bool) ([]db.Session
 	return sessions, rows.Err()
 }
 
-func (s *Store) ListSessions(ctx context.Context, f db.SessionFilter) (db.SessionPage, error) {
-	f.Limit = db.NormalizeSessionLimit(f.Limit)
-	dialect := db.ClickHouseQueryDialect()
-	where, args := db.BuildSessionFilterSQL(f, dialect)
-	rs := db.ResolveSort(f)
-	total := 0
-	var cur db.SessionCursor
-	if f.Cursor != "" {
-		var err error
-		cur, err = s.DecodeCursor(f.Cursor)
-		if err != nil {
-			return db.SessionPage{}, err
-		}
-		total = cur.Total
-	}
-	if total <= 0 {
-		if err := s.queryRowContext(ctx,
-			"SELECT toInt64(COUNT(*)) FROM sessions WHERE "+where, args...,
-		).Scan(&total); err != nil {
-			return db.SessionPage{}, fmt.Errorf("counting clickhouse sessions: %w", err)
-		}
-	}
-	cursorArgs := append([]any{}, args...)
-	pageBuilder := db.NewQueryBuilder(dialect, len(args))
-	cursorWhere := where
-	if f.Cursor != "" {
-		vals, err := db.CursorPredicateValues(cur, rs)
-		if err != nil {
-			return db.SessionPage{}, err
-		}
-		cursorWhere += " AND " + pageBuilder.CursorPredicate(rs, f, vals, cur.ID)
-	}
-	columns := sessionCols
-	if f.IncludeSource {
-		columns += ", file_path, file_size, local_modified_at"
-	}
-	query := "SELECT " + columns +
-		" FROM sessions WHERE " + cursorWhere + " " +
-		pageBuilder.OrderByClause(rs, f) + " " +
-		pageBuilder.Limit(f.Limit+1)
-	cursorArgs = append(cursorArgs, pageBuilder.Args()...)
-	rows, err := s.queryContext(ctx, query, cursorArgs...)
-	if err != nil {
-		return db.SessionPage{}, fmt.Errorf("querying clickhouse sessions: %w", err)
-	}
-	defer rows.Close()
-	sessions, err := scanSessionRowsWithSource(rows, f.IncludeSource)
-	if err != nil {
-		return db.SessionPage{}, err
-	}
-	return db.BuildSessionPage(sessions, total, f, rs, s.EncodeCursor), nil
-}
-
-func (s *Store) GetSidebarSessionIndex(ctx context.Context, f db.SessionFilter) (db.SidebarSessionIndex, error) {
-	f.IncludeChildren = true
-	f.IncludeOrphans = true
-	f.Cursor = ""
-	f.Limit = 0
-
-	dialect := db.ClickHouseQueryDialect()
-	where, args := db.BuildSessionFilterSQL(f, dialect)
-	rootFilter := f
-	rootFilter.IncludeChildren = false
-	rootWhere, rootArgs := db.BuildSessionBaseFilterSQL(rootFilter, dialect)
-	canonicalRootWhere := db.BuildCanonicalRootWhere(dialect, "sessions", f.IncludeOrphans)
-	var total int
-	if err := s.queryRowContext(ctx,
-		"SELECT toInt64(COUNT(*)) FROM sessions WHERE "+rootWhere+" AND "+canonicalRootWhere,
-		rootArgs...,
-	).Scan(&total); err != nil {
-		return db.SidebarSessionIndex{}, fmt.Errorf("counting clickhouse sidebar roots: %w", err)
-	}
-	query := `
-		SELECT
-			id,
-			parent_session_id,
-			relationship_type,
-			project,
-			project_assigned,
-			machine,
-			agent,
-			agent_label,
-			entrypoint,
-			session_kind,
-			COALESCE(display_name, session_name) AS display_name,
-			started_at,
-			ended_at,
-			created_at,
-			termination_status,
-			message_count,
-			user_message_count,
-			transcript_revision,
-			is_automated,
-			position(COALESCE(first_message, ''), '<teammate-message') > 0
-		FROM sessions
-		WHERE ` + where + `
-		ORDER BY ` + sessionActivityExpr + ` DESC, id DESC`
-	rows, err := s.queryContext(ctx, query, args...)
-	if err != nil {
-		return db.SidebarSessionIndex{}, fmt.Errorf("querying clickhouse sidebar session index: %w", err)
-	}
-	defer rows.Close()
-
-	index := db.SidebarSessionIndex{Sessions: []db.SidebarSessionIndexRow{}, Total: total}
-	for rows.Next() {
-		var row db.SidebarSessionIndexRow
-		var startedAt, endedAt, createdAt any
-		if err := rows.Scan(
-			&row.ID, &row.ParentSessionID, &row.RelationshipType,
-			&row.Project, &row.ProjectAssigned, &row.Machine, &row.Agent,
-			&row.AgentLabel, &row.Entrypoint, &row.SessionKind, &row.DisplayName,
-			&startedAt, &endedAt, &createdAt,
-			&row.TerminationStatus, &row.MessageCount, &row.UserMessageCount,
-			&row.TranscriptRevision, &row.IsAutomated, &row.IsTeammate,
-		); err != nil {
-			return db.SidebarSessionIndex{}, fmt.Errorf("scanning clickhouse sidebar session index: %w", err)
-		}
-		if v := formatDBTime(startedAt); v != "" {
-			row.StartedAt = &v
-		}
-		if v := formatDBTime(endedAt); v != "" {
-			row.EndedAt = &v
-		}
-		row.CreatedAt = formatDBTime(createdAt)
-		index.Sessions = append(index.Sessions, row)
-	}
-	if err := rows.Err(); err != nil {
-		return db.SidebarSessionIndex{}, fmt.Errorf("iterating clickhouse sidebar session index: %w", err)
-	}
-	return index, nil
-}
-
-func (s *Store) GetSession(ctx context.Context, id string) (*db.Session, error) {
-	row := s.queryRowContext(ctx,
-		"SELECT "+sessionCols+" FROM sessions PREWHERE id = ? WHERE deleted_at IS NULL", id)
-	sess, err := scanSession(row)
-	if errors.Is(err, sql.ErrNoRows) {
-		return nil, nil
-	}
-	if err != nil {
-		return nil, fmt.Errorf("getting clickhouse session: %w", err)
-	}
-	return &sess, nil
-}
-
-func (s *Store) GetSessionFull(ctx context.Context, id string) (*db.Session, error) {
-	row := s.queryRowContext(ctx, "SELECT "+sessionFullCols+" FROM sessions PREWHERE id = ?", id)
-	sess, err := scanSessionProjection(row, true, false)
-	if errors.Is(err, sql.ErrNoRows) {
-		return nil, nil
-	}
-	if err != nil {
-		return nil, fmt.Errorf("getting clickhouse full session: %w", err)
-	}
-	return &sess, nil
-}
-
-func (s *Store) ListTrashedSessions(ctx context.Context) ([]db.Session, error) {
-	rows, err := s.queryContext(ctx,
-		"SELECT "+sessionCols+" FROM sessions WHERE deleted_at IS NOT NULL"+
-			" ORDER BY deleted_at DESC LIMIT 500")
-	if err != nil {
-		return nil, fmt.Errorf("listing clickhouse trash: %w", err)
-	}
-	defer rows.Close()
-	return scanSessionRows(rows)
-}
-
-func (s *Store) GetChildSessions(ctx context.Context, parentID string) ([]db.Session, error) {
-	rows, err := s.queryContext(ctx,
-		"SELECT "+sessionCols+` FROM sessions
-		 WHERE parent_session_id = ? AND deleted_at IS NULL
-		 ORDER BY COALESCE(started_at, created_at) ASC`, parentID)
-	if err != nil {
-		return nil, fmt.Errorf("querying clickhouse child sessions: %w", err)
-	}
-	defer rows.Close()
-	return scanSessionRows(rows)
-}
-
-func (s *Store) GetSessionVersion(ctx context.Context, id string) (int, int64, bool) {
-	var count int
-	var fileMtime sql.NullInt64
-	var fileHash sql.NullString
-	var updated any
-	err := s.queryRowContext(ctx,
-		`SELECT message_count, file_mtime, file_hash,
-		        COALESCE(local_modified_at, ended_at, started_at, created_at)
-		 FROM sessions WHERE id = ?`, id,
-	).Scan(&count, &fileMtime, &fileHash, &updated)
-	if err != nil {
-		return 0, 0, false
-	}
-	fileMtimePart := ""
-	if fileMtime.Valid {
-		fileMtimePart = strconv.FormatInt(fileMtime.Int64, 10)
-	}
-	fileHashPart := ""
-	if fileHash.Valid {
-		fileHashPart = fileHash.String
-	}
-	return count, db.SessionVersionMarker(fileMtimePart, fileHashPart, formatDBTime(updated)), true
-}
-
 func (s *Store) FindSessionIDsByPartial(ctx context.Context, partial string, limit int) ([]string, error) {
 	if partial == "" {
 		return nil, nil
@@ -339,7 +139,7 @@ func (s *Store) FindSessionIDsByPartial(ctx context.Context, partial string, lim
 	if limit <= 0 {
 		limit = 5
 	}
-	rows, err := s.queryContext(ctx,
+	rows, err := s.pageQueryContext(ctx,
 		`SELECT id FROM sessions
 		 WHERE position(id, ?) > 0 AND deleted_at IS NULL
 		 ORDER BY `+sessionActivityExpr+` DESC
@@ -360,7 +160,7 @@ func (s *Store) FindSessionIDsByRawSuffix(ctx context.Context, raw string, limit
 	if limit <= 0 {
 		limit = 5
 	}
-	rows, err := s.queryContext(ctx,
+	rows, err := s.pageQueryContext(ctx,
 		`SELECT id FROM sessions
 		 WHERE (id = ? OR endsWith(id, ?) OR endsWith(id, ?))
 		   AND deleted_at IS NULL
@@ -393,31 +193,37 @@ func scanIDs(rows *sql.Rows) ([]string, error) {
 }
 
 func (s *Store) GetStats(ctx context.Context, excludeOneShot, excludeAutomated bool) (db.Stats, error) {
+	count, args := db.StatsRootCountSQL(db.ClickHouseQueryDialect(), excludeOneShot, excludeAutomated)
 	query := `
 		SELECT
-			toInt64(COUNT(*)),
+			` + count + `,
 			toInt64(COALESCE(SUM(message_count), 0)),
 			toInt64(COUNT(DISTINCT project)),
 			toInt64(COUNT(DISTINCT machine)),
-			MIN(COALESCE(started_at, created_at))
+			MIN(COALESCE(started_at, created_at)),
+			(SELECT MIN(occurred_at) FROM cursor_usage_events)
 		FROM sessions
 		WHERE ` + rootSessionWhere(excludeOneShot, excludeAutomated)
 	var stats db.Stats
 	var earliest any
-	if err := s.queryRowContext(ctx, query).Scan(
+	var earliestAccount any
+	if err := s.pageQueryRowContext(ctx, query, args...).Scan(
 		&stats.SessionCount, &stats.MessageCount,
-		&stats.ProjectCount, &stats.MachineCount, &earliest,
+		&stats.ProjectCount, &stats.MachineCount, &earliest, &earliestAccount,
 	); err != nil {
 		return db.Stats{}, fmt.Errorf("fetching clickhouse stats: %w", err)
 	}
 	if v := formatDBTime(earliest); v != "" {
 		stats.EarliestSession = &v
 	}
+	if v := formatDBTime(earliestAccount); v != "" {
+		stats.EarliestAccountUsage = &v
+	}
 	return stats, nil
 }
 
 func (s *Store) GetProjects(ctx context.Context, excludeOneShot, excludeAutomated bool) ([]db.ProjectInfo, error) {
-	rows, err := s.queryContext(ctx,
+	rows, err := s.pageQueryContext(ctx,
 		`SELECT project, toInt64(COUNT(*)) FROM sessions WHERE `+
 			rootSessionWhere(excludeOneShot, excludeAutomated)+
 			` GROUP BY project ORDER BY project`)
@@ -437,7 +243,7 @@ func (s *Store) GetProjects(ctx context.Context, excludeOneShot, excludeAutomate
 }
 
 func (s *Store) GetActiveProjectLabels(ctx context.Context) ([]string, error) {
-	rows, err := s.queryContext(ctx,
+	rows, err := s.pageQueryContext(ctx,
 		`SELECT DISTINCT project FROM sessions WHERE deleted_at IS NULL ORDER BY project`)
 	if err != nil {
 		return nil, fmt.Errorf("querying active project labels: %w", err)
@@ -447,7 +253,7 @@ func (s *Store) GetActiveProjectLabels(ctx context.Context) ([]string, error) {
 }
 
 func (s *Store) GetAgents(ctx context.Context, excludeOneShot, excludeAutomated bool) ([]db.AgentInfo, error) {
-	rows, err := s.queryContext(ctx,
+	rows, err := s.pageQueryContext(ctx,
 		`SELECT agent, toInt64(COUNT(*)) FROM sessions WHERE agent <> '' AND `+
 			rootSessionWhere(excludeOneShot, excludeAutomated)+
 			` GROUP BY agent ORDER BY agent`)
@@ -467,7 +273,7 @@ func (s *Store) GetAgents(ctx context.Context, excludeOneShot, excludeAutomated 
 }
 
 func (s *Store) GetMachines(ctx context.Context, excludeOneShot, excludeAutomated bool) ([]string, error) {
-	rows, err := s.queryContext(ctx,
+	rows, err := s.pageQueryContext(ctx,
 		`SELECT DISTINCT machine FROM sessions WHERE `+
 			rootSessionWhere(excludeOneShot, excludeAutomated)+
 			` ORDER BY machine`)
@@ -479,7 +285,7 @@ func (s *Store) GetMachines(ctx context.Context, excludeOneShot, excludeAutomate
 }
 
 func (s *Store) GetBranches(ctx context.Context, excludeOneShot, excludeAutomated bool) ([]db.BranchInfo, error) {
-	rows, err := s.queryContext(ctx,
+	rows, err := s.pageQueryContext(ctx,
 		`SELECT DISTINCT project, git_branch FROM sessions WHERE `+
 			rootSessionWhere(excludeOneShot, excludeAutomated)+
 			` ORDER BY project, git_branch`)

@@ -15,9 +15,15 @@ import (
 // complete message set to store, the computed signal values,
 // and the data version to stamp after messages are written.
 type SessionBatchWrite struct {
-	Session             Session
-	Messages            []Message
-	UsageEvents         []UsageEvent
+	CodexForkState *CodexForkState
+	// StagedToolKeys maps final occurrence keys back to the parsed scratch keys.
+	StagedToolKeys    map[string]string
+	ArchiveProvenance *ArchiveSessionProvenance
+	Session           Session
+	Messages          []Message
+	UsageEvents       []UsageEvent
+	// PlanUsage replaces the session's plan usage row; nil removes it.
+	PlanUsage           *SessionPlanUsage
 	IdentityObservation export.ProjectIdentityObservation
 	// IdentitySnapshotProject distinguishes legacy omission (nil, use the
 	// aggregate project) from an explicit empty parser source (omit snapshot).
@@ -29,6 +35,8 @@ type SessionBatchWrite struct {
 	SkipSignalUpdates bool
 	DataVersion       int
 	ReplaceMessages   bool
+	// KeepTrashedCopyOnlyOnPinLoss limits ReplaceSessionKeepingTrashedCopy to replacements that lose a pin or note.
+	KeepTrashedCopyOnlyOnPinLoss bool
 	// CompleteStoredRows lets an append write complete stored rows at stored ordinals: it sets results on stored calls that are still empty and replaces stored text with longer text that starts with it (IsTextExtension). Rows keep their IDs; other stored rows are untouched.
 	// Results come from ToolCall.ResultContent and ResultContentLength; result events are not written.
 	CompleteStoredRows bool
@@ -56,6 +64,7 @@ func (db *DB) projectSessionBatchMessages(write SessionBatchWrite) []Message {
 func (db *DB) storageSessionBatchWrite(write SessionBatchWrite) SessionBatchWrite {
 	write.Messages = db.projectSessionBatchMessages(write)
 	if db.ArchiveContent().OmitsToolContent() {
+		write.Signals.ToolObservations = []ToolObservation{}
 		write.Checkpoint, write.CheckpointBlobs = nil, nil
 	}
 	write.Session, write.Messages = db.sessionAndMessagesForStorage(write.Session, write.Messages)
@@ -180,11 +189,11 @@ func (db *DB) WriteSessionBatchContext(
 		}
 
 		var sessionRecallRevocations recallEvidenceRevocationEvents
-		messagesWritten, err := writeOneSessionBatchTx(
+		messagesWritten, err := db.writeOneSessionBatchTx(
 			ctx, tx, ctxTx,
 			write,
 			&sessionRecallRevocations,
-			db.usageOnlyStorage(),
+			db.usageOnlyStorage(), nil,
 		)
 		switch {
 		case err == nil:
@@ -261,13 +270,17 @@ func (db *DB) WriteSessionBatchAtomic(ctx context.Context,
 	var writtenUsageIDs []string
 
 	for i, write := range writes {
-		write = db.storageSessionBatchWrite(sanitizeSessionBatchWrite(write))
-		messagesWritten, err := writeOneSessionBatchTx(
-			context.Background(), tx, tx,
-			write,
-			&pendingRecallRevocations,
-			db.usageOnlyStorage(),
-		)
+		sanitized, err := sanitizeSessionBatchWriteContext(ctx, write)
+		var messagesWritten int
+		if err == nil {
+			write = db.storageSessionBatchWrite(sanitized)
+			messagesWritten, err = db.writeOneSessionBatchTx(
+				ctx, tx, tx,
+				write,
+				&pendingRecallRevocations,
+				db.usageOnlyStorage(), nil,
+			)
+		}
 		if err != nil {
 			result.WrittenSessions = 0
 			result.WrittenMessages = 0
@@ -293,6 +306,10 @@ func (db *DB) WriteSessionBatchAtomic(ctx context.Context,
 		writtenUsageIDs = append(writtenUsageIDs, write.Session.ID)
 	}
 
+	if _, err := linkSubagentSessionsForSessionsTx(ctx, tx, writtenUsageIDs); err != nil {
+		return result, err
+	}
+
 	if len(beforeCommit) > 0 && beforeCommit[0] != nil {
 		if err := beforeCommit[0](); err != nil {
 			result.WrittenSessions = 0
@@ -308,11 +325,6 @@ func (db *DB) WriteSessionBatchAtomic(ctx context.Context,
 	db.notifyUsageSessions(writtenUsageIDs)
 	pendingRecallRevocations.flush()
 	return result, nil
-}
-
-func sanitizeSessionBatchWrite(write SessionBatchWrite) SessionBatchWrite {
-	sanitized, _ := sanitizeSessionBatchWriteContext(context.Background(), write)
-	return sanitized
 }
 
 func sanitizeSessionBatchWriteContext(
@@ -454,42 +466,16 @@ func rollbackSavepoint(tx transactionQueries, savepoint string) error {
 	return nil
 }
 
-func writeOneSessionBatchTx(
+func (db *DB) writeOneSessionBatchTx(
 	ctx context.Context,
 	tx *sql.Tx,
 	queries transactionQueries,
 	write SessionBatchWrite,
 	pendingRecallRevocations *recallEvidenceRevocationEvents,
 	usageOnly bool,
+	pinSnapshot *[]savedPin,
 ) (int, error) {
-	if write.IdentityObservation.Project != "" {
-		normalized, err := normalizeProjectIdentityObservation(
-			write.IdentityObservation,
-		)
-		if err != nil {
-			return 0, err
-		}
-		if normalized.SessionID == "" {
-			normalized.SessionID = write.Session.ID
-		}
-		if normalized.SessionID != write.Session.ID {
-			return 0, fmt.Errorf(
-				"identity observation session id %q does not match session id %q",
-				normalized.SessionID, write.Session.ID,
-			)
-		}
-		write.IdentityObservation = normalized
-	}
-
-	upsertResult, err := upsertSessionExec(
-		ctx,
-		tx.ExecContext,
-		func(ctx context.Context, query string, args ...any) rowScanner {
-			return tx.QueryRowContext(ctx, query, args...)
-		},
-		write.Session,
-		true,
-	)
+	upsertResult, err := db.upsertSessionBatchTx(ctx, tx, write)
 	if err != nil {
 		return 0, err
 	}
@@ -503,8 +489,9 @@ func writeOneSessionBatchTx(
 	}
 	sessionExists := !upsertResult.inserted
 	replacementTranscriptChanged := false
+	var stored []Message
 	if replaceMessages && sessionExists {
-		stored, err := sessionMessagesTx(
+		stored, err = sessionMessagesTx(
 			ctx, tx, write.Session.ID,
 		)
 		if err != nil {
@@ -523,38 +510,7 @@ func writeOneSessionBatchTx(
 		)
 	}
 
-	if write.IdentityObservation.Project != "" {
-		var err error
-		if write.IdentitySnapshotProject == nil {
-			err = upsertProjectIdentityObservationTxContext(
-				ctx, tx, write.IdentityObservation,
-			)
-		} else {
-			err = upsertProjectIdentityObservationWithSnapshotProjectTxContext(
-				ctx, tx, write.IdentityObservation,
-				*write.IdentitySnapshotProject,
-				upsertResult.inserted, true,
-			)
-		}
-		if err != nil {
-			return 0, err
-		}
-	}
-	if !upsertResult.inserted &&
-		upsertResult.previousProject != upsertResult.currentProject {
-		if err := reconcileSessionProjectIdentityAggregatesTx(
-			ctx, tx, write.Session.ID,
-			[]string{
-				upsertResult.previousProject,
-				upsertResult.currentProject,
-			},
-		); err != nil {
-			return 0, err
-		}
-	}
-	if err := replaceSessionUsageEventsTx(
-		queries, write.Session.ID, write.UsageEvents, false,
-	); err != nil {
+	if err := writeSessionBatchMetadataTx(ctx, tx, queries, write, upsertResult); err != nil {
 		return 0, err
 	}
 
@@ -565,12 +521,35 @@ func writeOneSessionBatchTx(
 		if err := reconcileConversationMessagesTx(queries, write.Session.ID, msgs, true, usageOnly); err != nil {
 			return 0, err
 		}
-		pins, err = savePinsTx(queries, write.Session.ID)
-		if err != nil {
-			return 0, err
-		}
-		if err := deleteSessionMessagesTx(queries, write.Session.ID); err != nil {
-			return 0, err
+		if replacementTranscriptChanged {
+			pins, err = savePinsTx(queries, write.Session.ID, msgs)
+			if err != nil {
+				return 0, err
+			}
+			if pinSnapshot != nil {
+				*pinSnapshot = pins
+			}
+			if err := deleteSessionMessagesTx(queries, write.Session.ID); err != nil {
+				return 0, err
+			}
+		} else {
+			// Keep IDs held by open clients. Parser metadata can still change
+			// without changing the transcript, so refresh those rows in place.
+			byOrdinal := make(map[int]Message, len(stored))
+			for _, msg := range stored {
+				byOrdinal[msg.Ordinal] = msg
+			}
+			var plan messageDiffPlan
+			for _, msg := range msgs {
+				old := byOrdinal[msg.Ordinal]
+				if !messageRowEqual(old, msg) {
+					plan.updates = append(plan.updates, messageDiffUpdate{id: old.ID, msg: msg})
+				}
+			}
+			if err := applySessionMessageDiffTx(ctx, tx, write.Session.ID, plan); err != nil {
+				return 0, err
+			}
+			msgs = nil
 		}
 	} else {
 		maxOrd, err := maxOrdinalTx(queries, write.Session.ID)
@@ -602,6 +581,10 @@ func writeOneSessionBatchTx(
 	}
 
 	if len(msgs) > 0 {
+		if !write.SkipSignalUpdates && (replaceMessages || !sessionExists) {
+			ApplyToolObservations(msgs, write.Signals.ToolObservations)
+			write.Signals.ToolObservations = nil
+		}
 		ids, err := insertMessagesTx(queries, msgs)
 		if err != nil {
 			return 0, err
@@ -814,8 +797,8 @@ func fillEmptyToolResultsTx(
 }
 
 // extendTruncatedTextTx writes candidate text into stored messages at
-// ordinals up to maxOrd whose stored text the candidate extends. It updates
-// only content and content_length by row id.
+// ordinals up to maxOrd whose stored text the candidate extends. It updates the
+// content, length, and dialogue projection by row ID.
 func extendTruncatedTextTx(
 	tx transactionQueries, sessionID string, msgs []Message, maxOrd int,
 ) (int, error) {
@@ -825,12 +808,12 @@ func extendTruncatedTextTx(
 			continue
 		}
 		var id int64
-		var stored string
+		var stored, thinking string
 		err := tx.QueryRow(
-			`SELECT id, content FROM messages
+			`SELECT id, content, thinking_text FROM messages
 			 WHERE session_id = ? AND ordinal = ?`,
 			sessionID, m.Ordinal,
-		).Scan(&id, &stored)
+		).Scan(&id, &stored, &thinking)
 		if errors.Is(err, sql.ErrNoRows) {
 			continue
 		}
@@ -843,10 +826,11 @@ func extendTruncatedTextTx(
 		if !IsTextExtension(stored, m.Content) {
 			continue
 		}
+		dialogue, dialogueIsContent := StoredDialogue(m.Content, thinking, m.DialogueText)
 		if _, err := tx.Exec(
-			`UPDATE messages SET content = ?, content_length = ?
+			`UPDATE messages SET content = ?, content_length = ?, dialogue_text = ?, dialogue_is_content = ?
 			 WHERE id = ?`,
-			m.Content, m.ContentLength, id,
+			m.Content, m.ContentLength, dialogue, dialogueIsContent, id,
 		); err != nil {
 			return 0, fmt.Errorf(
 				"extending text for %s ordinal %d: %w",
@@ -867,5 +851,93 @@ func messagesAfterOrdinal(msgs []Message, maxOrd int) []Message {
 			return msgs[i:]
 		}
 	}
+	return nil
+}
+
+func (db *DB) upsertSessionBatchTx(ctx context.Context, tx *sql.Tx, write SessionBatchWrite) (sessionUpsertResult, error) {
+	if err := db.checkArchiveSessionProvenanceTx(ctx, tx, write); err != nil {
+		return sessionUpsertResult{}, err
+	}
+
+	upsertResult, err := upsertSessionExec(
+		ctx,
+		tx.ExecContext,
+		func(ctx context.Context, query string, args ...any) rowScanner {
+			return tx.QueryRowContext(ctx, query, args...)
+		},
+		write.Session,
+		true,
+	)
+	if err != nil {
+		return sessionUpsertResult{}, err
+	}
+	if err := recordArchiveSessionProvenanceTx(ctx, tx, write); err != nil {
+		return sessionUpsertResult{}, err
+	}
+	return upsertResult, nil
+}
+
+func writeSessionBatchMetadataTx(ctx context.Context, tx *sql.Tx, queries transactionQueries, write SessionBatchWrite, upsertResult sessionUpsertResult) error {
+	if write.IdentityObservation.Project != "" {
+		normalized, err := normalizeProjectIdentityObservation(
+			write.IdentityObservation,
+		)
+		if err != nil {
+			return err
+		}
+		if normalized.SessionID == "" {
+			normalized.SessionID = write.Session.ID
+		}
+		if normalized.SessionID != write.Session.ID {
+			return fmt.Errorf(
+				"identity observation session id %q does not match session id %q",
+				normalized.SessionID, write.Session.ID,
+			)
+		}
+		write.IdentityObservation = normalized
+	}
+	if write.IdentityObservation.Project != "" {
+		var err error
+		if write.IdentitySnapshotProject == nil {
+			err = upsertProjectIdentityObservationTxContext(
+				ctx, tx, write.IdentityObservation,
+			)
+		} else {
+			err = upsertProjectIdentityObservationWithSnapshotProjectTxContext(
+				ctx, tx, write.IdentityObservation,
+				*write.IdentitySnapshotProject,
+				upsertResult.inserted, true,
+			)
+		}
+		if err != nil {
+			return err
+		}
+	}
+	if !upsertResult.inserted &&
+		upsertResult.previousProject != upsertResult.currentProject {
+		if err := reconcileSessionProjectIdentityAggregatesTx(
+			ctx, tx, write.Session.ID,
+			[]string{
+				upsertResult.previousProject,
+				upsertResult.currentProject,
+			},
+		); err != nil {
+			return err
+		}
+	}
+	if err := writeCodexForkStateTx(ctx, tx, write.Session.ID, write.CodexForkState); err != nil {
+		return err
+	}
+	if err := replaceSessionUsageEventsTx(
+		queries, write.Session.ID, write.UsageEvents, false,
+	); err != nil {
+		return err
+	}
+	if err := replaceSessionPlanUsageTx(
+		queries, write.Session.ID, write.PlanUsage, false,
+	); err != nil {
+		return err
+	}
+
 	return nil
 }

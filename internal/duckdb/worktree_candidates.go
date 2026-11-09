@@ -5,6 +5,7 @@ import (
 	"fmt"
 
 	"go.kenn.io/agentsview/internal/db"
+	"go.kenn.io/agentsview/internal/readbase"
 )
 
 func (s *Store) ListArchiveWorktreeCandidates(ctx context.Context, request db.ArchiveWorktreeCandidateRequest) ([]db.WorktreeReclassificationCandidate, error) {
@@ -13,11 +14,13 @@ func (s *Store) ListArchiveWorktreeCandidates(ctx context.Context, request db.Ar
 
 // Snapshots use the latest observation for each source archive and session.
 func (s *Store) loadWorktreeCandidateSessions(
-	ctx context.Context, ids []string,
+	ctx context.Context, ids []string, filter db.SessionFilter,
 ) ([]db.WorktreeCandidateSession, error) {
 	byID := make(map[string]db.WorktreeCandidateSession, len(ids))
-	err := duckQueryChunked(ids, func(chunk []string) error {
-		ph, args := duckInPlaceholders(chunk)
+	err := db.QueryChunkedSize(ids, readbase.MaxSQLVars, func(chunk []string) error {
+		filter.IDs = chunk
+		filter.IDsExact = true
+		where, args := db.BuildSessionBaseFilterSQL(filter, db.DuckDBQueryDialect())
 		query := `
 			WITH ranked_snapshots AS (
 				SELECT source_archive_id, source_session_id, project, machine,
@@ -37,7 +40,7 @@ func (s *Store) loadWorktreeCandidateSessions(
 			  ON snap.source_archive_id = s.source_archive_id
 			 AND snap.source_session_id = s.id
 			 AND snap.rn = 1
-			WHERE s.id IN ` + ph + ` AND s.deleted_at IS NULL
+			WHERE s.id IN (SELECT id FROM sessions WHERE ` + where + `)
 			ORDER BY s.id`
 		rows, err := s.queryContext(ctx, query, args...)
 		if err != nil {

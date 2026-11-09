@@ -50,6 +50,7 @@ type lineReader struct {
 	buf              []byte
 	err              error
 	bytesRead        int64 // total bytes consumed (from countingReader)
+	terminated       bool  // the returned line ended with a newline
 	skippedOversized bool  // callers requiring complete input must reject skipped records
 }
 
@@ -81,6 +82,7 @@ func newLineReaderContext(
 	lr.buf = lr.buf[:0]
 	lr.err = nil
 	lr.bytesRead = 0
+	lr.terminated = false
 	lr.skippedOversized = false
 	return lr
 }
@@ -100,6 +102,7 @@ func releaseLineReader(lr *lineReader) {
 	lr.maxLen = 0
 	lr.err = nil
 	lr.bytesRead = 0
+	lr.terminated = false
 	lr.skippedOversized = false
 	lineReaderPool.Put(lr)
 }
@@ -152,6 +155,8 @@ func (lr *lineReader) updateBytesRead() {
 }
 
 func (lr *lineReader) readLineBytes() ([]byte, error) {
+	start := lr.bytesRead
+	lr.terminated = false
 	lr.buf = lr.buf[:0]
 	oversized := false
 
@@ -178,6 +183,7 @@ func (lr *lineReader) readLineBytes() ([]byte, error) {
 		// a second initialScanBufSize scratch buffer for every file.
 		if len(lr.buf) == 0 && !isPrefix {
 			lr.updateBytesRead()
+			lr.terminated = lr.bytesRead-start > int64(len(chunk))
 			if len(chunk) > lr.maxLen {
 				lr.skippedOversized = true
 				return nil, nil
@@ -204,6 +210,7 @@ func (lr *lineReader) readLineBytes() ([]byte, error) {
 		}
 	}
 
+	lr.terminated = lr.bytesRead-start > int64(len(lr.buf))
 	return lr.buf, nil
 }
 
@@ -214,7 +221,7 @@ func (lr *lineReader) readLineBytes() ([]byte, error) {
 // can use offset+consumed as a safe resume point even if the
 // file had a partially written line at EOF.
 func readJSONLFrom(
-	path string, offset int64, fn func(line string),
+	ctx context.Context, path string, offset int64, fn func(line string),
 ) (consumed int64, err error) {
 	f, err := os.Open(path)
 	if err != nil {
@@ -228,7 +235,7 @@ func readJSONLFrom(
 		)
 	}
 
-	lr := newLineReader(f, maxLineSize)
+	lr := newLineReaderContext(ctx, f, maxLineSize)
 	defer releaseLineReader(lr)
 	for {
 		line, ok := lr.next()

@@ -37,6 +37,7 @@ type doctorDBInspection struct {
 	DBExists                 bool
 	DBReadable               bool
 	DBError                  error
+	ArchiveOnly              bool
 	UserVersion              *int
 	SessionCounts            []doctorDataVersionCount
 	SessionCountsErr         error
@@ -61,8 +62,11 @@ type doctorSyncReport struct {
 
 func newDoctorCommand() *cobra.Command {
 	cmd := &cobra.Command{
-		Use:          "doctor",
-		Short:        "Collect support diagnostics",
+		Use:   "doctor",
+		Short: "Collect support diagnostics",
+		Long:  "Inspect configuration and archive health when sync or memory behavior is unexpected.",
+		Example: "  agentsview doctor sync\n" +
+			"  agentsview doctor memory --help",
 		GroupID:      groupMeta,
 		SilenceUsage: true,
 		Args:         cobra.NoArgs,
@@ -82,7 +86,7 @@ func newDoctorSyncCommand() *cobra.Command {
 		SilenceUsage: true,
 		Args:         cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			cfg, err := config.LoadReadOnly()
+			cfg, err := config.LoadReadOnlyFor(config.ScopeLocal)
 			if err != nil {
 				return err
 			}
@@ -142,6 +146,7 @@ func inspectDoctorDB(ctx context.Context, path string) doctorDBInspection {
 		insp.DBError = err
 		return insp
 	}
+	version, insp.ArchiveOnly = db.DecodeUserVersion(version)
 	insp.DBReadable = true
 	insp.UserVersion = &version
 
@@ -285,6 +290,8 @@ func doctorDebugLineRelevant(line string) bool {
 		"resync:",
 		"aborting swap",
 		"resync aborted",
+		"needs retry",
+		"need retry",
 		"sync complete",
 		"failed",
 		"warning",
@@ -329,6 +336,9 @@ func writeDoctorSyncReport(w io.Writer, report doctorSyncReport) {
 		fmt.Fprintln(w, "SQLite user_version: unavailable")
 	} else {
 		fmt.Fprintf(w, "SQLite user_version: %d\n", *report.UserVersion)
+	}
+	if report.ArchiveOnly {
+		fmt.Fprintln(w, "Archive mode: archive-only")
 	}
 	fmt.Fprintf(w, "Binary data version: %d\n", currentVersion)
 	fmt.Fprintf(w, "Startup sync decision: %s\n",
@@ -380,6 +390,9 @@ func doctorStartupDecision(
 	}
 	if *report.UserVersion > currentVersion {
 		return "refuse startup (database requires newer agentsview)"
+	}
+	if report.ArchiveOnly {
+		return "archive-only; source sync is disabled"
 	}
 	return "normal initial sync (no data-version resync)"
 }
@@ -525,6 +538,9 @@ func doctorLikelyCause(
 			"SQLite user_version is newer than this binary. Use an AgentsView build with data version %d or newer, or restore an archive backup compatible with data version %d",
 			*report.UserVersion, currentVersion,
 		)
+	}
+	if report.ArchiveOnly {
+		return "archive-only; source sync is disabled"
 	}
 	return "data-version resync is not expected; Running initial sync... is normal incremental startup work"
 }

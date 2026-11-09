@@ -211,7 +211,7 @@ func (db *DB) InsertRecallEntry(ctx context.Context, m RecallEntry) (string, err
 // copied earlier in the resync (re-synced or orphan-copied), so this normally
 // covers every entry; parser-excluded sessions are the exception. Any skipped
 // entries are logged.
-func (db *DB) CopyRecallEntriesFrom(sourcePath string) error {
+func (db *DB) CopyRecallEntriesFrom(ctx context.Context, sourcePath string) error {
 	if err := db.requireDerivedTextStorage("recall entries"); err != nil {
 		return err
 	}
@@ -220,7 +220,6 @@ func (db *DB) CopyRecallEntriesFrom(sourcePath string) error {
 
 	// Pin one connection for the ATTACH/INSERT/DETACH sequence; ATTACH is
 	// connection-scoped and the pool may otherwise switch connections.
-	ctx := context.Background()
 	conn, err := db.getWriter().Conn(ctx)
 	if err != nil {
 		return fmt.Errorf("acquiring connection: %w", err)
@@ -233,8 +232,13 @@ func (db *DB) CopyRecallEntriesFrom(sourcePath string) error {
 		return fmt.Errorf("attaching source db: %w", err)
 	}
 	defer func() {
-		_, _ = conn.ExecContext(ctx, "DETACH DATABASE old_db")
+		_, _ = execWithoutCancel(ctx, conn, "DETACH DATABASE old_db")
 	}()
+
+	if _, err := prepareCodexSessionIDMap(ctx, conn, false); err != nil {
+		return err
+	}
+	defer func() { _, _ = execWithoutCancel(ctx, conn, dropCodexSessionIDMapSQL) }()
 
 	tx, err := conn.BeginTx(ctx, nil)
 	if err != nil {
@@ -273,12 +277,13 @@ func (db *DB) CopyRecallEntriesFrom(sourcePath string) error {
 		SELECT
 			id, type, scope, status, review_state, title, body, trigger,
 			confidence, uncertainty, project, cwd, git_branch, agent,
-			source_session_id, source_episode_id, source_run_id,
+			COALESCE(mapped.target_id, source_session_id), source_episode_id, source_run_id,
 			extractor_method, model, transferable, provenance_ok,
 			supersedes_entry_id, superseded_by_entry_id,
 			created_at, updated_at
 		FROM old_db.recall_entries
-		WHERE source_session_id IN (SELECT id FROM main.sessions)`)
+		LEFT JOIN _codex_page_metadata mapped ON mapped.source_id = source_session_id
+		WHERE COALESCE(mapped.target_id, source_session_id) IN (SELECT id FROM main.sessions)`)
 	if err != nil {
 		return fmt.Errorf("copying entries: %w", err)
 	}
@@ -301,12 +306,13 @@ func (db *DB) CopyRecallEntriesFrom(sourcePath string) error {
 			message_end_source_uuid, content_digest, tool_use_id, snippet
 		)
 		SELECT
-			entry_id, session_id, message_start_ordinal,
+			entry_id, COALESCE(mapped.target_id, session_id), message_start_ordinal,
 			message_end_ordinal, message_start_source_uuid,
 			message_end_source_uuid, content_digest, tool_use_id, snippet
 		FROM old_db.recall_evidence
+		LEFT JOIN _codex_page_metadata mapped ON mapped.source_id = session_id
 		WHERE entry_id IN (SELECT id FROM main.recall_entries)
-		  AND session_id IN (SELECT id FROM main.sessions)`); err != nil {
+		  AND COALESCE(mapped.target_id, session_id) IN (SELECT id FROM main.sessions)`); err != nil {
 		return fmt.Errorf("copying recall evidence: %w", err)
 	}
 	if err := revokeRecallEntriesWithDroppedEvidenceTx(
@@ -1097,7 +1103,7 @@ func (db *DB) queryRecallEntriesVector(
 	searcher := db.getRecallVectorSearcher()
 	if searcher == nil {
 		return RecallPage{}, NewSemanticUnavailableError(
-			"recall index is not available; run 'agentsview embeddings build --store recall'",
+			"recall index is not available; run 'agentsview index embeddings build --store recall'",
 		)
 	}
 	limit := recallLimit(q.Limit)
@@ -1273,7 +1279,7 @@ func (db *DB) listRecallEntriesByIDs(
 	var entries []RecallEntry
 	err := queryChunked(ids, func(chunk []string) error {
 		where, filterArgs := buildRecallEntryWhere(q, false)
-		placeholders, idArgs := inPlaceholders(chunk)
+		placeholders, idArgs := InPlaceholders(chunk)
 		args := slices.Concat(idArgs, filterArgs)
 		rows, err := db.getReader().QueryContext(ctx,
 			"SELECT "+recallBaseCols+" FROM recall_entries WHERE id IN "+

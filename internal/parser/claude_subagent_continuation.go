@@ -158,7 +158,7 @@ func (p *claudeProvider) joinClaudeSubagentContinuations(
 		// sub-agent transcript has no replayed project sibling to resolve.
 		siblingOpts.siblingLineage = false
 		siblingResults, _, err := claudeParseFile(
-			sibling, project, machine, siblingOpts,
+			ctx, sibling, project, machine, siblingOpts,
 		)
 		if err != nil {
 			return nil, false, err
@@ -208,6 +208,7 @@ func (p *claudeProvider) joinClaudeSubagentContinuations(
 	joined.Session.Cwd = ""
 	joined.Session.GitBranch = ""
 	joined.Session.SessionName = ""
+	joined.Session.PRLinks = nil
 	joined.Session.claudeRenameSeen = false
 	// A continued session's stored transcript ends in a companion, so no
 	// resume point inside the parsed file describes the end of its messages.
@@ -240,6 +241,7 @@ func (p *claudeProvider) joinClaudeSubagentContinuations(
 		joined.Session.SessionKind = firstNonEmptyJSONLString(joined.Session.SessionKind, meta.SessionKind)
 		joined.Session.Cwd = firstNonEmptyJSONLString(joined.Session.Cwd, meta.Cwd)
 		joined.Session.GitBranch = firstNonEmptyJSONLString(joined.Session.GitBranch, meta.GitBranch)
+		joined.Session.PRLinks = mergePRLinks(joined.Session.PRLinks, meta.PRLinks)
 		if meta.claudeRenameSeen {
 			joined.Session.SessionName = meta.SessionName
 			joined.Session.claudeRenameSeen = true

@@ -123,7 +123,7 @@ func (e *Engine) ParseDiff(ctx context.Context, opts ParseDiffOptions) (*ParseDi
 
 	// The worktree resolver caches are not thread-safe; everything
 	// below runs in this single collector goroutine.
-	resolver := e.loadWorktreeProjectResolver()
+	resolver := e.loadWorktreeProjectResolverContext(ctx)
 	visited := make(map[string]bool)
 	var presencePaths []string
 
@@ -136,6 +136,7 @@ func (e *Engine) ParseDiff(ctx context.Context, opts ParseDiffOptions) (*ParseDi
 	runCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	runCtx = parser.WithProjectRootMemo(runCtx)
+	runCtx = parser.WithCodexParentInventoryBatch(runCtx)
 	results := e.startWorkers(runCtx, files)
 	for i := range total {
 		var r syncJob
@@ -176,6 +177,14 @@ func (e *Engine) ParseDiff(ctx context.Context, opts ParseDiffOptions) (*ParseDi
 		if opts.Progress != nil {
 			opts.Progress(i+1, total)
 		}
+	}
+
+	changedParents, err := parser.ValidateCodexParentInventoryBatch(runCtx)
+	if err != nil {
+		return nil, fmt.Errorf("parse-diff: validate Codex parent inventory: %w", err)
+	}
+	if len(changedParents) > 0 {
+		return nil, fmt.Errorf("parse-diff: parent files changed for %d Codex forks; retry the comparison", len(changedParents))
 	}
 
 	// Presence sweep after all files: stored sessions under a
@@ -444,6 +453,14 @@ func isPerSessionDBVirtualSource(agent parser.AgentType, path string) bool {
 		path, parser.WindsurfStateDBName,
 	); ok {
 		return agent == parser.AgentWindsurf
+	}
+	// Hermes and Augure Desktop share the "state.db#<sessionID>" virtual
+	// path, but that literal filename is not unique to them, so this case
+	// stays keyed to their agent types rather than joining the base list.
+	if _, _, ok := parser.ParseVirtualSourcePathForBase(
+		path, "state.db",
+	); ok {
+		return agent == parser.AgentHermes || agent == parser.AgentAugureDesktop
 	}
 	for _, base := range perSessionDBVirtualSourceBases {
 		if _, _, ok := parser.ParseVirtualSourcePathForBase(path, base); ok {

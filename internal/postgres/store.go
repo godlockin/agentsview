@@ -5,7 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
-	"io"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -22,30 +22,30 @@ var _ db.Store = (*Store)(nil)
 // When allowInsecure is true, non-loopback connections without
 // TLS produce a warning instead of failing.
 func NewStore(
-	pgURL, schema string, allowInsecure bool,
+	ctx context.Context, pgURL, schema string, allowInsecure bool,
 ) (*Store, error) {
-	pg, err := Open(pgURL, schema, allowInsecure)
+	pg, err := Open(ctx, pgURL, schema, allowInsecure)
 	if err != nil {
 		return nil, err
 	}
-	if err = RejectHostedPush(context.Background(), pg); err != nil {
+	if err = RejectHostedPush(ctx, pg); err != nil {
 		pg.Close()
 		if errors.Is(err, ErrHostedProjectionOwned) {
 			return nil, errors.New("hosted schema requires raw_tenant and the hosted read adapter")
 		}
 		return nil, err
 	}
-	return &Store{pg: pg}, nil
+	return &Store{pg: pg, ownedDB: pg}, nil
 }
 
 // NewHostedStore opens the read adapter with the same fixed tenant boundary as
 // custody. It fails before serving queries if the runtime role or schema is unsafe.
-func NewHostedStore(pgURL, schema, tenant string, allowInsecure bool) (*HostedStore, error) {
-	pg, err := OpenHosted(pgURL, schema, tenant, allowInsecure)
+func NewHostedStore(ctx context.Context, pgURL, schema, tenant string, allowInsecure bool) (*HostedStore, error) {
+	pg, err := OpenHosted(ctx, pgURL, schema, tenant, allowInsecure)
 	if err != nil {
 		return nil, err
 	}
-	h, err := newHostedAdapter(pg, tenant)
+	h, err := newHostedAdapter(ctx, pg, tenant)
 	if err != nil {
 		pg.Close()
 		return nil, err
@@ -54,26 +54,40 @@ func NewHostedStore(pgURL, schema, tenant string, allowInsecure bool) (*HostedSt
 }
 
 // DB returns the underlying *sql.DB for operations that need
-// direct access (e.g. schema compatibility checks).
-func (s *Store) DB() *sql.DB { return s.pg }
+// direct access (e.g. schema compatibility checks), or nil for a borrowed view.
+func (s *Store) DB() *sql.DB {
+	if s.readTx != nil {
+		return nil
+	}
+	if s.ownedDB != nil {
+		return s.ownedDB
+	}
+	// Preserve directly constructed stores used by internal callers and tests.
+	pool, _ := s.pg.(*sql.DB)
+	return pool
+}
 
 // Close closes the underlying database connection.
 func (s *Store) Close() error {
-	return s.pg.Close()
+	if pool := s.DB(); pool != nil {
+		return pool.Close()
+	}
+	return nil
 }
 
 func (s *Store) SetCustomPricing(p map[string]config.CustomModelRate) {
-	s.pricingMu.Lock()
-	defer s.pricingMu.Unlock()
-	s.customPricing = p
+	s.runtimeState().pricingMu.Lock()
+	defer s.runtimeState().pricingMu.Unlock()
+	s.runtimeState().customPricing = p
+	s.runtimeState().pricingGeneration++
 	s.forgetPricingLoad()
 }
 
 // SetCursorSecret sets the HMAC key used for cursor signing.
 func (s *Store) SetCursorSecret(secret []byte) {
-	s.cursorMu.Lock()
-	defer s.cursorMu.Unlock()
-	s.cursorSecret = append([]byte(nil), secret...)
+	s.runtimeState().cursorMu.Lock()
+	defer s.runtimeState().cursorMu.Unlock()
+	s.runtimeState().cursorSecret = append([]byte(nil), secret...)
 }
 
 // ReadOnly returns true because PG serve still treats the remote
@@ -84,15 +98,15 @@ func (s *Store) ReadOnly() bool { return true }
 // InsightGenerationAvailable reports whether startup proved this PG role can
 // persist generated insights.
 func (s *Store) InsightGenerationAvailable() bool {
-	s.insightCapabilityMu.RLock()
-	defer s.insightCapabilityMu.RUnlock()
-	return s.insightGenerationAvailable
+	s.runtimeState().insightCapabilityMu.RLock()
+	defer s.runtimeState().insightCapabilityMu.RUnlock()
+	return s.runtimeState().insightGenerationAvailable
 }
 
 func (s *Store) setInsightGenerationAvailable(available bool) {
-	s.insightCapabilityMu.Lock()
-	defer s.insightCapabilityMu.Unlock()
-	s.insightGenerationAvailable = available
+	s.runtimeState().insightCapabilityMu.Lock()
+	defer s.runtimeState().insightCapabilityMu.Unlock()
+	s.runtimeState().insightGenerationAvailable = available
 }
 
 // DetectInsightGenerationAvailability probes whether this PG connection can
@@ -101,7 +115,7 @@ func (s *Store) setInsightGenerationAvailable(available bool) {
 func (s *Store) DetectInsightGenerationAvailability(
 	ctx context.Context,
 ) error {
-	tx, err := s.pg.BeginTx(ctx, nil)
+	tx, err := s.beginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf(
 			"beginning insight generation capability probe: %w",
@@ -154,10 +168,6 @@ func (s *Store) GetSessionVersion(ctx context.Context,
 	}
 	return count, db.SessionVersionMarker(FormatISO8601(updatedAt)), true
 }
-
-// ------------------------------------------------------------
-// Unsupported write stubs (return db.ErrReadOnly)
-// ------------------------------------------------------------
 
 const maxPGInsights = 500
 
@@ -361,58 +371,6 @@ func (s *Store) GetCachedInsight(
 	return &insight, nil
 }
 
-func (s *Store) ListRecallEntries(
-	_ context.Context, _ db.RecallQuery,
-) ([]db.RecallEntry, error) {
-	return nil, db.ErrReadOnly
-}
-
-func (s *Store) GetRecallEntry(
-	_ context.Context, _ string,
-) (*db.RecallEntry, error) {
-	return nil, db.ErrReadOnly
-}
-
-func (s *Store) ReviewRecallEntry(
-	_ context.Context, _ string, _ db.RecallReviewAction,
-) (db.RecallEntry, error) {
-	return db.RecallEntry{}, db.ErrReadOnly
-}
-
-func (s *Store) QueryRecallEntries(
-	_ context.Context, _ db.RecallQuery,
-) (db.RecallPage, error) {
-	return db.RecallPage{}, db.ErrReadOnly
-}
-
-func (s *Store) RecordRecallQueryEvent(
-	_ context.Context, _ db.RecallQueryEvent,
-) (string, error) {
-	return "", db.ErrReadOnly
-}
-
-func (s *Store) InsertRecallEntry(ctx context.Context, _ db.RecallEntry) (string, error) {
-	return "", db.ErrReadOnly
-}
-
-func (s *Store) ImportAcceptedRecallEntriesJSONL(
-	_ context.Context, _ io.Reader,
-) (db.RecallImportResult, error) {
-	return db.RecallImportResult{}, db.ErrReadOnly
-}
-
-func (s *Store) ImportAcceptedRecallEntriesJSONLWithOptions(
-	_ context.Context, _ io.Reader, _ db.RecallImportOptions,
-) (db.RecallImportResult, error) {
-	return db.RecallImportResult{}, db.ErrReadOnly
-}
-
-func (s *Store) IngestEvalTrajectory(
-	_ context.Context, _ db.EvalTrajectoryIngest,
-) (db.EvalTrajectoryIngestResult, error) {
-	return db.EvalTrajectoryIngestResult{}, db.ErrReadOnly
-}
-
 // RenameSession updates the visible session name in PG.
 func (s *Store) RenameSession(ctx context.Context,
 	id string, displayName *string,
@@ -486,23 +444,54 @@ func (s *Store) SoftDeleteSessions(ctx context.Context, ids []string) (int, erro
 // RestoreSession restores a trashed session and invalidates source freshness
 // so changes made while it was trashed are parsed.
 func (s *Store) RestoreSession(ctx context.Context, id string) (int64, error) {
-	res, err := s.pg.ExecContext(ctx,
-		`UPDATE sessions
-		 SET deleted_at = NULL,
-		     deletion_cause = NULL,
-		     data_version = $2,
-		     updated_at = NOW()
-		 WHERE id = $1 AND deleted_at IS NOT NULL`,
-		id, max(db.CurrentDataVersion()-1, 0),
-	)
+	return retryPGCuration(ctx, func() (int64, error) { return s.restoreSession(ctx, id) })
+}
+
+func (s *Store) restoreSession(ctx context.Context, id string) (int64, error) {
+	tx, err := s.beginTx(ctx, nil)
 	if err != nil {
-		return 0, mapPGWriteError(
-			"restoring session "+id, err,
-		)
+		return 0, mapPGWriteError("begin restore transaction", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	n, err := restorePGSessionTx(ctx, tx, id)
+	if err != nil {
+		return 0, mapPGWriteError("restoring session "+id, err)
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, mapPGWriteError("committing restore transaction", err)
+	}
+	return n, nil
+}
+
+// Restoring one member ends the old whole-thread trash action. Leave other
+// materialized members in trash, and retain the source scope baseline so a
+// subsequent push cannot undo this PostgreSQL curation decision.
+func restorePGSessionTx(ctx context.Context, tx *sql.Tx, id string) (int64, error) {
+	res, err := tx.ExecContext(ctx, `UPDATE sessions
+		SET deleted_at = NULL, deletion_cause = NULL,
+			data_version = $2, updated_at = NOW()
+		WHERE id = $1 AND deleted_at IS NOT NULL`,
+		id, max(db.CurrentDataVersion()-1, 0))
+	if err != nil {
+		return 0, err
 	}
 	n, err := res.RowsAffected()
 	if err != nil {
-		return 0, fmt.Errorf("counting restored session %s: %w", id, err)
+		return 0, err
+	}
+	if n > 0 {
+		_, err = tx.ExecContext(ctx, `UPDATE sessions scope
+			SET trash_includes_codex_pages = FALSE, updated_at = NOW()
+			FROM sessions candidate
+			WHERE candidate.id = $1 AND candidate.provenance_kind = 'legacy'
+				AND scope.provenance_kind = 'legacy' AND scope.trash_includes_codex_pages
+				AND scope.agent = candidate.agent
+				AND (scope.id = candidate.id OR (left(right(candidate.id, 37), 1) = '_'
+					AND scope.id = left(candidate.id, -37)))
+				AND `+pgCodexScopeOwnerMatchSQL, id)
+		if err != nil {
+			return 0, err
+		}
 	}
 	return n, nil
 }
@@ -511,7 +500,11 @@ func (s *Store) RestoreSession(ctx context.Context, id string) (int64, error) {
 func (s *Store) DeleteSessionIfTrashed(ctx context.Context,
 	id string,
 ) (int64, error) {
-	tx, err := s.pg.BeginTx(ctx, nil)
+	return retryPGCuration(ctx, func() (int64, error) { return s.deleteSessionIfTrashed(ctx, id) })
+}
+
+func (s *Store) deleteSessionIfTrashed(ctx context.Context, id string) (int64, error) {
+	tx, err := s.beginTx(ctx, nil)
 	if err != nil {
 		return 0, mapPGWriteError(
 			"begin delete-if-trashed tx for "+id,
@@ -520,7 +513,7 @@ func (s *Store) DeleteSessionIfTrashed(ctx context.Context,
 	}
 	defer func() { _ = tx.Rollback() }()
 
-	sessionIDs, excludedIDs, err := readPGTrashedSessionExclusions(
+	sessionIDs, excludedIDs, scopedIDs, err := readPGTrashedSessionExclusions(
 		ctx, tx,
 		"s.id = $1 AND s.deleted_at IS NOT NULL",
 		id,
@@ -535,7 +528,7 @@ func (s *Store) DeleteSessionIfTrashed(ctx context.Context,
 		return 0, nil
 	}
 
-	if err := insertPGExcludedSessionIDs(ctx, tx, excludedIDs); err != nil {
+	if err := insertPGTrashedSessionExclusions(ctx, tx, excludedIDs, scopedIDs); err != nil {
 		return 0, mapPGWriteError(
 			"recording excluded trashed session "+id,
 			err,
@@ -584,7 +577,11 @@ func (s *Store) EmptyTrash(ctx context.Context) (int, error) {
 }
 
 func (s *Store) emptyTrash(ctx context.Context, legacyOnly bool) (int, error) {
-	tx, err := s.pg.BeginTx(ctx, nil)
+	return retryPGCuration(ctx, func() (int, error) { return s.emptyTrashOnce(ctx, legacyOnly) })
+}
+
+func (s *Store) emptyTrashOnce(ctx context.Context, legacyOnly bool) (int, error) {
+	tx, err := s.beginTx(ctx, nil)
 	if err != nil {
 		return 0, mapPGWriteError("begin empty-trash tx", err)
 	}
@@ -594,7 +591,7 @@ func (s *Store) emptyTrash(ctx context.Context, legacyOnly bool) (int, error) {
 	if legacyOnly {
 		where += " AND s.provenance_kind='legacy'"
 	}
-	sessionIDs, excludedIDs, err := readPGTrashedSessionExclusions(
+	sessionIDs, excludedIDs, scopedIDs, err := readPGTrashedSessionExclusions(
 		ctx, tx, where,
 	)
 	if err != nil {
@@ -607,7 +604,7 @@ func (s *Store) emptyTrash(ctx context.Context, legacyOnly bool) (int, error) {
 		return 0, nil
 	}
 
-	if err := insertPGExcludedSessionIDs(ctx, tx, excludedIDs); err != nil {
+	if err := insertPGTrashedSessionExclusions(ctx, tx, excludedIDs, scopedIDs); err != nil {
 		return 0, mapPGWriteError("recording excluded trashed sessions", err)
 	}
 
@@ -631,9 +628,9 @@ func (s *Store) emptyTrash(ctx context.Context, legacyOnly bool) (int, error) {
 
 func readPGTrashedSessionExclusions(
 	ctx context.Context, tx *sql.Tx, where string, args ...any,
-) ([]string, []string, error) {
+) ([]string, []string, []string, error) {
 	rows, err := tx.QueryContext(ctx,
-		`SELECT s.id, sa.alias_id, rsa.session_id, rsaa.alias_id
+		`SELECT s.id, sa.alias_id, rsa.session_id, rsaa.alias_id, s.trash_includes_codex_pages
 		 FROM sessions s
 		 LEFT JOIN session_aliases sa ON sa.session_id = s.id
 		 LEFT JOIN session_aliases rsa ON rsa.alias_id = s.id
@@ -643,11 +640,12 @@ func readPGTrashedSessionExclusions(
 		args...,
 	)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
 	defer rows.Close()
 
 	sessionIDs := []string{}
+	scopedIDs := []string{}
 	excludedIDs := []string{}
 	sessionSeen := map[string]struct{}{}
 	excludedSeen := map[string]struct{}{}
@@ -663,17 +661,21 @@ func readPGTrashedSessionExclusions(
 	}
 	for rows.Next() {
 		var id string
+		var scope bool
 		var aliasID sql.NullString
 		var reverseSessionID sql.NullString
 		var reverseAliasID sql.NullString
 		if err := rows.Scan(
-			&id, &aliasID, &reverseSessionID, &reverseAliasID,
+			&id, &aliasID, &reverseSessionID, &reverseAliasID, &scope,
 		); err != nil {
-			return nil, nil, err
+			return nil, nil, nil, err
 		}
 		if _, ok := sessionSeen[id]; !ok {
 			sessionSeen[id] = struct{}{}
 			sessionIDs = append(sessionIDs, id)
+			if scope {
+				scopedIDs = append(scopedIDs, id)
+			}
 		}
 		addExcludedID(id)
 		if aliasID.Valid {
@@ -687,9 +689,42 @@ func readPGTrashedSessionExclusions(
 		}
 	}
 	if err := rows.Err(); err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
-	return sessionIDs, excludedIDs, nil
+	rows.Close()
+	if len(scopedIDs) > 0 {
+		children, err := tx.QueryContext(ctx, `SELECT candidate.id FROM sessions candidate
+			JOIN sessions scope ON scope.id = left(candidate.id, -37)
+			WHERE candidate.provenance_kind = 'legacy' AND left(right(candidate.id, 37), 1) = '_'
+				AND scope.id = ANY($1) AND scope.agent = candidate.agent
+				AND `+pgCodexScopeOwnerMatchSQL+`
+			ORDER BY candidate.id FOR UPDATE OF candidate`, scopedIDs)
+		if err != nil {
+			return nil, nil, nil, err
+		}
+		defer children.Close()
+		for children.Next() {
+			var id string
+			if err := children.Scan(&id); err != nil {
+				return nil, nil, nil, err
+			}
+			if _, ok := sessionSeen[id]; !ok {
+				sessionIDs = append(sessionIDs, id)
+			}
+			// The owned thread exclusion covers this page. EmptyTrash may
+			// also have selected it above; neither path should turn inherited
+			// scope into a global exact-ID exclusion.
+			delete(excludedSeen, id)
+		}
+		if err := children.Err(); err != nil {
+			return nil, nil, nil, err
+		}
+		excludedIDs = slices.DeleteFunc(excludedIDs, func(id string) bool {
+			_, keep := excludedSeen[id]
+			return !keep
+		})
+	}
+	return sessionIDs, excludedIDs, scopedIDs, nil
 }
 
 func deletePGTrashedSessionRows(
@@ -698,9 +733,20 @@ func deletePGTrashedSessionRows(
 	if len(ids) == 0 {
 		return 0, nil
 	}
+	var hasCommitLinks bool
+	if err := tx.QueryRowContext(ctx, `SELECT to_regclass('commit_links') IS NOT NULL`).Scan(&hasCommitLinks); err != nil {
+		return 0, err
+	}
+	if hasCommitLinks {
+		if _, err := tx.ExecContext(ctx, `UPDATE commit_links
+			SET retained=TRUE,turn_ordinal=NULL,turn_text=''
+			WHERE session_id = ANY($1)`, ids); err != nil {
+			return 0, err
+		}
+	}
 	res, err := tx.ExecContext(ctx,
 		`DELETE FROM sessions
-		 WHERE id = ANY($1) AND deleted_at IS NOT NULL`,
+		 WHERE id = ANY($1)`,
 		ids,
 	)
 	if err != nil {
@@ -711,24 +757,4 @@ func deletePGTrashedSessionRows(
 		return 0, err
 	}
 	return n, nil
-}
-
-// UpsertSession is not supported in read-only mode.
-func (s *Store) UpsertSession(ctx context.Context, _ db.Session) error {
-	return db.ErrReadOnly
-}
-
-// ReplaceSessionMessages is not supported in read-only mode.
-func (s *Store) ReplaceSessionMessages(ctx context.Context,
-	_ string, _ []db.Message,
-) error {
-	return db.ErrReadOnly
-}
-
-// WriteSessionBatchAtomic is not supported in read-only mode.
-func (s *Store) WriteSessionBatchAtomic(ctx context.Context,
-	_ []db.SessionBatchWrite,
-	_ ...func() error,
-) (db.SessionBatchResult, error) {
-	return db.SessionBatchResult{}, db.ErrReadOnly
 }

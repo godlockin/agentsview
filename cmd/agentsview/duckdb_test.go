@@ -6,9 +6,7 @@ import (
 	"encoding/json/v2"
 	"net/http"
 	"net/http/httptest"
-	"os"
 	"path/filepath"
-	"syscall"
 	"testing"
 	"time"
 
@@ -18,12 +16,6 @@ import (
 	"go.kenn.io/agentsview/internal/config"
 	"go.kenn.io/agentsview/internal/storage"
 )
-
-func TestDuckDBLongRunningSignalsIncludeSIGTERM(t *testing.T) {
-	signals := duckDBLongRunningSignals()
-	assert.Contains(t, signals, os.Interrupt)
-	assert.Contains(t, signals, syscall.SIGTERM)
-}
 
 func TestResolveDuckDBPushProjects(t *testing.T) {
 	tests := []projectResolutionCase[DuckDBPushConfig]{
@@ -351,9 +343,34 @@ func TestWriteDuckDBPushDiagnosticsReportsRebuildMode(t *testing.T) {
 		"a rebuild has no incremental candidate/skip counters to print")
 }
 
+// A resumed rebuild reports the sessions it kept from the unfinished one, so
+// a push that wrote one session does not look like it lost the rest.
+func TestWriteDuckDBPushDiagnosticsReportsResumedRebuildKept(t *testing.T) {
+	var out bytes.Buffer
+
+	writeDuckDBPushDiagnostics(&out, storage.MirrorPushResult{
+		SessionsPushed: 1,
+		MessagesPushed: 1,
+		Diagnostics: storage.MirrorPushDiagnostics{
+			Full:          true,
+			RebuildReason: "resuming an unfinished rebuild, started because: missing file",
+			SkippedUnchangedSessions: storage.MirrorSessionCounts{
+				Total:   4,
+				ByAgent: map[string]int{"claude": 3, "codex": 1},
+			},
+			PushedSessions: storage.MirrorSessionCounts{
+				Total:   1,
+				ByAgent: map[string]int{"claude": 1},
+			},
+		},
+	})
+
+	assert.Contains(t, out.String(),
+		"DuckDB push kept: sessions 4 (claude=3, codex=1) already written by the unfinished rebuild")
+}
+
 // TestWriteDuckDBPushDiagnosticsReportsDeferredMode verifies a deferred
-// watch-mode push (mirror held by a live serve; see
-// storage.MirrorPushOptions.Automatic) prints its mode and reason
+// watch-mode push waiting for the rebuild lock prints its mode and reason
 // instead of the incremental or rebuild counters, none of which exist for
 // a push that touched nothing.
 func TestWriteDuckDBPushDiagnosticsReportsDeferredMode(t *testing.T) {
@@ -362,13 +379,13 @@ func TestWriteDuckDBPushDiagnosticsReportsDeferredMode(t *testing.T) {
 	writeDuckDBPushDiagnostics(&out, storage.MirrorPushResult{
 		Diagnostics: storage.MirrorPushDiagnostics{
 			Deferred:       true,
-			DeferredReason: "mirror is locked by a serving process; deferring until it is released",
+			DeferredReason: "another push is rebuilding the mirror; deferring until it finishes",
 		},
 	})
 
 	got := out.String()
 	assert.Contains(t, got,
-		"DuckDB push mode: deferred (mirror is locked by a serving process; deferring until it is released)")
+		"DuckDB push mode: deferred (another push is rebuilding the mirror; deferring until it finishes)")
 	assert.NotContains(t, got, "DuckDB push wrote:",
 		"a deferred push wrote nothing and must not print write counters")
 }

@@ -221,6 +221,7 @@ func TestDirectBackend_Stats_CursorAttribution(t *testing.T) {
 	})
 	require.NoError(t, err)
 	require.NotNil(t, stats)
+	assert.Equal(t, 1, stats.Totals.SessionsAll)
 	source := requireCursorAttributionSource(t, stats)
 	assert.Equal(t, "available", source.Status)
 	assert.Equal(t, "machine_local", source.Scope)
@@ -233,6 +234,13 @@ func TestDirectBackend_Stats_CursorAttribution(t *testing.T) {
 		"claude-3.5-sonnet",
 		source.Metrics.ConversationCounts[0].Model,
 	)
+
+	outcomes, err := svc.Stats(t.Context(), service.StatsFilter{
+		Since: "28d", Agent: "cursor", OutcomesOnly: true,
+	})
+	require.NoError(t, err)
+	assert.Zero(t, outcomes.Totals)
+	assert.Nil(t, outcomes.CodeAttribution)
 }
 
 func TestDirectBackend_Stats_CursorAttributionIgnoredForNonCursorFilter(
@@ -270,6 +278,27 @@ func TestDirectBackend_Stats_CursorAttributionReportsMissingDB(t *testing.T) {
 	require.NotEmpty(t, source.Warnings)
 	assert.Contains(t, source.Warnings[0],
 		"Cursor attribution database is unavailable")
+}
+
+func TestDirectBackend_Stats_ArchiveOnlySkipsCursorAttribution(t *testing.T) {
+	svc, env := newDirectTestSvc(t)
+	committed := time.Now().Add(-2 * time.Hour)
+	path := seedCursorAttributionDB(t, []cursorCommitFixture{{
+		commitHash: "receiving-host", scoredAt: committed.UnixMilli(),
+		commitDate: formatCursorCommitDate(committed), linesAdded: 100,
+	}}, nil)
+	t.Setenv("AGENTSVIEW_CURSOR_ATTRIBUTION_DB", path)
+	ordinary, err := svc.Stats(t.Context(), service.StatsFilter{Since: "28d", Agent: "cursor"})
+	require.NoError(t, err)
+	require.Equal(t, "available", requireCursorAttributionSource(t, ordinary).Status)
+	assert.EqualValues(t, 100, requireCursorAttributionSource(t, ordinary).Metrics.LinesAdded)
+	require.NoError(t, env.db.EnableArchiveOnly(t.Context()))
+	archived, err := svc.Stats(t.Context(), service.StatsFilter{Since: "28d", Agent: "cursor"})
+	require.NoError(t, err)
+	source := requireCursorAttributionSource(t, archived)
+	assert.Equal(t, "unavailable", source.Status)
+	assert.Nil(t, source.Metrics)
+	assert.Contains(t, source.Warnings, "Cursor attribution is unavailable in an archive-only database")
 }
 
 func TestDirectBackend_Stats_CursorAttributionReportsLoadError(t *testing.T) {
@@ -585,6 +614,19 @@ func TestDirectBackend_List_InvalidActiveSince(t *testing.T) {
 	assert.Nil(t, list)
 	assert.Contains(t, err.Error(), `invalid active_since "yesterday"`)
 	assert.Contains(t, err.Error(), "RFC3339")
+}
+
+func TestDirectBackend_SearchContent_InvalidExcludeActiveSince(t *testing.T) {
+	svc, _ := newDirectTestSvc(t)
+	for _, cutoff := range []string{"yesterday", "0001-01-01T00:00:00Z"} {
+		t.Run(cutoff, func(t *testing.T) {
+			page, err := svc.SearchContent(t.Context(), service.ContentSearchRequest{
+				Pattern: "needle", ExcludeActiveSince: cutoff,
+			})
+			require.ErrorContains(t, err, "invalid exclude_active_since")
+			assert.Nil(t, page)
+		})
+	}
 }
 
 func TestDirectBackend_List_ValidDatesAccepted(t *testing.T) {
@@ -1651,4 +1693,32 @@ func TestDirectBackendSyncVisualStudioCopilotByIDFollowsConversationToSibling(
 	assert.Nil(t, other,
 		"a scoped single-session sync must not insert unrelated conversations "+
 			"from the same trace file")
+}
+
+func TestDirectBackend_Stats_ArchiveOnlyHostOutcomesUnavailable(t *testing.T) {
+	svc, env := newDirectTestSvc(t)
+	require.NoError(t, env.db.EnableArchiveOnly(t.Context()))
+	stats, err := svc.Stats(t.Context(), service.StatsFilter{
+		Since: "28d", Agent: "claude", IncludeGitOutcomes: true, IncludeGitHubOutcomes: true,
+	})
+	require.NoError(t, err)
+	assert.Nil(t, stats.OutcomeStats)
+	require.NotNil(t, stats.CodeAttribution)
+	require.Len(t, stats.CodeAttribution.Sources, 2)
+	for i, provider := range []string{"git", "github"} {
+		source := stats.CodeAttribution.Sources[i]
+		assert.Equal(t, provider, source.Provider)
+		assert.Equal(t, "unavailable", source.Status)
+		assert.Nil(t, source.Metrics)
+		assert.Contains(t, source.Warnings, provider+" outcomes are unavailable in an archive-only database")
+	}
+}
+
+func TestValidateUsageRefreshRequiresCombinedID(t *testing.T) {
+	for _, input := range []service.SyncInput{
+		{UsageRefresh: true, Subagents: true},
+		{ID: "parent", UsageRefresh: true},
+	} {
+		require.ErrorIs(t, service.ValidateUsageRefresh(input), service.ErrInvalidUsageRefresh)
+	}
 }

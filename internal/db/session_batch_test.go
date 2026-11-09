@@ -6,7 +6,10 @@ import (
 	"testing"
 	"time"
 
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"go.kenn.io/agentsview/internal/config"
+	"go.kenn.io/agentsview/internal/friction"
 )
 
 func messageCountWrite(id string, count int) SessionBatchWrite {
@@ -457,6 +460,47 @@ func TestWriteSessionBatchAtomicExtendsTruncatedText(t *testing.T) {
 	})
 }
 
+func TestWriteSessionBatchAtomicExtendedDialogueSearch(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		dialogue *string
+	}{
+		{"classified", new("cut short and finished with quillword")},
+		{"unclassified", nil},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			d := testDB(t)
+			ctx := t.Context()
+			const id = "dialogue-extend"
+			stored := extendTestMsg(id, 0, "cut short [Thinking] reasoning")
+			stored.DialogueText = new("cut short")
+			_, err := d.WriteSessionBatchAtomic(ctx, []SessionBatchWrite{{
+				Session: extendTestSession(id, 1), Messages: []Message{stored}, ReplaceMessages: true,
+			}})
+			require.NoError(t, err)
+			messages, err := d.GetAllMessages(ctx, id)
+			require.NoError(t, err)
+			require.Len(t, messages, 1)
+			require.Equal(t, new("cut short"), messages[0].DialogueText)
+
+			candidate := extendTestMsg(id, 0, "cut short [Thinking] reasoning and finished with quillword")
+			candidate.DialogueText = tc.dialogue
+			_, err = d.WriteSessionBatchAtomic(ctx, []SessionBatchWrite{{
+				Session: extendTestSession(id, 1), Messages: []Message{candidate}, CompleteStoredRows: true,
+			}})
+			require.NoError(t, err)
+
+			results, err := d.SearchContent(ctx, ContentSearchFilter{
+				Pattern: "quillword", Mode: "substring", Sources: []string{"messages"},
+				IncludeOneShot: true, IncludeAutomated: true, Limit: 10,
+			})
+			require.NoError(t, err)
+			require.Len(t, results.Matches, 1)
+			require.Equal(t, id, results.Matches[0].SessionID)
+		})
+	}
+}
+
 func extendTestExportActive(t *testing.T, d *DB) bool {
 	t.Helper()
 	var active bool
@@ -556,4 +600,64 @@ func TestWriteSessionBatchAtomicExtendedTextReconcilesConversationExport(t *test
 		}
 		require.True(t, found)
 	})
+}
+
+func TestUsageOnlyBatchWritesClearExistingFriction(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		atomic bool
+	}{
+		{name: "context batch"},
+		{name: "atomic batch", atomic: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			d := testDB(t)
+			_, err := d.WriteSessionBatchAtomic(t.Context(), []SessionBatchWrite{
+				messageCountWrite("session", 4),
+			})
+			require.NoError(t, err)
+
+			findings := frictionFixture("session")
+			require.NoError(t, d.replaceSessionFriction(
+				t.Context(), "session", findings,
+				friction.RulesVersion,
+				FrictionHash(findings, friction.RulesVersion),
+			))
+			existingFindings, err := d.SessionFrictionFindings(
+				t.Context(), "session",
+			)
+			require.NoError(t, err)
+			require.Len(t, existingFindings, len(findings))
+			d.SetArchiveContent(config.ArchiveContentUsage)
+
+			write := messageCountWrite("session", 4)
+			var result SessionBatchResult
+			if tc.atomic {
+				result, err = d.WriteSessionBatchAtomic(
+					t.Context(), []SessionBatchWrite{write},
+				)
+			} else {
+				result, err = d.WriteSessionBatchContext(
+					t.Context(), []SessionBatchWrite{write},
+				)
+			}
+			require.NoError(t, err)
+			require.Equal(t, 1, result.WrittenSessions)
+
+			storedFindings, err := d.SessionFrictionFindings(
+				t.Context(), "session",
+			)
+			require.NoError(t, err)
+			assert.Empty(t, storedFindings)
+			stored, err := d.GetSessionFull(t.Context(), "session")
+			require.NoError(t, err)
+			require.NotNil(t, stored)
+			assert.Zero(t, stored.FrictionCount)
+			assert.Equal(t, friction.RulesVersion, stored.FrictionRulesVersion)
+			assert.Equal(t,
+				FrictionHash(nil, friction.RulesVersion),
+				stored.FrictionHash,
+			)
+		})
+	}
 }

@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -16,9 +17,13 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"go.kenn.io/agentsview/internal/apiclient"
+	"go.kenn.io/agentsview/internal/config"
 	"go.kenn.io/agentsview/internal/db"
 	"go.kenn.io/agentsview/internal/dbtest"
+	"go.kenn.io/agentsview/internal/integrations/docbank"
 	"go.kenn.io/agentsview/internal/service"
+	"go.kenn.io/agentsview/internal/servicehttp"
 )
 
 // newInMemoryPair connects a real MCP client to srv over an in-memory
@@ -39,29 +44,30 @@ func newInMemoryPair(
 	return ss, cs
 }
 
+// withTestDocbank configures Docbank at an address nothing listens on, enough to advertise the lookup tool.
+func withTestDocbank() service.DirectBackendOption {
+	return service.WithDocbank(docbank.New(config.DocbankIntegration{URL: "http://127.0.0.1:1", APIKeyEnv: "DOCBANK_TEST_KEY"}))
+}
+
 func callParams(name string, args map[string]any) *mcp.CallToolParams {
 	return &mcp.CallToolParams{Name: name, Arguments: args}
 }
 
-func TestNewServer_RegistersEightReadOnlyTools(t *testing.T) {
+func TestNewServer_RegistersTwentyReadOnlyTools(t *testing.T) {
 	d := dbtest.OpenTestDB(t)
 	srv := newServer(ServeOptions{
-		Service: service.NewDirectBackend(d, nil),
+		Service: service.NewDirectBackend(d, nil, withTestDocbank()),
 		Now:     func() time.Time { return fixedNow },
 	})
 	require.NotNil(t, srv)
 
-	st, ct := newInMemoryPair(t, srv)
-	tools, err := ct.ListTools(t.Context(), nil)
-	require.NoError(t, err)
-	require.Len(t, tools.Tools, 8)
+	tools := listCatalog(t, srv)
+	require.Len(t, tools.Tools, 20)
 	for _, tl := range tools.Tools {
 		require.NotNil(t, tl.Annotations, "tool %s missing annotations", tl.Name)
 		require.True(t, tl.Annotations.ReadOnlyHint,
 			"tool %s should be annotated read-only", tl.Name)
 	}
-	require.NoError(t, ct.Close())
-	require.NoError(t, st.Wait())
 }
 
 func TestNewServer_MemoryProfileRegistersOnlyEvidenceTools(t *testing.T) {
@@ -72,9 +78,7 @@ func TestNewServer_MemoryProfileRegistersOnlyEvidenceTools(t *testing.T) {
 		Now:     func() time.Time { return fixedNow },
 	})
 
-	st, ct := newInMemoryPair(t, srv)
-	tools, err := ct.ListTools(t.Context(), nil)
-	require.NoError(t, err)
+	tools := listCatalog(t, srv)
 	require.Len(t, tools.Tools, 3)
 	names := make([]string, 0, len(tools.Tools))
 	for _, tool := range tools.Tools {
@@ -88,8 +92,6 @@ func TestNewServer_MemoryProfileRegistersOnlyEvidenceTools(t *testing.T) {
 		}
 	}
 	assert.ElementsMatch(t, []string{ToolSearchContent, ToolGetMessages, ToolGetMemoryStatus}, names)
-	require.NoError(t, ct.Close())
-	require.NoError(t, st.Wait())
 }
 
 func TestServer_GetMemoryStatus(t *testing.T) {
@@ -117,6 +119,74 @@ func TestServer_GetMemoryStatus(t *testing.T) {
 	assert.Equal(t, service.MemoryReady, status.Lexical.Status)
 	assert.Equal(t, service.MemoryUnavailable, status.Semantic.Status)
 	assert.Equal(t, service.MemoryPartial, status.Status)
+}
+
+// Measured catalogs: full 86,462 bytes, memory 21,219 bytes.
+// Budgets allow 10%, rounded up to 1,000 bytes; increases need review and matching docs/mcp.md updates.
+const (
+	fullCatalogBudget   = 96_000
+	memoryCatalogBudget = 24_000
+)
+
+func listCatalog(t *testing.T, srv *mcp.Server) *mcp.ListToolsResult {
+	t.Helper()
+	st, ct := newInMemoryPair(t, srv)
+	defer func() {
+		require.NoError(t, ct.Close())
+		require.NoError(t, st.Wait())
+	}()
+	tools, err := ct.ListTools(t.Context(), nil)
+	require.NoError(t, err)
+	return tools
+}
+
+func checkCatalogBudget(tools *mcp.ListToolsResult, budget int) error {
+	raw, err := json.Marshal(tools)
+	if err != nil {
+		return err
+	}
+	if len(raw) <= budget {
+		return nil
+	}
+	var detail strings.Builder
+	fmt.Fprintf(&detail, "tool catalog: %d bytes exceeds %d-byte budget", len(raw), budget)
+	for _, tool := range tools.Tools {
+		raw, err := json.Marshal(tool)
+		if err != nil {
+			return err
+		}
+		fmt.Fprintf(&detail, "\n%s: %d bytes", tool.Name, len(raw))
+	}
+	return errors.New(detail.String())
+}
+
+func TestNewServer_CatalogFitsBudget(t *testing.T) {
+	for _, tc := range []struct {
+		profile Profile
+		budget  int
+	}{{ProfileFull, fullCatalogBudget}, {ProfileMemory, memoryCatalogBudget}} {
+		t.Run(string(tc.profile), func(t *testing.T) {
+			d := dbtest.OpenTestDB(t)
+			tools := listCatalog(t, newServer(ServeOptions{
+				Service: service.NewDirectBackend(d, nil, withTestDocbank()),
+				Profile: tc.profile,
+			}))
+			require.NoError(t, checkCatalogBudget(tools, tc.budget))
+		})
+	}
+}
+
+func TestCheckCatalogBudget_FailsOneByteOver(t *testing.T) {
+	const budget = 1_000
+	tools := &mcp.ListToolsResult{Tools: []*mcp.Tool{{Name: "catalog_fixture", Description: "x"}}}
+	raw, err := json.Marshal(tools)
+	require.NoError(t, err)
+	tools.Tools[0].Description += strings.Repeat("x", budget-len(raw))
+	require.NoError(t, checkCatalogBudget(tools, budget))
+	tools.Tools[0].Description += "x"
+	err = checkCatalogBudget(tools, budget)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "catalog_fixture:")
 }
 
 func TestParseProfile(t *testing.T) {
@@ -147,7 +217,7 @@ func TestNewServer_OmitsRecallToolForUnsupportedBackend(t *testing.T) {
 	st, ct := newInMemoryPair(t, srv)
 	tools, err := ct.ListTools(t.Context(), nil)
 	require.NoError(t, err)
-	require.Len(t, tools.Tools, 7)
+	require.Len(t, tools.Tools, 18)
 	for _, tool := range tools.Tools {
 		assert.NotEqual(t, ToolQueryRecall, tool.Name)
 	}
@@ -334,5 +404,32 @@ func TestServeHTTP_ShutsDownOnContextCancel(t *testing.T) {
 		require.ErrorIs(t, err, context.Canceled)
 	case <-time.After(10 * time.Second):
 		require.Fail(t, "ServeHTTP did not return after context cancel")
+	}
+}
+
+func TestServer_ArchiveFreshnessWarning(t *testing.T) {
+	var stale atomic.Bool
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if stale.Load() {
+			w.Header().Set(apiclient.ArchiveStaleHeader, "true")
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"matches":[]}`))
+	}))
+	defer server.Close()
+	st, ct := newInMemoryPair(t, newServer(ServeOptions{Service: servicehttp.NewHTTPBackend(server.URL, "", false, "")}))
+	defer func() { require.NoError(t, ct.Close()); require.NoError(t, st.Wait()) }()
+	for _, value := range []bool{true, false} {
+		stale.Store(value)
+		result, err := ct.CallTool(t.Context(), callParams(ToolSearchContent, map[string]any{"pattern": "example", "mode": "substring", "include_active": true}))
+		require.NoError(t, err)
+		require.False(t, result.IsError)
+		warning := false
+		for _, content := range result.Content {
+			if text, ok := content.(*mcp.TextContent); ok && strings.Contains(text.Text, apiclient.ArchiveStaleWarning) {
+				warning = true
+			}
+		}
+		assert.Equal(t, value, warning)
 	}
 }

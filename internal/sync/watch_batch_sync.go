@@ -393,8 +393,13 @@ func (e *Engine) SyncWatchBatchThenRun(
 		return SyncStats{}, err
 	}
 	changed := false
+	var titleRetry WatchBatch
+	ctx = context.WithValue(ctx, nativeTitleRetryContextKey{}, &titleRetry)
 	e.syncMu.Lock()
 	defer func() {
+		if len(titleRetry.Paths) > 0 {
+			err = composeWatchBatchErrors(err, &watchBatchApplyError{cause: errors.New("native title reconciliation failed"), retry: titleRetry})
+		}
 		e.clearCurrentProgress()
 		e.syncMu.Unlock()
 		if changed {
@@ -462,7 +467,7 @@ func (e *Engine) SyncWatchBatchThenRun(
 	if stats.Deferred > 0 {
 		return stats, nil
 	}
-	e.signalSched.flushAllInline()
+	e.signalSched.flushAllInline(ctx)
 	e.clearCurrentProgress()
 	if work != nil {
 		if err := work(); err != nil {

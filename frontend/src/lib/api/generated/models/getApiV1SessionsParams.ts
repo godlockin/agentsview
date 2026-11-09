@@ -4,6 +4,10 @@
 
 export type GetApiV1SessionsParams = {
   /**
+   * Include default-exclusion counts; true also samples hidden children, false counts only one-shot and automated sessions. First page only.
+   */
+  exclusion_counts?: boolean;
+  /**
    * Filter by project
    */
   project?: string;
@@ -12,7 +16,7 @@ export type GetApiV1SessionsParams = {
    */
   exclude_project?: string;
   /**
-   * Filter by machine
+   * Exact machine ID or alias, comma-separated IDs or aliases, or a unique whole display label (case-sensitive). Blank means all machines; unknown or ambiguous values return HTTP 400.
    */
   machine?: string;
   /**
@@ -108,6 +112,14 @@ export type GetApiV1SessionsParams = {
    * Filter sessions by starred status
    */
   starred?: boolean;
+  /**
+   * Keep sessions carrying this exact label; repeat to require several
+   */
+  label?: string[];
+  /**
+   * Keep sessions linked to a pull request: owner/repo, owner/repo#123, or github.com::owner/repo#123
+   */
+  pr?: string;
   /**
    * Sort order: a comma-separated list of keys, each optionally suffixed :asc or :desc (e.g. messages:desc,started:asc). A key with no suffix uses the descending param, then its natural direction. Valid keys: recent, started, messages, user-messages, output-tokens, peak-context, failures, retries, edit-churn, compactions, context-pressure, health, secrets, id.
    */

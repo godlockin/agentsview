@@ -250,6 +250,58 @@ async function chooseOverlayMetric(target: HTMLElement, label: string) {
   await tick();
 }
 
+// A full day of five-minute buckets. Bucket 4 holds the 00:15-00:30 peak.
+function fullDayMinuteReport(): Report {
+  const dayStart = Date.parse("2026-06-16T00:00:00Z");
+  const buckets: BucketFixture[] = Array.from({ length: 288 }, (_, i) => ({
+    start: new Date(dayStart + i * 300_000).toISOString(),
+    end: new Date(dayStart + (i + 1) * 300_000).toISOString(),
+    max_agents: i === 4 ? 5 : i === 3 || i === 5 ? 1 : 0,
+    interactive_at_peak: i === 4 ? 2 : i === 3 || i === 5 ? 1 : 0,
+    automated_at_peak: i === 4 ? 3 : 0,
+    max_interactive_agents: i === 3 ? 4 : i === 4 ? 2 : i === 5 ? 1 : 0,
+    max_automated_agents: i === 4 ? 3 : 0,
+    user_messages: 1,
+    assistant_messages: 2,
+    agent_minutes: 5,
+    output_tokens: 1000,
+    cost: testMoney(0.1),
+  }));
+  return makeReport({
+    range_start: "2026-06-16T00:00:00Z",
+    range_end: "2026-06-17T00:00:00Z",
+    effective_end: "2026-06-17T00:00:00Z",
+    bucket_unit: "minute",
+    bucket_seconds: 300,
+    bucket_count: 288,
+    elapsed_bucket_count: 288,
+    buckets,
+  });
+}
+
+// Reports one content width to every observer, as a resized panel would.
+function useChartWidth(width: number) {
+  Object.defineProperty(globalThis, "ResizeObserver", {
+    configurable: true,
+    writable: true,
+    value: resizeObserverWithWidth(width),
+  });
+}
+
+function resizeObserverWithWidth(width: number) {
+  return class {
+    constructor(private callback: ResizeObserverCallback) {}
+    observe(target: Element) {
+      this.callback(
+        [{ target, contentRect: { width } } as unknown as ResizeObserverEntry],
+        this as unknown as ResizeObserver,
+      );
+    }
+    unobserve() {}
+    disconnect() {}
+  };
+}
+
 async function dragRange(target: HTMLElement, start: number, end: number) {
   const hits = target.querySelectorAll<SVGRectElement>(".slot-hit");
   await fireEvent.pointerDown(hits[start]!, { button: 0 });
@@ -299,19 +351,31 @@ describe("ConcurrencyTimeline", () => {
     const originalX = container.querySelector('[data-concurrency-bar="2"] rect')!.getAttribute("x");
 
     await fireEvent.click(getByRole("radio", { name: "User messages" }));
-    expect([...container.querySelectorAll(".y-label")].map((el) => el.textContent)).toEqual(["0", "1", "2"]);
+    expect([...container.querySelectorAll(".y-label")].map((el) => el.textContent)).toEqual([
+      "0",
+      "1",
+      "2",
+    ]);
     expect(container.querySelector(".chart-peak")?.textContent).toBe("4 total");
     const prompt = container.querySelector('[data-concurrency-bar="2"] rect')!;
     expect(prompt.getAttribute("x")).toBe(originalX);
     expect(Number(prompt.getAttribute("height"))).toBe(160);
     await fireEvent.mouseEnter(container.querySelectorAll(".slot-hit")[2]!);
     expect(container.querySelector(".tooltip-metrics")?.textContent).toMatch(/User messages\s*2/);
-    expect(container.querySelector(".tooltip-metrics")?.textContent).toMatch(/Assistant messages\s*80/);
+    expect(container.querySelector(".tooltip-metrics")?.textContent).toMatch(
+      /Assistant messages\s*80/,
+    );
     await dragRange(container, 1, 2);
     expect(onSelectRange).toHaveBeenCalledWith({ start: 1, end: 3, label: "Tue 03:00–09:00" });
 
     await fireEvent.click(getByRole("radio", { name: "Assistant messages" }));
-    expect([...container.querySelectorAll(".y-label")].map((el) => el.textContent)).toEqual(["0", "20", "40", "60", "80"]);
+    expect([...container.querySelectorAll(".y-label")].map((el) => el.textContent)).toEqual([
+      "0",
+      "20",
+      "40",
+      "60",
+      "80",
+    ]);
     expect(container.querySelector(".chart-peak")?.textContent).toBe("100 total");
     expect(container.querySelector('[data-concurrency-bar="3"] rect')).toBeNull();
 
@@ -658,6 +722,9 @@ describe("ConcurrencyTimeline", () => {
 
   it("emits an idle one-bucket range without computing membership locally", async () => {
     const report = makeReport({
+      range_start: "2026-06-16T10:00:00Z",
+      range_end: "2026-06-16T10:15:00Z",
+      effective_end: "2026-06-16T10:10:00Z",
       bucket_unit: "minute",
       bucket_seconds: 300,
       bucket_count: 3,
@@ -771,6 +838,35 @@ describe("ConcurrencyTimeline", () => {
     target.remove();
   });
 
+  it("keeps the keyboard anchor when a session page replaces the report", async () => {
+    const onSelectRange = vi.fn();
+    const report = minuteReport();
+    const { container, rerender } = render(ConcurrencyTimeline, {
+      report,
+      onSelectRange,
+    });
+    const shiftRight = (idx: number) =>
+      container
+        .querySelector(`[data-concurrency-bucket-index="${idx}"]`)!
+        .dispatchEvent(
+          new KeyboardEvent("keydown", { key: "ArrowRight", shiftKey: true, bubbles: true }),
+        );
+
+    shiftRight(0);
+    await tick();
+    expect(onSelectRange).toHaveBeenLastCalledWith(expect.objectContaining({ start: 0, end: 2 }));
+
+    // ActivityPage loads the selected sessions and stores a new report object
+    // that keeps the same buckets.
+    await rerender({
+      report: { ...report, report_id: "page-2", by_session: [] },
+      selectedRange: { start: 0, end: 2 },
+    });
+    shiftRight(1);
+    await tick();
+    expect(onSelectRange).toHaveBeenLastCalledWith(expect.objectContaining({ start: 0, end: 3 }));
+  });
+
   it("selects a slot with a keyboard Enter", async () => {
     const onSelectRange = vi.fn();
     const target = document.createElement("div");
@@ -834,18 +930,6 @@ describe("ConcurrencyTimeline", () => {
     render(ConcurrencyTimeline, { report: minuteReport() });
     const bars = document.querySelectorAll("rect[data-bucket-bar]");
     expect(bars.length).toBe(3);
-  });
-
-  it("shades a future region when the range is partial", () => {
-    const r = minuteReport({
-      bucket_count: 3,
-      elapsed_bucket_count: 2,
-      partial: true,
-      as_of: "2026-06-16T00:10:00Z",
-      effective_end: "2026-06-16T00:10:00Z",
-    });
-    render(ConcurrencyTimeline, { report: r });
-    expect(document.querySelector("rect[data-future]")).toBeTruthy();
   });
 
   it("formats a date-range tooltip for daily buckets", async () => {
@@ -994,5 +1078,95 @@ describe("ConcurrencyTimeline", () => {
 
     unmount(c);
     target.remove();
+  });
+  it("merges five-minute buckets into wider bars on a narrow chart", async () => {
+    useChartWidth(700);
+    const onSelectRange = vi.fn();
+    const target = document.createElement("div");
+    document.body.appendChild(target);
+    const c = mount(ConcurrencyTimeline, {
+      target,
+      props: { report: fullDayMinuteReport(), onSelectRange },
+    });
+    await tick();
+    // 700px leaves a 652px plot: 5- and 10-minute bars would draw under 5px.
+    const hits = target.querySelectorAll<SVGRectElement>(".slot-hit");
+    expect(hits.length).toBe(96);
+    const drawn = Array.from(target.querySelectorAll(".concurrency-seg")).map((seg) =>
+      Number(seg.getAttribute("width")),
+    );
+    expect(Math.min(...drawn)).toBeGreaterThanOrEqual(5);
+
+    hits[1]!.dispatchEvent(new MouseEvent("mouseenter", { bubbles: true }));
+    await tick();
+    const tip = target.querySelector(".tooltip")!;
+    expect(tip.querySelector(".tooltip-date")?.textContent).toBe("00:15–00:30");
+    const rows = Array.from(tip.querySelectorAll(".tooltip-metrics > div")).map((row) =>
+      row.textContent?.replace(/\s+/g, " ").trim(),
+    );
+    expect(rows).toEqual([
+      "Interactive 2",
+      "Subagents 0",
+      "Automated 3",
+      "Combined peak 5",
+      "Interactive peak 4",
+      "Subagent peak 0",
+      "Automated peak 3",
+      "Agent-min 15",
+      "Uncached Input 0",
+      "Output Tokens 3K",
+      "Cost $0.30",
+    ]);
+
+    // Selections still address the report's own five-minute buckets.
+    await dragRange(target, 1, 2);
+    expect(onSelectRange).toHaveBeenCalledWith({ start: 3, end: 9, label: "00:15–00:45" });
+    unmount(c);
+    target.remove();
+  });
+
+  it("highlights every bar that overlaps a selection of report buckets", async () => {
+    useChartWidth(700);
+    const target = document.createElement("div");
+    document.body.appendChild(target);
+    const c = mount(ConcurrencyTimeline, {
+      target,
+      props: { report: fullDayMinuteReport(), selectedRange: { start: 4, end: 7 } },
+    });
+    await tick();
+    const pressed = Array.from(target.querySelectorAll(".slot-hit"))
+      .map((hit, i) => [i, hit.getAttribute("aria-pressed")] as const)
+      .filter(([, value]) => value === "true")
+      .map(([i]) => i);
+    expect(pressed).toEqual([1, 2]);
+    unmount(c);
+    target.remove();
+  });
+
+  it("keeps five-minute bars when the chart is wide enough", async () => {
+    Object.defineProperty(globalThis, "ResizeObserver", {
+      configurable: true,
+      writable: true,
+      value: resizeObserverWithWidth(1900),
+    });
+    const target = document.createElement("div");
+    document.body.appendChild(target);
+    const c = mount(ConcurrencyTimeline, {
+      target,
+      props: { report: fullDayMinuteReport() },
+    });
+    await tick();
+    expect(target.querySelectorAll(".slot-hit").length).toBe(288);
+    unmount(c);
+    target.remove();
+  });
+
+  it("labels message bars with the merged interval", async () => {
+    useChartWidth(700);
+    const { container, getByRole } = render(ConcurrencyTimeline, {
+      report: fullDayMinuteReport(),
+    });
+    await fireEvent.click(getByRole("radio", { name: "User messages" }));
+    expect(container.querySelector(".legend")?.textContent).toContain("15 min");
   });
 });

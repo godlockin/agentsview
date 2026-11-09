@@ -2,6 +2,7 @@ package artifact
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"fmt"
 	"path/filepath"
@@ -14,6 +15,76 @@ import (
 )
 
 const importLocalOrigin = "local-b2c3d4"
+
+func TestArtifactImportKeepsLauncherParentEditable(t *testing.T) {
+	for _, kind := range []string{"", "non-interactive"} {
+		t.Run("kind="+kind, func(t *testing.T) {
+			source := testExportDB(t)
+			relationship := ""
+			if kind == "non-interactive" {
+				relationship = "subagent"
+			}
+			seedSession(t, source, "worker", "project", func(s *db.Session) {
+				s.SessionKind, s.RelationshipType = kind, relationship
+			})
+			seedSession(t, source, "manager-a", "project")
+			seedSession(t, source, "manager-b", "project")
+			store := newTestArtifactStore(t)
+			exportHash := func() string {
+				t.Helper()
+				_, err := ExportToStore(t.Context(), source, store, ExportOptions{Origin: contractOrigin, Full: true})
+				require.NoError(t, err)
+				return latestStoreCheckpointForTest(t, store, contractOrigin).Sessions[contractOrigin+"~worker"]
+			}
+			before := exportHash()
+			for _, parent := range []string{"manager-a", "manager-b"} {
+				_, err := source.SetSessionExternalParent(t.Context(), "worker", parent)
+				require.NoError(t, err)
+				assert.Equal(t, before, exportHash(), "launcher annotations must not change canonical content")
+			}
+			destination := testDB(t)
+			coordinator := NewStoreImportCoordinator(destination, store, importLocalOrigin)
+			recordAllImportEntries(t, coordinator, store, contractOrigin)
+			_, err := coordinator.Finalize(t.Context())
+			require.NoError(t, err)
+			id := contractOrigin + "~worker"
+			worker, err := destination.GetSessionFull(t.Context(), id)
+			require.NoError(t, err)
+			require.NotNil(t, worker)
+			assert.Nil(t, worker.ParentSessionID)
+			assert.Equal(t, relationship, worker.RelationshipType)
+			_, err = source.ClearSessionExternalParent(t.Context(), "worker")
+			require.NoError(t, err)
+			assert.Equal(t, before, exportHash(), "clearing the annotation must preserve canonical content")
+		})
+	}
+}
+
+func TestArtifactImportPreservesNativeParents(t *testing.T) {
+	source := testExportDB(t)
+	parent := "manager"
+	seedSession(t, source, "worker", "project")
+	_, err := source.WriteSessionBatchAtomic(t.Context(), []db.SessionBatchWrite{{
+		Session: db.Session{ID: parent, Agent: "claude", Machine: "local", Project: "project", MessageCount: 1}, ReplaceMessages: true,
+		Messages: []db.Message{{SessionID: parent, Ordinal: 0, Role: "assistant", Content: "spawn", HasToolUse: true, ToolCalls: []db.ToolCall{{ToolName: "Agent", Category: "Task", SubagentSessionID: "worker"}}}},
+	}})
+	require.NoError(t, err)
+	_, err = source.SetSessionExternalParent(t.Context(), "worker", parent)
+	require.NoError(t, err)
+	store := newTestArtifactStore(t)
+	_, err = ExportToStore(t.Context(), source, store, ExportOptions{Origin: contractOrigin, Full: true})
+	require.NoError(t, err)
+	destination := testDB(t)
+	coordinator := NewStoreImportCoordinator(destination, store, importLocalOrigin)
+	recordAllImportEntries(t, coordinator, store, contractOrigin)
+	_, err = coordinator.Finalize(t.Context())
+	require.NoError(t, err)
+	worker, err := destination.GetSessionFull(t.Context(), contractOrigin+"~worker")
+	require.NoError(t, err)
+	require.NotNil(t, worker)
+	require.NotNil(t, worker.ParentSessionID)
+	assert.Equal(t, contractOrigin+"~manager", *worker.ParentSessionID)
+}
 
 func TestArtifactImportEndToEndAndReplay(t *testing.T) {
 	t.Parallel()
@@ -228,7 +299,7 @@ func TestStoreImportCoordinatorTracksIndependentFutureRequirements(t *testing.T)
 
 				return createHashedImportArtifact(
 					t, store, KindManifests, ".json",
-					[]byte(`{"origin":"contract-a1b2c3","v":5}`),
+					fmt.Appendf(nil, `{"origin":"contract-a1b2c3","v":%d}`, manifestFormatVersion+1),
 				)
 			},
 			wantManifest: manifestFormatVersion + 1,
@@ -364,7 +435,7 @@ func TestStoreImportCoordinatorFinishesSupportedSessionsBeforeFutureGate(
 	sessionMap := map[string]string{
 		contractOrigin + "~000-future": createHashedImportArtifact(
 			t, store, KindManifests, ".json",
-			[]byte(`{"origin":"contract-a1b2c3","v":5}`),
+			fmt.Appendf(nil, `{"origin":"contract-a1b2c3","v":%d}`, manifestFormatVersion+1),
 		),
 	}
 	const supportedSessions = artifactImportDrainLimit + 1
@@ -1084,20 +1155,27 @@ func TestStoreImportCoordinatorBoundsUnchangedCheckpointWork(t *testing.T) {
 	}})
 	sessionMap := make(map[string]string, unchangedSessions+1)
 	destination := testDB(t)
-	for i := range unchangedSessions {
-		gid := fmt.Sprintf("%s~unchanged-%05d", contractOrigin, i)
-		hash := fmt.Sprintf("%064x", i+1)
-		sessionMap[gid] = hash
-		require.NoError(t, destination.RecordArtifactImportedSession(
-			t.Context(),
-			db.ArtifactImportedSession{
-				Origin:            contractOrigin,
-				GID:               gid,
-				ManifestHash:      hash,
-				ImportedSessionID: gid,
-			},
-		))
-	}
+	// No checkpoint stages exist yet, so there is nothing to mark satisfied.
+	// imported_at uses its column default.
+	require.NoError(t, destination.Update(t.Context(), func(tx *sql.Tx) error {
+		stmt, err := tx.PrepareContext(t.Context(), `INSERT INTO artifact_imported_sessions
+			(origin, gid, manifest_hash, imported_session_id) VALUES (?, ?, ?, ?)`)
+		if err != nil {
+			return err
+		}
+		defer func() { _ = stmt.Close() }()
+		for i := range unchangedSessions {
+			gid := fmt.Sprintf("%s~unchanged-%05d", contractOrigin, i)
+			hash := fmt.Sprintf("%064x", i+1)
+			sessionMap[gid] = hash
+			if _, err := stmt.ExecContext(
+				t.Context(), contractOrigin, gid, hash, gid,
+			); err != nil {
+				return err
+			}
+		}
+		return nil
+	}))
 	sessionMap[contractOrigin+"~changed"] = changedHash
 	checkpointEntry := createImportTestCheckpoint(
 		t, base, contractOrigin, 1, sessionMap,

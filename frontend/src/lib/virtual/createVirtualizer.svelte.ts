@@ -9,6 +9,7 @@ import {
   windowScroll,
   // kit-ui-check-ignore: local wrapper preserves TanStack scroll reconciliation and measurement-cache semantics used by MessageList; replacing it with kit-ui VirtualList is a separate migration.
 } from "@tanstack/virtual-core";
+import { untrack } from "svelte";
 
 type PartialKeys<T, K extends keyof T> = Omit<T, K> & Partial<Pick<T, K>>;
 
@@ -90,8 +91,15 @@ function createBaseVirtualizer<TScroll extends Element | Window, TItem extends E
     }
     lastMeasureCacheKey = opts.measureCacheKey;
 
+    const getItemKey = opts.getItemKey;
+    const orderChanged =
+      opts.count === instance.options.count &&
+      getItemKey !== undefined &&
+      instance.getVirtualItems().some((item) => item.key !== getItemKey(item.index));
     instance.setOptions(resolvedOpts);
     instance._willUpdate();
+    // A reorder can leave the visible range unchanged, so TanStack won't notify.
+    if (orderChanged) untrack(() => _version++);
 
     postUpdate?.(instance, opts, cacheKeyChanged);
 
@@ -109,6 +117,15 @@ function createBaseVirtualizer<TScroll extends Element | Window, TItem extends E
   };
 }
 
+function scrollReconcileState(v: Virtualizer<HTMLElement, HTMLElement>) {
+  // TanStack has no public read of the in-flight scroll target.
+  return v as unknown as { scrollState: { index: number | null } | null };
+}
+
+export function cancelScrollReconcile(v: Virtualizer<HTMLElement, HTMLElement> | undefined) {
+  v?.cancelScroll();
+}
+
 export function createVirtualizer(optsFn: () => ElementOpts) {
   return createBaseVirtualizer<HTMLElement, HTMLElement>(
     () => {
@@ -124,6 +141,7 @@ export function createVirtualizer(optsFn: () => ElementOpts) {
     },
     (instance, opts, reset) => {
       const scrollEl = opts.getScrollElement?.() ?? null;
+      if (reset) cancelScrollReconcile(instance);
       if (!scrollEl) return;
       if (reset) {
         scrollEl.scrollTop = 0;
@@ -136,9 +154,7 @@ export function createVirtualizer(optsFn: () => ElementOpts) {
       // leaving the viewport at the wrong position (observed as
       // pinned-message navigation stopping mid-scroll in ascending
       // sort when the target item is not yet rendered).
-      // scrollState is typed private but is a plain public field at runtime.
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      if ((instance as any).scrollState?.index != null) return;
+      if (scrollReconcileState(instance).scrollState?.index != null) return;
       if (scrollEl.scrollTop > 0) {
         instance.scrollToOffset(scrollEl.scrollTop);
       }

@@ -49,6 +49,7 @@ func newBackupCommand() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:          "backup",
 		Short:        "Back up the archive and agent source directories",
+		Long:         "Create restorable snapshots of the SQLite archive and agent source directories while the daemon keeps running, and list existing backup sets with their sizes and checksums.",
 		GroupID:      groupData,
 		SilenceUsage: true,
 		Args:         cobra.NoArgs,

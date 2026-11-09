@@ -7,6 +7,7 @@ describe("supportsResume", () => {
     expect(supportsResume("codex")).toBe(true);
     expect(supportsResume("traex")).toBe(true);
     expect(supportsResume("augure-code")).toBe(true);
+    expect(supportsResume("open-interpreter")).toBe(true);
     expect(supportsResume("copilot")).toBe(true);
     expect(supportsResume("cursor")).toBe(true);
     expect(supportsResume("gemini")).toBe(true);
@@ -61,9 +62,6 @@ describe("buildResumeCommand", () => {
       }),
     ).toBe("claude --resume abc-123 --dangerously-skip-permissions --fork-session --print");
   });
-  it("generates claude resume command", () => {
-    expect(buildResumeCommand("claude", "abc-123-def")).toBe("claude --resume abc-123-def");
-  });
 
   it("generates codex resume command", () => {
     expect(buildResumeCommand("codex", "codex:sess-1")).toBe("codex resume sess-1");
@@ -83,11 +81,36 @@ describe("buildResumeCommand", () => {
     );
   });
 
+  it("generates open-interpreter resume command with the interpreter CLI", () => {
+    expect(buildResumeCommand("open-interpreter", "open-interpreter:sess-1")).toBe(
+      "interpreter resume sess-1",
+    );
+    expect(
+      buildResumeCommand("open-interpreter", "open-interpreter:run-1", { model: "glm-5.2" }),
+    ).toBe("interpreter resume run-1 -m 'glm-5.2'");
+  });
+
   it("leaves possible collision IDs to the server for every agent", () => {
     expect(buildResumeCommand("gemini", "gemini:abc_alt-0a1b2c3d4e5f6a7b")).toBeNull();
     expect(buildResumeCommand("gemini", "host~gemini:abc_alt-0a1b2c3d4e5f6a7b")).toBeNull();
     expect(buildResumeCommand("gemini", "gemini:abc_alt-notahash")).toBeNull();
     expect(buildResumeCommand("amp", "amp:abc_alt-0a1b2c3d4e5f6a7b")).toBeNull();
+  });
+
+  it("resumes the thread of a Codex revert page", () => {
+    const thread = "11111111-1111-4111-8111-111111111111";
+    const page = `${thread}_22222222-2222-4222-8222-222222222222`;
+    expect(buildResumeCommand("codex", `codex:${page}`)).toBe(`codex resume ${thread}`);
+    expect(buildResumeCommand("traex", `traex:${page}`)).toBe(`traex resume ${thread}`);
+    expect(buildResumeCommand("augure-code", `augure-code:${page}`)).toBe(
+      `augure resume ${thread}`,
+    );
+    expect(buildResumeCommand("open-interpreter", `open-interpreter:${page}`)).toBe(
+      `interpreter resume ${thread}`,
+    );
+    expect(buildResumeCommand("codex", `codex:${thread}`)).toBe(`codex resume ${thread}`);
+    expect(buildResumeCommand("augure-code", "augure-code:run_1")).toBe("augure resume run_1");
+    expect(buildResumeCommand("claude", page)).toBe(`claude --resume ${page}`);
   });
 
   it("pins Claude and Codex models with shell quoting", () => {
@@ -136,10 +159,6 @@ describe("buildResumeCommand", () => {
 
   it("returns null for pi (server-only resume)", () => {
     expect(buildResumeCommand("pi", "pi:session-1")).toBeNull();
-  });
-
-  it("strips agent prefix from compound IDs", () => {
-    expect(buildResumeCommand("codex", "codex:my-session-id")).toBe("codex resume my-session-id");
   });
 
   it("handles plain IDs without prefix", () => {

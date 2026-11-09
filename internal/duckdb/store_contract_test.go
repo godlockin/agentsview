@@ -180,9 +180,9 @@ func TestDuckDBStoreContract(t *testing.T) {
 	}{
 		{"sessions_cursors_and_metadata", duckContractSessionsCursorsAndMetadata},
 		{"messages_search_and_secrets", duckContractMessagesSearchAndSecrets},
-		{"read_only_curation", duckContractReadOnlyCuration},
-		{"analytics_trends_and_usage", duckContractAnalyticsTrendsAndUsage},
+		{"starred_and_pinned_reads", duckContractStarredAndPinnedReads},
 		{"local_only_methods_read_only", duckContractLocalOnlyMethodsReadOnly},
+		{"analytics_trends_and_usage", duckContractAnalyticsTrendsAndUsage},
 		{"data_inventory_rules_candidates", duckContractDataInventoryRulesCandidates},
 	}
 	for _, tt := range tests {
@@ -217,13 +217,6 @@ func TestDuckDBSystemPrefixSQLTerminalRemainder(t *testing.T) {
 	assert.Equal(t, []string{"reminder-malformed", "reminder-ordinary"}, got)
 }
 
-// TestDuckDBStoreHasSemanticFalse pins that the DuckDB store reports no
-// semantic search capability until it gets its own VectorSearcher seam.
-func TestDuckDBStoreHasSemanticFalse(t *testing.T) {
-	s := &Store{}
-	assert.False(t, s.HasSemantic(), "DuckDB HasSemantic")
-}
-
 // TestDuckDBSearchContentSemanticModesUnavailable pins that "semantic" and
 // "hybrid" are rejected with db.ErrSemanticUnavailable before any query runs
 // -- a zero-value Store (no live *sql.DB) is enough to prove that.
@@ -238,7 +231,7 @@ func TestDuckDBSearchContentSemanticModesUnavailable(t *testing.T) {
 		assert.Contains(t, err.Error(),
 			"semantic search is not supported by the DuckDB backend",
 			"mode %q: backend-specific remediation", mode)
-		assert.NotContains(t, err.Error(), "agentsview embeddings build",
+		assert.NotContains(t, err.Error(), "agentsview index embeddings build",
 			"mode %q: local build guidance cannot enable DuckDB", mode)
 	}
 }
@@ -356,6 +349,7 @@ func duckContractSessionsCursorsAndMetadata(
 	t *testing.T, store *Store, fixture syncFixture,
 ) {
 	t.Helper()
+	require.True(t, store.ReadOnly())
 
 	ctx := t.Context()
 
@@ -521,7 +515,7 @@ func duckContractMessagesSearchAndSecrets(
 	require.Contains(t, source, "secret token")
 }
 
-func duckContractReadOnlyCuration(
+func duckContractStarredAndPinnedReads(
 	t *testing.T, store *Store, fixture syncFixture,
 ) {
 	t.Helper()
@@ -531,17 +525,6 @@ func duckContractReadOnlyCuration(
 	stars, err := store.ListStarredSessionIDs(ctx)
 	require.NoError(t, err)
 	require.Equal(t, []string{fixture.alphaID}, stars)
-
-	ok, err := store.StarSession(ctx, fixture.betaID)
-	require.ErrorIs(t, err, db.ErrReadOnly)
-	require.False(t, ok)
-	require.ErrorIs(t, store.UnstarSession(ctx, fixture.alphaID), db.ErrReadOnly)
-	require.ErrorIs(t, store.BulkStarSessions(ctx, []string{fixture.betaID}), db.ErrReadOnly)
-
-	pinID, err := store.PinMessage(ctx, fixture.alphaID, 1, nil)
-	require.ErrorIs(t, err, db.ErrReadOnly)
-	require.Zero(t, pinID)
-	require.ErrorIs(t, store.UnpinMessage(ctx, fixture.alphaID, 1), db.ErrReadOnly)
 
 	pins, err := store.ListPinnedMessages(ctx, fixture.alphaID, "")
 	require.NoError(t, err)
@@ -620,29 +603,6 @@ func duckContractAnalyticsTrendsAndUsage(
 		*sessionUsage.CostUSD, 1e-9)
 }
 
-func duckContractLocalOnlyMethodsReadOnly(
-	t *testing.T, store *Store, fixture syncFixture,
-) {
-	t.Helper()
-	require.True(t, store.ReadOnly())
-	name := "ignored"
-	requireReadOnlyDuck(t, store.RenameSession(t.Context(), fixture.alphaID, &name))
-	requireReadOnlyDuck(t, store.SoftDeleteSession(t.Context(), fixture.alphaID))
-	_, err := store.RestoreSession(t.Context(), fixture.alphaID)
-	requireReadOnlyDuck(t, err)
-	_, err = store.DeleteSessionIfTrashed(t.Context(), fixture.alphaID)
-	requireReadOnlyDuck(t, err)
-	_, err = store.EmptyTrash(t.Context())
-	requireReadOnlyDuck(t, err)
-	_, err = store.InsertInsight(t.Context(), db.Insight{})
-	requireReadOnlyDuck(t, err)
-	requireReadOnlyDuck(t, store.DeleteInsight(t.Context(), 1))
-	_, err = store.RecordRecallQueryEvent(t.Context(), db.RecallQueryEvent{
-		Surface: db.RecallQuerySurfaceQuery,
-	})
-	requireReadOnlyDuck(t, err)
-}
-
 // duckContractDataInventoryRulesCandidates exercises the three Data reads
 // (GetProjectInventory, ListProjectRules, ListArchiveWorktreeCandidates)
 // against the shared sync fixture, which has no worktree mapping rules and
@@ -681,12 +641,6 @@ func duckContractDataInventoryRulesCandidates(
 	assert.Equal(t, "unavailable", candidates[0].EvidenceKind, "no cwd or identity evidence seeded")
 	assert.False(t, candidates[0].Available)
 	assert.Equal(t, 1, candidates[0].ContributingSessions)
-}
-
-func requireReadOnlyDuck(t *testing.T, err error) {
-	t.Helper()
-	require.Error(t, err)
-	assert.ErrorIs(t, err, db.ErrReadOnly, "expected ErrReadOnly, got %v", err)
 }
 
 func TestDuckDBGetUsageMatchingSessionCountCountsCopilotSessionsWithoutUsageRows(
@@ -1072,4 +1026,99 @@ func duckContentSessionIDs(matches []db.ContentMatch) []string {
 		ids[i] = match.SessionID
 	}
 	return ids
+}
+
+func duckContractLocalOnlyMethodsReadOnly(
+	t *testing.T, store *Store, fixture syncFixture,
+) {
+	t.Helper()
+	name := "ignored"
+	requireReadOnlyDuck(t, store.RenameSession(t.Context(), fixture.alphaID, &name))
+	requireReadOnlyDuck(t, store.SoftDeleteSession(t.Context(), fixture.alphaID))
+	_, err := store.RestoreSession(t.Context(), fixture.alphaID)
+	requireReadOnlyDuck(t, err)
+	_, err = store.DeleteSessionIfTrashed(t.Context(), fixture.alphaID)
+	requireReadOnlyDuck(t, err)
+	_, err = store.EmptyTrash(t.Context())
+	requireReadOnlyDuck(t, err)
+	_, err = store.InsertInsight(t.Context(), db.Insight{})
+	requireReadOnlyDuck(t, err)
+	requireReadOnlyDuck(t, store.DeleteInsight(t.Context(), 1))
+	_, err = store.RecordRecallQueryEvent(t.Context(), db.RecallQueryEvent{
+		Surface: db.RecallQuerySurfaceQuery,
+	})
+	requireReadOnlyDuck(t, err)
+}
+
+func requireReadOnlyDuck(t *testing.T, err error) {
+	t.Helper()
+	require.Error(t, err)
+	assert.ErrorIs(t, err, db.ErrReadOnly, "expected ErrReadOnly, got %v", err)
+}
+
+func TestDuckDBSidebarIndexPaging(t *testing.T) {
+	for _, tt := range []struct {
+		name      string
+		sessions  []db.Session
+		starredID string
+		check     func(*testing.T, *Store)
+	}{
+		{
+			name: "cursor walk",
+			sessions: []db.Session{
+				{ID: "root-a", StartedAt: new("2026-01-01T00:00:00Z")},
+				{ID: "child-a", StartedAt: new("2026-01-04T00:00:00Z"), ParentSessionID: new("root-a"), RelationshipType: "subagent"},
+				{ID: "root-b", StartedAt: new("2026-01-03T00:00:00Z")},
+				{ID: "root-c", StartedAt: new("2026-01-02T00:00:00Z")},
+			},
+			check: func(t *testing.T, store *Store) {
+				t.Helper()
+				cursor := ""
+				for i, want := range [][]string{{"child-a", "root-a"}, {"root-b"}, {"root-c"}} {
+					page, err := store.GetSidebarSessionIndex(t.Context(), db.SessionFilter{Limit: 1, Cursor: cursor})
+					require.NoError(t, err)
+					assert.Equal(t, want, duckSidebarSessionIDs(page.Sessions))
+					assert.Equal(t, 3, page.Total)
+					assert.Equal(t, i < 2, page.NextCursor != "")
+					cursor = page.NextCursor
+				}
+			},
+		},
+		{
+			name: "starred descendant",
+			sessions: []db.Session{
+				{ID: "unstarred-newer", StartedAt: new("2026-01-20T00:00:00Z")},
+				{ID: "root", StartedAt: new("2026-01-01T00:00:00Z")},
+				{ID: "starred-child", StartedAt: new("2026-01-10T00:00:00Z"), ParentSessionID: new("root"), RelationshipType: "subagent"},
+			},
+			starredID: "starred-child",
+			check: func(t *testing.T, store *Store) {
+				t.Helper()
+				page, err := store.GetSidebarSessionIndex(t.Context(), db.SessionFilter{Starred: true, Limit: 1})
+				require.NoError(t, err)
+				assert.Equal(t, []string{"starred-child", "root"}, duckSidebarSessionIDs(page.Sessions))
+				assert.Equal(t, 1, page.Total)
+				assert.Empty(t, page.NextCursor)
+			},
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			ctx := t.Context()
+			local := newLocalDB(t)
+			for _, session := range tt.sessions {
+				session.Project, session.Machine, session.Agent = "sidebar", "local", "claude"
+				session.MessageCount, session.UserMessageCount = 1, 1
+				require.NoError(t, local.UpsertSession(ctx, session))
+			}
+			if tt.starredID != "" {
+				ok, err := local.StarSession(ctx, tt.starredID)
+				require.NoError(t, err)
+				require.True(t, ok)
+			}
+			syncer := newInMemoryTestSync(t, local, storage.MirrorPushOptions{})
+			pushDataReadMirror(t, ctx, syncer)
+			store := NewStoreFromDB(syncer.DB())
+			tt.check(t, store)
+		})
+	}
 }

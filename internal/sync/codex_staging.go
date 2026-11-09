@@ -76,13 +76,16 @@ type codexStagingSink struct {
 	// contentFailures records per-call content-failure verdicts captured
 	// during ingestion for sole events or publication for multi-event
 	// summaries, so the engine can reuse them in the signal pass.
-	contentFailures map[string]bool
+	toolNameByCallKey map[string]string
+	statusByCallKey   map[string]string
+	contentFailures   map[string]db.StagedToolVerdict
 	// stageErr is the sticky first scratch failure. Once set, staging is
 	// unrecoverable for this parse: events are no longer accepted and the
 	// publish must fail, so a disk-full or I/O error can never commit a
 	// "successful" archive missing tool outputs.
 	stageErr        error
 	validationStats db.ValidationStats
+	forkSummaries   map[string]bool
 }
 
 // fail records the sticky staging failure. Later events and the publish
@@ -251,11 +254,12 @@ CREATE TABLE stage_events (
     source TEXT NOT NULL,
     status TEXT NOT NULL,
     content TEXT NOT NULL,
-    raw_content_digest BLOB NOT NULL,
+    raw_content_digest BLOB,
     content_length INTEGER NOT NULL,
     timestamp TEXT NOT NULL DEFAULT '',
     blanked INTEGER NOT NULL DEFAULT 0,
-    summary_participates INTEGER NOT NULL DEFAULT 0
+    summary_participates INTEGER DEFAULT 0,
+    summary_effective INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX idx_stage_events_call ON stage_events(call_key, seq);
 CREATE INDEX idx_stage_events_identity
@@ -289,7 +293,7 @@ func newCodexStagingSink(ctx context.Context,
 		os.Remove(path)
 		return nil, err
 	}
-	scratch, err := sql.Open("sqlite3", path)
+	scratch, err := sql.Open("sqlite3", sqliteScratchDSN(path))
 	if err != nil {
 		os.Remove(path)
 		return nil, fmt.Errorf("opening codex staging db: %w", err)
@@ -444,6 +448,10 @@ func (s *codexStagingSink) AppendMessage(m parser.ParsedMessage) int {
 			CallIndex:      callIndex,
 		}] = stageKey
 		s.categoryByCallKey[stageKey] = tc.Category
+		if s.toolNameByCallKey == nil {
+			s.toolNameByCallKey = make(map[string]string)
+		}
+		s.toolNameByCallKey[stageKey] = tc.ToolName
 	}
 	return ordinal
 }
@@ -589,6 +597,10 @@ func (s *codexStagingSink) AppendToolResultEvent(ctx context.Context,
 	if blanked != 0 {
 		storedContent = ""
 	}
+	if s.statusByCallKey == nil {
+		s.statusByCallKey = make(map[string]string)
+	}
+	s.statusByCallKey[stageKey] = ev.Status
 	eventIndex := int(s.eventByCallKey[stageKey])
 	s.eventByCallKey[stageKey]++
 	s.addEventFindings(stageKey, eventIndex, storedContent)
@@ -601,13 +613,16 @@ func (s *codexStagingSink) AppendToolResultEvent(ctx context.Context,
 			summary = ""
 		}
 		s.singleSummaryLengths[stageKey] = len(summary)
+		s.recordContentOutcome(stageKey, summary, ev.Status, signals.IsUnknownResultContent(storedContent))
 		if !s.disableSignals {
 			if s.contentFailures == nil {
-				s.contentFailures = make(map[string]bool)
+				s.contentFailures = make(map[string]db.StagedToolVerdict)
 			}
-			s.contentFailures[stageKey] = signals.IsFailure(signals.ToolCallRow{
+			verdict := s.contentFailures[stageKey]
+			verdict.Failure = signals.IsFailure(signals.ToolCallRow{
 				Category: s.categoryByCallKey[stageKey], ResultContent: summary,
 			})
+			s.contentFailures[stageKey] = verdict
 		}
 	} else {
 		delete(s.singleSummaryLengths, stageKey)
@@ -684,18 +699,27 @@ func (s *codexStagingSink) PublishToolResultImages(ctx context.Context) error {
 	}
 
 	s.singleSummaryLengths = make(map[string]int)
-	s.contentFailures = make(map[string]bool)
-	s.findings = nil
-	s.findingPos = nil
+	s.contentFailures = make(map[string]db.StagedToolVerdict)
+	// Summary-only fork results were already projected when spooled. Keep
+	// their findings while rebuilding findings for the event rows below.
+	findings, positions := s.findings[:0], s.findingPos[:0]
+	for i, finding := range s.findings {
+		if s.findingPos[i].eventIndex < 0 {
+			findings = append(findings, finding)
+			positions = append(positions, s.findingPos[i])
+		}
+	}
+	s.findings, s.findingPos = findings, positions
 	s.eventByCallKey = make(map[string]int64)
 	type singleSummaryCandidate struct {
 		length  int
 		failure bool
+		outcome string
 	}
 	candidates := make(map[string]singleSummaryCandidate)
 	rows, err = s.scratch.QueryContext(ctx, `
 		SELECT call_key, content, content_length, blanked,
-		       summary_participates
+		       COALESCE(summary_participates, summary_effective)
 		FROM stage_events
 		ORDER BY seq`)
 	if err != nil {
@@ -725,7 +749,7 @@ func (s *codexStagingSink) PublishToolResultImages(ctx context.Context) error {
 			if participates == 0 {
 				summary = ""
 			}
-			candidate := singleSummaryCandidate{length: len(summary)}
+			candidate := singleSummaryCandidate{length: len(summary), outcome: string(signals.ClassifyToolOutcome(signals.ToolCallRow{ToolName: s.toolNameByCallKey[callKey], Category: s.categoryByCallKey[callKey], ResultContent: summary, ResultContentLength: len(summary), EventStatus: s.statusByCallKey[callKey], ResultContentUnknown: signals.IsUnknownResultContent(summary)}))}
 			if !s.disableSignals {
 				candidate.failure = signals.IsFailure(signals.ToolCallRow{
 					Category:      s.categoryByCallKey[callKey],
@@ -749,7 +773,7 @@ func (s *codexStagingSink) PublishToolResultImages(ctx context.Context) error {
 	for callKey, candidate := range candidates {
 		s.singleSummaryLengths[callKey] = candidate.length
 		if !s.disableSignals {
-			s.contentFailures[callKey] = candidate.failure
+			s.contentFailures[callKey] = db.StagedToolVerdict{Failure: candidate.failure, Outcome: candidate.outcome}
 		}
 	}
 	return nil
@@ -786,20 +810,142 @@ func (s *codexStagingSink) Findings(
 	sessionID string,
 	positions map[string]db.StagedToolCallPosition,
 ) []db.SecretFinding {
-	out := make([]db.SecretFinding, len(s.findings))
+	out := make([]db.SecretFinding, 0, len(s.findings))
 	for i, f := range s.findings {
 		f.SessionID = sessionID
 		pos, ok := positions[s.findingPos[i].stageKey]
-		if ok {
-			f.MessageOrdinal = pos.Ordinal
-			callIdx := pos.CallIndex
-			evIdx := s.findingPos[i].eventIndex
-			f.CallIndex = &callIdx
+		if !ok {
+			continue
+		}
+		f.MessageOrdinal = pos.Ordinal
+		callIdx := pos.CallIndex
+		evIdx := s.findingPos[i].eventIndex
+		f.CallIndex = &callIdx
+		if evIdx >= 0 {
 			f.EventIndex = &evIdx
 		}
-		out[i] = f
+		out = append(out, f)
 	}
 	return out
+}
+
+// forkResultEvents materializes only a call that must merge archived results.
+// Healthy full parses continue publishing directly from scratch.
+func (s *codexStagingSink) forkResultEvents(ctx context.Context, key string) ([]db.ToolResultEvent, error) {
+	rows, err := s.scratch.QueryContext(ctx, `SELECT tool_use_id, agent_id, subagent_session_id,
+ source, status, content, content_length, timestamp, raw_content_digest, summary_participates
+ FROM stage_events WHERE call_key=? ORDER BY seq`, key)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var events []db.ToolResultEvent
+	for rows.Next() {
+		var event db.ToolResultEvent
+		if err := rows.Scan(&event.ToolUseID, &event.AgentID, &event.SubagentSessionID,
+			&event.Source, &event.Status, &event.Content, &event.ContentLength, &event.Timestamp,
+			&event.RawContentDigest, &event.SummaryParticipates); err != nil {
+			return nil, err
+		}
+		event.SubagentSessionID = applyIDPrefixToID(s.idPrefix, event.SubagentSessionID)
+		event.EventIndex = len(events)
+		events = append(events, event)
+	}
+	return events, rows.Err()
+}
+
+// stageForkCall keeps only event metadata in the reconciled transcript. Payloads
+// remain in scratch, including saved calls that are absent from the source.
+func (s *codexStagingSink) stageForkCall(ctx context.Context, key string, call *db.ToolCall) error {
+	if _, err := s.scratch.ExecContext(ctx, `DELETE FROM stage_events WHERE call_key=?`, key); err != nil {
+		return err
+	}
+	if s.toolNameByCallKey == nil {
+		s.toolNameByCallKey = make(map[string]string)
+	}
+	if s.statusByCallKey == nil {
+		s.statusByCallKey = make(map[string]string)
+	}
+	s.categoryByCallKey[key], s.toolNameByCallKey[key] = call.Category, call.ToolName
+	delete(s.singleSummaryLengths, key)
+	delete(s.contentFailures, key)
+	findings, positions := s.findings[:0], s.findingPos[:0]
+	for i, finding := range s.findings {
+		if s.findingPos[i].stageKey != key {
+			findings = append(findings, finding)
+			positions = append(positions, s.findingPos[i])
+		}
+	}
+	s.findings, s.findingPos = findings, positions
+	imagePolicy, assetsDir := s.toolResultImages, ""
+	if s.database != nil {
+		assetsDir = s.database.AssetsDir()
+		if imagePolicy == config.ToolResultImagesOffload && s.database.ArchiveContent().OmitsToolContent() {
+			imagePolicy = config.ToolResultImagesDrop
+		}
+	}
+	for i := range call.ResultEvents {
+		event := &call.ResultEvents[i]
+		participates := strings.TrimSpace(event.Content) != ""
+		if event.SummaryParticipates != nil {
+			participates = *event.SummaryParticipates
+		}
+		blanked := s.blocked[call.Category]
+		content := event.Content
+		if blanked {
+			content = ""
+		} else {
+			content = db.ProjectToolResultImageContent(content, imagePolicy, assetsDir)
+			event.ContentLength = db.ResolveResultContentLength(content, event.ContentLength)
+		}
+		s.eventSeq++
+		if _, err := s.scratch.ExecContext(ctx, `INSERT INTO stage_events
+ (seq,call_key,tool_use_id,agent_id,subagent_session_id,source,status,content,
+ raw_content_digest,content_length,timestamp,blanked,summary_participates,summary_effective)
+ VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, s.eventSeq, key, event.ToolUseID,
+			event.AgentID, event.SubagentSessionID, event.Source, event.Status, content,
+			event.RawContentDigest, event.ContentLength, event.Timestamp, blanked, event.SummaryParticipates, participates); err != nil {
+			return err
+		}
+		s.statusByCallKey[key] = event.Status
+		s.addEventFindings(key, i, content)
+		event.Content = ""
+	}
+	if (len(call.ResultEvents) == 0 || s.blocked[call.Category] || call.ResultContent == "") &&
+		(call.ResultContent != "" || call.ResultContentLength > 0) {
+		// Summary-only and policy-blanked archive calls can retain a known
+		// summary length that nullable event metadata cannot reconstruct.
+		if _, err := s.scratch.ExecContext(ctx, `CREATE TABLE IF NOT EXISTS stage_fork_summaries
+ (call_key TEXT PRIMARY KEY, content TEXT NOT NULL, length INTEGER NOT NULL)`); err != nil {
+			return err
+		}
+		content := call.ResultContent
+		if s.blocked[call.Category] {
+			content = ""
+		} else {
+			content = db.ProjectToolResultImageContent(content, imagePolicy, assetsDir)
+			call.ResultContentLength = db.ResolveResultContentLength(content, call.ResultContentLength)
+		}
+		if _, err := s.scratch.ExecContext(ctx, `INSERT OR REPLACE INTO stage_fork_summaries VALUES (?,?,?)`, key, content, call.ResultContentLength); err != nil {
+			return err
+		}
+		if s.forkSummaries == nil {
+			s.forkSummaries = make(map[string]bool)
+		}
+		s.forkSummaries[key] = true
+		if !s.disableSignals {
+			for _, match := range secrets.ScanDefinite(content) {
+				s.findings = append(s.findings, db.SecretFinding{
+					RuleName: match.Rule, Confidence: match.Confidence, LocationKind: "tool_result",
+					MatchStart: match.Start, MatchEnd: match.End, MatchIndex: match.Index,
+					RedactedMatch: match.Redacted, RulesVersion: secrets.DefiniteRulesVersion(),
+				})
+				s.findingPos = append(s.findingPos, stagedFindingPos{stageKey: key, eventIndex: -1})
+			}
+		}
+	}
+	call.ResultContent = ""
+	return nil
 }
 
 // InsertEventsTx inserts the staged result events into tool_result_events
@@ -874,6 +1020,16 @@ func (s *codexStagingSink) ResolveSummary(
 	if err := ctx.Err(); err != nil {
 		return "", 0, err
 	}
+	if s.forkSummaries[stageKey] {
+		err := s.scratch.QueryRowContext(ctx, `SELECT content,length FROM stage_fork_summaries WHERE call_key=?`, stageKey).Scan(&summary, &contentLength)
+		s.recordContentOutcome(stageKey, summary, "", signals.IsUnknownResultContent(summary))
+		if !s.disableSignals {
+			verdict := s.contentFailures[stageKey]
+			verdict.Failure = signals.IsFailure(signals.ToolCallRow{Category: s.categoryByCallKey[stageKey], ResultContent: summary})
+			s.contentFailures[stageKey] = verdict
+		}
+		return summary, contentLength, err
+	}
 	if length, ok := s.singleSummaryLengths[stageKey]; ok {
 		return "", length, nil
 	}
@@ -885,16 +1041,19 @@ func (s *codexStagingSink) ResolveSummary(
 		}
 		if !s.disableSignals {
 			if s.contentFailures == nil {
-				s.contentFailures = make(map[string]bool)
+				s.contentFailures = make(map[string]db.StagedToolVerdict)
 			}
-			s.contentFailures[stageKey] = signals.IsFailure(signals.ToolCallRow{
+			verdict := s.contentFailures[stageKey]
+			verdict.Failure = signals.IsFailure(signals.ToolCallRow{
 				Category: s.categoryByCallKey[stageKey],
 			})
+			verdict.Outcome = "unknown"
+			s.contentFailures[stageKey] = verdict
 		}
 		return "", contentLength, nil
 	}
 	rows, err := s.scratch.QueryContext(ctx, `
-		SELECT agent_id, content, summary_participates
+		SELECT agent_id, content, COALESCE(summary_participates, summary_effective)
 		FROM stage_events
 		WHERE call_key = ?
 		ORDER BY seq`,
@@ -911,6 +1070,7 @@ func (s *codexStagingSink) ResolveSummary(
 	var soleContent string
 	var order []string
 	latest := make(map[string]string)
+	evidenceByAgent := make(map[string]string)
 	var lastAnon string
 	hasAnon := false
 	for rows.Next() {
@@ -925,10 +1085,13 @@ func (s *codexStagingSink) ResolveSummary(
 		} else {
 			soleContent = ""
 		}
+		agent := strings.TrimSpace(agentID)
+		if strings.TrimSpace(content) != "" {
+			evidenceByAgent[agent] = content
+		}
 		if !participates {
 			continue
 		}
-		agent := strings.TrimSpace(agentID)
 		if agent == "" {
 			hasAnon = true
 			lastAnon = content
@@ -977,10 +1140,20 @@ func (s *codexStagingSink) ResolveSummary(
 			ResultContent: summary,
 		})
 		if s.contentFailures == nil {
-			s.contentFailures = make(map[string]bool)
+			s.contentFailures = make(map[string]db.StagedToolVerdict)
 		}
-		s.contentFailures[stageKey] = verdict
+		contentVerdict := s.contentFailures[stageKey]
+		contentVerdict.Failure = verdict
+		s.contentFailures[stageKey] = contentVerdict
 	}
+	selectedEvents := make([]signals.ResultContentEvidence, 0, len(evidenceByAgent))
+	for agent, content := range evidenceByAgent {
+		selectedEvents = append(selectedEvents, signals.ResultContentEvidence{AgentID: agent, Content: content})
+	}
+	if eventCount == 1 {
+		selectedEvents = []signals.ResultContentEvidence{{Content: soleContent}}
+	}
+	s.recordContentOutcome(stageKey, summary, s.statusByCallKey[stageKey], signals.ToolResultContentUnknown(summary, eventCount, selectedEvents))
 	if eventCount == 1 {
 		summary = db.DedupToolCallResultSummary(
 			summary, []db.ToolResultEvent{{Content: soleContent}},
@@ -993,7 +1166,7 @@ func (s *codexStagingSink) resolveBlockedSummaryLength(
 	ctx context.Context, stageKey string,
 ) (int, error) {
 	rows, err := s.scratch.QueryContext(ctx, `
-		SELECT agent_id, content_length, summary_participates
+		SELECT agent_id, content_length, COALESCE(summary_participates, summary_effective)
 		FROM stage_events
 		WHERE call_key = ?
 		ORDER BY seq`,
@@ -1007,7 +1180,7 @@ func (s *codexStagingSink) resolveBlockedSummaryLength(
 	order := make([]string, 0)
 	latestByAgent := make(map[string]int)
 	lastAnonLength := 0
-	allHaveAgentID := true
+	hasAnon := false
 	for rows.Next() {
 		var agentID string
 		var length int
@@ -1020,7 +1193,7 @@ func (s *codexStagingSink) resolveBlockedSummaryLength(
 		}
 		agentID = strings.TrimSpace(agentID)
 		if agentID == "" {
-			allHaveAgentID = false
+			hasAnon = true
 			lastAnonLength = length
 			continue
 		}
@@ -1038,7 +1211,7 @@ func (s *codexStagingSink) resolveBlockedSummaryLength(
 			return lastAnonLength, nil
 		}
 		length := latestByAgent[order[0]]
-		if lastAnonLength > 0 {
+		if hasAnon {
 			length += 2 + lastAnonLength
 		}
 		return length, nil
@@ -1047,7 +1220,7 @@ func (s *codexStagingSink) resolveBlockedSummaryLength(
 	for _, agentID := range order {
 		parts = append(parts, len(agentID)+2+latestByAgent[agentID])
 	}
-	if !allHaveAgentID && lastAnonLength > 0 {
+	if hasAnon {
 		parts = append(parts, lastAnonLength)
 	}
 	total := 0
@@ -1063,6 +1236,18 @@ func (s *codexStagingSink) resolveBlockedSummaryLength(
 // ContentFailures returns the per-call content-failure verdicts captured
 // during summary resolution in the publish transaction. Calls the
 // transaction never resolved (no registered tool call) are absent.
-func (s *codexStagingSink) ContentFailures() map[string]bool {
+func (s *codexStagingSink) ContentFailures() map[string]db.StagedToolVerdict {
 	return s.contentFailures
+}
+
+func (s *codexStagingSink) recordContentOutcome(key, content, status string, unknown bool) {
+	if s.disableSignals {
+		return
+	}
+	if s.contentFailures == nil {
+		s.contentFailures = make(map[string]db.StagedToolVerdict)
+	}
+	verdict := s.contentFailures[key]
+	verdict.Outcome = string(signals.ClassifyToolOutcome(signals.ToolCallRow{ToolName: s.toolNameByCallKey[key], Category: s.categoryByCallKey[key], ResultContent: content, ResultContentLength: len(content), EventStatus: status, ResultContentUnknown: unknown}))
+	s.contentFailures[key] = verdict
 }

@@ -62,6 +62,36 @@ func (p *antigravityProvider) SourcesForChangedPath(
 	return p.sources.SourcesForChangedPath(ctx, req)
 }
 
+func (p *antigravityProvider) ChangedPathRelevance(
+	ctx context.Context,
+	req ChangedPathRequest,
+) (ChangedPathRelevance, error) {
+	if err := ctx.Err(); err != nil {
+		return ChangedPathUnclassified, err
+	}
+	for _, root := range p.sources.roots {
+		if req.WatchRoot != "" && !antigravityWatchRootMatches(root, req.WatchRoot) {
+			continue
+		}
+		rel, ok := relUnder(root, filepath.Clean(req.Path))
+		if ok && (antigravityConversationIndexPath(rel) ||
+			rel == AntigravitySummariesDBName+"-shm") {
+			return ChangedPathNonData, nil
+		}
+	}
+	return ChangedPathUnclassified, nil
+}
+
+// antigravityConversationIndexPath reports whether rel names the WAL index of
+// a conversation database. Every read-only open rewrites that index without
+// changing session data; committed writes land in the main file or the -wal.
+func antigravityConversationIndexPath(rel string) bool {
+	name := filepath.Base(rel)
+	return filepath.Dir(rel) == "conversations" &&
+		strings.HasSuffix(name, ".db-shm") &&
+		IsValidSessionID(strings.TrimSuffix(name, ".db-shm"))
+}
+
 func (p *antigravityProvider) FindSource(
 	ctx context.Context,
 	req FindSourceRequest,
@@ -114,6 +144,7 @@ func (p *antigravityProvider) Parse(
 			SkipReason:        SkipNoSession,
 		}, nil
 	}
+	applyAntigravityTitle(ctx, sess, src)
 	if req.Fingerprint.Hash != "" {
 		sess.File.Hash = req.Fingerprint.Hash
 	}
@@ -255,7 +286,7 @@ func (s antigravitySourceSet) findSourceFile(root, id string) string {
 }
 
 func (s antigravitySourceSet) WatchPlan(context.Context) (WatchPlan, error) {
-	roots := make([]WatchRoot, 0, len(s.roots)*3)
+	roots := make([]WatchRoot, 0, len(s.roots)*4)
 	for _, root := range s.roots {
 		roots = append(roots,
 			WatchRoot{
@@ -288,6 +319,12 @@ func (s antigravitySourceSet) WatchPlan(context.Context) (WatchPlan, error) {
 				Recursive:    false,
 				IncludeGlobs: []string{"*.db", "*.db-wal", "*.trajectory.json"},
 				DebounceKey:  string(AgentAntigravity) + ":conversations:" + root,
+			},
+			WatchRoot{
+				Path:         root,
+				Recursive:    false,
+				IncludeGlobs: []string{AntigravitySummariesDBName, AntigravitySummariesDBName + "-wal"},
+				DebounceKey:  string(AgentAntigravity) + ":titles:" + root,
 			},
 		)
 	}
@@ -574,10 +611,12 @@ func antigravityProviderCapabilities() Capabilities {
 	source := jsonlFileProviderSourceCapabilities()
 	source.StreamingDiscovery = CapabilitySupported
 	source.ForceReplaceOnParse = CapabilitySupported
+	source.ChangedPathRelevance = CapabilitySupported
 	return Capabilities{
 		Source: source,
 		Content: ContentCapabilities{
 			FirstMessage:         CapabilitySupported,
+			SessionName:          CapabilitySupported,
 			Thinking:             CapabilitySupported,
 			ToolCalls:            CapabilitySupported,
 			ToolResults:          CapabilitySupported,

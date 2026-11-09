@@ -202,16 +202,19 @@ class InsightsStore {
     });
   }
 
-  generateForSession(session: Session) {
+  generateForSession(
+    session: Session,
+    type: "agent_analysis" | "tool_effectiveness" = "agent_analysis",
+  ) {
     const date = sessionInsightDate(session);
-    this.type = "agent_analysis";
+    this.type = type;
     this.dateFrom = date;
     this.dateTo = date;
     this.project = session.project || "";
     this.automatedScope = "human";
     this.#startGeneration(
       {
-        type: "agent_analysis",
+        type,
         dateFrom: date,
         dateTo: date,
         project: session.project || "",
@@ -324,7 +327,7 @@ class InsightsStore {
           this.items = [insight, ...this.items.filter((s) => s.id !== insight.id)];
           this.selectedId = insight.id;
         } else {
-          this.load();
+          void this.load();
         }
       })
       .catch((e) => {

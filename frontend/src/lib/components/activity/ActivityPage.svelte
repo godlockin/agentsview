@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { errorTelemetry } from "../../utils/error-telemetry.js";
   import { formatDateTime, m } from "../../i18n/index.js";
   import { onMount, untrack } from "svelte";
   import {
@@ -34,6 +35,7 @@
   import ConcurrencyTimeline from "./ConcurrencyTimeline.svelte";
   import SessionsTable from "./SessionsTable.svelte";
   import Breakdowns from "./Breakdowns.svelte";
+  import { shortenId } from "../../utils/shortId.js";
   import ActivityInsight from "./ActivityInsight.svelte";
 
   // Date-only (local) bounds for the inline insight panel, derived from the
@@ -187,13 +189,6 @@
   // Machines sharing a friendly label get a short ID fragment so they stay
   // distinguishable. Full IDs are non-shrinking meta and would squeeze the
   // label to zero width in the compact menu, so unique labels get no meta.
-  function shortMachineId(machine: string, peers: string[]): string {
-    const head = machine.slice(0, 8);
-    if (peers.every((peer) => peer === machine || peer.slice(0, 8) !== head)) return head;
-    const tail = machine.slice(-8);
-    if (peers.every((peer) => peer === machine || peer.slice(-8) !== tail)) return `…${tail}`;
-    return machine;
-  }
   const machineOptions = $derived.by((): TypeaheadOption[] => {
     const byLabel = new Map<string, string[]>();
     for (const machine of activity.machines) {
@@ -209,7 +204,7 @@
       ...activity.machines.map((machine) => {
         const label = sessions.machineLabel(machine);
         const peers = byLabel.get(label) ?? [];
-        const shortId = peers.length > 1 ? shortMachineId(machine, peers) : undefined;
+        const shortId = peers.length > 1 ? shortenId(machine, peers) : undefined;
         return {
           name: machine,
           label,
@@ -372,6 +367,7 @@
 
   function onMachineChange(value: string) {
     activity.setMachine(value);
+    if (!activity.machines.length) activity.loadFilterOptions();
     activity.load();
   }
 
@@ -448,7 +444,7 @@
       <Typeahead
         options={machineOptions}
         value={activity.machine}
-        fallbackLabel={m.activity_all_machines()}
+        fallbackLabel={activity.machine || m.activity_all_machines()}
         placeholder={m.activity_filter_machines_placeholder()}
         title={m.activity_filter_by_machine()}
         emptyLabel={m.activity_no_matching_machines()}
@@ -526,7 +522,7 @@
     {:else if activity.loading}
       <div class="status">{m.activity_loading_report()}</div>
     {:else if activity.error}
-      <div class="status error">
+      <div class="status error" {@attach errorTelemetry("analytics")}>
         <span>{activity.error}</span>
         <button class="retry-btn" onclick={() => activity.load()}>
           {m.shared_retry()}

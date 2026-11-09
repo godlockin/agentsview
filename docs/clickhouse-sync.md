@@ -3,10 +3,10 @@ title: ClickHouse Sync
 description: Push the SQLite archive into ClickHouse and serve a read-only web UI from it
 ---
 
-AgentsView stores sessions locally in SQLite. `agentsview clickhouse push`
-copies those sessions into ClickHouse. `agentsview clickhouse serve` runs the
-web UI by querying that copy. Keep the copy current with `push --watch` or
-`clickhouse service`.
+AgentsView stores sessions locally in SQLite.
+`agentsview replica clickhouse push` copies those sessions into ClickHouse.
+`agentsview replica clickhouse serve` runs the web UI by querying that copy.
+Keep the copy current with `push --watch` or `clickhouse service`.
 
 Each machine pushes its own sessions. SQLite stays the archive. ClickHouse is a
 remote copy, the same operator story as [PostgreSQL sync](/docs/pg-sync/), not a
@@ -17,6 +17,34 @@ edits, and project inventory. Rename, trash, insights, stars, and pins stay on
 the SQLite archive; the ClickHouse UI does not write them. Semantic search works
 when `[vector]` is enabled locally and the push includes vectors (see
 [Vector Push](#vector-push)). Hosted raw sync is not part of this path.
+
+Content search matches dialogue for `--in messages` and reasoning for
+`--in thinking` in substring and regex modes. Substring and regex searches
+include reasoning by default; pass `--in messages` to skip it. A regex without a
+literal prefix loads every in-scope body from the selected sources into memory
+before matching and pagination. Hybrid keyword search matches dialogue; semantic
+search uses rendered messages.
+
+Each archive's first push from a binary that stores dialogue is a full push. It
+re-sends every session in the configured mirror scope, including sessions
+without dialogue, and needs a role that can update the ClickHouse schema. Until
+the schema has `messages.dialogue_text`, reads fail with a schema compatibility
+error naming that column.
+
+The Analytics panels for Activity, Session Shape, Velocity, Tools, Skills, and
+Signals read per-session counts that push stores with each session, so they no
+longer scan every message on each load. The first push from each archive after
+upgrading is a full push that re-sends every session in the mirror scope to
+store those counts, reported as `publishing stored session counts`. Until it
+finishes, panels count the remaining sessions from their messages, with the
+same results. Serve reports a missing-column error until a push from the new
+binary has updated the schema.
+
+Commit lookups return the copied links and prompts.
+The first push after upgrading is a full push to copy existing commit links.
+A deleted session remains visible as a missing record. Project filters use the
+project saved with its links in SQLite, including after a rebuild or a deletion
+before the first push.
 
 ## Quick Start
 
@@ -54,7 +82,7 @@ legacy `[clickhouse]` field names `url`, `database`, `machine_name`,
 ### 2. Push Sessions
 
 ```bash
-agentsview clickhouse push
+agentsview replica clickhouse push
 ```
 
 This one-shot command syncs all local sessions, messages, and tool calls to
@@ -63,19 +91,19 @@ ClickHouse. The schema is created automatically on first push.
 To keep ClickHouse current automatically, run the foreground watcher:
 
 ```bash
-agentsview clickhouse push --watch
+agentsview replica clickhouse push --watch
 ```
 
 Or install it as a per-user background service on macOS or Linux:
 
 ```bash
-agentsview clickhouse service install
+agentsview replica clickhouse service install
 ```
 
 ### 3. Serve the Dashboard
 
 ```bash
-agentsview clickhouse serve
+agentsview replica clickhouse serve
 ```
 
 Opens the read-only web UI at `http://127.0.0.1:8080`, backed entirely by
@@ -86,12 +114,14 @@ ______________________________________________________________________
 
 ## Commands
 
-### `agentsview clickhouse push`
+<a id="agentsview-clickhouse-push"></a>
+
+### `agentsview replica clickhouse push`
 
 Sync sessions from the local SQLite database to ClickHouse.
 
 ```bash
-agentsview clickhouse push [target] [flags]
+agentsview replica clickhouse push [target] [flags]
 ```
 
 | Flag                 | Default | Description                                                               |
@@ -102,6 +132,7 @@ agentsview clickhouse push [target] [flags]
 | `--exclude-projects` |         | Comma-separated projects to exclude                                       |
 | `--all-projects`     | `false` | Ignore configured project filters for this run                            |
 | `--watch`            | `false` | Run continuously, pushing on change plus a periodic floor                 |
+| `--no-start-daemon`  | `false` | With `--watch`, require a writable daemon; exit if none is running        |
 | `--debounce`         | `30s`   | Coalesce window after a filesystem change before pushing (`--watch` only) |
 | `--interval`         | `15m`   | Periodic floor push interval (`--watch` only)                             |
 | `--no-vectors`       | `false` | Skip the semantic-search vector phase for this run                        |
@@ -129,18 +160,39 @@ to fan out across every configured target. `--all --watch` is rejected.
 Use `--full` to bypass fingerprints and re-push everything — for example after a
 schema reset or when message content was rewritten in place.
 
-If any sessions fail to push, the cursor is not advanced so they are retried on
-the next run. The exit code is 1 when any errors occur, 0 otherwise.
+Every push sends the most recently active sessions first, so recent activity
+reaches the mirror before older history. A full push that stops partway, for
+example because the process restarted, resumes on the next push: sessions it
+already pushed are skipped. The summary says `resuming an unfinished full push`
+and counts the skipped sessions. The push starts over instead when `--full` is
+passed or when the archive was rebuilt, the push scope changed, or the mirror
+format changed since it began. When `--full` discards an unfinished full push,
+the summary says `discarded an unfinished full push`. A full push that reaches
+the end with session errors resumes only while something else still requires a
+full push. Otherwise the next push is incremental: it picks up failed sessions
+that changed since the last clean push and skips the rest. If a `--full` push
+ends with errors, run it again.
+
+If a full push ended with session errors and began under a different push scope,
+archive, or mirror format, the next push is also full. Pushes stay full until
+one finishes without errors. This brings back sessions that a filtered push
+removed from the mirror when you restore the wider scope. The push log names
+each session that failed, and pushes return to incremental once those sessions
+push cleanly.
+
+If any sessions fail during an incremental push, the cursor is not advanced, so
+the next push retries them. The exit code is 1 when any errors occur, 0
+otherwise.
 
 #### Automatic Push Watcher
 
-`agentsview clickhouse push --watch` runs a long-lived auto-push daemon in the
-foreground:
+`agentsview replica clickhouse push --watch` runs a long-lived auto-push daemon
+in the foreground:
 
 ```bash
-agentsview clickhouse push --watch
-agentsview clickhouse push --watch --debounce 1m
-agentsview clickhouse push --watch --interval 5m
+agentsview replica clickhouse push --watch
+agentsview replica clickhouse push --watch --debounce 1m
+agentsview replica clickhouse push --watch --interval 5m
 ```
 
 The watcher performs one initial local sync plus ClickHouse push, then pushes
@@ -170,13 +222,13 @@ subset:
 
 ```bash
 # Push only these projects
-agentsview clickhouse push --projects alpha,beta
+agentsview replica clickhouse push --projects alpha,beta
 
 # Push everything except this project
-agentsview clickhouse push --exclude-projects scratch
+agentsview replica clickhouse push --exclude-projects scratch
 
 # Ignore config-file filters for this run
-agentsview clickhouse push --all-projects
+agentsview replica clickhouse push --all-projects
 ```
 
 `--projects` and `--exclude-projects` are mutually exclusive. `--all-projects`
@@ -192,8 +244,32 @@ projects = ["alpha", "beta"]
 ```
 
 CLI flags override config values. Use
-[`agentsview projects`](/docs/commands/#agentsview-projects) to list available
-project names.
+[`agentsview project list`](/docs/commands/#agentsview-projects) to list
+available project names.
+
+#### Push Batch Size
+
+`clickhouse push` writes changed sessions in batches of 100. Each batch ends
+with one delete per session table, and under ClickHouse's default
+`lightweight_delete_mode` each delete rewrites every active part of its table,
+even when no rows match. Fewer batches mean fewer rewrites, which matters most
+for full pushes and for servers on slow storage.
+
+Raise the batch size per target with `push_batch_size`:
+
+```toml
+[clickhouse]
+url = "clickhouse://localhost:9000/agentsview"
+push_batch_size = 500
+```
+
+Larger batches hold more session content in memory at once. On a test archive of
+about 46,800 sessions, a full push peaked at about 2.8 GB of memory with the
+default of 100, 3.4 GB at 500, 4.5 GB at 1,000, and 7.5 GB at 2,000, while the
+batch phase took 510 s, 206 s, 135 s, and 142 s. Peak memory depends on the
+largest sessions that land in one batch, so leave headroom. The value must be at
+least 1; remove the key to use the default. A delegated push sends the target's
+value to the daemon, so the setting applies there too.
 
 #### Vector Push
 
@@ -213,33 +289,27 @@ matches a pushed generation.
 
 #### Enabling Semantic Search
 
-Follow these steps on the machine that owns the sessions. Every step names the
-output that confirms it, so an operator or an agent can run the sequence
-unattended and stop at the first step that does not confirm.
+On the machine that owns the sessions, choose **Settings → Embeddings → Turn on** to approve the download and build the local index without restarting. For CLI setup, follow the steps below.
 
-1. Enable vectors in `~/.agentsview/config.toml`. `model`, `dimension`, and one
-   `[vector.embeddings.servers.<name>]` entry with an `endpoint` are required;
-   the full key list is in
+1. Enable vectors in `~/.agentsview/config.toml`. AgentsView discovers Ollama
+   with Nomic or uses Kit's shared local server. Explicit recipes and server
+   settings are described in
    [Enabling `[vector]`](/docs/semantic-search/#enabling-vector).
 
     ```toml
     [vector]
     enabled = true
-
-    [vector.embeddings]
-    model = "nomic-embed-text"
-    dimension = 768
-    default_server = "local"
-
-    [vector.embeddings.servers.local]
-    endpoint = "http://localhost:11434/v1"
     ```
 
-1. Build the local index and confirm an active generation exists:
+1. Restart the daemon, then build the local index. The CLI asks before the first
+   download; declining stops the download and build. `--yes` skips rebuild
+   confirmation but does not approve this download. Approve the first install
+   interactively before running unattended builds. Confirm an active
+   generation exists:
 
     ```bash
-    agentsview embeddings build --yes
-    agentsview embeddings list
+    agentsview index embeddings build --yes
+    agentsview index embeddings list
     ```
 
     `embeddings list` prints one row per generation with a `STATE` column; the
@@ -249,7 +319,7 @@ unattended and stop at the first step that does not confirm.
 1. Push to ClickHouse and confirm the vector phase ran:
 
     ```bash
-    agentsview clickhouse push
+    agentsview replica clickhouse push
     ```
 
     The summary ends with
@@ -265,7 +335,7 @@ unattended and stop at the first step that does not confirm.
    queries are embedded at search time.
 
     ```bash
-    agentsview clickhouse serve --no-browser
+    agentsview replica clickhouse serve --no-browser
     ```
 
     The startup log contains
@@ -288,20 +358,23 @@ unattended and stop at the first step that does not confirm.
 Keeping vectors current is two jobs. Embedding new sessions happens locally: the
 `agentsview` daemon does it after each sync while `[vector.embed]`
 `run_after_sync` is on (the default), and without a running daemon you run
-`agentsview embeddings build --yes` before each push. Replicating the result is
-the vector phase inside every `clickhouse push`, so the same watcher or service
-as the session push (`clickhouse push --watch` or `clickhouse service install`)
-carries new vectors once they exist locally. There is no separate vector command
-to schedule, and the watcher never generates embeddings itself.
+`agentsview index embeddings build --yes` before each push. Replicating the
+result is the vector phase inside every `clickhouse push`, so the same watcher
+or service as the session push (`clickhouse push --watch` or
+`clickhouse service install`) carries new vectors once they exist locally. There
+is no separate vector command to schedule, and the watcher never generates
+embeddings itself.
 
-### `agentsview clickhouse status`
+<a id="agentsview-clickhouse-status"></a>
+
+### `agentsview replica clickhouse status`
 
 Show the current sync state.
 
 ```bash
-agentsview clickhouse status [target] [flags]
-agentsview clickhouse status --all
-agentsview clickhouse status --projects alpha,beta
+agentsview replica clickhouse status [target] [flags]
+agentsview replica clickhouse status --all
+agentsview replica clickhouse status --projects alpha,beta
 ```
 
 Without a target name, `clickhouse status` uses the effective default target.
@@ -311,18 +384,66 @@ print every configured target sequentially.
 Use the same `--projects`, `--exclude-projects`, or `--all-projects` filter
 flags as `clickhouse push`.
 
-### `agentsview clickhouse service`
+When the [push watcher](#automatic-push-watcher) runs on this machine, status
+also shows what it last did. The watcher records each push it runs in
+`clickhouse-watch-health.json` in the data directory. `Watcher last success:` is
+the end of the last push that worked. `Watcher failing since:` and
+`Watcher last error:` appear while pushes fail.
+
+To alert on a stalled watcher, run status from a timer or monitor with
+`--max-stale`:
+
+```bash
+agentsview replica clickhouse status --max-stale 10m
+```
+
+The command exits non-zero, and names the cause, in any of these cases:
+
+- Every push has failed for longer than the limit, for any reason. A watcher
+  that exits during a push, or that exits with an error before its first push,
+  counts as a failed push, so a crash loop or restart loop fails the check
+  too.
+- A push started more than the limit ago and has not finished.
+- No push has finished for longer than the `--interval` floor plus the limit.
+  The watcher pushes at least once per interval even when nothing changed, so
+  this catches a watcher that stopped, or one whose pushes wait on a local
+  sync that never finishes.
+
+The check reads only what the watcher recorded about its own pushes. It does not
+inspect the archive to guess what a push would send. A failure or a push that is
+still running gets the full limit to recover before the check fails. With the
+default 15-minute interval, `--max-stale 10m` fails after 25 minutes without a
+finished push.
+
+When the record already shows a stall, status reports it without querying the
+replica, because a stuck push can hold locks that block the status query.
+Otherwise the replica gets one minute to answer, and the check fails if it does
+not.
+
+The check uses wall-clock time. After a machine wakes from a sleep longer than
+the interval plus the limit, the check fails until the watcher's next push:
+within the debounce after a session changes, and otherwise within one interval.
+On a laptop, alert only when the check fails twice in a row, spaced at least one
+interval apart.
+
+`--max-stale` fails without a watcher record for the target, because nothing
+reports what pushes did. It also fails when the record was written before the
+target's URL or schema changed, until a watcher using the new settings starts.
+
+<a id="agentsview-clickhouse-service"></a>
+
+### `agentsview replica clickhouse service`
 
 Install and manage the [`clickhouse push --watch`](#automatic-push-watcher)
 auto-push daemon as a per-user OS service.
 
 ```bash
-agentsview clickhouse service install
-agentsview clickhouse service status
-agentsview clickhouse service logs -f
-agentsview clickhouse service stop
-agentsview clickhouse service start
-agentsview clickhouse service uninstall
+agentsview replica clickhouse service install
+agentsview replica clickhouse service status
+agentsview replica clickhouse service logs -f
+agentsview replica clickhouse service stop
+agentsview replica clickhouse service start
+agentsview replica clickhouse service uninstall
 ```
 
 Supported service managers:
@@ -332,10 +453,18 @@ Supported service managers:
 | macOS    | launchd LaunchAgent |
 | Linux    | `systemd --user`    |
 
-The generated unit runs `agentsview clickhouse push --watch`, pins
+The generated unit runs `agentsview replica clickhouse push --watch`, pins
 `AGENTSVIEW_DATA_DIR` to the data directory used at install time, and writes
 logs to `~/.agentsview/clickhouse-watch.log` unless you changed the data
 directory.
+
+If you run your own collector service, use
+`agentsview replica clickhouse service install --no-start-daemon`. The push
+service exits if no writable daemon is running, and the service manager restarts
+it until the collector answers. It retries pushes while the collector restarts,
+without starting a daemon or opening the archive directly. Reinstalling restarts
+the service with the new flag. The default installation still starts a missing
+daemon for hosts that run only the push service.
 
 `install` requires a literal ClickHouse URL in the effective default target of
 `~/.agentsview/config.toml`, either the legacy `[clickhouse].url` or the target
@@ -349,12 +478,14 @@ start at boot unless user lingering is enabled. If lingering is disabled,
 `install` prints the exact `loginctl enable-linger "$USER"` command and offers
 to run it.
 
-### `agentsview clickhouse serve`
+<a id="agentsview-clickhouse-serve"></a>
+
+### `agentsview replica clickhouse serve`
 
 Start a read-only web UI backed by ClickHouse.
 
 ```bash
-agentsview clickhouse serve [flags]
+agentsview replica clickhouse serve [flags]
 ```
 
 Accepts the same serve flags as [`pg serve`](/docs/pg-sync/#agentsview-pg-serve)
@@ -372,8 +503,29 @@ Activity report reads these instead of parsing usage JSON and scanning tool
 events on every request. The fill runs once per mirror, keeps the source tables
 unchanged, and resumes from the start if interrupted. Until it completes, a
 read-only serve role fails the compatibility check with a message naming the
-missing fill; run `agentsview clickhouse push` with a role that can create
-tables to finish it.
+missing fill; run `agentsview replica clickhouse push` with a role that can
+create tables to finish it.
+
+If `clickhouse serve` runs with a read-only role, upgrade the machine that
+pushes first, run `agentsview replica clickhouse push` once, then upgrade the
+machines that serve. This release adds the `session_plan_usage` table, which
+holds Codex Cloud plan usage, and the `usage_price_models` table, which lists
+the models stored usage prices cover. A read-only role cannot create them. Until
+a push creates them, an upgraded `clickhouse serve` with that role fails to
+start with "clickhouse mirror schema is missing session_plan_usage". A serve
+role that can create tables adds the tables itself at startup, so the order does
+not matter for it.
+
+#### Required system-table permissions
+
+Schema setup needs `SELECT ON system.projections` to inspect the prepared usage
+projections. This applies to `clickhouse push` and to `clickhouse serve` when
+its role can create tables. Without it, setup fails with
+`reading prepared usage projections` and an access-denied error. An
+administrator must run `GRANT SELECT ON system.projections TO <schema_user>`.
+For an XML-managed user, add `<query>GRANT SELECT ON system.projections</query>`
+to its `<grants>` and run `SYSTEM RELOAD USERS`. A read-only serve role does not
+need this grant; run a push with the schema-capable role first.
 
 The serve role also needs `GRANT SELECT ON system.parts`. The Activity report
 checks whether the mirror changed by hashing the active parts of its source
@@ -417,6 +569,7 @@ ______________________________________________________________________
 | `projects`           | Inclusive project filter                                              |
 | `exclude_projects`   | Exclusive project filter                                              |
 | `push_vectors`       | Run the vector phase on push; default `true`                          |
+| `push_batch_size`    | Sessions per push batch; default `100`                                |
 | `default_clickhouse` | Named target used when more than one `[clickhouse.NAME]` block exists |
 
 Environment overrides for the effective default target:
@@ -463,6 +616,32 @@ protocol, add `secure=true` to the URL (typical TLS port 9440). For HTTP, use an
 `allow_insecure` is set. Loopback (`127.0.0.1`, `localhost`) may stay plaintext
 or skip verification.
 
+### Connections and query threads
+
+Each agentsview process opens up to 12 ClickHouse connections, and each query
+uses at most 8 threads. The Analytics page sends 11 requests at once, so every
+panel's query can start right away, and the queries share the server's cores
+instead of each claiming one thread per core. `clickhouse serve` opens 4 more
+connections for the session list, sidebar filters, and single-session views,
+so page navigation never waits behind dashboard or Usage queries.
+
+To retune either limit, add a URL parameter:
+
+```toml
+[clickhouse]
+url = "clickhouse://user:pass@host:9440/agentsview?secure=true&max_open_conns=16&max_threads=4"
+```
+
+- `max_open_conns` sets the main pool size. The 4 page connections stay
+  fixed.
+- `max_threads` sets the per-query thread cap. `max_threads=0` restores the
+  ClickHouse server default, one thread per core.
+
+The best values depend on the server. A query thread costs more CPU when the
+data directory sits on network storage, so a host with slow storage or few
+cores may want fewer threads. The ClickHouse user must be allowed to change
+settings; a profile with `readonly=1` rejects them.
+
 ______________________________________________________________________
 
 ## Differences from PostgreSQL
@@ -498,3 +677,57 @@ The mirror is designed for MergeTree, not copied from PostgreSQL SQL.
   Putting `FINAL` in query text is rejected by this design.
 - **Lightweight deletes** need ClickHouse 23.3+; the integration suite pins
   `clickhouse/clickhouse-server:26.8`.
+- **Data directory on NFS.** ClickHouse cannot swap tables (`EXCHANGE TABLES`)
+  when its data directory is on a filesystem without atomic rename exchange,
+  such as NFS. The `prepare_usage` view needs that swap for every scheduled
+  refresh. The schema step detects this, logs
+  `this database cannot swap tables (EXCHANGE TABLES)`, drops the view, and
+  creates a `prepared_usage_rebuild_lock_<n>` table. To detect it, the schema
+  step tries one swap of two empty tables, and the server logs that failed
+  swap as an `UNSUPPORTED_METHOD` error. The schema step tries it once after
+  each server start and reuses the answer until the next restart. While that
+  lock table exists, a push rebuilds the prepared usage table itself before it
+  returns once a rebuild is due, and logs why and how long it took; the next
+  item says when a rebuild is due. A push that finds
+  another push rebuilding skips its rebuild and logs which lock that push
+  holds. The running rebuild checks once more after it publishes and rebuilds
+  again if the data that arrived meanwhile makes a rebuild due. A skipped or
+  failed rebuild does not fail the push: usage reads stay correct but slower
+  until a later rebuild succeeds, and the next push tries again. The mirror
+  database keeps one small lock table between pushes.
+- **Prepared usage rebuilds.** Usage reads stay exact while the prepared usage
+  table is behind: they compute the rows of sessions pushed since the last
+  rebuild themselves. A rebuild rewrites the whole table, so a push rebuilds it,
+  or starts the `prepare_usage` view's refresh, only when the table is empty,
+  prices changed, or the rows reads compute themselves reach one-fiftieth of the
+  stored rows. Other pushes write nothing to the table. Where the view exists,
+  its 15-minute schedule still refreshes the table. Rows of deleted sessions
+  stay in the table until the next rebuild; reads skip them.
+- **Lock of a stopped push.** A lock expires an hour after its push last renewed
+  it, so a push stopped mid-rebuild makes later pushes skip their rebuilds for
+  up to an hour. If the skip message names a held lock and you know no push is
+  running, end that wait by marking that lock released. Run this in the mirror
+  database:
+  `ALTER TABLE prepared_usage_rebuild_lock_<n> MODIFY COMMENT '{"status":"released"}'`.
+  A lock comment is JSON whose `status` is `held`, `released`, or `retired`.
+  If an edit leaves a comment that is not one of these, each push logs an
+  error and skips its rebuild, and the schema step fails. The error names the
+  lock and gives the statement above to repair it. Do not drop the lock table;
+  the next push would reuse its number. Leave a lock whose status is `retired`
+  alone.
+- **Moving off NFS.** The first schema step after the server restarts on the new
+  data directory checks again. Restarting the server is how to force a new
+  check. When it finds that the database can swap tables again, it creates a
+  new lock table with status `retired`, drops the older lock tables, and then
+  creates the `prepare_usage` view. Do not drop the retired lock: it stops a
+  push that started before the switch from overwriting the view's rows. If the
+  database later loses table swapping again, the schema step marks the retired
+  lock released, and pushes rebuild again.
+- **Half-finished switch.** If the schema step stops between retiring the lock
+  and creating the view, the next push creates the view. If the database can
+  no longer swap tables by then, the push releases the lock and rebuilds
+  instead.
+- **Missing view.** If a push logs that the `prepare_usage` view is missing,
+  usage reads stay correct but slower until it exists. Another client may be
+  recreating it. If the message repeats, restart agentsview; its schema step
+  recreates the view.

@@ -12,7 +12,7 @@ import (
 // ErrReplaceUnchanged reports a replacement whose messages already match the stored transcript.
 var ErrReplaceUnchanged = errors.New("replacement matches the stored transcript")
 
-// ReplaceSessionKeepingTrashedCopy replaces an active session's messages with write.Messages and, in the same transaction, keeps the previous version as a trashed copy under a new ID: its row, messages, tool calls, display name, and pins. It returns the copy's ID.
+// ReplaceSessionKeepingTrashedCopy replaces messages and keeps the previous row, messages, tools, name, and pins in Trash atomically; with KeepTrashedCopyOnlyOnPinLoss, it returns an empty ID when all pins survive.
 func (db *DB) ReplaceSessionKeepingTrashedCopy(
 	ctx context.Context, write SessionBatchWrite,
 ) (string, error) {
@@ -21,13 +21,17 @@ func (db *DB) ReplaceSessionKeepingTrashedCopy(
 	}
 	write.ReplaceMessages = true
 	write.RejectMessageCountDecrease = false
-	write = db.storageSessionBatchWrite(sanitizeSessionBatchWrite(write))
+	sanitized, err := sanitizeSessionBatchWriteContext(ctx, write)
+	if err != nil {
+		return "", err
+	}
+	write = db.storageSessionBatchWrite(sanitized)
 	id := write.Session.ID
 
 	// Writers hold db.mu, so the row read here matches the messages the transaction reads.
 	db.mu.Lock()
 	defer db.mu.Unlock()
-	src, err := db.getSessionFullUncoalesced(ctx, id)
+	src, err := db.GetArtifactExportSession(ctx, id)
 	if err != nil {
 		return "", err
 	}
@@ -68,45 +72,87 @@ func (db *DB) ReplaceSessionKeepingTrashedCopy(
 	if err != nil {
 		return "", err
 	}
-
-	copyID := replacedSessionCopyID(id, time.Now())
-	copyWrite := db.storageSessionBatchWrite(sessionCopyWrite(*src, copyID, stored))
-	copyWrite.UsageEvents = make([]UsageEvent, len(events))
-	for i, ev := range events {
-		ev.ID, ev.SessionID = 0, copyID
-		copyWrite.UsageEvents[i] = ev
-	}
-	// The batch writer replaces a session's usage events, so keep the stored ones unless the import supplies its own.
-	if len(write.UsageEvents) == 0 {
-		write.UsageEvents = events
-	}
-	if _, err := writeOneSessionBatchTx(
-		ctx, tx, ctxTx, copyWrite, &pending, db.usageOnlyStorage(),
-	); err != nil {
-		return "", fmt.Errorf("writing replaced session copy: %w", err)
-	}
-	if _, err := tx.ExecContext(ctx, `
-		UPDATE sessions
-		SET display_name = (SELECT display_name FROM sessions WHERE id = ?),
-		    deleted_at = strftime('%Y-%m-%dT%H:%M:%fZ','now'),
-		    local_modified_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
-		WHERE id = ?`, id, copyID,
-	); err != nil {
-		return "", fmt.Errorf("trashing replaced session copy: %w", err)
-	}
-	if err := copySessionPinsTx(ctx, tx, id, copyID); err != nil {
+	planUsage, err := sessionPlanUsageWithQuerier(ctx, tx, id)
+	if err != nil {
 		return "", err
 	}
 
-	if _, err := writeOneSessionBatchTx(
-		ctx, tx, ctxTx, write, &pending, db.usageOnlyStorage(),
+	// The batch writer replaces a session's usage events and plan usage, so keep the stored ones unless the import supplies its own.
+	if len(write.UsageEvents) == 0 {
+		write.UsageEvents = events
+	}
+	if write.PlanUsage == nil {
+		write.PlanUsage = planUsage
+	}
+	externalParent, err := loadSessionExternalParent(ctx, tx, id)
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return "", err
+	}
+	var pins []savedPin
+	if _, err := db.writeOneSessionBatchTx(
+		ctx, tx, ctxTx, write, &pending, db.usageOnlyStorage(), &pins,
 	); err != nil {
+		return "", err
+	}
+	pins = slices.DeleteFunc(pins, func(pin savedPin) bool { return pin.messageFound == 0 })
+	keepCopy := !write.KeepTrashedCopyOnlyOnPinLoss
+	if !keepCopy {
+		var restored int
+		if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM pinned_messages p JOIN messages m ON m.id = p.message_id WHERE p.session_id = ?`, id).Scan(&restored); err != nil {
+			return "", fmt.Errorf("counting restored pins: %w", err)
+		}
+		keepCopy = restored < len(pins)
+	}
+	copyID := ""
+	if keepCopy {
+		copyID = replacedSessionCopyID(id, time.Now())
+		copyWrite := db.storageSessionBatchWrite(sessionCopyWrite(*src, copyID, stored))
+		copyWrite.UsageEvents = make([]UsageEvent, len(events))
+		for i, ev := range events {
+			ev.ID, ev.SessionID = 0, copyID
+			copyWrite.UsageEvents[i] = ev
+		}
+		copyWrite.PlanUsage = planUsage
+		if _, err := db.writeOneSessionBatchTx(
+			ctx, tx, ctxTx, copyWrite, &pending, db.usageOnlyStorage(), nil,
+		); err != nil {
+			return "", fmt.Errorf("writing replaced session copy: %w", err)
+		}
+		if externalParent.SessionID != "" {
+			if _, err := tx.ExecContext(ctx, `
+				INSERT INTO session_external_parents (
+					session_id, parent_session_id, created_at, updated_at
+				) VALUES (?, ?, ?, ?)`, copyID, externalParent.ParentSessionID,
+				externalParent.CreatedAt, externalParent.UpdatedAt,
+			); err != nil {
+				return "", fmt.Errorf("copying replaced session parent: %w", err)
+			}
+		}
+		if _, err := tx.ExecContext(ctx, `
+		UPDATE sessions
+		SET display_name = ?,
+		    deleted_at = strftime('%Y-%m-%dT%H:%M:%fZ','now'),
+		    local_modified_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+		WHERE id = ?`, src.DisplayName, copyID,
+		); err != nil {
+			return "", fmt.Errorf("trashing replaced session copy: %w", err)
+		}
+		if err := copySessionPinsTx(ctx, tx, pins, copyID); err != nil {
+			return "", err
+		}
+	}
+
+	if _, err := linkSubagentSessionsForSessionsTx(ctx, tx, []string{id, copyID}); err != nil {
 		return "", err
 	}
 	if err := tx.Commit(); err != nil {
 		return "", fmt.Errorf("committing session replace: %w", err)
 	}
-	db.notifyUsageSessions([]string{copyID, id})
+	changed := []string{id}
+	if copyID != "" {
+		changed = append(changed, copyID)
+	}
+	db.notifyUsageSessions(changed)
 	pending.flush()
 	return copyID, nil
 }
@@ -139,16 +185,15 @@ func sessionCopyWrite(src Session, copyID string, msgs []Message) SessionBatchWr
 }
 
 // copySessionPinsTx copies pins to the message at the same ordinal in another session.
-func copySessionPinsTx(ctx context.Context, tx *sql.Tx, fromID, toID string) error {
-	if _, err := tx.ExecContext(ctx, `
+func copySessionPinsTx(ctx context.Context, tx *sql.Tx, pins []savedPin, toID string) error {
+	for _, pin := range pins {
+		if _, err := tx.ExecContext(ctx, `
 		INSERT INTO pinned_messages (session_id, message_id, ordinal, note, created_at)
-		SELECT ?, cm.id, cm.ordinal, p.note, p.created_at
-		FROM pinned_messages p
-		JOIN messages sm ON sm.id = p.message_id
-		JOIN messages cm ON cm.session_id = ? AND cm.ordinal = sm.ordinal
-		WHERE p.session_id = ?`, toID, toID, fromID,
-	); err != nil {
-		return fmt.Errorf("copying pins to %s: %w", toID, err)
+		SELECT ?, cm.id, cm.ordinal, ?, ? FROM messages cm
+		WHERE cm.session_id = ? AND cm.ordinal = ?`, toID, pin.note, pin.createdAt, toID, pin.ordinal,
+		); err != nil {
+			return fmt.Errorf("copying pins to %s: %w", toID, err)
+		}
 	}
 	return nil
 }

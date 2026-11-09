@@ -2,14 +2,20 @@ package clickhouse
 
 import (
 	"context"
+	"crypto/rand"
 	"crypto/sha256"
 	"database/sql"
 	"encoding/hex"
+	"encoding/json/v2"
 	"errors"
 	"fmt"
 	"log"
 	"slices"
 	"strings"
+	"sync"
+	"time"
+
+	chdriver "github.com/ClickHouse/clickhouse-go/v2"
 
 	"go.kenn.io/agentsview/internal/db"
 )
@@ -34,15 +40,11 @@ var usageColumns = []struct{ name, typ, expression string }{
 const usageMessageFields = `session_id, ordinal, timestamp, model, provider_id,
 	claude_message_id, claude_request_id, source_uuid, push_version`
 
+// usageMessagesOrderBy is the replacement key of usage_messages, the same key
+// as messages, since the view writes one row per message.
+var usageMessagesOrderBy = []string{"session_id", "ordinal"}
+
 func ensureUsageMessages(ctx context.Context, conn *sql.DB) error {
-	const marker = "usage_messages_backfill"
-	metadata, err := readMetadata(ctx, conn, marker)
-	if err != nil {
-		return err
-	}
-	if metadata[marker] == "1" {
-		return nil
-	}
 	columns := []string{
 		"session_id String", "ordinal Int64", "timestamp Nullable(DateTime64(6, 'UTC'))",
 		"model String", "provider_id String", "claude_message_id String",
@@ -57,17 +59,27 @@ func ensureUsageMessages(ctx context.Context, conn *sql.DB) error {
 	// The low bit makes a live insert beat a concurrent, older backfill of
 	// the same push version. UInt128 preserves every possible UInt64 version.
 	columns = append(columns, "revision UInt128", "INDEX usage_time timestamp TYPE minmax GRANULARITY 1")
-	queries := []string{
-		"CREATE TABLE IF NOT EXISTS usage_messages (" + strings.Join(columns, ", ") + `)
-		 ENGINE = ReplacingMergeTree(revision) ORDER BY (session_id, ordinal)
-		 SETTINGS index_granularity = 64`,
-		"CREATE MATERIALIZED VIEW IF NOT EXISTS usage_messages_mv TO usage_messages AS SELECT " +
-			selection + ", toUInt128(push_version) * 2 + 1 AS revision FROM messages",
+	if _, err := conn.ExecContext(ctx, "CREATE TABLE IF NOT EXISTS usage_messages ("+strings.Join(columns, ", ")+`)
+		 ENGINE = ReplacingMergeTree(revision) ORDER BY (`+strings.Join(usageMessagesOrderBy, ", ")+`)
+		 SETTINGS index_granularity = 64`); err != nil {
+		return fmt.Errorf("creating stored usage messages: %w", err)
 	}
-	for _, query := range queries {
-		if _, err := conn.ExecContext(ctx, query); err != nil {
-			return fmt.Errorf("creating stored usage messages: %w", err)
-		}
+	// Mirrors from before the view computed the counters read them from
+	// stored columns of messages that the code no longer creates.
+	if err := ensureView(ctx, conn, mirrorView{
+		name:    "usage_messages_mv",
+		clauses: "TO usage_messages",
+		query:   "SELECT " + selection + ", toUInt128(push_version) * 2 + 1 AS revision FROM messages",
+	}); err != nil {
+		return err
+	}
+	const marker = "usage_messages_backfill"
+	metadata, err := readMetadata(ctx, conn, marker)
+	if err != nil {
+		return err
+	}
+	if metadata[marker] == "1" {
+		return nil
 	}
 	log.Print("ClickHouse: filling usage messages before serving; source messages remain unchanged")
 	if _, err := conn.ExecContext(ctx, "INSERT INTO usage_messages SELECT "+selection+
@@ -166,9 +178,149 @@ const chPreparedUsageKeyColumn = "ts_key"
 
 const chPreparedUsageSortingKey = chPreparedUsageKeyColumn + ", session_id"
 
-// chPreparedUsageRefresh is the scheduled rebuild. Every push also starts a
-// refresh, so the schedule only covers a trigger that failed.
+// chPreparedUsageRefresh is the scheduled rebuild. A push also starts a
+// refresh once enough has changed; see preparedUsageRebuildDue.
 const chPreparedUsageRefresh = "EVERY 15 MINUTE"
+
+// chPreparedUsageBehindShare decides when a push rebuilds prepared_usage or
+// starts the view's refresh. Reads stay exact while the table is behind:
+// they prepare the rows of the sessions pushed since the last rebuild
+// themselves. Those rows cost each read time, and a rebuild rewrites the
+// whole table, so a push rebuilds once the rows reads prepare reach one
+// chPreparedUsageBehindShare of the stored rows. A rebuild then rewrites at
+// most that many times the rows that changed, and reads prepare at most that
+// share of what they read. On a 300,000-row test table, a 5,000-row delta
+// added about 0.13 seconds to the first read after a push.
+const chPreparedUsageBehindShare = 50
+
+// chPreparedUsageRefreshSettings apply to every query that fills
+// prepared_usage, whether the view runs it or a push does.
+const chPreparedUsageRefreshSettings = "final=1,max_threads=4"
+
+// chPreparedUsageBuildPrefix names the tables a push fills before it moves
+// their rows into prepared_usage. Each carries the number of the rebuild
+// lock its push holds; see rebuildPreparedUsage.
+const chPreparedUsageBuildPrefix = "prepared_usage_build_"
+
+// chPreparedUsageRebuildLockPrefix names the numbered tables that lock
+// prepared_usage rebuilds; see acquireRebuildLock.
+const chPreparedUsageRebuildLockPrefix = "prepared_usage_rebuild_lock_"
+
+// chPreparedUsageRebuildLockPattern and chPreparedUsageBuildPattern match
+// the names of the rebuild lock and build tables; chTableNumberSQL reads
+// their numbers.
+const (
+	chPreparedUsageRebuildLockPattern = "^" + chPreparedUsageRebuildLockPrefix + "[0-9]+$"
+	chPreparedUsageBuildPattern       = "^" + chPreparedUsageBuildPrefix + "[0-9]+$"
+)
+
+// chTableNumberSQL reads the number at the end of a table's name.
+const chTableNumberSQL = "toUInt64OrZero(extract(name, '([0-9]+)$'))"
+
+// chRebuildLockTimeout is how long a rebuild lock lasts after its holder
+// last renewed it. After that, another push treats the holder as stopped and
+// takes the next lock. A rebuilding push renews its lock every
+// chRebuildLockRenewal.
+const (
+	chRebuildLockTimeout = time.Hour
+	chRebuildLockRenewal = 10 * time.Minute
+)
+
+// rebuildLockState is the state of one rebuild lock. It lives as JSON in
+// the lock table's comment, which ClickHouse changes atomically, including
+// on NFS.
+type rebuildLockState struct {
+	Status rebuildLockStatus `json:"status"`
+	// RenewedAt is the ClickHouse server's Unix time when the holder last
+	// renewed a held lock, so every client compares it with one clock.
+	RenewedAt int64 `json:"renewed_at,omitzero"`
+}
+
+type rebuildLockStatus string
+
+const (
+	rebuildLockHeld     rebuildLockStatus = "held"
+	rebuildLockReleased rebuildLockStatus = "released"
+	// rebuildLockRetired marks the newest lock of a database whose view
+	// refreshes prepared_usage, so no push takes the lock; see
+	// retireRebuildLocks.
+	rebuildLockRetired rebuildLockStatus = "retired"
+)
+
+// commentSQL returns the state as a quoted SQL string for COMMENT clauses.
+func (s rebuildLockState) commentSQL() string {
+	encoded, err := json.Marshal(s)
+	if err != nil {
+		// A struct of a string and an integer always encodes.
+		panic(fmt.Sprintf("encoding prepared usage rebuild lock state: %v", err))
+	}
+	return chSQLString(string(encoded))
+}
+
+// parseRebuildLockState reads the state of the lock table of generation
+// from its comment. Only a manual edit can make the comment unreadable, so
+// the error names the table and the statement that repairs it.
+func parseRebuildLockState(generation uint64, comment string) (rebuildLockState, error) {
+	var state rebuildLockState
+	err := json.Unmarshal([]byte(comment), &state)
+	if err == nil {
+		switch state.Status {
+		case rebuildLockHeld, rebuildLockReleased, rebuildLockRetired:
+			return state, nil
+		}
+		err = fmt.Errorf("unknown status %q", state.Status)
+	}
+	lock := fmt.Sprintf("%s%d", chPreparedUsageRebuildLockPrefix, generation)
+	// The statement comes last so it can be copied from the log as is.
+	return rebuildLockState{}, fmt.Errorf("prepared usage rebuild lock %s has comment %q, which is not a lock "+
+		"state (%w); repair it in the mirror database with: ALTER TABLE %s MODIFY COMMENT %s",
+		lock, comment, err, lock, rebuildLockState{Status: rebuildLockReleased}.commentSQL())
+}
+
+// createRebuildLock creates the lock table of generation with state.
+// CREATE TABLE fails when the name exists, which is what makes taking a
+// lock atomic.
+func createRebuildLock(ctx context.Context, conn *sql.DB, generation uint64, state rebuildLockState) error {
+	_, err := conn.ExecContext(ctx, fmt.Sprintf("CREATE TABLE %s%d (x UInt8) ENGINE = Memory COMMENT %s",
+		chPreparedUsageRebuildLockPrefix, generation, state.commentSQL()))
+	return err
+}
+
+// setRebuildLock replaces the state of the lock table of generation.
+func setRebuildLock(ctx context.Context, conn *sql.DB, generation uint64, state rebuildLockState) error {
+	_, err := conn.ExecContext(ctx, fmt.Sprintf("ALTER TABLE %s%d MODIFY COMMENT %s",
+		chPreparedUsageRebuildLockPrefix, generation, state.commentSQL()))
+	return err
+}
+
+// chNoLockSkipMessage explains why a push without the view skips its
+// rebuild when the database has no rebuild lock: only the schema step of a
+// database that cannot swap tables creates one; see openRebuildLocks.
+const chNoLockSkipMessage = "clickhouse push: the prepare_usage view is missing. Usage reads are slower " +
+	"until it exists. Another client may be recreating it. If this message repeats, restart agentsview " +
+	"to recreate it."
+
+// chRetiredSkipMessage explains why a push skips its rebuild once the
+// newest rebuild lock is retired.
+const chRetiredSkipMessage = "clickhouse push: skipping the prepared usage rebuild: this database can swap " +
+	"tables again, so the prepare_usage view's scheduled refresh keeps prepared usage current"
+
+// chExchangeProbePrefix names the scratch tables chExchangeSupported
+// exchanges.
+const chExchangeProbePrefix = "agentsview_exchange_probe_"
+
+// chExchangeProbeKey is the sync_metadata key that records the last table
+// exchange probe as a chExchangeProbe.
+const chExchangeProbeKey = "agentsview_table_exchange_probe"
+
+// chExchangeProbe is the answer of a table exchange probe, the serverUUID()
+// of the server that ran it, and the server time, in Unix seconds, at which
+// it started.
+type chExchangeProbe struct {
+	ProbedAt  int64  `json:"probed_at"`
+	Server    string `json:"server"`
+	Supported bool   `json:"supported"`
+}
 
 // chSnapshotStampSQL identifies the complete snapshot set as a row count and
 // a sum of per-row hashes, so any republished or deleted session changes it.
@@ -392,13 +544,12 @@ func ensurePreparedUsageProjections(ctx context.Context, conn *sql.DB) (err erro
 	if len(missing) == 0 {
 		return nil
 	}
-	var hasView uint8
-	if err := conn.QueryRowContext(ctx, `SELECT count() > 0 FROM system.tables
-		WHERE database = currentDatabase() AND name = 'prepare_usage'`).Scan(&hasView); err != nil {
-		return fmt.Errorf("checking prepared usage view: %w", err)
+	hasView, err := preparedUsageViewExists(ctx, conn)
+	if err != nil {
+		return err
 	}
 	queries := missing
-	if hasView != 0 {
+	if hasView {
 		if _, err := conn.ExecContext(ctx, "SYSTEM STOP VIEW prepare_usage"); err != nil {
 			return fmt.Errorf("stopping prepared usage refresh: %w", err)
 		}
@@ -432,26 +583,14 @@ func ensurePreparedUsage(ctx context.Context, conn *sql.DB) error {
 	if err == nil && rebuild {
 		// The table is derived from the snapshots, so replacing it loses
 		// nothing; the next refresh fills it, and reads use the raw rows
-		// until it has. Stop the refresh first so it cannot block the drop.
-		// An earlier rebuild may have dropped the view and stopped before
-		// the table, so stop it only when it exists.
+		// until it has. Drop the view first so a refresh cannot block the
+		// drop of the table.
 		log.Print("ClickHouse: rebuilding prepared usage for the current refresh query")
-		var hasView uint8
-		if err := conn.QueryRowContext(ctx, `SELECT count() > 0 FROM system.tables
-			WHERE database = currentDatabase() AND name = 'prepare_usage'`).Scan(&hasView); err != nil {
-			return fmt.Errorf("checking prepared usage view: %w", err)
+		if err := dropPreparedUsageView(ctx, conn); err != nil {
+			return err
 		}
-		queries := []string{
-			"DROP VIEW IF EXISTS prepare_usage SYNC",
-			"DROP TABLE IF EXISTS prepared_usage SYNC",
-		}
-		if hasView != 0 {
-			queries = append([]string{"SYSTEM STOP VIEW prepare_usage"}, queries...)
-		}
-		for _, query := range queries {
-			if _, err := conn.ExecContext(ctx, query); err != nil {
-				return fmt.Errorf("replacing prepared usage: %w", err)
-			}
+		if _, err := conn.ExecContext(ctx, "DROP TABLE IF EXISTS prepared_usage SYNC"); err != nil {
+			return fmt.Errorf("replacing prepared usage: %w", err)
 		}
 	}
 	if _, err := conn.ExecContext(ctx, `CREATE TABLE IF NOT EXISTS prepared_usage ENGINE=MergeTree
@@ -462,15 +601,709 @@ func ensurePreparedUsage(ctx context.Context, conn *sql.DB) error {
 	if err := ensurePreparedUsageProjections(ctx, conn); err != nil {
 		return err
 	}
-	if _, err := conn.ExecContext(ctx, `CREATE MATERIALIZED VIEW IF NOT EXISTS prepare_usage REFRESH `+chPreparedUsageRefresh+`
-		TO prepared_usage EMPTY AS `+prepared+" SETTINGS final=1,max_threads=4"); err != nil {
-		return fmt.Errorf("creating prepared usage: %w", err)
+	exchange, err := chExchangeSupportedSinceStart(ctx, conn)
+	if err != nil {
+		return err
+	}
+	if !exchange {
+		// Every refresh of the view would fail at its exchange, so each
+		// push rebuilds the table instead, including the push that runs
+		// this schema step.
+		log.Print("ClickHouse: this database cannot swap tables (EXCHANGE TABLES), usually because its data " +
+			"directory is on NFS; each push rebuilds prepared usage itself instead of the prepare_usage view's " +
+			"scheduled refresh")
+		// Release a retired lock before dropping the view, so a push that
+		// finds no view rebuilds; see refreshPreparedUsage for the gap a
+		// replaced prepared_usage leaves.
+		if err := openRebuildLocks(ctx, conn); err != nil {
+			return err
+		}
+		return dropPreparedUsageView(ctx, conn)
+	}
+	// Fence off rebuilds before the view exists, so none can publish after
+	// a view refresh: a rebuild that already took a lock finds the retired
+	// lock newer than its own, and dropping its build table waits for a
+	// publish already running and fails a later one. A push that tries to
+	// take the lock from here on finds it retired; see acquireRebuildLock.
+	// A push rebuilds only while a lock exists, so a database with no lock
+	// has no rebuild to fence.
+	if err := retireRebuildLocks(ctx, conn); err != nil {
+		return fmt.Errorf("switching prepared usage to scheduled refresh: %w", err)
+	}
+	if err := createPreparedUsageView(ctx, conn); err != nil {
+		return err
 	}
 	// A new table serves reads only once filled; start that now rather
 	// than after the schedule or the next push.
 	if rebuild {
 		if _, err := conn.ExecContext(ctx, "SYSTEM REFRESH VIEW prepare_usage"); err != nil {
 			return fmt.Errorf("filling prepared usage: %w", err)
+		}
+	}
+	return nil
+}
+
+// createPreparedUsageView creates the view that refreshes prepared_usage
+// on the server. It leaves the table empty until the first refresh.
+//
+// The prepared_usage comment covers the refresh schedule and query, and a
+// change to either drops the view with the table. The view's own check also
+// covers the refresh settings.
+func createPreparedUsageView(ctx context.Context, conn *sql.DB) error {
+	return ensureView(ctx, conn, mirrorView{
+		name:    "prepare_usage",
+		clauses: "REFRESH " + chPreparedUsageRefresh + " TO prepared_usage EMPTY",
+		query:   chPreparedUsageQuery() + " SETTINGS " + chPreparedUsageRefreshSettings,
+	})
+}
+
+func preparedUsageViewExists(ctx context.Context, conn *sql.DB) (bool, error) {
+	var hasView uint8
+	if err := conn.QueryRowContext(ctx, `SELECT count() > 0 FROM system.tables
+		WHERE database = currentDatabase() AND name = 'prepare_usage'`).Scan(&hasView); err != nil {
+		return false, fmt.Errorf("checking prepared usage view: %w", err)
+	}
+	return hasView != 0, nil
+}
+
+// dropPreparedUsageView drops the view that refreshes prepared_usage. It
+// stops the refresh first so a running one cannot block the drop; an earlier
+// rebuild may have dropped the view already, so it is stopped only when it
+// exists.
+func dropPreparedUsageView(ctx context.Context, conn *sql.DB) error {
+	hasView, err := preparedUsageViewExists(ctx, conn)
+	if err != nil {
+		return err
+	}
+	queries := []string{"DROP VIEW IF EXISTS prepare_usage SYNC"}
+	if hasView {
+		queries = append([]string{"SYSTEM STOP VIEW prepare_usage"}, queries...)
+	}
+	for _, query := range queries {
+		if _, err := conn.ExecContext(ctx, query); err != nil {
+			return fmt.Errorf("dropping prepared usage view: %w", err)
+		}
+	}
+	return nil
+}
+
+// chExchangeSupportedSinceStart returns chExchangeSupported's answer and
+// probes at most once per server start. A failed probe logs an
+// UNSUPPORTED_METHOD error on the server, and a push watch runs the schema
+// step before every push. The answer depends on the filesystem that holds the
+// server's metadata directory, which changes only across a restart, so an
+// answer this server probed since it started still holds. An answer probed
+// before then is probed again. So is one from another server: RESTORE runs on
+// a live server and can copy in an answer newer than this server's start.
+func chExchangeSupportedSinceStart(ctx context.Context, conn *sql.DB) (bool, error) {
+	// A probe takes milliseconds, so probe tables an hour old belong to a
+	// push that was killed during one. A stored answer skips the probe until
+	// the next restart, so they are dropped here rather than in the probe.
+	if err := dropTables(ctx, conn, "match(name, ?) AND metadata_modification_time <= now() - INTERVAL 1 HOUR",
+		"^"+chExchangeProbePrefix+"[a-z0-9]+_[ab]$"); err != nil {
+		return false, err
+	}
+	// now() and uptime() count whole seconds, so the computed start can be
+	// one second after the start's own second, and a probe from that second
+	// would look older than the start. A probe up to a second before the
+	// computed start therefore counts as current. Trusting a stale answer
+	// would take a probe, a restart, and a move of the data directory within
+	// two seconds.
+	var now, started int64
+	var server string
+	if err := conn.QueryRowContext(ctx,
+		"SELECT toUnixTimestamp(now()) AS t, t - uptime(), toString(serverUUID())").Scan(&now, &started, &server); err != nil {
+		return false, fmt.Errorf("reading server identity and start time: %w", err)
+	}
+	stored, err := readMetadata(ctx, conn, chExchangeProbeKey)
+	if err != nil {
+		return false, err
+	}
+	if value, ok := stored[chExchangeProbeKey]; ok {
+		// The probe can always run again, so an unreadable record is replaced
+		// rather than failing the schema step.
+		var probe chExchangeProbe
+		switch err := json.Unmarshal([]byte(value), &probe); {
+		case err != nil:
+			log.Printf("ClickHouse: the saved table swap check in sync_metadata could not be read, "+
+				"so it will run again: %v (stored value %q)", err, value)
+		case probe.Server == server && probe.ProbedAt >= started-1:
+			return probe.Supported, nil
+		}
+	}
+	supported, err := chExchangeSupported(ctx, conn)
+	if err != nil {
+		return false, err
+	}
+	value, err := json.Marshal(chExchangeProbe{ProbedAt: now, Server: server, Supported: supported})
+	if err != nil {
+		return false, fmt.Errorf("encoding table exchange probe: %w", err)
+	}
+	if err := writeMetadata(ctx, conn, map[string]string{chExchangeProbeKey: string(value)}); err != nil {
+		return false, err
+	}
+	return supported, nil
+}
+
+// chExchangeSupported reports whether the mirror database can exchange two
+// tables. A refreshable view that replaces its target ends every refresh
+// with EXCHANGE TABLES, which ClickHouse runs as a renameat2 call with the
+// RENAME_EXCHANGE flag on the database's metadata files and no fallback. A
+// filesystem without that flag, such as NFS, fails it with
+// UNSUPPORTED_METHOD. The probe exchanges two empty tables in the same
+// database, so it renames files in the same metadata directory a refresh
+// does; where the tables keep their data does not matter.
+func chExchangeSupported(ctx context.Context, conn *sql.DB) (supported bool, err error) {
+	probe := chExchangeProbePrefix + strings.ToLower(rand.Text())
+	tables := []string{probe + "_a", probe + "_b"}
+	defer func() {
+		for _, table := range tables {
+			if _, dropErr := conn.ExecContext(context.WithoutCancel(ctx), "DROP TABLE IF EXISTS "+table+" SYNC"); dropErr != nil {
+				err = errors.Join(err, fmt.Errorf("dropping table exchange probe: %w", dropErr))
+			}
+		}
+	}()
+	for _, table := range tables {
+		if _, err := conn.ExecContext(ctx, "CREATE TABLE "+table+" (x UInt8) ENGINE = Memory"); err != nil {
+			return false, fmt.Errorf("creating table exchange probe: %w", err)
+		}
+	}
+	_, err = conn.ExecContext(ctx, "EXCHANGE TABLES "+tables[0]+" AND "+tables[1])
+	if ex, ok := errors.AsType[*chdriver.Exception](err); ok && ex.Code == codeUnsupportedMethod {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("probing table exchange: %w", err)
+	}
+	return true, nil
+}
+
+// refreshPreparedUsage brings prepared_usage up to date after a push once a
+// rebuild is due; see preparedUsageRebuildDue. Where the view exists, it
+// starts the view's refresh, which runs on the server. Where the schema step
+// found that the database cannot swap tables, it dropped the view and left a
+// rebuild lock, and the push rebuilds the table before it returns.
+func refreshPreparedUsage(ctx context.Context, conn *sql.DB) error {
+	hasView, err := preparedUsageViewExists(ctx, conn)
+	if err != nil {
+		return err
+	}
+	if !hasView {
+		locks, _, state, err := newestRebuildLock(ctx, conn)
+		if err != nil {
+			return err
+		}
+		switch {
+		case locks == 0:
+			log.Print(chNoLockSkipMessage)
+			return nil
+		case state.Status == rebuildLockRetired:
+			// A schema step that replaces prepared_usage drops the view
+			// first. If the database also lost its swap support, the step
+			// releases the retired lock only afterwards, so this push may
+			// see that gap rather than a switch that stopped halfway.
+			// Creating the view then would leave every refresh failing
+			// until the next schema step.
+			exchange, err := chExchangeSupportedSinceStart(ctx, conn)
+			if err != nil {
+				return err
+			}
+			if exchange {
+				if err := finishScheduledRefreshSwitch(ctx, conn); err != nil {
+					return fmt.Errorf("finishing the switch to the prepare_usage view (the next push retries): %w", err)
+				}
+				return nil
+			}
+			if err := openRebuildLocks(ctx, conn); err != nil {
+				return err
+			}
+		}
+		if err := rebuildPreparedUsage(ctx, conn); err != nil {
+			return fmt.Errorf("rebuilding prepared usage (the next push retries): %w", err)
+		}
+		return nil
+	}
+	due, reason, err := preparedUsageRebuildDue(ctx, conn)
+	if err != nil || !due {
+		return err
+	}
+	log.Printf("clickhouse push: starting prepared usage refresh: %s", reason)
+	if _, err := conn.ExecContext(ctx, "SYSTEM REFRESH VIEW prepare_usage"); err != nil {
+		return fmt.Errorf("starting prepared usage refresh (the next scheduled refresh retries): %w", err)
+	}
+	return nil
+}
+
+// finishScheduledRefreshSwitch completes a switch to the view that a schema
+// step started but did not finish: it retired the rebuild locks, then
+// stopped before it created the view, so no push rebuilds and nothing
+// refreshes. Retiring again drops any build table the schema step left
+// behind before the view can refresh.
+func finishScheduledRefreshSwitch(ctx context.Context, conn *sql.DB) error {
+	log.Print("clickhouse push: finishing the switch of prepared usage to the prepare_usage view's scheduled refresh")
+	if err := retireRebuildLocks(ctx, conn); err != nil {
+		return err
+	}
+	if err := createPreparedUsageView(ctx, conn); err != nil {
+		return err
+	}
+	if _, err := conn.ExecContext(ctx, "SYSTEM REFRESH VIEW prepare_usage"); err != nil {
+		return fmt.Errorf("filling prepared usage: %w", err)
+	}
+	return nil
+}
+
+// rebuildPreparedUsage refreshes prepared_usage without exchanging tables.
+// It runs the view's query into a new build table, then moves the build
+// table's parts into prepared_usage with REPLACE PARTITION, which swaps all
+// of the table's parts at once. Readers therefore see either the previous
+// rows or the new ones, each with the stamp of the snapshots they were
+// derived from.
+//
+// Rebuilds take turns, as the view's refreshes do. A read checks freshness
+// and fetches rows in separate queries, so a build that read older snapshots
+// must not replace a newer one between them: the read would trust the newer
+// stamp and serve the older rows. A push that finds another rebuild running
+// skips its own. The running rebuild checks once more after it publishes and
+// rebuilds again when the snapshots that arrived meanwhile make a rebuild due,
+// as the view queues one more refresh for a request that arrives during a
+// refresh.
+func rebuildPreparedUsage(ctx context.Context, conn *sql.DB) (err error) {
+	due, _, err := preparedUsageRebuildDue(ctx, conn)
+	if err != nil || !due {
+		return err
+	}
+	generation, acquired, err := acquireRebuildLock(ctx, conn)
+	if acquired {
+		defer func() {
+			err = errors.Join(err, releaseRebuildLock(context.WithoutCancel(ctx), conn, generation))
+		}()
+	}
+	if err != nil || !acquired {
+		return err
+	}
+	// Deferred after the release, so this runs first: a renewal must not
+	// mark the lock held again after its release.
+	renewCtx, stopRenewing := context.WithCancel(ctx)
+	var renewing sync.WaitGroup
+	renewing.Go(func() { keepRebuildLock(renewCtx, conn, generation) })
+	defer func() {
+		stopRenewing()
+		renewing.Wait()
+	}()
+	// Only a lock holder creates a build table, so a build table with a
+	// lower number belongs to a push that was stopped or lost its lock.
+	// Dropping it fences that push off: a publish already reading the table
+	// holds it, so DROP ... SYNC waits for the publish to finish before this
+	// rebuild starts, and a later publish fails for lack of its table. Either
+	// way the older rows never land after this rebuild's rows. A build table
+	// with a higher number belongs to a successor and is left alone.
+	if err := dropTables(ctx, conn, "match(name, ?) AND "+chTableNumberSQL+" < ?",
+		chPreparedUsageBuildPattern, generation); err != nil {
+		return err
+	}
+	// The first pass checks again because the previous holder may have
+	// published these snapshots while this push waited for the lock.
+	for pass := range 3 {
+		due, reason, err := preparedUsageRebuildDue(ctx, conn)
+		if err != nil || !due {
+			return err
+		}
+		switch pass {
+		case 1:
+			log.Print("clickhouse push: another push changed sessions or prices during the rebuild; rebuilding prepared usage once more")
+		case 2:
+			log.Print("clickhouse push: another push changed sessions or prices during the second rebuild; " +
+				"usage reads compute those sessions directly, which is slower, until the next push rebuilds prepared usage")
+			return nil
+		}
+		if err := publishPreparedUsageBuild(ctx, conn, generation, reason); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// publishPreparedUsageBuild fills the build table of the lock generation
+// with the view's query and moves its parts into prepared_usage. The reason
+// says why the rebuild is due, for the log.
+func publishPreparedUsageBuild(ctx context.Context, conn *sql.DB, generation uint64, reason string) (err error) {
+	log.Printf("clickhouse push: rebuilding prepared usage: %s", reason)
+	started := time.Now()
+	build := fmt.Sprintf("%s%d", chPreparedUsageBuildPrefix, generation)
+	if _, err := conn.ExecContext(ctx, "CREATE TABLE "+build+" AS prepared_usage"); err != nil {
+		return fmt.Errorf("creating prepared usage build table: %w", err)
+	}
+	defer func() {
+		if _, dropErr := conn.ExecContext(context.WithoutCancel(ctx), "DROP TABLE IF EXISTS "+build+" SYNC"); dropErr != nil {
+			err = errors.Join(err, fmt.Errorf("dropping prepared usage build table: %w", dropErr))
+		}
+	}()
+	// The build table copies prepared_usage, whose columns were created
+	// from this query, so the columns match by position.
+	if _, err := conn.ExecContext(ctx, "INSERT INTO "+build+" "+chPreparedUsageQuery()+
+		" SETTINGS "+chPreparedUsageRefreshSettings); err != nil {
+		return supersededBuildError(ctx, conn, build, fmt.Errorf("filling prepared usage build table: %w", err))
+	}
+	// A push whose lock expired may have lost it to a newer rebuild before
+	// it created its build table, which that rebuild's drop then missed. If
+	// the takeover comes after this check instead, the new holder drops the
+	// build table and fences the publish off.
+	superseded, err := rebuildLockSuperseded(ctx, conn, generation)
+	if err != nil {
+		return err
+	}
+	if superseded {
+		return errRebuildSuperseded
+	}
+	if _, err := conn.ExecContext(ctx, "ALTER TABLE prepared_usage REPLACE PARTITION tuple() FROM "+build); err != nil {
+		return supersededBuildError(ctx, conn, build, fmt.Errorf("replacing prepared usage rows: %w", err))
+	}
+	log.Printf("clickhouse push: rebuilt prepared usage in %s", time.Since(started).Round(time.Millisecond))
+	return nil
+}
+
+// errRebuildSuperseded reports a rebuild that a newer rebuild took over
+// from after this one outlasted its lock.
+var errRebuildSuperseded = errors.New("a newer rebuild took over; discarding this build")
+
+// supersededBuildError returns errRebuildSuperseded when err comes from a
+// missing table and the build table is gone, which means a newer rebuild
+// took over and dropped it. Otherwise it returns err.
+func supersededBuildError(ctx context.Context, conn *sql.DB, build string, err error) error {
+	if !isMissingTableError(err) {
+		return err
+	}
+	var exists uint8
+	if checkErr := conn.QueryRowContext(context.WithoutCancel(ctx), `SELECT count() > 0 FROM system.tables
+		WHERE database = currentDatabase() AND name = ?`, build).Scan(&exists); checkErr != nil || exists != 0 {
+		return errors.Join(err, checkErr)
+	}
+	return errRebuildSuperseded
+}
+
+// keepRebuildLock renews the lock generation every chRebuildLockRenewal
+// until ctx ends, so a rebuild that runs longer than chRebuildLockTimeout
+// keeps its lock. It stops when the lock is gone, which means a newer
+// holder took over.
+func keepRebuildLock(ctx context.Context, conn *sql.DB, generation uint64) {
+	ticker := time.NewTicker(chRebuildLockRenewal)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
+		err := renewRebuildLock(ctx, conn, generation)
+		if isMissingTableError(err) {
+			return
+		}
+		if err != nil && ctx.Err() == nil {
+			log.Printf("clickhouse push: renewing prepared usage rebuild lock: %v", err)
+		}
+	}
+}
+
+// renewRebuildLock marks the lock generation held as of the server's
+// current time.
+func renewRebuildLock(ctx context.Context, conn *sql.DB, generation uint64) error {
+	var now int64
+	if err := conn.QueryRowContext(ctx, "SELECT toUnixTimestamp(now())").Scan(&now); err != nil {
+		return fmt.Errorf("reading server time: %w", err)
+	}
+	return setRebuildLock(ctx, conn, generation, rebuildLockState{Status: rebuildLockHeld, RenewedAt: now})
+}
+
+// acquireRebuildLock takes the next prepared usage rebuild lock. The locks
+// are tables numbered in the order pushes took them, and the newest one
+// decides: it is held until its holder marks it released in its comment, or
+// until its holder has not renewed it for chRebuildLockTimeout. A database
+// with no lock, or whose newest lock is retired, refreshes prepared_usage
+// with its view, and no push rebuilds it. To take the lock, a push creates
+// the table with the next number. CREATE TABLE fails when the name
+// exists, so of two pushes that read the same newest lock only one gets the
+// next number. Numbers never repeat, so a push that lost its lock cannot
+// release or outrank its successor. The new holder drops every older lock,
+// and the newest lock stays after release to keep the numbers rising, so one
+// lock table remains between rebuilds.
+func acquireRebuildLock(ctx context.Context, conn *sql.DB) (generation uint64, acquired bool, err error) {
+	var now int64
+	if err := conn.QueryRowContext(ctx, "SELECT toUnixTimestamp(now())").Scan(&now); err != nil {
+		return 0, false, fmt.Errorf("reading server time: %w", err)
+	}
+	rows, err := conn.QueryContext(ctx, `SELECT `+chTableNumberSQL+` AS generation, comment
+		FROM system.tables WHERE database = currentDatabase() AND match(name, ?)
+		ORDER BY generation`, chPreparedUsageRebuildLockPattern)
+	if err != nil {
+		return 0, false, fmt.Errorf("reading prepared usage rebuild locks: %w", err)
+	}
+	defer rows.Close()
+	var generations []uint64
+	var comment string
+	for rows.Next() {
+		var g uint64
+		if err := rows.Scan(&g, &comment); err != nil {
+			return 0, false, fmt.Errorf("scanning prepared usage rebuild lock: %w", err)
+		}
+		generations = append(generations, g)
+	}
+	if err := rows.Err(); err != nil {
+		return 0, false, fmt.Errorf("reading prepared usage rebuild locks: %w", err)
+	}
+	if len(generations) == 0 {
+		log.Print(chNoLockSkipMessage)
+		return 0, false, nil
+	}
+	newest, err := parseRebuildLockState(generations[len(generations)-1], comment)
+	if err != nil {
+		return 0, false, err
+	}
+	if newest.Status == rebuildLockRetired {
+		log.Print(chRetiredSkipMessage)
+		return 0, false, nil
+	}
+	if newest.Status == rebuildLockHeld && now-newest.RenewedAt < int64(chRebuildLockTimeout/time.Second) {
+		log.Printf("clickhouse push: skipping the prepared usage rebuild: another push holds %s%d "+
+			"(last renewed %s); usage reads are slower until that push finishes, or for an hour after "+
+			"its last renewal if it stopped; see \"Lock of a stopped push\" in the ClickHouse sync guide",
+			chPreparedUsageRebuildLockPrefix, generations[len(generations)-1],
+			time.Unix(newest.RenewedAt, 0).Format(time.RFC3339))
+		return 0, false, nil
+	}
+	generation = generations[len(generations)-1]
+	generation++
+	acquired, err = takeRebuildLock(ctx, conn, generation, now)
+	if err != nil || !acquired {
+		return 0, false, err
+	}
+	for _, g := range generations {
+		if _, err := conn.ExecContext(ctx, fmt.Sprintf("DROP TABLE IF EXISTS %s%d SYNC", chPreparedUsageRebuildLockPrefix, g)); err != nil {
+			return generation, true, fmt.Errorf("dropping old prepared usage rebuild lock: %w", err)
+		}
+	}
+	return generation, true, nil
+}
+
+// takeRebuildLock creates the lock table of generation, which succeeds for
+// only one push. A push that read the locks before a long pause can create a
+// generation a newer holder already dropped; it finds the newer lock and
+// gives the generation up, so a retired generation and its build table name
+// are never used again.
+func takeRebuildLock(ctx context.Context, conn *sql.DB, generation uint64, now int64) (bool, error) {
+	lock := fmt.Sprintf("%s%d", chPreparedUsageRebuildLockPrefix, generation)
+	err := createRebuildLock(ctx, conn, generation, rebuildLockState{Status: rebuildLockHeld, RenewedAt: now})
+	if ex, ok := errors.AsType[*chdriver.Exception](err); ok && ex.Code == codeTableAlreadyExists {
+		log.Print("clickhouse push: skipping the prepared usage rebuild: another push took the rebuild lock first")
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("locking prepared usage rebuild: %w", err)
+	}
+	superseded, err := rebuildLockSuperseded(ctx, conn, generation)
+	if err == nil && !superseded {
+		return true, nil
+	}
+	if _, dropErr := conn.ExecContext(context.WithoutCancel(ctx), "DROP TABLE IF EXISTS "+lock+" SYNC"); dropErr != nil {
+		err = errors.Join(err, fmt.Errorf("dropping prepared usage rebuild lock: %w", dropErr))
+	}
+	if err == nil {
+		log.Print("clickhouse push: skipping the prepared usage rebuild: a newer push already took a later rebuild lock")
+	}
+	return false, err
+}
+
+// rebuildLockSuperseded reports whether a push took a newer rebuild lock
+// than generation.
+func rebuildLockSuperseded(ctx context.Context, conn *sql.DB, generation uint64) (bool, error) {
+	var superseded uint8
+	if err := conn.QueryRowContext(ctx, `SELECT count() > 0 FROM system.tables
+		WHERE database = currentDatabase() AND match(name, ?) AND `+chTableNumberSQL+` > ?`,
+		chPreparedUsageRebuildLockPattern, generation).Scan(&superseded); err != nil {
+		return false, fmt.Errorf("checking prepared usage rebuild lock: %w", err)
+	}
+	return superseded != 0, nil
+}
+
+// releaseRebuildLock marks the lock generation released. A newer holder may
+// already have dropped it, which leaves nothing to release.
+func releaseRebuildLock(ctx context.Context, conn *sql.DB, generation uint64) error {
+	err := setRebuildLock(ctx, conn, generation, rebuildLockState{Status: rebuildLockReleased})
+	if err != nil && !isMissingTableError(err) {
+		return fmt.Errorf("releasing prepared usage rebuild lock: %w", err)
+	}
+	return nil
+}
+
+// chPreparedUsageBehindSQL counts the rows reads prepare themselves: the
+// rows of every snapshot that no stored row was derived from, as
+// chPreparedUsageDeltaRowsSQL would select them. The covered snapshots come
+// from the covered_sessions projection, which FINAL would bypass.
+func chPreparedUsageBehindSQL() string {
+	return `SELECT count() FROM (` + chPreparedUsageKeyedSQL(`(s.id, s.revision) NOT IN (
+		SELECT session_id, snapshot_revision FROM prepared_usage
+		GROUP BY session_id, snapshot_revision SETTINGS final=0)`) + `)`
+}
+
+// preparedUsageRebuildDue reports whether a push should rebuild prepared_usage
+// or start the view's refresh, and why. Reads stay exact either way, so a
+// rebuild is due only when it changes what reads cost: the table is empty, the
+// stored price copies no longer serve reads, or reads prepare too many rows
+// themselves; see chPreparedUsageBehindShare.
+func preparedUsageRebuildDue(ctx context.Context, conn *sql.DB) (due bool, reason string, err error) {
+	var stored, live usageStamp
+	var prepared uint64
+	err = conn.QueryRowContext(ctx, `SELECT snapshot_count, snapshot_hash, pricing_digest, price_count,
+		(SELECT count() FROM prepared_usage) FROM prepared_usage LIMIT 1 SETTINGS final=0`).Scan(
+		&stored.snapshotCount, &stored.snapshotHash, &stored.pricingDigest, &stored.priceCount, &prepared)
+	if errors.Is(err, sql.ErrNoRows) {
+		return true, "the table is empty", nil
+	}
+	if err != nil {
+		return false, "", fmt.Errorf("reading prepared usage stamp: %w", err)
+	}
+	if err := conn.QueryRowContext(ctx, `SELECT `+chSnapshotStampSQL+`,
+		`+chPreparedUsagePricingDigestSQL+` AS pricing_digest, `+chPriceStampSQL).Scan(
+		&live.snapshotCount, &live.snapshotHash, &live.pricingDigest, &live.priceCount); err != nil {
+		return false, "", fmt.Errorf("reading current usage stamp: %w", err)
+	}
+	switch {
+	case stored == live:
+		return false, "", nil
+	case stored.pricingDigest != live.pricingDigest || live.priceCount < stored.priceCount:
+		// Until the stored price copies match the price records again, reads
+		// price every row through the per-request join.
+		return true, "prices changed", nil
+	}
+	var behind uint64
+	if err := conn.QueryRowContext(ctx, chPreparedUsageBehindSQL()).Scan(&behind); err != nil {
+		return false, "", fmt.Errorf("counting usage rows prepared at read time: %w", err)
+	}
+	limit := prepared / chPreparedUsageBehindShare
+	if behind < limit {
+		return false, "", nil
+	}
+	return true, fmt.Sprintf("reads prepare %d usage rows themselves, and the limit for a table of %d rows is %d",
+		behind, prepared, limit), nil
+}
+
+// retireRebuildLocks fences off rebuilds that pushes started while the
+// database could not exchange tables. The view refreshes prepared_usage
+// from here on, as when the data directory moved off NFS. It takes one more
+// lock number marked retired, which stays until openRebuildLocks: a push
+// that took an older lock finds the newer one and discards its build, and a
+// push that tries to take the lock later finds it retired and skips. It then
+// drops the older locks and every build table. A database that never
+// rebuilt this way has no lock tables and gets none.
+func retireRebuildLocks(ctx context.Context, conn *sql.DB) error {
+	for range 3 {
+		locks, newest, state, err := newestRebuildLock(ctx, conn)
+		if err != nil || locks == 0 {
+			return err
+		}
+		retired := newest
+		if state.Status != rebuildLockRetired {
+			retired++
+			newestRetired, err := createRetiredLock(ctx, conn, retired)
+			if err != nil {
+				return err
+			}
+			if !newestRetired {
+				continue
+			}
+		}
+		return dropTables(ctx, conn, "match(name, ?) OR (match(name, ?) AND "+chTableNumberSQL+" < ?)",
+			chPreparedUsageBuildPattern, chPreparedUsageRebuildLockPattern, retired)
+	}
+	return errors.New("retiring prepared usage rebuild locks: other pushes kept taking newer locks")
+}
+
+// createRetiredLock creates the retired lock of generation and reports
+// whether it is the newest lock. While retirement paused after reading the
+// locks, pushes may have taken newer numbers and dropped this one, so the
+// create can succeed below a newer lock; that lock's holder would stay
+// unfenced, so the caller retires above it instead. The lower retired lock
+// is dropped with the other old locks.
+func createRetiredLock(ctx context.Context, conn *sql.DB, generation uint64) (bool, error) {
+	err := createRebuildLock(ctx, conn, generation, rebuildLockState{Status: rebuildLockRetired})
+	if ex, ok := errors.AsType[*chdriver.Exception](err); ok && ex.Code == codeTableAlreadyExists {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("retiring prepared usage rebuild lock: %w", err)
+	}
+	superseded, err := rebuildLockSuperseded(ctx, conn, generation)
+	return err == nil && !superseded, err
+}
+
+// openRebuildLocks lets pushes rebuild prepared_usage in a database that
+// cannot swap tables. A push rebuilds only while a rebuild lock exists and
+// the newest one is not retired, so this creates the first lock, or
+// releases the lock an earlier switch to the view retired.
+func openRebuildLocks(ctx context.Context, conn *sql.DB) error {
+	locks, newest, state, err := newestRebuildLock(ctx, conn)
+	if err != nil {
+		return err
+	}
+	if locks == 0 {
+		err := createRebuildLock(ctx, conn, 1, rebuildLockState{Status: rebuildLockReleased})
+		if ex, ok := errors.AsType[*chdriver.Exception](err); ok && ex.Code == codeTableAlreadyExists {
+			return nil
+		}
+		if err != nil {
+			return fmt.Errorf("creating prepared usage rebuild lock: %w", err)
+		}
+		return nil
+	}
+	if state.Status != rebuildLockRetired {
+		return nil
+	}
+	if err := setRebuildLock(ctx, conn, newest, rebuildLockState{Status: rebuildLockReleased}); err != nil {
+		return fmt.Errorf("reopening prepared usage rebuild lock: %w", err)
+	}
+	return nil
+}
+
+// newestRebuildLock returns how many rebuild lock tables exist and the
+// number and state of the newest one.
+func newestRebuildLock(ctx context.Context, conn *sql.DB) (locks, newest uint64, state rebuildLockState, err error) {
+	var comment string
+	if err := conn.QueryRowContext(ctx, `SELECT count(), max(`+chTableNumberSQL+`), argMax(comment, `+chTableNumberSQL+`)
+		FROM system.tables WHERE database = currentDatabase() AND match(name, ?)`,
+		chPreparedUsageRebuildLockPattern).Scan(&locks, &newest, &comment); err != nil {
+		return 0, 0, rebuildLockState{}, fmt.Errorf("reading prepared usage rebuild locks: %w", err)
+	}
+	if locks == 0 {
+		return 0, 0, rebuildLockState{}, nil
+	}
+	state, err = parseRebuildLockState(newest, comment)
+	return locks, newest, state, err
+}
+
+// dropTables drops the tables of the current database that the condition
+// on system.tables selects. Callers select only names they make, which need
+// no quoting.
+func dropTables(ctx context.Context, conn *sql.DB, condition string, args ...any) error {
+	rows, err := conn.QueryContext(ctx, `SELECT name FROM system.tables
+		WHERE database = currentDatabase() AND (`+condition+`)`, args...)
+	if err != nil {
+		return fmt.Errorf("listing tables to drop: %w", err)
+	}
+	defer rows.Close()
+	var names []string
+	for rows.Next() {
+		var name string
+		if err := rows.Scan(&name); err != nil {
+			return fmt.Errorf("scanning table to drop: %w", err)
+		}
+		names = append(names, name)
+	}
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("listing tables to drop: %w", err)
+	}
+	for _, name := range names {
+		if _, err := conn.ExecContext(ctx, "DROP TABLE IF EXISTS "+name+" SYNC"); err != nil {
+			return fmt.Errorf("dropping table %s: %w", name, err)
 		}
 	}
 	return nil

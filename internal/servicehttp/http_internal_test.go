@@ -1,8 +1,10 @@
 package servicehttp
 
 import (
+	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"sync/atomic"
 	"testing"
 	"testing/synctest"
@@ -13,16 +15,20 @@ import (
 	"go.kenn.io/agentsview/internal/service"
 )
 
-func TestNewHTTPBackendUsesLongRunningClient(t *testing.T) {
-	t.Parallel()
-	svc := NewHTTPBackend("http://example.test", "", false, "")
-	backend, ok := svc.(*httpBackend)
-	require.True(t, ok)
-	require.NotNil(t, backend.client)
-	require.NotNil(t, backend.longRunningClient)
-
-	assert.Equal(t, 30*time.Second, backend.client.Timeout)
-	assert.Zero(t, backend.longRunningClient.Timeout)
+func TestWatchFiltersSessionReady(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		assert.Equal(t, "/api/v1/sessions/session-a/watch", r.URL.Path)
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = fmt.Fprint(w, "event: session_ready\ndata: session-a\n\nevent: session_updated\ndata: session-a\n\nevent: heartbeat\ndata: tick\n\n")
+	}))
+	t.Cleanup(srv.Close)
+	events, err := NewHTTPBackend(srv.URL, "", false, "").Watch(t.Context(), "session-a")
+	require.NoError(t, err)
+	var got []service.Event
+	for event := range events {
+		got = append(got, event)
+	}
+	assert.Equal(t, []service.Event{{Event: "session_updated", Data: "session-a"}, {Event: "heartbeat", Data: "tick"}}, got)
 }
 
 func TestHTTPBackendRecallCapabilityRespectsReadOnlyMode(t *testing.T) {
@@ -309,4 +315,48 @@ func TestListEmptySessionSelectionReturnsEmptyWithoutRequest(t *testing.T) {
 	assert.Empty(t, page.Sessions)
 	assert.Zero(t, page.Total)
 	assert.Zero(t, requests.Load())
+}
+
+func TestUsageModelGroupsQuery(t *testing.T) {
+	for _, grouped := range []bool{false, true} {
+		t.Run(strconv.FormatBool(grouped), func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				assert.Equal(t, grouped, r.URL.Query().Has("group_models"))
+				if grouped {
+					assert.Equal(t, "true", r.URL.Query().Get("group_models"))
+				}
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = w.Write([]byte(`{"model_aliases":{"model-a":"group"}}`))
+			}))
+			t.Cleanup(srv.Close)
+			backend := NewHTTPBackend(srv.URL, "", false, "")
+			req := service.UsageRequest{GroupModels: grouped}
+			summary, err := backend.UsageSummary(t.Context(), req)
+			require.NoError(t, err)
+			assert.Equal(t, map[string]string{"model-a": "group"}, summary.ModelAliases)
+			_, err = backend.UsagePairwiseComparison(t.Context(), service.UsagePairwiseComparisonRequest{UsageRequest: req})
+			require.NoError(t, err)
+		})
+	}
+}
+
+func TestSearchContentForwardsConceptsAndSemanticIntent(t *testing.T) {
+	t.Parallel()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		query := r.URL.Query()
+		assert.Equal(t, []string{"auth model", "retry policy"}, query["concepts"])
+		assert.False(t, query.Has("pattern"))
+		assert.Equal(t, service.SemanticSearchIntentValue, r.Header.Get(service.SemanticSearchIntentHeader))
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"matches":[],"candidate_truncated":true}`))
+	}))
+	t.Cleanup(srv.Close)
+
+	res, err := NewHTTPBackend(srv.URL, "", false, "").SearchContent(
+		t.Context(), service.ContentSearchRequest{
+			Concepts: []string{"auth model", "retry policy"},
+		},
+	)
+	require.NoError(t, err)
+	assert.True(t, res.CandidateTruncated)
 }

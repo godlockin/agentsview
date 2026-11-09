@@ -29,6 +29,9 @@ coverage.out
 # Air (live-reload dev server)
 /tmp/
 
+# Frontend scratch directory
+frontend/tmp/
+
 # OS files
 .DS_Store
 Thumbs.db
@@ -72,6 +75,7 @@ docs/.env*.local
 .github/hooks/
 .superpowers/
 .worktrees/
+.claude/worktrees/
 
 # Visual verification scratch — per-task screenshot/HTML capture dirs.
 .test-data*/
@@ -86,3 +90,6 @@ graphify-out/
 /.roborev/
 .serena/
 .env*
+
+# gotestsum JSON events and rerun reports written by CI test targets
+/gotestsum/

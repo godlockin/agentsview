@@ -13,10 +13,6 @@ import (
 	"go.kenn.io/agentsview/internal/storage"
 )
 
-// localSyncTimestampLayout is the layout ListSessionsForMirrorWindow
-// compares sync_marker against.
-const localSyncTimestampLayout = "2006-01-02T15:04:05.000Z"
-
 // Sync pushes the SQLite archive into one ClickHouse mirror. Push is
 // one-way: it never reads content back into SQLite.
 type Sync struct {
@@ -27,6 +23,9 @@ type Sync struct {
 	excludeProjects []string
 	// vectorSource, when non-nil, enables the vector push phase.
 	vectorSource storage.VectorPushSource
+	// sessionBatchSize is how many sessions share one set of insert blocks
+	// and delete statements. Zero selects sessionPushBatchSize.
+	sessionBatchSize int
 
 	connMu sync.Mutex
 	conn   *sql.DB
@@ -41,8 +40,24 @@ type Sync struct {
 	// snapshot syncUsagePrices loaded.
 	pricer *usagePricer
 
+	// fullRunRecorded reports that the current push recorded its full push
+	// run, so a later failure can resume it.
+	fullRunRecorded bool
+
+	// unownedPruned records that this Sync already removed this machine's
+	// mirror sessions without an archive id that the archive no longer
+	// holds. Pushes always record their archive, so no new ones appear.
+	unownedPruned bool
+
 	// hooks is nil in production; tests inject failures at push boundaries.
 	hooks *pushHooks
+	// vectorBatchSessions overrides the vector flush session bound when
+	// positive; tests lower it to cover several flushes in one push.
+	vectorBatchSessions int
+	// vectorFlushKeysBytes overrides the bound on a vector flush DELETE's
+	// key parameters when positive; tests set it to split flushes over the
+	// native protocol too.
+	vectorFlushKeysBytes int
 
 	closeOnce sync.Once
 	closeErr  error
@@ -55,6 +70,9 @@ type pushHooks struct {
 	// its stale rows deleted, before the session rows (and fingerprints)
 	// land.
 	beforeSessionRows func(batch []db.Session) error
+	// beforeVectorState runs after a vector batch's documents and chunks are
+	// written and its stale rows deleted, before its push state rows land.
+	beforeVectorState func(sessionIDs []string) error
 }
 
 // SyncStatus summarizes a mirror from its own metadata.

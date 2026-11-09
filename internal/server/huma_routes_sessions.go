@@ -37,6 +37,8 @@ func (s *Server) registerSessionRoutes() {
 	s.get(group, "/session-ids/resolve", "Resolve session IDs", s.humaResolveSessionIDs)
 	s.get(group, "/sessions/{id}", "Get session", s.humaGetSession)
 	s.get(group, "/sessions/{id}/messages", "List session messages", s.humaGetMessages)
+	s.get(group, "/sessions/{id}/commits", "List session commits", s.humaSessionCommits)
+	s.get(group, "/sessions/{id}/file-references", "Find session images in Docbank", s.humaFileReferences)
 	s.get(group, "/sessions/{id}/tool-calls", "List session tool calls", s.humaToolCalls)
 	s.get(group, "/sessions/{id}/tool-sequences", "Get session tool sequences", s.humaToolSequences)
 	s.get(group, "/sessions/{id}/children", "List child sessions", s.humaGetChildSessions)
@@ -77,7 +79,7 @@ type markdownDepth string
 type sessionFilterInput struct {
 	Project          string            `query:"project" doc:"Filter by project"`
 	ExcludeProject   string            `query:"exclude_project" doc:"Exclude a project"`
-	Machine          string            `query:"machine" doc:"Filter by machine"`
+	Machine          string            `query:"machine" doc:"Exact machine ID or alias, comma-separated IDs or aliases, or a unique whole display label (case-sensitive). Blank means all machines; unknown or ambiguous values return HTTP 400."`
 	GitBranch        string            `query:"git_branch" doc:"Filter by git branch; opaque (project, branch) tokens from the /branches endpoint"`
 	Agent            string            `query:"agent" doc:"Filter by agent"`
 	Date             string            `query:"date" format:"date" doc:"Filter sessions active on this YYYY-MM-DD date"`
@@ -88,8 +90,8 @@ type sessionFilterInput struct {
 	MinMessages      int               `query:"min_messages" minimum:"0" doc:"Minimum total message count"`
 	MaxMessages      int               `query:"max_messages" minimum:"0" doc:"Maximum total message count"`
 	MinUserMessages  int               `query:"min_user_messages" minimum:"0" doc:"Minimum user message count"`
-	IncludeOneShot   bool              `query:"include_one_shot" doc:"Include one-shot sessions"`
-	IncludeAutomated bool              `query:"include_automated" doc:"Include automated sessions"`
+	IncludeOneShot   optionalBoolParam `query:"include_one_shot" doc:"Include one-shot sessions"`
+	IncludeAutomated optionalBoolParam `query:"include_automated" doc:"Include automated sessions"`
 	IncludeChildren  bool              `query:"include_children" doc:"Include child sessions"`
 	IncludeSource    bool              `query:"include_source" doc:"Include available source file path, size, and archive-row update time on /sessions; accepted but ignored by /sessions/sidebar-index"`
 	Outcome          string            `query:"outcome" doc:"Filter by detected outcome"`
@@ -100,6 +102,8 @@ type sessionFilterInput struct {
 	MinToolFailures  optionalIntParam  `query:"min_tool_failures" minimum:"0" doc:"Minimum tool failure count"`
 	HasSecret        bool              `query:"has_secret" doc:"Filter sessions with secret findings"`
 	Starred          bool              `query:"starred" doc:"Filter sessions by starred status"`
+	Label            []string          `query:"label,explode" doc:"Keep sessions carrying this exact label; repeat to require several"`
+	PR               string            `query:"pr" doc:"Keep sessions linked to a pull request: owner/repo, owner/repo#123, or github.com::owner/repo#123"`
 	OrderBy          string            `query:"order_by" default:"recent" doc:"Sort order: a comma-separated list of keys, each optionally suffixed :asc or :desc (e.g. messages:desc,started:asc). A key with no suffix uses the descending param, then its natural direction. Valid keys: recent, started, messages, user-messages, output-tokens, peak-context, failures, retries, edit-churn, compactions, context-pressure, health, secrets, id."`
 	Descending       optionalBoolParam `query:"descending" doc:"Default sort direction for keys in order_by that carry no explicit :asc/:desc suffix"`
 }
@@ -110,6 +114,7 @@ type SessionListFilters = sessionFilterInput
 
 // Batch selection belongs only to the session list, not sidebar discovery.
 type listSessionsInput struct {
+	ExclusionCounts optionalBoolParam `query:"exclusion_counts" doc:"Include default-exclusion counts; true also samples hidden children, false counts only one-shot and automated sessions. First page only."`
 	SessionListFilters
 	IDs    string `query:"ids" doc:"Comma-separated list of 1 to 100 session IDs. Quote IDs containing commas or line breaks with RFC 4180 CSV quoting; IDs containing CRLF are rejected. Raw IDs include host copies; tilde-qualified IDs match exactly. Explicit filters intersect the selection; discovery exclusions do not apply."`
 	IDsSet bool
@@ -195,32 +200,36 @@ func (in *sessionFilterInput) listFilter() (service.ListFilter, error) {
 	}
 	limit := clampLimit(in.Limit, db.DefaultSessionLimit, db.MaxSessionLimit)
 	filter := service.ListFilter{
-		Project:          in.Project,
-		ExcludeProject:   in.ExcludeProject,
-		Machine:          in.Machine,
-		GitBranch:        in.GitBranch,
-		Agent:            in.Agent,
-		Date:             in.Date,
-		DateFrom:         in.DateFrom,
-		DateTo:           in.DateTo,
-		Timezone:         timezone,
-		ActiveSince:      in.ActiveSince,
-		MinMessages:      in.MinMessages,
-		MaxMessages:      in.MaxMessages,
-		MinUserMessages:  in.MinUserMessages,
-		IncludeOneShot:   in.IncludeOneShot,
-		IncludeAutomated: in.IncludeAutomated,
-		IncludeChildren:  in.IncludeChildren,
-		IncludeSource:    in.IncludeSource,
-		Outcome:          in.Outcome,
-		HealthGrade:      in.HealthGrade,
-		Cursor:           in.Cursor,
-		Limit:            limit,
-		Termination:      in.Termination,
-		HasSecret:        in.HasSecret,
-		Starred:          in.Starred,
-		OrderBy:          in.OrderBy,
-		Descending:       optionalBoolValue(in.Descending),
+		Project:            in.Project,
+		ExcludeProject:     in.ExcludeProject,
+		Machine:            in.Machine,
+		GitBranch:          in.GitBranch,
+		Agent:              in.Agent,
+		Date:               in.Date,
+		DateFrom:           in.DateFrom,
+		DateTo:             in.DateTo,
+		Timezone:           timezone,
+		ActiveSince:        in.ActiveSince,
+		MinMessages:        in.MinMessages,
+		MaxMessages:        in.MaxMessages,
+		MinUserMessages:    in.MinUserMessages,
+		IncludeOneShot:     in.IncludeOneShot.Value,
+		OneShotFilterSet:   in.IncludeOneShot.IsSet,
+		IncludeAutomated:   in.IncludeAutomated.Value,
+		AutomatedFilterSet: in.IncludeAutomated.IsSet,
+		IncludeChildren:    in.IncludeChildren,
+		IncludeSource:      in.IncludeSource,
+		Outcome:            in.Outcome,
+		HealthGrade:        in.HealthGrade,
+		Cursor:             in.Cursor,
+		Limit:              limit,
+		Termination:        in.Termination,
+		HasSecret:          in.HasSecret,
+		Starred:            in.Starred,
+		Labels:             in.Label,
+		PR:                 in.PR,
+		OrderBy:            in.OrderBy,
+		Descending:         optionalBoolValue(in.Descending),
 	}
 	if in.MinToolFailures.IsSet {
 		filter.MinToolFailures = &in.MinToolFailures.Value
@@ -246,27 +255,39 @@ func (in *sessionFilterInput) dbFilter(includeChildren bool) (db.SessionFilter, 
 	if in.Limit > 0 {
 		limit = clampLimit(in.Limit, db.DefaultSessionLimit, db.MaxSessionLimit)
 	}
+	pr, err := db.ParsePRFilter(in.PR)
+	if err != nil {
+		return db.SessionFilter{}, apiError(http.StatusBadRequest, err.Error())
+	}
+	labels, err := db.LabelFilterValues(in.Label)
+	if err != nil {
+		return db.SessionFilter{}, apiError(http.StatusBadRequest, err.Error())
+	}
 	return db.SessionFilter{
-		Project:          in.Project,
-		ExcludeProject:   in.ExcludeProject,
-		Machine:          in.Machine,
-		GitBranch:        in.GitBranch,
-		Agent:            in.Agent,
-		Date:             in.Date,
-		DateFrom:         in.DateFrom,
-		DateTo:           in.DateTo,
-		Timezone:         timezone,
-		ActiveSince:      in.ActiveSince,
-		MinMessages:      in.MinMessages,
-		MaxMessages:      in.MaxMessages,
-		MinUserMessages:  in.MinUserMessages,
-		ExcludeOneShot:   !in.IncludeOneShot,
-		ExcludeAutomated: !in.IncludeAutomated,
-		IncludeChildren:  includeChildren,
-		Cursor:           in.Cursor,
-		Limit:            limit,
-		Termination:      in.Termination,
-		Starred:          in.Starred,
+		Project:            in.Project,
+		ExcludeProject:     in.ExcludeProject,
+		Machine:            in.Machine,
+		GitBranch:          in.GitBranch,
+		Agent:              in.Agent,
+		Date:               in.Date,
+		DateFrom:           in.DateFrom,
+		DateTo:             in.DateTo,
+		Timezone:           timezone,
+		ActiveSince:        in.ActiveSince,
+		MinMessages:        in.MinMessages,
+		MaxMessages:        in.MaxMessages,
+		MinUserMessages:    in.MinUserMessages,
+		ExcludeOneShot:     !in.IncludeOneShot.Value,
+		OneShotFilterSet:   in.IncludeOneShot.IsSet,
+		ExcludeAutomated:   !in.IncludeAutomated.Value,
+		AutomatedFilterSet: in.IncludeAutomated.IsSet,
+		IncludeChildren:    includeChildren,
+		Cursor:             in.Cursor,
+		Limit:              limit,
+		Termination:        in.Termination,
+		Starred:            in.Starred,
+		Labels:             labels,
+		PR:                 pr,
 	}, nil
 }
 
@@ -278,6 +299,7 @@ func (s *Server) humaListSessions(
 	if err != nil {
 		return nil, err
 	}
+	filter.ExclusionCounts = optionalBoolValue(in.ExclusionCounts)
 	if in.IDsSet {
 		filter.IDs, err = parseSessionIDs(in.IDs)
 		if err != nil {
@@ -288,6 +310,9 @@ func (s *Server) humaListSessions(
 	if err != nil {
 		if errors.Is(err, db.ErrInvalidCursor) {
 			return nil, apiError(http.StatusBadRequest, "invalid cursor")
+		}
+		if errors.Is(err, db.ErrInvalidPRFilter) || errors.Is(err, db.ErrSessionLabelsInvalid) {
+			return nil, apiError(http.StatusBadRequest, err.Error())
 		}
 		return nil, serverError(err)
 	}
@@ -470,6 +495,7 @@ type sessionToolSequenceCall struct {
 	Ordinal              int    `json:"ordinal"`
 	CallIndex            int    `json:"call_index"`
 	ToolUseID            string `json:"tool_use_id"`
+	CallFingerprint      string `json:"call_fingerprint" doc:"Tool name and input fingerprint a jump checks, since some agents derive tool IDs from position"`
 	ToolName             string `json:"tool_name"`
 	Outcome              string `json:"outcome" enum:"errored,empty,content,unknown"`
 	Repeat               string `json:"repeat" enum:"none,identical,near_identical"`
@@ -523,7 +549,7 @@ func buildSessionToolSequences(
 	session *db.Session,
 	rows []signals.ToolCallRow,
 ) sessionToolSequencesResponse {
-	extracted := signals.ExtractToolSequences(rows, session.TerminationStatus != nil && (*session.TerminationStatus == string(parser.TerminationClean) || *session.TerminationStatus == string(parser.TerminationAwaitingUser)))
+	extracted := signals.ExtractToolSequences(rows, parser.TerminationComplete(session.TerminationStatus))
 	response := sessionToolSequencesResponse{
 		SessionID:      session.ID,
 		TotalToolCalls: len(extracted.Calls),
@@ -575,6 +601,7 @@ func projectSessionToolSequenceCall(
 		Ordinal:              outcome.MessageOrdinal,
 		CallIndex:            outcome.CallIndex,
 		ToolUseID:            outcome.ToolUseID,
+		CallFingerprint:      row.Fingerprint(),
 		ToolName:             outcome.ToolName,
 		Outcome:              string(outcome.Outcome),
 		Repeat:               string(outcome.Repeat),
@@ -646,6 +673,10 @@ type sessionUsageResponse struct {
 	RollupCostSource    export.CostSource               `json:"rollup_cost_source,omitempty"`
 	HasRollupCost       *bool                           `json:"has_rollup_cost,omitempty"`
 	RollupSubagentCount *int                            `json:"rollup_subagent_count,omitempty"`
+	// PlanUsage carries codex-cloud plan figures. A session with only plan
+	// usage keeps has_token_data and has_cost false.
+	PlanUsage       *db.PlanUsageView       `json:"plan_usage,omitempty"`
+	CaptureCoverage *db.CaptureCoverageView `json:"capture_coverage,omitempty"`
 }
 
 type sessionUsageInput struct {
@@ -673,8 +704,9 @@ type sessionUsageBreakdownResponse struct {
 }
 
 type sessionUsageErrorBody struct {
-	Code    string `json:"code"`
-	Message string `json:"message"`
+	Code       string   `json:"code"`
+	Message    string   `json:"message"`
+	Candidates []string `json:"candidates,omitempty"`
 }
 
 type sessionUsageError struct {
@@ -732,6 +764,8 @@ func newSessionUsageHumaResponse(usage *db.SessionUsage) sessionUsageResponse {
 		SubagentCount:     usage.SubagentCount,
 		Breakdown:         breakdown,
 		ServerRunning:     true,
+		PlanUsage:         usage.PlanUsage.PlanUsageView(),
+		CaptureCoverage:   usage.PlanUsage.CaptureCoverageView(),
 	}
 }
 
@@ -739,13 +773,60 @@ func (s *Server) humaSessionUsage(
 	ctx context.Context,
 	in *sessionUsageInput,
 ) (*jsonOutput[sessionUsageResponse], error) {
+	response, err := s.exactSessionUsage(ctx, in)
+	usageErr, ok := errors.AsType[*sessionUsageError](err)
+	if !ok || (usageErr.Body.Code != "session_not_found" && usageErr.Body.Code != "ambiguous_session_id") {
+		return response, err
+	}
+	if strings.Contains(in.ID, "~") {
+		return nil, err
+	}
+	if agent, ok := parser.AgentByPrefix(in.ID); ok && agent.IDPrefix != "" {
+		return nil, err
+	}
+	candidates, resolveErr := s.sessions.FindSessionIDsByRawSuffix(ctx, in.ID, 5)
+	if resolveErr != nil {
+		return nil, sessionUsageQueryError(resolveErr)
+	}
+	switch len(candidates) {
+	case 0:
+		return nil, &sessionUsageError{Status: http.StatusNotFound, Body: sessionUsageErrorBody{
+			Code: "session_not_found", Message: "session not found",
+		}}
+	case 1:
+		resolved := *in
+		resolved.ID = candidates[0]
+		return s.exactSessionUsage(ctx, &resolved)
+	default:
+		return nil, &sessionUsageError{Status: http.StatusConflict, Body: sessionUsageErrorBody{
+			Code: "ambiguous_session_id", Message: "multiple sessions match; retry with a canonical candidate ID", Candidates: candidates,
+		}}
+	}
+}
+
+func sessionUsageQueryError(err error) error {
+	if handled := handleHumaContextError(err); handled != nil {
+		return handled
+	}
+	if identity, ok := errors.AsType[*db.SessionIdentityError](err); ok && identity.State == "ambiguous" {
+		return &sessionUsageError{Status: http.StatusConflict, Body: sessionUsageErrorBody{
+			Code: "ambiguous_session_id", Message: "multiple sessions match; retry with a canonical candidate ID",
+			Candidates: identity.Variants[:min(len(identity.Variants), 5)],
+		}}
+	}
+	return &sessionUsageError{Status: http.StatusInternalServerError, Body: sessionUsageErrorBody{
+		Code: "usage_query_failed", Message: "failed to query session usage",
+	}}
+}
+
+func (s *Server) exactSessionUsage(
+	ctx context.Context,
+	in *sessionUsageInput,
+) (*jsonOutput[sessionUsageResponse], error) {
 	if in.Rollup {
 		rollup, err := service.GetSessionUsageRollup(ctx, s.db, in.ID, in.Breakdown)
 		if err != nil {
-			if handled := handleHumaContextError(err); handled != nil {
-				return nil, handled
-			}
-			return nil, &sessionUsageError{Status: http.StatusInternalServerError, Body: sessionUsageErrorBody{Code: "usage_query_failed", Message: "failed to query session usage"}}
+			return nil, sessionUsageQueryError(err)
 		}
 		if rollup == nil {
 			return nil, &sessionUsageError{Status: http.StatusNotFound, Body: sessionUsageErrorBody{Code: "session_not_found", Message: "session not found"}}
@@ -772,16 +853,7 @@ func (s *Server) humaSessionUsage(
 		usage, err = s.db.GetSessionUsage(ctx, in.ID, in.Breakdown)
 	}
 	if err != nil {
-		if handled := handleHumaContextError(err); handled != nil {
-			return nil, handled
-		}
-		return nil, &sessionUsageError{
-			Status: http.StatusInternalServerError,
-			Body: sessionUsageErrorBody{
-				Code:    "usage_query_failed",
-				Message: "failed to query session usage",
-			},
-		}
+		return nil, sessionUsageQueryError(err)
 	}
 	if usage == nil {
 		return nil, &sessionUsageError{
@@ -1075,6 +1147,9 @@ func (s *Server) humaRestoreSession(ctx context.Context,
 	if n == 0 {
 		return nil, apiError(http.StatusNotFound, "session not found or not in trash")
 	}
+	if s.broadcaster != nil {
+		s.broadcaster.Emit("sessions")
+	}
 	s.notifySessionMutation()
 	return &noContentOutput{Status: http.StatusNoContent}, nil
 }
@@ -1221,6 +1296,9 @@ func (s *Server) humaWatchSession(
 		}
 		streamCtx := hctx.Context()
 		updates := s.sessionMonitor(streamCtx, in.ID)
+		if !stream.Send("session_ready", in.ID) {
+			return
+		}
 		heartbeat := time.NewTicker(
 			sessionwatch.PollInterval * sessionwatch.HeartbeatTicks,
 		)
@@ -1281,6 +1359,9 @@ func (s *Server) humaEvents(
 		}
 		sub, unsub := s.broadcaster.Subscribe()
 		defer unsub()
+		if !stream.SendJSON("events_ready", struct{}{}) {
+			return
+		}
 		heartbeat := time.NewTicker(
 			sessionwatch.PollInterval * sessionwatch.HeartbeatTicks,
 		)
@@ -1308,6 +1389,9 @@ func (s *Server) humaUploadSession(
 	if s.db.ReadOnly() {
 		return nil, apiError(http.StatusNotImplemented,
 			"uploads are not available in read-only mode")
+	}
+	if err := s.requireSourceSync(ctx); err != nil {
+		return nil, err
 	}
 	project := strings.TrimSpace(in.Project)
 	if project == "" {
@@ -1352,7 +1436,7 @@ func (s *Server) humaUploadSession(
 			"claude provider does not support uploads")
 	}
 	results, err := uploader.ParseUploadedTranscript(
-		upload.tempPath, project, machine,
+		ctx, upload.tempPath, project, machine,
 	)
 	if err != nil {
 		return nil, apiError(http.StatusBadRequest,
@@ -1411,6 +1495,9 @@ func (s *Server) humaUploadSession(
 			"failed to save session to database")
 	}
 	cleanupCommittedUpload(uploadCommit)
+	if s.broadcaster != nil {
+		s.broadcaster.Emit("sessions")
+	}
 	main := results[0]
 	return &jsonOutput[uploadSessionResponse]{
 		Body: uploadSessionResponse{
@@ -1787,4 +1874,25 @@ func (s *Server) humaResumeWithOpener(ctx context.Context,
 			Cwd:      launchDir,
 		},
 	}, nil
+}
+
+func (s *Server) humaFileReferences(ctx context.Context, in *idPathInput) (*jsonOutput[service.FileReferencesResult], error) {
+	result, err := service.FileReferences(ctx, s.sessions, in.ID)
+	if err != nil {
+		return nil, fileReferencesError(err)
+	}
+	return &jsonOutput[service.FileReferencesResult]{Body: result}, nil
+}
+
+func fileReferencesError(err error) error {
+	switch {
+	case errors.Is(err, service.ErrSessionNotFound):
+		return apiError(http.StatusNotFound, "session not found")
+	case errors.Is(err, service.ErrRevisionBoundReadUnavailable):
+		return apiError(http.StatusNotImplemented, err.Error())
+	case errors.Is(err, service.ErrSourceChanged):
+		return apiErrorWithCode(http.StatusConflict, "source_changed", err.Error())
+	default:
+		return serverError(err)
+	}
 }

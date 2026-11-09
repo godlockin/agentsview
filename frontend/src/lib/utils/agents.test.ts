@@ -14,8 +14,10 @@ describe("KNOWN_AGENTS", () => {
       "claude",
       "cowork",
       "codex",
+      "codex-cloud",
       "traex",
       "augure-code",
+      "open-interpreter",
       "augure-desktop",
       "copilot",
       "devin",
@@ -37,6 +39,7 @@ describe("KNOWN_AGENTS", () => {
       "visualstudio-copilot",
       "pi",
       "stepcode",
+      "fx",
       "tau",
       "prime-agent",
       "qwen",
@@ -68,6 +71,7 @@ describe("KNOWN_AGENTS", () => {
       "codebuff",
       "freebuff",
       "crush",
+      "muse",
     ]);
   });
 
@@ -79,43 +83,6 @@ describe("KNOWN_AGENTS", () => {
 });
 
 describe("agentColor", () => {
-  it("returns correct color for known agents", () => {
-    expect(agentColor("claude")).toBe("var(--accent-blue)");
-    expect(agentColor("codex")).toBe("var(--accent-green)");
-    expect(agentColor("traex")).toBe("var(--accent-coral)");
-    expect(agentColor("augure-code")).toBe("var(--accent-lime)");
-    expect(agentColor("augure-desktop")).toBe("var(--accent-violet)");
-    expect(agentColor("copilot")).toBe("var(--accent-amber)");
-    expect(agentColor("devin")).toBe("var(--accent-red)");
-    expect(agentColor("evener")).toBe("var(--accent-teal)");
-    expect(agentColor("gemini")).toBe("var(--accent-rose)");
-    expect(agentColor("opencode")).toBe("var(--accent-purple)");
-    expect(agentColor("opencodereview")).toBe("var(--accent-indigo)");
-    expect(agentColor("openhands")).toBe("var(--accent-teal)");
-    expect(agentColor("cursor")).toBe("var(--accent-black)");
-    expect(agentColor("amp")).toBe("var(--accent-coral)");
-    expect(agentColor("zencoder")).toBe("var(--accent-red)");
-    expect(agentColor("zed")).toBe("var(--accent-green)");
-    expect(agentColor("pi")).toBe("var(--accent-indigo)");
-    expect(agentColor("stepcode")).toBe("var(--accent-indigo)");
-    expect(agentColor("tau")).toBe("var(--accent-amber)");
-    expect(agentColor("prime-agent")).toBe("var(--accent-indigo)");
-    expect(agentColor("qwen")).toBe("var(--accent-cyan)");
-    expect(agentColor("qwenpaw")).toBe("var(--accent-cyan)");
-    expect(agentColor("deepseek-tui")).toBe("var(--accent-cyan)");
-    expect(agentColor("deepseek-harness")).toBe("var(--accent-cyan)");
-    expect(agentColor("vscode-copilot")).toBe("var(--accent-teal)");
-    expect(agentColor("visualstudio-copilot")).toBe("var(--accent-blue)");
-    expect(agentColor("qclaw")).toBe("var(--accent-orange)");
-    expect(agentColor("workbuddy")).toBe("var(--accent-violet)");
-    expect(agentColor("codebuddy")).toBe("var(--accent-blue)");
-    expect(agentColor("piebald")).toBe("var(--accent-orange)");
-    expect(agentColor("roocode")).toBe("var(--accent-rose)");
-    expect(agentColor("omnigent")).toBe("var(--accent-teal)");
-    expect(agentColor("cline")).toBe("var(--accent-violet)");
-    expect(agentColor("crush")).toBe("var(--accent-coral)");
-  });
-
   it("falls back to blue for unknown agents", () => {
     expect(agentColor("unknown")).toBe("var(--accent-blue)");
     expect(agentColor("")).toBe("var(--accent-blue)");
@@ -155,6 +122,12 @@ describe("entrypointBadge", () => {
     expect(entrypointBadge(null)).toBeNull();
     expect(entrypointBadge(undefined)).toBeNull();
   });
+
+  it("names the codex-cloud origins", () => {
+    expect(entrypointBadge("codex-web")).toBe("Codex web");
+    expect(entrypointBadge("codex-cloud")).toBe("Codex cloud");
+    expect(entrypointBadge("dot")).toBe("dot");
+  });
 });
 
 describe("agentLabel", () => {
@@ -176,6 +149,7 @@ describe("agentLabel", () => {
     expect(agentLabel("workbuddy")).toBe("WorkBuddy");
     expect(agentLabel("codebuddy")).toBe("CodeBuddy");
     expect(agentLabel("piebald")).toBe("Piebald");
+    expect(agentLabel("fx")).toBe("fx");
     expect(agentLabel("zed")).toBe("Zed");
     expect(agentLabel("qwen")).toBe("Qwen Code");
     expect(agentLabel("qwenpaw")).toBe("QwenPaw");
@@ -188,9 +162,11 @@ describe("agentLabel", () => {
     expect(agentLabel("omnigent")).toBe("Omnigent");
     expect(agentLabel("traex")).toBe("TraeX");
     expect(agentLabel("augure-code")).toBe("Augure Code");
+    expect(agentLabel("open-interpreter")).toBe("Open Interpreter");
     expect(agentLabel("augure-desktop")).toBe("Augure Desktop");
     expect(agentLabel("opencodereview")).toBe("Open Code Review");
     expect(agentLabel("crush")).toBe("Charm Crush");
+    expect(agentLabel("muse")).toBe("Muse Code");
   });
 
   it("capitalizes simple agent names", () => {

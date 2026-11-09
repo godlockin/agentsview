@@ -1,5 +1,10 @@
 // @vitest-environment jsdom
-import { afterEach, describe, expect, it } from "vite-plus/test";
+import { reportErrorShown } from "../../utils/telemetry.js";
+vi.mock("../../utils/telemetry.js", () => ({
+  reportErrorShown: vi.fn(),
+  reportTelemetry: vi.fn(),
+}));
+import { afterEach, describe, expect, it, vi } from "vite-plus/test";
 import { mount, tick, unmount } from "svelte";
 import { usage } from "../../stores/usage.svelte.js";
 import { testMoney } from "../../test/money.js";
@@ -75,9 +80,11 @@ function cardLabels(): string[] {
 }
 
 function cardFor(label: string): HTMLElement | undefined {
-  return Array.from(document.querySelectorAll<HTMLElement>(".card-label")).find(
-    (el) => el.textContent?.trim() === label,
-  )?.parentElement ?? undefined;
+  return (
+    Array.from(document.querySelectorAll<HTMLElement>(".card-label")).find(
+      (el) => el.textContent?.trim() === label,
+    )?.parentElement ?? undefined
+  );
 }
 
 function cardValue(label: string): string | undefined {
@@ -89,6 +96,7 @@ function cardSub(label: string): string | undefined {
 }
 
 afterEach(() => {
+  vi.restoreAllMocks();
   if (component) {
     unmount(component);
     component = undefined;
@@ -98,6 +106,8 @@ afterEach(() => {
   }
   usage.cancelInFlightReads();
   usage.summary = null;
+  usage.referenceSummary = null;
+  usage.selectedProjectKey = "";
   usage.errors.summary = null;
   usage.mode = "cost";
   usage.setSelectedTokenTypes(["input", "cache_write", "cache_read", "output"]);
@@ -105,6 +115,43 @@ afterEach(() => {
 });
 
 describe("UsageSummaryCards", () => {
+  it.each([
+    { current: 3, prior: 1, expected: "+200% vs prior" },
+    { current: 3, prior: 0, expected: "+0% vs prior" },
+    { current: 1, prior: 2, expected: "-50% vs prior" },
+  ])(
+    "compares $current dollars with $prior prior dollars",
+    async ({ current, prior, expected }) => {
+      const data = summary();
+      data.totals.totalCost = testMoney(current);
+      data.comparison = {
+        priorFrom: "2026-06-30",
+        priorTo: "2026-06-30",
+        priorTotalCost: testMoney(prior),
+        deltaPct: 0,
+      };
+      usage.summary = data;
+      component = mount(UsageSummaryCards, { target: document.body });
+      await tick();
+
+      expect(cardSub("Total Cost")).toBe(expected);
+    },
+  );
+
+  it("reports the analytics kind for a displayed summary failure", async () => {
+    const { UsageService } = await import("../../api/generated/index.js");
+    vi.mocked(reportErrorShown).mockClear();
+    usage.summary = null;
+    vi.spyOn(UsageService, "getApiV1UsageSummary").mockRejectedValueOnce(
+      new Error("Summary failed"),
+    );
+    component = mount(UsageSummaryCards, { target: document.body });
+    await usage.fetchSummary({ loadComparison: false });
+    await tick();
+    expect(document.querySelector(".error-bar")?.textContent).toContain("Summary failed");
+    expect(reportErrorShown).toHaveBeenCalledExactlyOnceWith("analytics");
+  });
+
   it("uses the selected token types for aggregate token cards", async () => {
     usage.summary = summary();
     usage.mode = "token";
@@ -127,26 +174,31 @@ describe("UsageSummaryCards", () => {
     expect(peakDay).toBe("25");
   });
 
-  it("keeps the Copilot credits card while a brushed range is active", async () => {
-    const parent = summary();
-    parent.from = "2026-07-01";
-    parent.to = "2026-07-03";
-    parent.totals.copilotAICredits = 5;
-    usage.summary = parent;
+  it.each(["a brushed range is active", "a selected project has no credits"])(
+    "keeps the Copilot credits card while %s",
+    async (situation) => {
+      const parent = summary();
+      parent.from = "2026-07-01";
+      parent.to = "2026-07-03";
+      parent.totals.copilotAICredits = 5;
+      usage.summary = parent;
+      if (situation !== "a brushed range is active") {
+        usage.selectedProjectKey = "pl1:sha256:selected";
+        usage.referenceSummary = parent;
+      }
+      component = mount(UsageSummaryCards, { target: document.body });
+      await tick();
+      const cardCount = document.querySelectorAll(".summary-cards .card").length;
 
-    component = mount(UsageSummaryCards, {
-      target: document.body,
-    });
-    await tick();
-    const cardCount = document.querySelectorAll(".summary-cards .card").length;
-
-    usage.setTimeRange("2026-07-01", "2026-07-02");
-    usage.cancelInFlightReads();
-    await tick();
-
-    expect(document.querySelectorAll(".summary-cards .card")).toHaveLength(cardCount);
-    expect(document.body.textContent).toContain("Copilot AI Credits");
-  });
+      if (situation === "a brushed range is active") {
+        usage.setTimeRange("2026-07-01", "2026-07-02");
+        usage.cancelInFlightReads();
+      } else usage.summary = summary();
+      await tick();
+      expect(document.querySelectorAll(".summary-cards .card")).toHaveLength(cardCount);
+      expect(document.body.textContent).toContain("Copilot AI Credits");
+    },
+  );
 
   it("labels uncached input and adds total input", async () => {
     usage.summary = issueSummary();
@@ -228,7 +280,13 @@ describe("UsageSummaryCards", () => {
     parent.to = "2026-07-02";
     const day = parent.daily[0]!;
     parent.daily = [
-      { ...day, date: "2026-07-01", inputTokens: 100, cacheCreationTokens: 10, cacheReadTokens: 900 },
+      {
+        ...day,
+        date: "2026-07-01",
+        inputTokens: 100,
+        cacheCreationTokens: 10,
+        cacheReadTokens: 900,
+      },
       { ...day, date: "2026-07-02", inputTokens: 50, cacheCreationTokens: 5, cacheReadTokens: 450 },
     ];
     parent.totals = {
@@ -252,7 +310,8 @@ describe("UsageSummaryCards", () => {
     expect(cardValue("Total Input")).toBe("505");
   });
 
-  it("renders the total input card in the summary error state", async () => {
+  it("renders the total input card in the summary error state and retries the full refresh", async () => {
+    const refresh = vi.spyOn(usage, "fetchAll").mockResolvedValue();
     usage.summary = issueSummary();
     usage.errors.summary = "boom";
 
@@ -263,5 +322,9 @@ describe("UsageSummaryCards", () => {
 
     expect(document.querySelectorAll(".summary-cards .card")).toHaveLength(10);
     expect(cardValue("Total Input")).toBe("--");
+    // Retry keeps the brush and refetches its full-window context like any refresh.
+    document.querySelector<HTMLButtonElement>(".retry-btn")!.click();
+    expect(refresh).toHaveBeenCalledExactlyOnceWith({ preserveTimeRange: true });
+    refresh.mockRestore();
   });
 });

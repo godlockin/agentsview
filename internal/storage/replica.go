@@ -23,6 +23,10 @@ type ReplicaTarget struct {
 	AllowInsecure bool
 	// PushVectors reports whether the target accepts the vector push phase.
 	PushVectors bool
+	// PushBatchSize is how many sessions one push batch writes. Zero selects
+	// the backend default. Only ClickHouse reads it; PostgreSQL rejects a
+	// nonzero value.
+	PushBatchSize int
 }
 
 // ReplicaTargetRef names one configured replica target before its settings
@@ -128,6 +132,13 @@ type SyncStateStore interface {
 	GetOrCreateSyncState(ctx context.Context, key, defaultValue string) (string, error)
 }
 
+// StoresFriction reports whether a replica stores Friction Log findings, so
+// pushes to it must first bring stale findings current.
+func StoresFriction(r Replica) bool {
+	f, ok := r.(interface{ StoresFriction() bool })
+	return ok && f.StoresFriction()
+}
+
 // Replica is a remote database the archive pushes into and that serves the
 // web UI read-only. Implementations must be safe to use as zero values; the
 // CLI and server hold one value per compiled-in backend.
@@ -156,7 +167,7 @@ type Replica interface {
 		opts PusherOptions,
 	) (Pusher, error)
 	// OpenStore connects for CLI reads without touching the schema.
-	OpenStore(target ReplicaTarget) (ReplicaStore, error)
+	OpenStore(ctx context.Context, target ReplicaTarget) (ReplicaStore, error)
 	// OpenServeStore connects for `<backend> serve`: it brings the schema
 	// current when the role may write, verifies compatibility, and probes
 	// optional capabilities such as insight generation.

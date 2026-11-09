@@ -14,7 +14,7 @@ import (
 // "at least one filter is required".
 func TestPruneCobraPathAgeAloneSatisfiesFilters(t *testing.T) {
 	cfg, err := buildPruneConfigFromFlags(
-		"", -1, "", "", "30d", false, true, false)
+		"", "", -1, "", "", "30d", false, true, false)
 	require.NoError(t, err)
 	assert.True(t, cfg.Filter.HasFilters(),
 		"--age alone must satisfy the filter requirement")
@@ -24,14 +24,14 @@ func TestPruneCobraPathAgeAloneSatisfiesFilters(t *testing.T) {
 
 func TestPruneCobraPathAgeAndBeforeMutuallyExclusive(t *testing.T) {
 	_, err := buildPruneConfigFromFlags(
-		"", -1, "2026-01-01", "", "30d", false, true, false)
+		"", "", -1, "2026-01-01", "", "30d", false, true, false)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "mutually exclusive")
 }
 
 func TestPruneCobraPathExplicitFiltersStillWork(t *testing.T) {
 	cfg, err := buildPruneConfigFromFlags(
-		"proj-a", -1, "", "", "", false, false, false)
+		"", "proj-a", -1, "", "", "", false, false, false)
 	require.NoError(t, err)
 	assert.True(t, cfg.Filter.HasFilters())
 	assert.Equal(t, "proj-a", cfg.Filter.Project)

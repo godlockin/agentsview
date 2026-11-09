@@ -21,7 +21,9 @@ import (
 	"go.kenn.io/agentsview/internal/activity"
 	"go.kenn.io/agentsview/internal/db"
 	"go.kenn.io/agentsview/internal/export"
+	"go.kenn.io/agentsview/internal/kept"
 	"go.kenn.io/agentsview/internal/money"
+	"go.kenn.io/agentsview/internal/readbase"
 )
 
 var (
@@ -53,9 +55,31 @@ func (s *Store) GetActivityReport(
 	if err != nil {
 		return activity.Report{}, err
 	}
-	artifacts.Report.BySession = artifacts.Sessions
-	artifacts.Report.SessionsTotal = len(artifacts.Sessions)
-	return artifacts.Report, nil
+	return activity.ReportWithSessions(artifacts), nil
+}
+
+type activityReportBackend struct {
+	*Store
+	candidates    chSessionSet
+	rangeStartUTC string
+	rangeEndUTC   string
+	pairing       *activityReportPairing
+}
+
+func (b activityReportBackend) ActivityReportUsage(
+	ctx context.Context, ids []string, q activity.Query,
+) ([]activity.UsageRow, *export.PricingBlock, error) {
+	return b.activityReportUsage(ctx, b.candidates, ids, b.rangeStartUTC, b.rangeEndUTC, q)
+}
+
+func (b activityReportBackend) ActivityReportCandidateSource([]string, activity.Query) activity.CandidateSource {
+	return b.pairing.candidateSource()
+}
+
+func (b activityReportBackend) ActivityReportMessageCounts(
+	ctx context.Context, ids []string, q activity.Query, artifacts *activity.CandidateArtifacts,
+) error {
+	return b.pairing.countMessages(ctx, ids, q, artifacts)
 }
 
 func (s *Store) BuildActivityReportArtifacts(
@@ -64,7 +88,7 @@ func (s *Store) BuildActivityReportArtifacts(
 	q activity.Query,
 	onProgress activity.ProgressFunc,
 ) (activity.CandidateArtifacts, error) {
-	db.ReportProgress(onProgress, activity.Progress{Phase: activity.ProgressLoadingSessions})
+	activity.ReportProgress(onProgress, activity.Progress{Phase: activity.ProgressLoadingSessions})
 	ctx, err := s.withPartsSnapshot(ctx)
 	if err != nil {
 		return activity.CandidateArtifacts{}, err
@@ -78,18 +102,15 @@ func (s *Store) BuildActivityReportArtifacts(
 	// Only the reports of ended days a client opens are kept on disk. Every
 	// open refreshes the file's modification time, and a sweep removes the
 	// files no client opened for activityReportUnopened.
-	onDisk := !q.Partial && activityDayPreset(q, time.Now())
+	onDisk := !q.Partial && kept.DayPreset(q, time.Now())
 	if !q.Partial {
-		selection = activityReportSelection(f, q)
+		selection = kept.Selection(f, q)
 		if fingerprint, err = s.partsFingerprint(ctx); err != nil {
 			return activity.CandidateArtifacts{}, err
 		}
-		if kept, key, ok := s.checkedActivityReport(selection, fingerprint, onDisk); ok {
-			if onDisk {
-				s.touchActivityReport(selection, key, kept)
-			}
-			db.ReportProgress(onProgress, kept.done)
-			return kept.artifacts, nil
+		if kept, _, ok := s.checkedActivityReport(selection, fingerprint, onDisk); ok {
+			activity.ReportProgress(onProgress, kept.Done)
+			return kept.Artifacts, nil
 		}
 	}
 
@@ -106,22 +127,10 @@ func (s *Store) BuildActivityReportArtifacts(
 		if err != nil {
 			return activity.CandidateArtifacts{}, err
 		}
-		if kept, ok := s.reportMemo(onDisk).get(selection, memoKey); ok {
+		if report, ok := s.reports.Get(selection, memoKey, onDisk); ok {
 			s.markActivityReportChecked(selection, fingerprint, memoKey)
-			if onDisk {
-				s.touchActivityReport(selection, memoKey, kept[0])
-			}
-			db.ReportProgress(onProgress, kept[0].done)
-			return kept[0].artifacts, nil
-		}
-		if onDisk {
-			if kept, ok := s.loadActivityReport(selection, memoKey); ok {
-				s.reportMemo(onDisk).put(selection, memoKey, []activityReportEntry{kept})
-				s.markActivityReportChecked(selection, fingerprint, memoKey)
-				s.touchActivityReport(selection, memoKey, kept)
-				db.ReportProgress(onProgress, kept.done)
-				return kept.artifacts, nil
-			}
+			activity.ReportProgress(onProgress, report.Done)
+			return report.Artifacts, nil
 		}
 	}
 	// A kept report answers its range until a push changes the listing's
@@ -142,7 +151,7 @@ func (s *Store) BuildActivityReportArtifacts(
 	}
 	ctx = chdriver.Context(ctx, chdriver.WithExternalTable(table))
 	candidates := chSessionSet{body: "SELECT id FROM activity_candidate_ids"}
-	db.ReportProgress(onProgress, activity.Progress{
+	activity.ReportProgress(onProgress, activity.Progress{
 		Phase: activity.ProgressLoadingUsage, SessionsTotal: len(sessions),
 	})
 
@@ -151,106 +160,42 @@ func (s *Store) BuildActivityReportArtifacts(
 	pairCtx, cancelPairs := context.WithCancel(ctx)
 	defer cancelPairs()
 	pairs := s.startActivityReportPairs(pairCtx, candidates, ids, versions, q)
-	usage, pricing, err := s.activityReportUsage(
-		ctx, candidates, ids, rangeStartUTC, rangeEndUTC, q)
+	backend := activityReportBackend{
+		Store: s, candidates: candidates,
+		rangeStartUTC: rangeStartUTC, rangeEndUTC: rangeEndUTC, pairing: pairs,
+	}
+	artifacts, done, err := activity.BuildReportArtifacts(
+		ctx, backend, sessions, ids, q, onProgress, "aggregating clickhouse activity report")
 	if err != nil {
 		return activity.CandidateArtifacts{}, err
 	}
 
-	rowsProcessed := int64(0)
-	source := pairs.candidateSource()
-	artifacts, err := activity.BuildCandidateArtifactsFromSourceWithSurvivorUsage(ctx, activity.Params{
-		RangeStart:    q.RangeStart,
-		RangeEnd:      q.RangeEnd,
-		Loc:           q.Loc,
-		EffectiveEnd:  q.EffectiveEnd,
-		Partial:       q.Partial,
-		GapCapSeconds: q.GapCapSeconds,
-		Bucket:        q.Bucket,
-	}, sessions, func(
-		ctx context.Context, yield func(activity.IntervalCandidate) error,
-	) error {
-		db.ReportProgress(onProgress, activity.Progress{
-			Phase: activity.ProgressScanningActivity, SessionsTotal: len(sessions),
-		})
-		return source(ctx, func(candidate activity.IntervalCandidate) error {
-			rowsProcessed++
-			db.ReportProgress(onProgress, activity.Progress{
-				Phase:         activity.ProgressScanningActivity,
-				SessionsTotal: len(sessions), RowsProcessed: rowsProcessed,
-			})
-			return yield(candidate)
-		})
-	}, usage)
-	if err != nil {
-		return activity.CandidateArtifacts{}, fmt.Errorf("aggregating clickhouse activity report: %w", err)
-	}
-	if err := pairs.countMessages(ctx, ids, q, &artifacts); err != nil {
-		return activity.CandidateArtifacts{}, err
-	}
-	db.ReportProgress(onProgress, activity.Progress{
-		Phase: activity.ProgressFinalizing, SessionsTotal: len(sessions),
-		SessionsProcessed: len(sessions), RowsProcessed: rowsProcessed,
-	})
-	artifacts.Report.SchemaVersion = export.ActivityReportSchemaVersion
-	artifacts.Report.Pricing = pricing
-	projects, err := s.BuildProjectIdentityMap(ctx, db.ActivityReportProjectLabels(sessions))
-	if err != nil {
-		return activity.CandidateArtifacts{}, err
-	}
-	artifacts.Report.BySession = artifacts.Sessions
-	activity.SanitizeProjectLabels(&artifacts.Report, projects)
-	artifacts.Sessions = artifacts.Report.BySession
-	artifacts.Report.BySession = []activity.SessionRow{}
-	artifacts.Report.Projects = export.ProjectMapForWire(projects)
-	done := activity.Progress{
-		Phase: activity.ProgressDone, SessionsTotal: len(sessions),
-		SessionsProcessed: len(sessions), RowsProcessed: rowsProcessed,
-	}
-	db.ReportProgress(onProgress, done)
 	if memoKey != "" {
-		entry := activityReportEntry{artifacts: artifacts, done: done}
-		s.reportMemo(onDisk).put(selection, memoKey, []activityReportEntry{entry})
+		s.reports.Put(selection, memoKey, onDisk, kept.Report{Artifacts: artifacts, Done: done})
 		s.markActivityReportChecked(selection, fingerprint, memoKey)
-		if onDisk {
-			s.saveActivityReport(selection, memoKey, entry)
-		}
 	}
 	return artifacts, nil
-}
-
-// activityDiskReportMemoLimit caps the reports kept in memory beside
-// their files on disk.
-const activityDiskReportMemoLimit = 8
-
-// reportMemo is the memo for a report of a range kept on disk, or of one
-// kept only in memory.
-func (s *Store) reportMemo(onDisk bool) *usageRowMemo[activityReportEntry] {
-	if onDisk && s.reportDisk.dir != "" {
-		return &s.diskReports
-	}
-	return &s.activityReports
 }
 
 // markActivityReportChecked records the key an ended range's kept report
 // was kept under; its memo version is the parts it was last checked against.
 func (s *Store) markActivityReportChecked(selection, fingerprint, key string) {
-	s.activityChecks.put(selection, fingerprint, []string{key})
+	s.activityChecks.Put(selection, fingerprint, []string{key})
 }
 
 // checkedActivityReport returns the kept report for a selection checked
 // against exactly these parts. The parts name every row the report reads,
 // so the report's key cannot have changed.
-func (s *Store) checkedActivityReport(selection, fingerprint string, onDisk bool) (activityReportEntry, string, bool) {
-	check, ok := s.activityChecks.get(selection, fingerprint)
+func (s *Store) checkedActivityReport(selection, fingerprint string, onDisk bool) (kept.Report, string, bool) {
+	check, ok := s.activityChecks.Get(selection, fingerprint)
 	if !ok {
-		return activityReportEntry{}, "", false
+		return kept.Report{}, "", false
 	}
-	kept, ok := s.reportMemo(onDisk).get(selection, check[0])
+	report, ok := s.reports.Get(selection, check[0], onDisk)
 	if !ok {
-		return activityReportEntry{}, "", false
+		return kept.Report{}, "", false
 	}
-	return kept[0], check[0], true
+	return report, check[0], true
 }
 
 // endedActivityReportKey identifies everything the report of an ended
@@ -351,13 +296,6 @@ func chDeltaRowTime(value any) (time.Time, bool) {
 	return time.Time{}, false
 }
 
-// activityReportEntry is a kept report of a range that has ended and the
-// final progress its build reported. Callers only read the artifacts.
-type activityReportEntry struct {
-	artifacts activity.CandidateArtifacts
-	done      activity.Progress
-}
-
 // countMessages adds the user and assistant message counts to artifacts.
 // The pairing inputs hold every message of the candidate sessions, so the
 // counts need no read of their own.
@@ -410,7 +348,7 @@ func (s *Store) activityReportSessions(
 		return nil, nil, nil, err
 	}
 	memoKey := fmt.Sprintf("%s|%#v", where, args)
-	if cached, ok := s.activitySessionListings.get(memoKey, fingerprint); ok && len(cached) == 1 {
+	if cached, ok := s.activitySessionListings.Get(memoKey, fingerprint); ok && len(cached) == 1 {
 		listing := cached[0]
 		return slices.Clone(listing.sessions), slices.Clone(listing.ids), maps.Clone(listing.versions), nil
 	}
@@ -461,7 +399,7 @@ func (s *Store) activityReportSessions(
 			"iterating clickhouse activity report sessions: %w", err)
 	}
 	if keep {
-		s.activitySessionListings.put(memoKey, fingerprint, []activitySessionListing{{
+		s.activitySessionListings.Put(memoKey, fingerprint, []activitySessionListing{{
 			sessions: slices.Clone(sessions), ids: slices.Clone(ids), versions: maps.Clone(versions),
 		}})
 	}
@@ -482,16 +420,6 @@ func clickActivityReportCandidateWhere(
 				WHERE last_terminal_at >= ` + chTimestampSQL + `))
 		AND COALESCE(s.started_at, s.created_at) < ` + chTimestampSQL
 	return where, append(args, rangeStartUTC, rangeStartUTC, rangeEndUTC)
-}
-
-// activityReportSelection names an ended range's report by everything the
-// request chose: the filter as the build applies it, and the range.
-func activityReportSelection(f db.AnalyticsFilter, q activity.Query) string {
-	f.IncludeSubagents = true
-	f.IncludeForks = true
-	return fmt.Sprintf("%#v|%s|%s|%s|%s|%#v|%v", f, q.Timezone,
-		q.RangeStart.UTC().Format(time.RFC3339Nano), q.RangeEnd.UTC().Format(time.RFC3339Nano),
-		q.EffectiveEnd.UTC().Format(time.RFC3339Nano), q.Bucket, q.GapCapSeconds)
 }
 
 // chActivityCandidateDigestSQL selects the digest that identifies a set of
@@ -651,8 +579,8 @@ func (s *Store) GetSessionUsageRows(
 	// snapshot and dedup passes below need the complete row set, the same
 	// way the SQLite and PostgreSQL stores chunk this load.
 	var rowsAcc []clickSessionUsageOrderedRow
-	err = chQueryChunked(ids, func(chunk []string) error {
-		inList, inArgs := chInPlaceholders(chunk)
+	err = db.QueryChunkedSize(ids, readbase.MaxSQLVars, func(chunk []string) error {
+		inList, inArgs := db.InPlaceholders(chunk)
 		query := clickUsageNormalizedQuery(
 			chUsageStoredMessageEligibility+" AND s.id IN "+inList,
 			chUsageEventEligibility+" AND s.id IN "+inList,
@@ -673,10 +601,9 @@ func (s *Store) GetSessionUsageRows(
 		return clickSessionUsageRowLess(rowsAcc[i], rowsAcc[j], sessionOrder)
 	})
 	snapshotRows := make([]activity.UsageRow, len(rowsAcc))
-	rowContributes := make([]bool, len(rowsAcc))
-	rawOutputTokensBySession := make(map[string]int)
 	for i, o := range rowsAcc {
 		snapshotRows[i] = activity.UsageRow{
+			Model:               o.scan.model,
 			SessionID:           o.scan.sessionID,
 			Timestamp:           o.scan.ts,
 			MessageOrdinal:      db.UsageRowMessageOrdinal(o.scan.messageOrdinal),
@@ -693,85 +620,23 @@ func (s *Store) GetSessionUsageRows(
 			SourceUUID:          o.scan.sourceUUID,
 			UsageDedupKey:       o.scan.usageDedupKey,
 		}
-		rowContributes[i] = activity.UsageDataContributes(
+		snapshotRows[i].Contributes = activity.UsageDataContributes(
 			o.scan.cost.Valid, o.scan.inputTok, o.scan.outputTok,
 			o.scan.reasoningTok, o.scan.cacheCr, o.scan.cacheRd,
 			o.scan.webSearchRequests)
-		rawOutputTokensBySession[o.scan.sessionID] += o.scan.outputTok
 	}
-	canonicalTokenCoverageBySession, err := activity.CanonicalSessionTokenCoverageContext(ctx, snapshotRows)
-	if err != nil {
-		return nil, err
-	}
-	snapshotMask, snapshotAttribution, snapshotWebSearchRequests := activity.ClaudeSnapshotSurvivorSelection(snapshotRows)
-	seen := make(map[string]struct{})
-	deduplicatedOutputTokens := make(map[string]int)
-	discardedContributingSessions := make(map[string]struct{})
-	out := make([]activity.UsageRow, 0, len(rowsAcc))
-	for i, o := range rowsAcc {
-		if !snapshotMask[i] {
-			deduplicatedOutputTokens[o.scan.sessionID] += snapshotRows[i].OutputTokens
-			if rowContributes[i] {
-				discardedContributingSessions[o.scan.sessionID] = struct{}{}
-			}
-			continue
-		}
-		r := o.scan
-		r.webSearchRequests = snapshotWebSearchRequests[i]
-		attributionSessionID := snapshotAttribution[i]
-		if attributionSessionID != r.sessionID {
-			deduplicatedOutputTokens[r.sessionID] += r.outputTok
-			if rowContributes[i] {
-				discardedContributingSessions[r.sessionID] = struct{}{}
-			}
-		}
-		if key, ok := clickSessionUsageDedupKey(r); ok {
-			if _, dup := seen[key]; dup {
-				deduplicatedOutputTokens[r.sessionID] += r.outputTok
-				if rowContributes[i] {
-					discardedContributingSessions[r.sessionID] = struct{}{}
-				}
-				continue
-			}
-			seen[key] = struct{}{}
-		}
+	return activity.SelectSessionUsageRows(ctx, snapshotRows, func(i int, webSearches int) (activity.UsagePrice, error) {
+		r := rowsAcc[i].scan
+		r.webSearchRequests = webSearches
 		cost, costSource, priced, contributes, sessionCost, priceErr := clickActivityUsageCost(r, rateResolver)
 		if priceErr != nil {
-			return nil, priceErr
+			return activity.UsagePrice{}, priceErr
 		}
-		out = append(out, activity.UsageRow{
-			SessionID:       attributionSessionID,
-			SourceSessionID: r.sessionID,
-			Model:           r.model,
-			Timestamp:       r.ts,
-			OutputTokens:    r.outputTok,
-			Cost:            cost,
-			CostSource:      costSource,
-			SessionCost:     sessionCost,
-			Priced:          priced,
-			Contributes:     contributes,
-			Agent:           r.agent,
-			ProviderID:      r.providerID,
-			ClaudeMessageID: r.claudeMessageID,
-			ClaudeRequestID: r.claudeRequestID,
-			SourceUUID:      r.sourceUUID,
-			UsageDedupKey:   r.usageDedupKey,
-
-			UsageSource:         r.source,
-			MessageOrdinal:      db.UsageRowMessageOrdinal(r.messageOrdinal),
-			InputTokens:         r.inputTok,
-			CacheCreationTokens: r.cacheCr,
-			CacheReadTokens:     r.cacheRd,
-			WebSearchRequests:   r.webSearchRequests,
-		})
-	}
-	return &activity.SessionUsageRows{
-		Rows:                            out,
-		RawOutputTokensBySession:        rawOutputTokensBySession,
-		DeduplicatedOutputTokens:        deduplicatedOutputTokens,
-		DiscardedContributingSessions:   discardedContributingSessions,
-		CanonicalTokenCoverageBySession: canonicalTokenCoverageBySession,
-	}, nil
+		return activity.UsagePrice{
+			Cost: cost, CostSource: costSource, SessionCost: sessionCost,
+			Priced: priced, Contributes: contributes,
+		}, nil
+	})
 }
 
 // activityReportUsage loads the usage rows of the candidate sessions plus the
@@ -823,14 +688,14 @@ func (s *Store) activityReportUsage(
 		// rows would never be read again and are not kept.
 		var memoSlot, memoVersion string
 		if !state.ready {
-			fingerprint, err := s.usageReadFingerprint(ctx, state)
+			fingerprint, err := s.partsFingerprint(ctx)
 			if err != nil {
 				return nil, nil, err
 			}
 			memoSlot = fmt.Sprintf("%s|%s|%s", lowerBound, upperBound, chSessionIDsDigest(ids))
 			memoVersion = fingerprint
 		}
-		if kept, ok := s.activityUsageRows.get(memoSlot, memoVersion); ok {
+		if kept, ok := s.activityUsageRows.Get(memoSlot, memoVersion); ok {
 			ordered, count = kept[0].all(), kept[0].count
 		} else {
 			query, args := clickActivityReportUsageQuery(candidates, lowerBound, upperBound)
@@ -851,7 +716,7 @@ func (s *Store) activityReportUsage(
 			// one; both only read the scanned rows.
 			if memoSlot != "" {
 				s.keeping.Go(func() {
-					s.activityUsageRows.put(memoSlot, memoVersion, []*activityUsageKept{keepActivityUsage(rowsAcc, order)})
+					s.activityUsageRows.Put(memoSlot, memoVersion, []*activityUsageKept{keepActivityUsage(rowsAcc, order)})
 				})
 			}
 			ordered = func(yield func(*clickActivityReportUsageRow) bool) {
@@ -881,9 +746,12 @@ func (s *Store) activityReportUsage(
 			UsageDedupKey:     r.usageDedupKey,
 		})
 	}
-	mask, attribution, webSearchRequests := activity.UsageSurvivorSelectionForSessions(
-		q.RangeStart, q.RangeEnd, q.EffectiveEnd, baseRows, ids,
+	mask, attribution, webSearchRequests, err := activity.UsageSurvivorSelectionForSessions(
+		ctx, q.RangeStart, q.RangeEnd, q.EffectiveEnd, baseRows, ids,
 	)
+	if err != nil {
+		return nil, nil, err
+	}
 	out = make([]activity.UsageRow, 0, count)
 	i := -1
 	for r := range ordered {
@@ -1018,7 +886,7 @@ func (s *Store) activityUsageRange(
 	ctx context.Context, state preparedUsageState, lowerBound, upperBound string,
 ) (*activityUsageKept, error) {
 	slot := lowerBound + "|" + upperBound
-	kept, ok := s.activityUsageRanges.get(slot, "")
+	kept, ok := s.activityUsageRanges.Get(slot, "")
 	incremental := ok && len(kept) > 0
 	var prev activityUsageRange
 	var changed []string
@@ -1063,12 +931,12 @@ func (s *Store) activityUsageRange(
 	// Only ranges in progress read this memo, so a range that has ended is
 	// never read again.
 	now := time.Now()
-	s.activityUsageRanges.deleteSlots(func(slot string) bool {
+	s.activityUsageRanges.DeleteSlots(func(slot string) bool {
 		_, upper, _ := strings.Cut(slot, "|")
 		end, err := time.Parse(time.RFC3339Nano, upper)
 		return err == nil && end.Before(now)
 	})
-	s.activityUsageRanges.put(slot, "", []activityUsageRange{{revisions: state.revisions, rows: rows}})
+	s.activityUsageRanges.Put(slot, "", []activityUsageRange{{revisions: state.revisions, rows: rows}})
 	return rows, nil
 }
 
@@ -1281,7 +1149,7 @@ func (s *Store) scanActivityUsageRows(
 		if r.messageOrdinal.Valid {
 			ordinal = r.messageOrdinal.Int64
 		}
-		parsedTS, ok := parseAnalyticsTime(r.ts)
+		parsedTS, ok := readbase.ParseAnalyticsTime(r.ts)
 		if len(chunk) == chunkRows {
 			chunks = append(chunks, chunk)
 			chunk = make([]clickSessionUsageOrderedRow, 0, chunkRows)
@@ -1305,19 +1173,6 @@ func (s *Store) scanActivityUsageRows(
 		rowsAcc = append(rowsAcc, c...)
 	}
 	return append(rowsAcc, chunk...), nil
-}
-
-func clickSessionUsageDedupKey(r clickActivityReportUsageRow) (string, bool) {
-	if r.claudeMessageID != "" && r.claudeRequestID != "" {
-		return "claude:" + r.claudeMessageID + ":" + r.claudeRequestID, true
-	}
-	if r.source == "message" && r.agent != "" && r.sourceUUID != "" {
-		return "source:" + r.agent + ":" + r.sourceUUID, true
-	}
-	if r.usageDedupKey != "" {
-		return "usage:" + r.usageDedupKey, true
-	}
-	return "", false
 }
 
 func clickSessionUsageRowLess(

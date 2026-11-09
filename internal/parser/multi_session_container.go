@@ -88,7 +88,7 @@ func classifySQLiteContainerPath(
 		return multiSessionMatch{Path: path, Container: path}, true
 	}
 	if allowMissing {
-		if dbPath, ok := sqliteContainerPathForEvent(
+		if dbPath, ok := SQLiteContainerPathForEvent(
 			root, path, dbRelPath, rejectShmSiblingEvents,
 		); ok {
 			return multiSessionMatch{Path: dbPath, Container: dbPath}, true
@@ -111,15 +111,8 @@ func sqliteContainerUnderRoot(
 	return !requireRegular || IsRegularFile(dbPath)
 }
 
-// sqliteContainerPathForEvent resolves a changed-path event naming the
-// database file itself or a WAL/SHM/journal sibling to the container's
-// canonical path. While the database exists, a "-wal" event whose WAL is
-// gone or holds no frames is ignored: every read connection, this process's
-// own included, creates an empty WAL on open and deletes it on close, so
-// resolving those events made each scan schedule the next one. A commit
-// writes frames past the header and a checkpoint writes the database file
-// itself, so no content change is lost. A deleted database still resolves.
-func sqliteContainerPathForEvent(
+// SQLiteContainerPathForEvent ignores frameless WALs because SQLite readers create them.
+func SQLiteContainerPathForEvent(
 	root, path, dbRelPath string, rejectShmSiblingEvents bool,
 ) (string, bool) {
 	root = filepath.Clean(root)
@@ -727,7 +720,7 @@ func (s multiSessionContainerSourceSet) changedTokenMembers(
 	var sources []SourceRef
 	err = s.cfg.memberTokens(ctx, match.toSource(root),
 		func(member multiSessionMemberToken) error {
-			row, ok, err := cursor.lookup(ctx, member.Path)
+			row, ok, err := cursor.Lookup(ctx, member.Path)
 			if err != nil {
 				return err
 			}
@@ -757,21 +750,21 @@ func (s multiSessionContainerSourceSet) changedTokenMembers(
 // start of the stored side, reusing the first page when that page holds one.
 func firstUnsuppressedStoredPage(
 	ctx context.Context, pager StoredMemberFreshnessPager,
-) (storedMemberFreshnessCursor, bool, error) {
+) (StoredMemberFreshnessCursor, bool, error) {
 	after := ""
 	for {
 		rows, done, err := pager(ctx, after, storedMemberFreshnessPageSize)
 		if err != nil {
-			return storedMemberFreshnessCursor{}, false, err
+			return StoredMemberFreshnessCursor{}, false, err
 		}
 		for _, row := range rows {
 			if row.Suppressed {
 				continue
 			}
 			if after != "" {
-				return storedMemberFreshnessCursor{pager: pager}, true, nil
+				return StoredMemberFreshnessCursor{pager: pager}, true, nil
 			}
-			return storedMemberFreshnessCursor{
+			return StoredMemberFreshnessCursor{
 				pager: pager,
 				rows:  rows,
 				after: rows[len(rows)-1].Path,
@@ -779,7 +772,7 @@ func firstUnsuppressedStoredPage(
 			}, true, nil
 		}
 		if done || len(rows) == 0 {
-			return storedMemberFreshnessCursor{}, false, nil
+			return StoredMemberFreshnessCursor{}, false, nil
 		}
 		after = rows[len(rows)-1].Path
 	}

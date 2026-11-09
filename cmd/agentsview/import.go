@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"log"
 	"maps"
 	"os"
 	"path/filepath"
@@ -23,13 +22,7 @@ type ImportConfig struct {
 	Replace []string
 }
 
-func runImport(cfg ImportConfig) {
-	if err := importSessions(cfg); err != nil {
-		log.Fatal(err)
-	}
-}
-
-func importSessions(cfg ImportConfig) error {
+func importSessions(ctx context.Context, cfg ImportConfig) error {
 	if cfg.Type == "gemini-apps" && len(cfg.Replace) > 0 {
 		return errors.New("--replace is not supported for gemini-apps imports")
 	}
@@ -39,18 +32,20 @@ func importSessions(cfg ImportConfig) error {
 	}
 	cfg.Path = expandedPath
 
-	appCfg, err := config.LoadMinimal()
+	appCfg, err := config.LoadMinimalFor(config.ScopeLocal)
 	if err != nil {
 		return fmt.Errorf("loading config: %w", err)
 	}
 
-	database, writeLock, err := openWriteDB(context.Background(), appCfg)
+	database, writeLock, err := openWriteDB(ctx, appCfg)
 	if err != nil {
 		return fmt.Errorf("opening database: %w", err)
 	}
 	defer closeWriteDB(database, writeLock)
 
-	ctx := context.Background()
+	if err := database.RequireSourceSync(ctx); err != nil {
+		return err
+	}
 
 	// Handle zip files.
 	dir, cleanup, err := resolveImportSource(cfg.Path)

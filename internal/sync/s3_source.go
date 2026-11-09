@@ -105,21 +105,23 @@ func (e *Engine) s3SourceMetadataChanged(ctx context.Context, file parser.Discov
 	if !ok {
 		return false
 	}
+	storedID, err := e.s3StoredSessionID(ctx, file, p)
+	if err != nil || storedID == "" {
+		return true
+	}
 	return e.s3SourceMetadataChangedFromInfo(ctx,
-		file, p, file.SourceSize, file.SourceMtime, file.SourceFingerprint,
+		file, storedID, file.SourceSize, file.SourceMtime, file.SourceFingerprint,
 	)
 }
 
 func (e *Engine) s3SourceMetadataChangedFromInfo(ctx context.Context,
-	file parser.DiscoveredFile, p parser.S3Provider,
+	file parser.DiscoveredFile, sessionID string,
 	size, mtime int64, sourceFingerprint string,
 ) bool {
-	sessionID := s3DiscoveredSessionIDWithProvider(file, p)
 	if sessionID == "" {
 		return false
 	}
-	storedPath := e.db.GetSessionFilePath(ctx, sessionID)
-	if storedPath == "" || storedPath != file.Path {
+	if !parser.SharesSessionIDs(file.Agent) && e.db.GetSessionFilePath(ctx, sessionID) != file.Path {
 		return true
 	}
 	storedSize, storedMtime, ok := e.db.GetSessionFileInfo(ctx, sessionID)
@@ -136,6 +138,23 @@ func (e *Engine) s3SourceMetadataChangedFromInfo(ctx context.Context,
 		}
 	}
 	return false
+}
+
+// Shared-ID sources must compare metadata with the row owned by this object.
+func (e *Engine) s3StoredSessionID(ctx context.Context, file parser.DiscoveredFile, p parser.S3Provider) (string, error) {
+	if parser.SharesSessionIDs(file.Agent) {
+		records, err := e.db.ListSessionPathRecords(ctx, s3DiscoveredSessionIDWithProvider(file, p))
+		if err != nil {
+			return "", err
+		}
+		for _, r := range records {
+			if !r.Excluded && r.FilePath == file.Path {
+				return r.ID, nil
+			}
+		}
+		return "", nil
+	}
+	return s3DiscoveredSessionIDWithProvider(file, p), nil
 }
 
 type s3CodexIndexSnapshot struct {
@@ -205,6 +224,7 @@ func (e *Engine) s3CodexIndexSnapshot(
 }
 
 func (e *Engine) s3CodexIndexNeedsRefreshSince(
+	ctx context.Context,
 	file parser.DiscoveredFile,
 	cutoffNs int64,
 ) bool {
@@ -241,15 +261,15 @@ func (e *Engine) s3CodexIndexNeedsRefreshSince(
 		return false
 	}
 
-	title, ok := snapshot.titles[uuid]
+	title, ok := snapshot.titles[parser.CodexThreadIDFromSessionKey(uuid)]
 	if !ok {
 		return false
 	}
-	return e.s3CodexStoredNameDiffers(file, uuid, title)
+	return e.s3CodexStoredNameDiffers(ctx, file, uuid, title)
 }
 
 func (e *Engine) s3CodexIndexSessionNameChanged(
-	file parser.DiscoveredFile, uuid string,
+	ctx context.Context, file parser.DiscoveredFile, uuid string,
 ) (bool, error) {
 	indexURI, ok := parser.CodexS3SessionIndexURI(file.Path)
 	if !ok {
@@ -265,21 +285,21 @@ func (e *Engine) s3CodexIndexSessionNameChanged(
 	if !snapshot.statOK || !snapshot.titlesLoaded {
 		return false, nil
 	}
-	title, ok := snapshot.titles[uuid]
+	title, ok := snapshot.titles[parser.CodexThreadIDFromSessionKey(uuid)]
 	if !ok {
 		return false, nil
 	}
-	return e.s3CodexStoredNameDiffers(file, uuid, title), nil
+	return e.s3CodexStoredNameDiffers(ctx, file, uuid, title), nil
 }
 
 func (e *Engine) s3CodexStoredNameDiffers(
-	file parser.DiscoveredFile, uuid, indexTitle string,
+	ctx context.Context, file parser.DiscoveredFile, uuid, indexTitle string,
 ) bool {
 	sessionID := applyIDPrefixToID(
 		s3SessionIDPrefix(file.Machine), "codex:"+uuid,
 	)
 	return e.codexStoredNameDiffersBySessionID(
-		sessionID, indexTitle, false,
+		ctx, sessionID, indexTitle, false,
 	)
 }
 
@@ -414,13 +434,22 @@ func (e *Engine) SyncS3SubagentTranscriptsContext(
 	ctx context.Context, parentSessionID string, parentAgent parser.AgentType,
 	paths []string,
 ) error {
+	return e.syncS3SubagentTranscriptsContext(ctx, parentSessionID, parentAgent, paths, false)
+}
+
+func (e *Engine) syncS3SubagentTranscriptsContext(ctx context.Context, parentSessionID string, parentAgent parser.AgentType, paths []string, try bool) error {
+	if e.sourceSyncErr != nil {
+		return e.sourceSyncErr
+	}
 	if e.refuseWriteInForceParse("SyncS3SubagentTranscripts") {
 		return nil
 	}
 	if !isClaudeFormatAgent(parentAgent) {
 		return fmt.Errorf("sync s3 subagent transcripts: unsupported parent agent %q", parentAgent)
 	}
-	e.syncMu.Lock()
+	if err := e.lockSync(try); err != nil {
+		return err
+	}
 	synced := false
 	sessionsChanged := false
 	// Defers run LIFO: emit runs after syncMu.Unlock, matching the

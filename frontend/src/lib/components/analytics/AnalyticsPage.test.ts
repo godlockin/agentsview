@@ -11,13 +11,12 @@ import { settings } from "../../stores/settings.svelte.js";
 import { sync } from "../../stores/sync.svelte.js";
 import { ui } from "../../stores/ui.svelte.js";
 import { yokedDates } from "../../stores/yokedDates.svelte.js";
-import sourceRaw from "./AnalyticsPage.svelte?raw";
 // @ts-ignore
 import AnalyticsPage from "./AnalyticsPage.svelte";
 // @ts-ignore
 import QualityPage from "../quality/QualityPage.svelte";
-
-const source = sourceRaw.replace(/\r\n/g, "\n");
+import { requestUrl } from "../../test-support/request-url.js";
+import { MetadataService } from "../../api/generated/index.js";
 
 async function flushEffects() {
   await tick();
@@ -78,10 +77,61 @@ afterEach(() => {
   sessions.loading = false;
   sessions.filters.dateFrom = "";
   sessions.filters.dateTo = "";
+  sessions.filters.machine = "";
   yokedDates.setEnabled(false);
   analyticsPageDates.clear();
   ui.sidebarOpen = true;
   ui.isMobileViewport = false;
+});
+
+describe("AnalyticsPage grouped model filter", () => {
+  it("keeps a saved variant's group available after clearing an empty period", async () => {
+    vi.spyOn(sessions, "load").mockResolvedValue();
+    vi.spyOn(outcomeTotals, "load").mockResolvedValue();
+    vi.spyOn(analytics, "fetchAll").mockResolvedValue();
+    analytics.model = "claude-opus-4-20250514";
+    analytics.summary = {
+      total_sessions: 0,
+      total_messages: 0,
+      total_output_tokens: 0,
+      token_reporting_sessions: 0,
+      models: [],
+      model_aliases: { "claude-opus-4-20250514": "claude-4" },
+      active_projects: 0,
+      active_days: 0,
+      avg_messages: 0,
+      median_messages: 0,
+      p90_messages: 0,
+      most_active_project: "",
+      concentration: 0,
+      agents: {},
+    };
+    sessions.loading = false;
+    router.route = "sessions";
+    component = mount(AnalyticsPage, { target: document.body });
+    await flushEffects();
+    document
+      .querySelector<HTMLButtonElement>('button[aria-label="Model: claude-opus-4-20250514"]')!
+      .click();
+    await flushEffects();
+    const groupRow = () =>
+      [...document.querySelectorAll<HTMLButtonElement>(".kit-filter-dropdown__item")].find(
+        (row) =>
+          row.querySelector(".kit-filter-dropdown__label")?.textContent?.trim() === "claude-4",
+      );
+    const rows = [...document.querySelectorAll<HTMLButtonElement>(".kit-filter-dropdown__item")];
+    const groups = rows.filter(
+      (row) => row.querySelector(".kit-filter-dropdown__label")?.textContent?.trim() === "claude-4",
+    );
+    expect(rows).toHaveLength(2);
+    expect(groups).toHaveLength(1);
+    expect(groupRow()!.querySelector(".kit-filter-dropdown__check.on")).not.toBeNull();
+    expect(groupRow()!.getAttribute("title")).toBe("claude-opus-4-20250514");
+    groupRow()!.click();
+    await flushEffects();
+    expect(analytics.model).toBe("");
+    expect(groupRow()).toBeDefined();
+  });
 });
 
 describe("AnalyticsPage outcome window", () => {
@@ -107,7 +157,10 @@ describe("AnalyticsPage outcome window", () => {
             api_version: 10,
             data_version: 1,
             insight_generation_available: false,
+            friction_available: false,
+            friction_build_allowed: false,
             session_stats_available: backendAvailable,
+            kata_available: false,
           };
     router.route = "sessions";
     router.isRootPath = false;
@@ -142,7 +195,10 @@ describe("AnalyticsPage outcome window", () => {
         api_version: 10,
         data_version: 1,
         insight_generation_available: false,
+        friction_available: false,
+        friction_build_allowed: false,
         session_stats_available: true,
+        kata_available: false,
         read_only: true,
       };
       await flushEffects();
@@ -164,21 +220,110 @@ describe("AnalyticsPage outcome window", () => {
     expect(document.querySelector(".outcome-load-prs")).not.toBeNull();
   });
 
-  it.each([false, true])(
-    "refreshes only Git totals, respecting unsupported filters (%s)",
-    async (unsupported) => {
+  it.each([
+    { unsupported: false, requestedPRs: false, gitLoads: 1 },
+    { unsupported: true, requestedPRs: false, gitLoads: 0 },
+    { unsupported: false, requestedPRs: true, gitLoads: 0 },
+  ])(
+    "refresh reloads only unrequested Git totals: %o",
+    async ({ unsupported, requestedPRs, gitLoads }) => {
       const load = await start();
       const loadPRs = vi.spyOn(outcomeTotals, "loadWithPullRequests").mockResolvedValue();
       if (unsupported) analytics.model = "demo-model";
       await flushEffects();
       load.mockClear();
-      outcomeTotals.includePullRequests = true;
+      outcomeTotals.includePullRequests = requestedPRs;
+      if (requestedPRs) {
+        outcomeTotals.stats = {
+          repos_active: 1,
+          commits: 2,
+          loc_added: 3,
+          loc_removed: 0,
+          files_changed: 1,
+          prs_opened: 0,
+          prs_merged: 0,
+        };
+        expect(outcomeTotals.pullRequestLookupFailed).toBe(false);
+      }
       document.querySelector<HTMLButtonElement>('button[aria-label="Refresh analytics"]')!.click();
       await flushEffects();
-      expect(load).toHaveBeenCalledTimes(unsupported ? 0 : 1);
+      expect(load).toHaveBeenCalledTimes(gitLoads);
       expect(loadPRs).not.toHaveBeenCalled();
     },
   );
+
+  it.each(["transport error", "skipped PR", "skipped author", "absent totals"])(
+    "refresh reloads Git totals after a failed pull request lookup and restores the button (%s)",
+    async (failure) => {
+      const initialLoad = await start();
+      initialLoad.mockRestore();
+      const load = vi.spyOn(outcomeTotals, "load");
+      const lookup = vi.spyOn(outcomeTotals, "loadWithPullRequests");
+      const fetch = vi.spyOn(globalThis, "fetch").mockImplementation(async (url) => {
+        if (requestUrl(url).includes("include_github_outcomes=true")) {
+          if (failure === "transport error") throw new Error("Pull request lookup failed");
+          return Response.json({
+            outcome_stats: {
+              repos_active: 1,
+              commits: 2,
+              loc_added: 3,
+              loc_removed: 0,
+              files_changed: 1,
+              prs_opened: failure === "absent totals" ? undefined : 0,
+              prs_merged: failure === "absent totals" ? undefined : 0,
+              skipped:
+                failure === "absent totals"
+                  ? []
+                  : [
+                      {
+                        repo: "example",
+                        op: failure === "skipped author" ? "author" : "pr",
+                        reason: "GitHub lookup failed",
+                      },
+                    ],
+            },
+          });
+        }
+        return Response.json({
+          outcome_stats: {
+            repos_active: 1,
+            commits: 2,
+            loc_added: 3,
+            loc_removed: 0,
+            files_changed: 1,
+          },
+        });
+      });
+      document.querySelector<HTMLButtonElement>(".outcome-load-prs")!.click();
+      expect(outcomeTotals.pullRequestLookupFailed).toBe(false);
+      await lookup.mock.results[0]!.value;
+      await flushEffects();
+      expect(outcomeTotals.error).toBe(
+        failure === "transport error" ? "Pull request lookup failed" : null,
+      );
+      expect(document.querySelector(".outcome-load-prs")).toBeNull();
+
+      document.querySelector<HTMLButtonElement>('button[aria-label="Refresh analytics"]')!.click();
+      await flushEffects();
+      expect(load).toHaveBeenCalledTimes(1);
+      await load.mock.results[0]!.value;
+      await flushEffects();
+      expect(fetch).toHaveBeenCalledTimes(2);
+      expect(requestUrl(fetch.mock.calls[1]![0])).toContain("include_github_outcomes=false");
+      expect(outcomeTotals.stats?.commits).toBe(2);
+      expect(outcomeTotals.error).toBeNull();
+      expect(document.querySelector(".outcome-load-prs")).not.toBeNull();
+    },
+  );
+
+  it("passes the current outcome window to Retry", async () => {
+    const load = await start();
+    const retry = vi.spyOn(outcomeTotals, "retry").mockResolvedValue();
+    outcomeTotals.error = "Outcome request timed out";
+    await flushEffects();
+    document.querySelector<HTMLButtonElement>(".outcome-container .error button")!.click();
+    expect(retry).toHaveBeenCalledExactlyOnceWith(load.mock.calls[0]![0]);
+  });
 
   it("uses local days for the range and follows selected days and activity ranges", async () => {
     vi.stubEnv("TZ", "America/New_York");
@@ -248,6 +393,74 @@ describe("AnalyticsPage outcome window", () => {
 });
 
 describe("AnalyticsPage initial load", () => {
+  it("loads unfiltered analytics while machine metadata is pending", async () => {
+    vi.stubGlobal(
+      "ResizeObserver",
+      class {
+        observe() {}
+        disconnect() {}
+      },
+    );
+    const fetch = vi.spyOn(analytics, "fetchAll").mockResolvedValue();
+    vi.spyOn(sessions, "load").mockResolvedValue();
+    const metadata =
+      Promise.withResolvers<Awaited<ReturnType<typeof MetadataService.getApiV1Machines>>>();
+    vi.spyOn(MetadataService, "getApiV1Machines").mockReturnValue(metadata.promise);
+    router.isRootPath = true;
+    router.params = {};
+    sessions.initFromParams(router.params);
+    component = mount(AnalyticsPage, { target: document.body });
+
+    try {
+      await flushEffects();
+      expect(sessions.filters.machine).toBe("");
+      expect(sessions.machineFilterPending).toBe(false);
+      expect(fetch).toHaveBeenCalledTimes(1);
+    } finally {
+      metadata.resolve({
+        machines: [],
+        resolved_machines: [],
+        machine_labels: {},
+        machine_aliases: {},
+      });
+      await sessions.loadMachines();
+    }
+  });
+
+  it("loads analytics once with the resolved machine from a label deep link", async () => {
+    vi.stubGlobal(
+      "ResizeObserver",
+      class {
+        observe() {}
+        disconnect() {}
+      },
+    );
+    const requests: string[] = [];
+    vi.spyOn(analytics, "fetchAll").mockImplementation(async () => {
+      requests.push(analytics.machine);
+    });
+    vi.spyOn(sessions, "load").mockResolvedValue();
+    const metadata =
+      Promise.withResolvers<Awaited<ReturnType<typeof MetadataService.getApiV1Machines>>>();
+    vi.spyOn(MetadataService, "getApiV1Machines").mockReturnValue(metadata.promise);
+    router.isRootPath = false;
+    router.params = { machine: "Workstation", date_from: "2026-03-01", date_to: "2026-03-31" };
+    sessions.initFromParams(router.params);
+    component = mount(AnalyticsPage, { target: document.body });
+    await flushEffects();
+
+    metadata.resolve({
+      machines: ["id-a"],
+      resolved_machines: ["id-a"],
+      machine_labels: { "id-a": "Workstation" },
+      machine_aliases: {},
+    });
+    await sessions.loadMachines();
+    await flushEffects();
+
+    expect(requests).toEqual(["id-a"]);
+  });
+
   async function start() {
     vi.useFakeTimers();
     vi.stubGlobal(
@@ -614,70 +827,6 @@ describe("AnalyticsPage refresh behavior", () => {
     expect(analytics.windowDays).toBe(7);
   });
 
-  it("does not refresh analytical scans from SSE updates", () => {
-    expect(source).not.toContain("subscribeDebounced");
-    // SSE only flags new data; the periodic refetch lives in RefreshControl.
-    expect(source).toContain("analytics.markNewData");
-    expect(source).toContain("events.subscribe");
-  });
-
-  it("delegates the refresh affordance to the shared RefreshControl", () => {
-    expect(source).toContain("<RefreshControl");
-    expect(source).toContain("analytics.lastUpdatedAt");
-    // The scheduler, label tick, and icon now live in the shared component.
-    expect(source).not.toContain("createRefreshScheduler");
-    expect(source).not.toContain("REFRESH_INTERVAL_MS");
-    expect(source).not.toContain("REFRESH_LABEL_INTERVAL_MS");
-    expect(source).not.toContain("formatRefreshAge");
-    expect(source).not.toContain("RefreshCwIcon");
-    expect(source).not.toContain("setInterval");
-  });
-
-  it("shows relative last-updated status without ambiguous badges", () => {
-    expect(source).not.toContain("formatUpdatedAt");
-    expect(source).not.toContain("analytics.hasNewData");
-    expect(source).not.toContain("New data");
-    expect(source).not.toContain(".new-data");
-  });
-
-  it("keeps refresh progress out of content layout flow", () => {
-    const queryProgress = source.match(/\.query-progress\s*{[^}]+}/)?.[0] ?? "";
-
-    expect(queryProgress).toContain("position: absolute");
-    expect(queryProgress).toContain("left: 0;");
-    expect(queryProgress).toContain("right: 0;");
-    expect(queryProgress).not.toContain("position: sticky");
-    expect(queryProgress).not.toContain("margin:");
-  });
-
-  it("preserves rolling sessions analytics URLs with window_days", () => {
-    expect(source).toContain('"window_days"');
-    expect(source).toContain("parseSessionAnalyticsWindowDays");
-    expect(source).toContain("writeSessionDateParams");
-  });
-
-  it("refreshes analytics through date-aware session writeback", () => {
-    const helperStart = source.indexOf("function refreshAnalytics");
-    const helperEnd = source.indexOf("\n\n  function handleActivityRangeSelect", helperStart);
-    const helperBlock = source.slice(helperStart, helperEnd);
-
-    expect(helperStart).toBeGreaterThan(-1);
-    expect(helperBlock).toContain("analytics.fetchAll()");
-    expect(helperBlock).toContain("writeSessionDateParams(state)");
-    expect(source).toContain("onRefresh={refreshAnalytics}");
-    expect(source).not.toContain("onRefresh={() => analytics.fetchAll()}");
-  });
-
-  it("applies URL and yoke dates before the initial analytics fetch", () => {
-    const onMountIndex = source.indexOf("onMount(() =>");
-    const firstEffectAfterMount = source.indexOf("$effect(() =>", onMountIndex);
-    const onMountBlock = source.slice(onMountIndex, firstEffectAfterMount);
-
-    expect(onMountBlock).not.toContain("analytics.fetchAll();");
-    expect(source).toContain("const firstRun = !analyticsDateUrlInitRan");
-    expect(source).toContain("if (changed || initialHydration)");
-  });
-
   it("uses an Activity brush as a Sessions filter without replacing the chart window", async () => {
     Object.defineProperty(HTMLElement.prototype, "clientWidth", {
       configurable: true,
@@ -769,67 +918,95 @@ describe("AnalyticsPage refresh behavior", () => {
     expect(loadSessions).toHaveBeenCalled();
   });
 
-  it("only seeds saved yoke dates during initial URL hydration", () => {
-    const seedIndex = source.indexOf("yokedDates.seedForPanel()");
-    const firstRunIndex = source.indexOf("if (firstRun) {");
-
-    expect(seedIndex).toBeGreaterThan(-1);
-    expect(firstRunIndex).toBeGreaterThan(-1);
-    expect(seedIndex).toBeGreaterThan(firstRunIndex);
-    expect(source).toContain("if (router.isRootPath)");
-  });
-
-  it("treats drill-down clears as analytics date changes", () => {
-    const signatureStart = source.indexOf("function analyticsPanelDateSignature");
-    const signatureEnd = source.indexOf("\n\n  function applyAnalyticsPanelDate", signatureStart);
-    const signatureBlock = source.slice(signatureStart, signatureEnd);
-    const applyStart = source.indexOf("function applyAnalyticsPanelDate");
-    const applyEnd = source.indexOf("\n\n  function handleActivityRangeSelect", applyStart);
-    const applyBlock = source.slice(applyStart, applyEnd);
-
-    expect(signatureStart).toBeGreaterThan(-1);
-    expect(signatureBlock).toContain("selectedDate: analytics.selectedDate");
-    expect(signatureBlock).toContain("selectedDow: analytics.selectedDow");
-    expect(signatureBlock).toContain("selectedHour: analytics.selectedHour");
-    expect(applyBlock).toContain("const before = analyticsPanelDateSignature();");
-    expect(applyBlock).toContain("const after = analyticsPanelDateSignature();");
-  });
-
-  it("only applies analytics URL dates when the date signature changes", () => {
-    const helperStart = source.indexOf("function sessionAnalyticsDateUrlSignature");
-    const helperEnd = source.indexOf("function clearSessionDateFilters", helperStart);
-    const helperBlock = source.slice(helperStart, helperEnd);
-    const effectStart = source.indexOf("const dateSignature =");
-    const effectEnd = source.indexOf("onDestroy(() => {", effectStart);
-    const effectBlock = source.slice(effectStart, effectEnd);
-
-    expect(helperStart).toBeGreaterThan(-1);
-    expect(helperBlock).toContain("state.mode");
-    expect(helperBlock).toContain("state.windowDays");
-    expect(helperBlock).toContain("from: state.from");
-    expect(helperBlock).toContain("to: state.to");
-    expect(source).toContain("syncSessionFiltersForDateState(state)");
-    expect(source).toContain("let lastAnalyticsDateUrlSignature: string | null = $state(null);");
-    expect(effectBlock).toContain(
-      "const dateChanged = firstRun ||\n        lastAnalyticsDateUrlSignature !== dateSignature;",
+  it("keeps requested GitHub totals through automatic refresh", async () => {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    vi.stubGlobal(
+      "ResizeObserver",
+      class {
+        observe() {}
+        disconnect() {}
+      },
     );
-    expect(effectBlock).toContain("if (dateChanged) {");
-    expect(effectBlock).toContain("changed = applyAnalyticsPanelDate(state);");
-    expect(effectBlock).toContain("lastAnalyticsDateUrlSignature = dateSignature;");
-  });
-
-  it("does not use the rolling fallback when cleared session date filters remove URL dates", () => {
-    const noStateStart = source.indexOf("if (!state) {");
-    const noStateEnd = source.indexOf(
-      "let changed = false;\n      let sessionChanged = false;",
-      noStateStart,
+    const panels = vi.spyOn(analytics, "fetchAll").mockResolvedValue();
+    vi.spyOn(sessions, "load").mockResolvedValue();
+    let resolvePRs!: (value: Response) => void;
+    const pending = new Promise<Response>((resolve) => {
+      resolvePRs = resolve;
+    });
+    const statsRequests: { url: string; signal: AbortSignal | null | undefined }[] = [];
+    vi.spyOn(globalThis, "fetch").mockImplementation(async (url, options) => {
+      if (!requestUrl(url).includes("/api/v1/session-stats"))
+        return Response.json({ models: [], agents: [] });
+      statsRequests.push({ url: requestUrl(url), signal: options?.signal });
+      if (requestUrl(url).includes("include_github_outcomes=true")) return pending;
+      return Response.json({
+        outcome_stats: {
+          repos_active: 1,
+          commits: 2,
+          loc_added: 3,
+          loc_removed: 0,
+          files_changed: 1,
+        },
+      });
+    });
+    settings.githubConfigured = true;
+    sync.serverVersion = {
+      version: "test",
+      commit: "test",
+      build_date: "",
+      api_version: 10,
+      data_version: 1,
+      insight_generation_available: false,
+      friction_available: false,
+      friction_build_allowed: false,
+      session_stats_available: true,
+      kata_available: false,
+    };
+    router.params = { date_from: "2026-03-01", date_to: "2026-03-31" };
+    analytics.from = "2026-03-01";
+    analytics.to = "2026-03-31";
+    component = mount(AnalyticsPage, { target: document.body });
+    await flushEffects();
+    statsRequests.length = 0;
+    const lookup = vi.spyOn(outcomeTotals, "loadWithPullRequests");
+    document.querySelector<HTMLButtonElement>(".outcome-load-prs")!.click();
+    await flushEffects();
+    expect(statsRequests).toHaveLength(1);
+    const signal = statsRequests[0]!.signal;
+    expect(signal).toBeDefined();
+    expect(statsRequests[0]!.url).toContain("include_github_outcomes=true");
+    const beforeRefresh = panels.mock.calls.length;
+    await vi.advanceTimersByTimeAsync(5 * 60 * 1000);
+    await flushEffects();
+    expect(panels).toHaveBeenCalledTimes(beforeRefresh + 1);
+    expect(statsRequests).toHaveLength(1);
+    expect(signal?.aborted).toBe(false);
+    resolvePRs(
+      Response.json({
+        outcome_stats: {
+          repos_active: 1,
+          commits: 2,
+          loc_added: 3,
+          loc_removed: 0,
+          files_changed: 1,
+          prs_opened: 7,
+          prs_merged: 5,
+        },
+      }),
     );
-    const noStateBlock = source.slice(noStateStart, noStateEnd);
-
-    expect(noStateBlock).toContain("dateChanged && sessionDateFiltersAreClear()");
-    expect(noStateBlock).toContain("yokedDates.clear();");
-    expect(noStateBlock).toContain("} else if (dateChanged) {");
-    expect(noStateBlock).toContain("state = rollingPanelDate(analytics.windowDays);");
-    expect(noStateBlock).toContain("changed = applyAnalyticsPanelDate(state);");
+    await lookup.mock.results[0]!.value;
+    await flushEffects();
+    const showsOpenedPRs = () =>
+      [...document.querySelectorAll(".outcome-card")].some(
+        (card) =>
+          card.textContent?.includes("7") && card.textContent?.includes("Pull requests opened"),
+      );
+    expect(outcomeTotals.stats?.prs_opened).toBe(7);
+    expect(showsOpenedPRs()).toBe(true);
+    await vi.advanceTimersByTimeAsync(5 * 60 * 1000);
+    await flushEffects();
+    expect(panels).toHaveBeenCalledTimes(beforeRefresh + 2);
+    expect(statsRequests).toHaveLength(1);
+    expect(showsOpenedPRs()).toBe(true);
   });
 });

@@ -22,6 +22,7 @@ contracts are documented in
 | Event storms                   | One SSE emit per watcher flush drove ~1/s dashboard refetch; SQLite WAL sidecar events fanned out to every session in a shared DB.                                                                                                               | #367, #956                                     |
 | Per-row query shape            | `GetDailyUsage` ran 1.2M `json_extract` calls per scan and had no date pushdown.                                                                                                                                                                 | #309                                           |
 | Usage archive scaling          | Normalized facts removed JSON parsing but warm requests still ranked and priced hundreds of thousands of rows instead of reading daily aggregates.                                                                                               | Usage aggregate cache                          |
+| Metadata update reindexing     | Token receipts and coverage repairs re-tokenized unchanged message text, holding the writer longer as message bodies grew.                                                                                                                       | Guarded message update triggers                |
 
 ## Automated invariants and local benchmarks
 
@@ -30,9 +31,21 @@ contracts are documented in
 These count work units instead of measuring time, so they are immune to CI
 runner noise and fail loudly:
 
+- `TestDialogueFTSTriggerSync` and `TestDialogueFTSCorpusVersion/current`
+  (`internal/db/dialogue_test.go`) check that metadata updates add no
+  search-index writes and that current archives upgrade the old trigger
+  without rebuilding the index.
 - `TestWarmFullSyncDoesNoBulkWriteWork` (`internal/sync/perf_invariant_test.go`)
   — a second full sync over an unchanged Claude archive must skip everything
   and run zero bulk-write batches (`Engine.PhaseStats`).
+- `TestRepositoryProjectImportsReuseSQL` (`internal/db`) counts SQLite
+  preparation work while importing sessions with recorded repositories. Warm
+  imports reuse the repository lookup and retain both the effective project
+  and original source label. `BenchmarkRepositoryProjectImport` measures
+  imports with an existing project name and with a label that needs
+  attribution.
+- `TestSourceFreshnessSnapshotMatchesLiveQueries` (`internal/db`) compares
+  startup freshness with live queries, including NULL metadata and trash.
 - `TestProviderAuthoritativeUnchangedSessionSkipsOnResync`
   (`internal/sync/provider_freshness_integration_test.go`) — the generic
   freshness skip for provider-authoritative agents, Vibe as representative.
@@ -75,6 +88,27 @@ runner noise and fail loudly:
 - `TestCodexCursorCache`, `TestCodexCursorWarmColdParity`, and the cursor
   boundary tests in `internal/parser` — continuation state stays bounded and
   warm/cold parsing remains equivalent at safe offsets.
+- `TestCodexForkInventoryDoesNotAllocatePerUnchangedFile` (`internal/parser`) —
+  parsing another fork through the same provider factory must not enumerate
+  all unchanged rollout filenames again. Page creation and archival moves
+  still refresh the inventory through directory identity and modification
+  time.
+- `TestCodexForkInventoryFreshBatchDoesNotAllocatePerUnchangedFile`
+  (`internal/parser`) — each new sync batch reuses the thread index, including
+  its completion check. Allocations stay bounded as unrelated filenames grow.
+- `TestCodexForkParentTurnsReuseCombinedSet` (`internal/parser`) — parsing
+  another fork reuses the combined turn IDs from unchanged parent rollouts.
+  Allocation growth stays bounded as turns increase, including a parent with
+  more than 64 rollouts. `BenchmarkCodexForkParentTurns` measures that parse.
+- `TestCodexForkInventoryBatchDoesNotAllocatePerUnchangedDirectory`
+  (`internal/parser`) — warm forks in a sync batch must not walk unrelated
+  dated directories. `BenchmarkCodexForkParentDatedDirectories` compares 10
+  and 1,000 directories; parent file changes still invalidate cached turns,
+  and batch completion detects new pages.
+- `TestCodexParentInventoryBatchRetriesUnchangedForks` (`internal/sync`) — a
+  page restored during parsing leaves affected forks eligible for retry. A
+  second sync after restart removes copied history even when the fork files
+  have not changed; a third sync skips those verified files normally.
 - `TestIncrementalSync_CodexAppend`,
   `TestIncrementalSync_CodexLifecycleTailUpdatesTermination`, the partial-tail
   tests, the late tool-result append test
@@ -133,14 +167,34 @@ package list, sample count, and per-tier iteration counts for these benchmarks:
 - `BenchmarkReplaceSessionMessagesStreamingMerge` — the streaming chunk-merge
   diff path (one UPDATE, not a full delete+reinsert).
 - `BenchmarkInsertMessagesBatch` — multi-row batched ingest.
+- `BenchmarkMessageTokenUsageUpdate` — token receipts over varied message sizes.
+- `BenchmarkCopySparseOrphan` — retain one missing session from archives of
+  different sizes without scanning every old message to map its session ID.
+- `BenchmarkCopyMixedLegacyPageOrphans` — upgrade archived Codex pages alongside
+  other orphans without scanning the entire orphan inventory for each page.
+- `BenchmarkCopySessionMetadataPins` — copy sparse pins from analyzed archives
+  without checking every unpinned message against its transcript.
 - `BenchmarkResyncBulkContributorIngest` — the same archive entering the atomic
   rebuild through a contributor engine.
 - `BenchmarkSearchContentSubstringPage` / `BenchmarkSearchContentFTSPage` — one
   page of content search through the substring and FTS paths.
 - `BenchmarkPersistUnchangedSkipCache` — repeated persistence of an unchanged
   10k-entry skip cache must avoid copying the map and rewriting its rows.
+- `BenchmarkReconciliationSpoolAdd` and
+  `BenchmarkReconciliationSpoolContainsSource` — candidate writes and
+  membership lookups in the temporary discovery spool.
+- `BenchmarkCodexStagingToolResult` — stage short tool results with their
+  deduplication checks. Large result bodies can make SQL preparation a smaller
+  share of the parse cost.
+- `BenchmarkVectorMirrorUpsert` — publish document metadata to the vector
+  mirror, without embedding generation. Run it in `./internal/vector`, outside
+  the default benchmark package set.
 - `BenchmarkGetStats` — the repeatedly polled sidebar totals over 10k sessions.
   Computes all totals together so a refresh scans filtered sessions once.
+- `BenchmarkArchiveSessionReads` — session metadata, full session details, and
+  20-message pages through the serving reader pool. The fixture has 10k
+  sessions and 400 stored messages; setup and the first query stay outside the
+  timed loop.
 - `BenchmarkGetDailyUsage` — usage aggregation over 100k message rows. The usage
   aggregate implementation keeps this benchmark name so the gate compares it
   with the merge-base request path. Its warm cases must scan no normalized
@@ -327,9 +381,10 @@ threshold check.
 
 `make perf-sim` runs the retained simulator in `cmd/perfsim`. See
 [the simulator guide](performance-simulator.md) for archive-size comparisons,
-append-only profiles, and analytic-query measurements. Its small correctness
-fixture runs in the normal Go suite. Large runs are opt-in; their process-wide
-allocation samples include background work and are not CI timing assertions.
+append-only profiles, and analytic-query measurements. The normal Go suite
+checks the correctness fixture and bounds JSONL append-time growth between 1,000
+and 10,000 sessions. The growth check skips under `-short`. Full simulator runs
+are opt-in; their process-wide allocation samples include background work.
 
 `BenchmarkCodexStreamingDiscovery` in `internal/parser` is a diagnostic
 benchmark, like `BenchmarkCodexIncrementalCursor`, outside the default gate

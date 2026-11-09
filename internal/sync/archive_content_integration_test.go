@@ -733,6 +733,7 @@ func TestResyncProjectsArchivedSessionsOntoArchiveContent(t *testing.T) {
 				require.NotNil(t, stored.FirstMessage)
 				assert.Contains(t, joinedContent(messages), "the build tool is missing")
 				require.Len(t, calls, 1)
+				assert.Nil(t, calls[0].ObservedOutcome)
 				assert.Empty(t, calls[0].InputJSON)
 				assert.Empty(t, calls[0].ResultContent)
 				assert.Equal(t, len("make: command not found"), calls[0].ResultContentLength)
@@ -886,5 +887,46 @@ func TestArchivePolicyCortexToolResultsDoNotChangeAutomation(t *testing.T) {
 				})
 			}
 		})
+	}
+}
+
+func TestFrictionBackfillProjectsRowsAfterPolicyTightens(t *testing.T) {
+	claudeRoot := t.TempDir()
+	const sessionID = "friction-policy-transition-session"
+	writeTranscriptsFixture(t, claudeRoot, sessionID)
+
+	database := dbtest.OpenTestDB(t)
+	engine := sync.NewEngine(t.Context(), database, sync.EngineConfig{
+		AgentDirs:       map[parser.AgentType][]string{parser.AgentClaude: {claudeRoot}},
+		Machine:         "local",
+		FrictionEnabled: true,
+	})
+	t.Cleanup(engine.Close)
+	require.Equal(t, 1, engine.SyncAll(t.Context(), nil).Synced)
+	_, err := engine.BackfillFriction(t.Context())
+	require.NoError(t, err)
+
+	before, err := database.SessionFrictionFindings(t.Context(), sessionID)
+	require.NoError(t, err)
+	fullFindingText := make([]string, 0, len(before))
+	for _, finding := range before {
+		fullFindingText = append(fullFindingText,
+			finding.Text, finding.Evidence, finding.Title)
+	}
+	require.Contains(t, strings.Join(fullFindingText, "\n"), "make: command not found",
+		"the full-content archive retains the tool error in its finding")
+
+	database.SetArchiveContent(config.ArchiveContentTranscripts)
+	require.NoError(t, database.UpdateSessionSignals(t.Context(), sessionID, db.SessionSignalUpdate{Friction: &db.SessionFrictionUpdate{RulesVersion: "older-rules"}}))
+	processed, err := engine.BackfillFriction(t.Context())
+	require.NoError(t, err)
+	assert.Equal(t, 1, processed)
+
+	after, err := database.SessionFrictionFindings(t.Context(), sessionID)
+	require.NoError(t, err)
+	for _, finding := range after {
+		assert.NotContains(t, finding.Text, "make: command not found")
+		assert.NotContains(t, finding.Evidence, "make: command not found")
+		assert.NotContains(t, finding.Title, "make: command not found")
 	}
 }

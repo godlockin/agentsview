@@ -1,6 +1,7 @@
 package ingest_test
 
 import (
+	"fmt"
 	"testing"
 	"time"
 
@@ -8,6 +9,7 @@ import (
 	"github.com/stretchr/testify/require"
 	"go.kenn.io/agentsview/internal/config"
 	"go.kenn.io/agentsview/internal/db"
+	"go.kenn.io/agentsview/internal/friction"
 	"go.kenn.io/agentsview/internal/ingest"
 	"go.kenn.io/agentsview/internal/parser"
 	"go.kenn.io/agentsview/internal/signals"
@@ -133,6 +135,40 @@ func TestFinalizePreservesAuthoritativeSummaryTotals(t *testing.T) {
 	assert.Equal(t, summaryPeak, prepared.Session.PeakContextTokens)
 }
 
+func TestRefreshFrictionUsesPreparedToolResults(t *testing.T) {
+	parsed := parser.ParseResult{
+		Session: parser.ParsedSession{ID: "session-1", Agent: parser.AgentCodex},
+		Messages: []parser.ParsedMessage{
+			{
+				Ordinal: 0, Role: parser.RoleAssistant,
+				ToolCalls: []parser.ParsedToolCall{{
+					ToolUseID: "call-1", ToolName: "exec_command", Category: "Bash",
+				}},
+			},
+			{
+				Ordinal: 1, Role: parser.RoleUser,
+				ToolResults: []parser.ParsedToolResult{{
+					ToolUseID:  "call-1",
+					ContentRaw: `"bash: python3: command not found"`,
+				}},
+			},
+		},
+	}
+	candidate, err := ingest.PrepareCandidate(
+		t.Context(), parsed, ingest.ContentOptions{},
+	)
+	require.NoError(t, err)
+
+	prepared, err := ingest.Finalize(
+		t.Context(), candidate, ingest.ContentOptions{},
+	)
+	require.NoError(t, err)
+	require.NoError(t, ingest.RefreshFriction(&prepared, ingest.ContentOptions{}))
+	assert.Equal(t, 1, prepared.Session.FrictionCount)
+	assert.Equal(t, friction.RulesVersion, prepared.Session.FrictionRulesVersion)
+	assert.NotEmpty(t, prepared.Session.FrictionHash)
+}
+
 func TestFinalizeKeepsUsageWithoutMessagesAndStampsFinalID(t *testing.T) {
 	parsed := parser.ParseResult{
 		Session: parser.ParsedSession{
@@ -200,4 +236,43 @@ func TestFinalizeProjectsStoredContentBeforeSecretFindings(t *testing.T) {
 	assert.Empty(t, projected.Messages[0].ToolCalls[0].InputJSON)
 	assert.Empty(t, projected.Findings,
 		"findings must describe only content retained by storage policy")
+}
+
+func TestFinalizeTranscriptsDoesNotCountDistinctCallsAsRetries(t *testing.T) {
+	commands := []string{"ls -la", "cat README.md", "go test ./..."}
+	parsed := parser.ParseResult{
+		Session: parser.ParsedSession{ID: "session-1", Agent: parser.AgentClaude},
+	}
+	for i, command := range commands {
+		parsed.Messages = append(parsed.Messages, parser.ParsedMessage{
+			Ordinal: i, Role: parser.RoleAssistant,
+			Timestamp: time.Date(2026, 11, 5, 10, 0, i, 0, time.UTC),
+			ToolCalls: []parser.ParsedToolCall{{
+				ToolUseID: fmt.Sprintf("call-%d", i),
+				ToolName:  "Bash", Category: "Bash",
+				InputJSON: fmt.Sprintf(`{"command":%q}`, command),
+			}},
+		})
+	}
+
+	finalize := func(policy config.ArchiveContent) db.SessionSignalUpdate {
+		t.Helper()
+		candidate, err := ingest.PrepareCandidate(
+			t.Context(), parsed, ingest.ContentOptions{},
+		)
+		require.NoError(t, err)
+		prepared, err := ingest.Finalize(t.Context(), candidate,
+			ingest.ContentOptions{ArchiveContent: policy})
+		require.NoError(t, err)
+		return prepared.Signals
+	}
+	full := finalize(config.ArchiveContentFull)
+	transcripts := finalize(config.ArchiveContentTranscripts)
+
+	assert.Zero(t, full.ToolRetryCount)
+	assert.Zero(t, transcripts.ToolRetryCount,
+		"calls sharing only a tool name are not retries")
+	require.NotNil(t, full.HealthScore)
+	require.NotNil(t, transcripts.HealthScore)
+	assert.Equal(t, *full.HealthScore, *transcripts.HealthScore)
 }

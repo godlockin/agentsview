@@ -3,10 +3,13 @@ package server
 import "github.com/danielgtaylor/huma/v2"
 
 func (s *Server) registerTypedAPIRoutes() {
-	s.api.UseMiddleware(humaRequestInfoMiddleware)
+	s.api.UseMiddleware(s.humaRequestInfoMiddleware)
 
 	s.registerHealthRoutes()
+	s.registerDaemonRoutes()
 	s.registerSessionRoutes()
+	s.registerCommitRoutes()
+	s.registerSessionAnnotationRoutes()
 	s.registerOpenersRoutes()
 	s.registerAnalyticsRoutes()
 	s.registerActivityRoutes()
@@ -15,6 +18,8 @@ func (s *Server) registerTypedAPIRoutes() {
 	s.registerTrendsRoutes()
 	s.registerUsageRoutes()
 	s.registerInsightsRoutes()
+	s.registerFrictionRoutes()
+	s.registerKataRoutes()
 	s.registerSearchRoutes()
 	s.registerRecallRoutes()
 	s.describeTransferRoutes()
@@ -24,6 +29,7 @@ func (s *Server) registerTypedAPIRoutes() {
 	s.registerSyncRoutes()
 	s.registerRemoteSyncRoutes()
 	s.registerRawSyncRoutes()
+	s.registerCodexCloudRoutes()
 	s.registerPushRoutes()
 	s.registerConfigRoutes()
 	s.registerSettingsRoutes()

@@ -12,6 +12,45 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+func TestCopyOrphanedDataCodexTrashIsNotAReparse(t *testing.T) {
+	for _, trash := range []bool{false, true} {
+		t.Run(fmt.Sprintf("trash=%t", trash), func(t *testing.T) {
+			ctx := t.Context()
+			source := testDB(t)
+			path := "/history/rollout.jsonl"
+			insertSession(t, source, "old", "project", func(s *Session) {
+				s.Agent = "codex"
+				s.FilePath = &path
+			})
+			require.NoError(t, source.InsertMessages(ctx, []Message{{SessionID: "old", Ordinal: 0, Role: "user", Content: "retained history"}}))
+			destination := testDB(t)
+			insertSession(t, destination, "new", "project", func(s *Session) {
+				s.Agent = "codex"
+				s.FilePath = &path
+			})
+			if trash {
+				require.NoError(t, destination.SoftDeleteSession(ctx, "new"))
+			}
+			sourcePath := source.Path()
+			require.NoError(t, source.Close())
+			copied, err := destination.CopyOrphanedDataFrom(t.Context(), sourcePath)
+			require.NoError(t, err)
+			if trash {
+				assert.Equal(t, 1, copied)
+				messages, err := destination.GetAllMessages(ctx, "old")
+				require.NoError(t, err)
+				require.Len(t, messages, 1)
+				assert.Equal(t, "retained history", messages[0].Content)
+			} else {
+				assert.Zero(t, copied)
+				session, err := destination.GetSessionFull(ctx, "old")
+				require.NoError(t, err)
+				assert.Nil(t, session)
+			}
+		})
+	}
+}
+
 func TestCopySyncStateQueuesBothRecordedLocalArtifactIdentities(t *testing.T) {
 	ctx := t.Context()
 	source := testDB(t)
@@ -25,7 +64,7 @@ func TestCopySyncStateQueuesBothRecordedLocalArtifactIdentities(t *testing.T) {
 			ID: machine, Machine: machine, Agent: "claude", Project: "project-a",
 		}))
 	}
-	require.NoError(t, replacement.CopySyncStateFrom(source.Path()))
+	require.NoError(t, replacement.CopySyncStateFrom(t.Context(), source.Path()))
 	queued, err := replacement.PendingArtifactExports(ctx, 10)
 	require.NoError(t, err)
 	ids := make([]string, 0, len(queued))
@@ -116,7 +155,7 @@ func TestCopySyncStatePreservesArtifactImportAuthority(t *testing.T) {
 		t, filepath.Join(dir, "destination.db"), "destination",
 	)
 	defer destination.Close()
-	require.NoError(t, destination.CopySyncStateFrom(sourcePath))
+	require.NoError(t, destination.CopySyncStateFrom(t.Context(), sourcePath))
 
 	nextAttempt, err := destination.ReserveArtifactImportAttemptGeneration(ctx)
 	require.NoError(t, err)
@@ -191,8 +230,8 @@ func TestFullResyncPreservesImportedSessionUsage(t *testing.T) {
 		t, filepath.Join(dir, "destination.db"), "destination",
 	)
 	defer destination.Close()
-	require.NoError(t, destination.CopySyncStateFrom(sourcePath))
-	copied, err := destination.CopyOrphanedDataFrom(sourcePath)
+	require.NoError(t, destination.CopySyncStateFrom(t.Context(), sourcePath))
+	copied, err := destination.CopyOrphanedDataFrom(t.Context(), sourcePath)
 	require.NoError(t, err)
 	require.Equal(t, 1, copied)
 
@@ -233,7 +272,7 @@ func TestCopySyncStateAcceptsDatabaseWithoutArtifactImportTables(t *testing.T) {
 		t, filepath.Join(dir, "destination.db"), "destination",
 	)
 	defer destination.Close()
-	require.NoError(t, destination.CopySyncStateFrom(sourcePath))
+	require.NoError(t, destination.CopySyncStateFrom(t.Context(), sourcePath))
 }
 
 func TestCopySyncStateRejectsIncompatibleCheckpointStages(t *testing.T) {
@@ -307,7 +346,7 @@ func TestCopySyncStateRejectsIncompatibleCheckpointStages(t *testing.T) {
 				tc.destinationOffset, tc.complete,
 			)
 
-			err := destination.CopySyncStateFrom(sourcePath)
+			err := destination.CopySyncStateFrom(t.Context(), sourcePath)
 			require.ErrorIs(t, err, ErrArtifactImportConflict)
 		})
 	}
@@ -343,7 +382,7 @@ func TestCopySyncStateMergesCompatibleCheckpointStagePrefix(t *testing.T) {
 		t, destination, landing, []ArtifactCheckpointSession{one}, 10, false,
 	)
 
-	require.NoError(t, destination.CopySyncStateFrom(sourcePath))
+	require.NoError(t, destination.CopySyncStateFrom(t.Context(), sourcePath))
 	progress, err := destination.ArtifactCheckpointStageProgress(ctx, landing)
 	require.NoError(t, err)
 	assert.False(t, progress.Complete)
@@ -419,6 +458,53 @@ func TestExecWithoutCancelDropsTempTableWithCanceledContext(t *testing.T) {
 	require.NoError(t, err, "recreate temp table after cleanup")
 }
 
+func TestCopyOrphanedDataPreservesHermesCronGroups(t *testing.T) {
+	for _, legacySchema := range []bool{false, true} {
+		t.Run(fmt.Sprintf("legacy schema=%t", legacySchema), func(t *testing.T) {
+			ctx := t.Context()
+			srcPath := filepath.Join(t.TempDir(), "old.db")
+			src := testDBAtPath(t, srcPath, "src")
+			cases := []struct {
+				id, agent, stored string
+			}{
+				{"hermes:cron_job-a_20261009_120000", "hermes", ""},
+				{"augure-desktop:cron_job.b-c_20261009_120000", "augure-desktop", ""},
+				{"imported:hermes:cron_job-a_20261009_120000", "hermes", ""},
+			}
+			if !legacySchema {
+				cases = append(cases, struct{ id, agent, stored string }{
+					"hermes:cron_job-a_20261009_140000", "hermes", "retained-job",
+				}, struct{ id, agent, stored string }{
+					"hermes:20261009_140000_abcdef", "hermes", "retained-job",
+				}, struct{ id, agent, stored string }{
+					"imported:augure-desktop:cron_job-a_20261009_140000", "augure-desktop", "retained-job",
+				})
+			}
+			for _, tc := range cases {
+				require.NoError(t, src.UpsertSession(ctx, Session{ID: tc.id, Agent: tc.agent, Project: "hermes-cron", GroupKey: tc.stored}))
+			}
+			require.NoError(t, src.Close())
+			if legacySchema {
+				conn, err := sql.Open("sqlite3", srcPath)
+				require.NoError(t, err)
+				_, err = conn.ExecContext(ctx, usageChangeJournalTriggerDropsSQL+`DROP TRIGGER IF EXISTS artifact_sessions_update_queue; ALTER TABLE sessions DROP COLUMN group_key`)
+				require.NoError(t, err)
+				require.NoError(t, conn.Close())
+			}
+			dst := testDB(t)
+			count, err := dst.CopyOrphanedDataFrom(t.Context(), srcPath)
+			require.NoError(t, err)
+			assert.Equal(t, len(cases), count)
+			for _, tc := range cases {
+				session, err := dst.GetSession(ctx, tc.id)
+				require.NoError(t, err)
+				require.NotNil(t, session)
+				assert.Equal(t, tc.stored, session.GroupKey, tc.id)
+			}
+		})
+	}
+}
+
 func TestCopyOrphanedDataPreservesSessionKindAndPromptSource(t *testing.T) {
 	ctx := t.Context()
 	dir := t.TempDir()
@@ -444,7 +530,7 @@ func TestCopyOrphanedDataPreservesSessionKindAndPromptSource(t *testing.T) {
 	dstDB := testDBAtPath(t, dstPath, "dst")
 	defer dstDB.Close()
 
-	count, err := dstDB.CopyOrphanedDataFrom(srcPath)
+	count, err := dstDB.CopyOrphanedDataFrom(t.Context(), srcPath)
 	require.NoError(t, err, "CopyOrphanedDataFrom")
 	require.Equal(t, 1, count, "expected one orphan")
 
@@ -537,13 +623,14 @@ func TestCopyOrphanedDataSanitizesCopiedContent(t *testing.T) {
 		"PRAGMA user_version = %d", sanitizedSourceDataVersion-1,
 	))
 	require.NoError(t, err, "downgrade source data version")
+	require.NoError(t, srcDB.EnableArchiveOnly(ctx))
 	require.NoError(t, srcDB.Close(), "close source")
 
 	dstPath := filepath.Join(dir, "new.db")
 	dstDB := testDBAtPath(t, dstPath, "dst")
 	defer dstDB.Close()
 
-	count, err := dstDB.CopyOrphanedDataFrom(srcPath)
+	count, err := dstDB.CopyOrphanedDataFrom(t.Context(), srcPath)
 	require.NoError(t, err, "CopyOrphanedDataFrom")
 	require.Equal(t, 1, count, "expected one orphan")
 
@@ -637,14 +724,14 @@ func TestCopySkipsSanitizeForSanitizedSource(t *testing.T) {
 		{
 			name: "orphaned",
 			copy: func(dst *DB, srcPath string) (int, error) {
-				return dst.CopyOrphanedDataFrom(srcPath)
+				return dst.CopyOrphanedDataFrom(t.Context(), srcPath)
 			},
 		},
 		{
 			name:  "trashed",
 			trash: true,
 			copy: func(dst *DB, srcPath string) (int, error) {
-				ids, err := dst.CopyTrashedDataFrom(srcPath)
+				ids, err := dst.CopyTrashedDataFrom(t.Context(), srcPath)
 				return len(ids), err
 			},
 		},
@@ -733,4 +820,23 @@ func TestCopySkipsSanitizeForSanitizedSource(t *testing.T) {
 			})
 		}
 	}
+}
+
+func TestCopySessionMetadataDoesNotCarryUsagePricingRevision(t *testing.T) {
+	dir := t.TempDir()
+	sourcePath := filepath.Join(dir, "source.db")
+	source := testDBAtPath(t, sourcePath, "source")
+	_, err := source.getWriter().ExecContext(t.Context(), `
+		INSERT INTO archive_metadata (key, value) VALUES ('usage_pricing_revision', '42')`)
+	require.NoError(t, err)
+	require.NoError(t, source.Close())
+
+	destination := testDBAtPath(t, filepath.Join(dir, "destination.db"), "destination")
+	defer destination.Close()
+	require.NoError(t, destination.CopySessionMetadataFrom(t.Context(), sourcePath))
+
+	var revision string
+	err = destination.getReader().QueryRowContext(t.Context(), `
+		SELECT value FROM archive_metadata WHERE key = 'usage_pricing_revision'`).Scan(&revision)
+	assert.ErrorIs(t, err, sql.ErrNoRows)
 }

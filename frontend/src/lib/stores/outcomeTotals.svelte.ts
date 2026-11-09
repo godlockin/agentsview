@@ -32,6 +32,14 @@ export class OutcomeTotalsStore {
   loading = $state(false);
   error = $state<string | null>(null);
   includePullRequests = $state(false);
+  pullRequestLookupFailed = $derived(
+    this.includePullRequests &&
+      !this.loading &&
+      (this.error !== null ||
+        this.stats?.prs_opened == null ||
+        this.stats?.prs_merged == null ||
+        (this.stats?.skipped?.length ?? 0) > 0),
+  );
 
   /** Cancels replaced reads; only the newest request may apply its result. */
   private readonly latest = new LatestRead();
@@ -46,6 +54,16 @@ export class OutcomeTotalsStore {
   /** Reads the window again, with the pull-request lookups included. */
   async loadWithPullRequests(window: OutcomeWindow): Promise<void> {
     await this.read(window, true);
+  }
+
+  /** Reads the window again as last asked, keeping the failure shown until it settles. */
+  async retry(window: OutcomeWindow): Promise<void> {
+    const failure = this.error;
+    const reading = this.read(window, this.includePullRequests);
+    // read clears the error before its first await; restore it so the retry
+    // button stays on the page, busy, until the new result replaces it.
+    this.error = failure;
+    await reading;
   }
 
   reset(): void {
@@ -73,6 +91,7 @@ export class OutcomeTotalsStore {
           exclude_project: window.excludeProject,
           include_one_shot: window.includeOneShot,
           include_automated: window.includeAutomated,
+          outcomes_only: true,
           include_git_outcomes: true,
           include_github_outcomes: withPullRequests,
         },

@@ -29,6 +29,13 @@ func TestProviderSyncSemanticsDeclarations(t *testing.T) {
 			FingerprintHashRequiredForFreshness: true,
 			SkipCacheFreshWithoutStoredRow:      true,
 		},
+		// Open Interpreter shares the Codex provider, so it must share its
+		// semantics.
+		AgentInterpreter: {
+			FingerprintHashInCacheKey:           true,
+			FingerprintHashRequiredForFreshness: true,
+			SkipCacheFreshWithoutStoredRow:      true,
+		},
 		// TraeX shares the Codex provider, so it must share its semantics.
 		AgentTraeX: {
 			FingerprintHashInCacheKey:           true,
@@ -48,7 +55,14 @@ func TestProviderSyncSemanticsDeclarations(t *testing.T) {
 			FingerprintHashRequiredForFreshness: true,
 		},
 		// Augure Desktop shares the Hermes provider, so it must share its
-		// semantics.
+		// semantics. BatchFingerprintCache, PartialDiscovery, and
+		// MemberFreshnessOverridesFileForce are deliberately left
+		// unasserted here: they are pure declarations, so asserting them
+		// would pass even if the engine ignored them. Their behavior is
+		// covered in internal/sync (TestHermesIncrementalSyncBoundsSiblingWrites,
+		// TestHermesPartialDiscoverySyncsReadableTranscripts) and
+		// internal/remotesync
+		// (TestImporterHermesRoutineImportSkipsUnchangedMemberDespiteFileForceFullParse).
 		AgentAugureDesktop: {
 			FingerprintHashRequiredForFreshness: true,
 		},
@@ -131,6 +145,9 @@ func TestProviderSyncSemanticsDeclarations(t *testing.T) {
 		AgentEvener: {
 			FingerprintHashRequiredForFreshness: true,
 		},
+		AgentFx: {
+			FingerprintHashRequiredForFreshness: true,
+		},
 		// Codebuff requires the per-component stat-hash digest (persisted in
 		// the provider_freshness side-table) before a warm pass may consider a
 		// source fresh; the side-table row is the only signal that sees
@@ -157,7 +174,13 @@ func TestProviderSyncSemanticsDeclarations(t *testing.T) {
 	for _, factory := range ProviderFactories() {
 		agent := factory.Definition().Type
 		t.Run(string(agent), func(t *testing.T) {
-			assert.Equal(t, wantSync[agent], factory.Capabilities().Sync)
+			// The behavior-only fields are excluded from this declaration
+			// comparison; see the Hermes/Augure Desktop comment above.
+			got := factory.Capabilities().Sync
+			got.BatchFingerprintCache = false
+			got.PartialDiscovery = false
+			got.MemberFreshnessOverridesFileForce = false
+			assert.Equal(t, wantSync[agent], got)
 		})
 	}
 }

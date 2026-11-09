@@ -48,17 +48,20 @@ func TestParseAgeDuration(t *testing.T) {
 }
 
 func TestPruneAgeResolvesToBefore(t *testing.T) {
-	cfg, err := parsePruneFlags([]string{"--age", "30d"})
+	cfg, err := buildPruneConfigFromFlags(
+		"", "", -1, "", "", "30d", false, false, false)
 	require.NoError(t, err)
 	assert.NotEmpty(t, cfg.Filter.Before, "age resolves to a before date")
 	assert.True(t, cfg.Filter.HasFilters())
 
-	_, err = parsePruneFlags([]string{"--age", "30d", "--before", "2026-01-01"})
+	_, err = buildPruneConfigFromFlags(
+		"", "", -1, "2026-01-01", "", "30d", false, false, false)
 	assert.Error(t, err, "age and before are mutually exclusive")
 }
 
 func TestParsePruneFlagsSourceOnly(t *testing.T) {
-	cfg, err := parsePruneFlags([]string{"--project", "p", "--source-only"})
+	cfg, err := buildPruneConfigFromFlags(
+		"", "p", -1, "", "", "", true, false, false)
 	require.NoError(t, err)
 	assert.True(t, cfg.SourceOnly)
 }
@@ -86,7 +89,8 @@ func TestPruneTrashesSourcesAndRestores(t *testing.T) {
 	var out bytes.Buffer
 	pruner := &Pruner{DB: d, Out: &out, Trash: trashStore}
 
-	cfg, err := parsePruneFlags([]string{"--project", "proj-a", "--yes"})
+	cfg, err := buildPruneConfigFromFlags(
+		"", "proj-a", -1, "", "", "", false, false, true)
 	require.NoError(t, err)
 	require.NoError(t, pruner.Prune(t.Context(), cfg))
 
@@ -120,9 +124,8 @@ func TestPruneSourceOnlyKeepsArchiveRows(t *testing.T) {
 		DB: d, Out: &bytes.Buffer{}, In: os.Stdin,
 		Trash: trash.New(t.TempDir()),
 	}
-	cfg, err := parsePruneFlags([]string{
-		"--project", "proj-so", "--source-only", "--yes",
-	})
+	cfg, err := buildPruneConfigFromFlags(
+		"", "proj-so", -1, "", "", "", true, false, true)
 	require.NoError(t, err)
 	require.NoError(t, pruner.Prune(t.Context(), cfg))
 
@@ -144,7 +147,8 @@ func TestPruneDryRunLeavesFilesAlone(t *testing.T) {
 
 	var out bytes.Buffer
 	pruner := &Pruner{DB: d, Out: &out, Trash: trash.New(t.TempDir())}
-	cfg, err := parsePruneFlags([]string{"--project", "proj-dry", "--dry-run"})
+	cfg, err := buildPruneConfigFromFlags(
+		"", "proj-dry", -1, "", "", "", false, true, false)
 	require.NoError(t, err)
 	require.NoError(t, pruner.Prune(t.Context(), cfg))
 

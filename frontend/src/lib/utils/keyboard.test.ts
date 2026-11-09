@@ -5,8 +5,9 @@ import { sessions } from "../stores/sessions.svelte.js";
 import { starred } from "../stores/starred.svelte.js";
 import { router } from "../stores/router.svelte.js";
 import { messages } from "../stores/messages.svelte.js";
+import { sync } from "../stores/sync.svelte.js";
 import { inSessionSearch } from "../stores/inSessionSearch.svelte.js";
-import { SessionsService } from "../api/generated/index";
+import { SessionsService, SyncService } from "../api/generated/index";
 import { copyToClipboard } from "../utils/clipboard.js";
 import AppHeader from "../components/layout/AppHeader.svelte";
 import SidebarToggleButton from "../components/layout/SidebarToggleButton.svelte";
@@ -67,6 +68,22 @@ describe("registerShortcuts", () => {
     document.body.innerHTML = "";
     vi.restoreAllMocks();
     vi.clearAllMocks();
+  });
+
+  it("hides sync and ignores r for an archive-only server", async () => {
+    sync.serverVersion = { archive_only: true } as NonNullable<typeof sync.serverVersion>;
+    const request = vi.spyOn(SyncService, "postApiV1Sync");
+    const header = mount(AppHeader, { target: document.body });
+    try {
+      await tick();
+      expect(document.querySelector(".sync-btn")).toBeNull();
+      fireKey("r");
+      expect(request).not.toHaveBeenCalled();
+      expect(sync.syncing).toBe(false);
+    } finally {
+      unmount(header);
+      sync.serverVersion = null;
+    }
   });
 
   describe("remote c copy", () => {
@@ -1023,17 +1040,15 @@ describe("go to session shortcut", () => {
     },
   );
 
-  it.each([
-    { shiftKey: true },
-    { altKey: true },
-    { isComposing: true },
-    { keyCode: 229 },
-  ])("leaves the browser default for a guarded event %j", (options) => {
-    const event = fireCancelableKey("g", { ctrlKey: true, ...options });
+  it.each([{ shiftKey: true }, { altKey: true }, { isComposing: true }, { keyCode: 229 }])(
+    "leaves the browser default for a guarded event %j",
+    (options) => {
+      const event = fireCancelableKey("g", { ctrlKey: true, ...options });
 
-    expect(event.defaultPrevented).toBe(false);
-    expect(ui.activeModal).toBeNull();
-  });
+      expect(event.defaultPrevented).toBe(false);
+      expect(ui.activeModal).toBeNull();
+    },
+  );
 
   it("leaves an already-consumed event alone", () => {
     const event = new KeyboardEvent("keydown", {
@@ -1058,19 +1073,16 @@ describe("go to session shortcut", () => {
     expect(ui.activeModal).toBe("shortcuts");
   });
 
-  it.each(["input", "textarea", "select"])(
-    "leaves Ctrl+G available to a focused %s",
-    (tag) => {
-      const input = document.createElement(tag);
-      document.body.appendChild(input);
-      input.focus();
+  it.each(["input", "textarea", "select"])("leaves Ctrl+G available to a focused %s", (tag) => {
+    const input = document.createElement(tag);
+    document.body.appendChild(input);
+    input.focus();
 
-      const event = fireCancelableKey("g", { ctrlKey: true });
+    const event = fireCancelableKey("g", { ctrlKey: true });
 
-      expect(event.defaultPrevented).toBe(false);
-      expect(ui.activeModal).toBeNull();
-    },
-  );
+    expect(event.defaultPrevented).toBe(false);
+    expect(ui.activeModal).toBeNull();
+  });
 
   it("leaves Ctrl+G available to a focused contenteditable", () => {
     const editor = document.createElement("div");

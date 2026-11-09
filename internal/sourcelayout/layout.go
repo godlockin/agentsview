@@ -19,6 +19,7 @@ import (
 	"strings"
 
 	"go.kenn.io/agentsview/internal/db"
+	"go.kenn.io/agentsview/internal/parser"
 )
 
 // ReportOnlyReason is the stable string surfaced to CLI and web
@@ -59,6 +60,12 @@ func (fileLayout) Decide(sess db.Session) Decision {
 	path := derefPath(sess.FilePath)
 	if path == "" {
 		return Decision{Reason: "no source file recorded"}
+	}
+	// Shared application stores (e.g. Hermes state.db) cannot be
+	// removed per-session without corrupting other rows; leave them
+	// in place and report the reason.
+	if parser.OwnsAppStore(parser.AgentType(sess.Agent), path) {
+		return Decision{Reason: ReportOnlyReason}
 	}
 	if _, err := os.Stat(path); err != nil {
 		return Decision{Reason: "source file missing"}

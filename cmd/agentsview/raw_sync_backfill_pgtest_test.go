@@ -20,6 +20,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.kenn.io/agentsview/internal/config"
+	"go.kenn.io/agentsview/internal/db"
 	"go.kenn.io/agentsview/internal/parser"
 	"go.kenn.io/agentsview/internal/postgres"
 	"go.kenn.io/agentsview/internal/rawcheckpoint"
@@ -74,8 +75,10 @@ func TestRawSyncBackfillCommandCommitsOnceAndReusesHistoricalProof(t *testing.T)
 	require.NoError(t, os.MkdirAll(codexRoot, 0o700))
 	unselectedRoot := filepath.Join(t.TempDir(), "unreadable-import")
 	archivePath := filepath.Join(dataDir, "sessions.db")
-	require.NoError(t, os.Mkdir(archivePath, 0o700))
-	require.NoError(t, os.WriteFile(filepath.Join(archivePath, "sentinel"), []byte("archive untouched"), 0o600))
+	database, err := db.OpenIsolatedContext(t.Context(), archivePath)
+	require.NoError(t, err)
+	require.NoError(t, database.Close())
+	archiveBefore := mustReadRawSyncTestFile(t, archivePath)
 	configBody := rawSyncBackfillPGConfig(claudeRoot, codexRoot, unselectedRoot)
 	require.NoError(t, os.WriteFile(filepath.Join(dataDir, "config.toml"), configBody, 0o600))
 	sourceBefore, err := os.ReadFile(claudePath)
@@ -86,7 +89,7 @@ func TestRawSyncBackfillCommandCommitsOnceAndReusesHistoricalProof(t *testing.T)
 	t.Setenv("AGENTSVIEW_RAW_SYNC_CREDENTIAL", enrolled.Credential)
 
 	output, err := executeCommand(
-		newRootCommand(), "raw-sync", "backfill", "--run-id", "migration-a",
+		newRootCommand(), "source", "raw", "backfill", "--run-id", "migration-a",
 		"--provider", "claude", "--provider", "codex", "--batch-size", "1", "--format", "json",
 		"--allow-insecure-http",
 	)
@@ -105,14 +108,14 @@ func TestRawSyncBackfillCommandCommitsOnceAndReusesHistoricalProof(t *testing.T)
 	assert.Equal(t, hex.EncodeToString(manifestDigest[:]), manifestID)
 	assert.Equal(t, configBody, mustReadRawSyncTestFile(t, filepath.Join(dataDir, "config.toml")))
 	assert.Equal(t, sourceBefore, mustReadRawSyncTestFile(t, claudePath))
-	assert.Equal(t, "archive untouched", string(mustReadRawSyncTestFile(t, filepath.Join(archivePath, "sentinel"))))
+	assert.Equal(t, archiveBefore, mustReadRawSyncTestFile(t, archivePath), "backfill must leave the archive unchanged")
 
 	checkpoint, err := rawcheckpoint.Open(t.Context(), rawSyncCheckpointPath(dataDir))
 	require.NoError(t, err)
 	roots, err := checkpoint.BackfillRoots(t.Context(), "migration-a", parser.AgentClaude)
 	require.NoError(t, err)
 	require.Len(t, roots, 1)
-	provider, ok := parser.NewProvider(parser.AgentClaude, parser.ProviderConfig{Roots: []string{claudeRoot}})
+	provider, ok := parser.NewProvider(parser.AgentClaude, parser.ProviderConfig{Roots: []string{roots[0].LocalPath}})
 	require.True(t, ok)
 	discovered, err := parser.DiscoverRawCaptureSources(t.Context(), provider)
 	require.NoError(t, err)
@@ -129,7 +132,7 @@ func TestRawSyncBackfillCommandCommitsOnceAndReusesHistoricalProof(t *testing.T)
 
 	rawtest.AppendClaude(t, claudePath)
 	for _, providers := range [][]string{{"codex", "claude", "codex"}, {"claude", "codex"}} {
-		args := []string{"raw-sync", "backfill", "--run-id", "migration-a", "--batch-size", "512", "--format", "json", "--allow-insecure-http"}
+		args := []string{"source", "raw", "backfill", "--run-id", "migration-a", "--batch-size", "512", "--format", "json", "--allow-insecure-http"}
 		for _, name := range providers {
 			args = append(args, "--provider", name)
 		}
@@ -140,7 +143,7 @@ func TestRawSyncBackfillCommandCommitsOnceAndReusesHistoricalProof(t *testing.T)
 	require.NoError(t, admin.QueryRowContext(t.Context(), `SELECT count(*) FROM raw_manifests WHERE tenant_id=$1`, "tenant-runtime").Scan(&manifests))
 	assert.Equal(t, 1, manifests)
 	output, err = executeCommand(
-		newRootCommand(), "raw-sync", "backfill", "--run-id", "migration-a",
+		newRootCommand(), "source", "raw", "backfill", "--run-id", "migration-a",
 		"--provider", "claude", "--format", "json", "--allow-insecure-http",
 	)
 	require.Error(t, err)
@@ -150,7 +153,7 @@ func TestRawSyncBackfillCommandCommitsOnceAndReusesHistoricalProof(t *testing.T)
 	otherHTTPServer := httptest.NewServer(rawHandler)
 	t.Cleanup(otherHTTPServer.Close)
 	output, err = executeCommand(
-		newRootCommand(), "raw-sync", "backfill", "--run-id", "migration-a",
+		newRootCommand(), "source", "raw", "backfill", "--run-id", "migration-a",
 		"--provider", "claude", "--provider", "codex", "--format", "json",
 		"--server", otherHTTPServer.URL, "--allow-insecure-http",
 	)
@@ -159,7 +162,7 @@ func TestRawSyncBackfillCommandCommitsOnceAndReusesHistoricalProof(t *testing.T)
 	assert.Contains(t, err.Error(), "server does not match")
 
 	output, err = executeCommand(
-		newRootCommand(), "raw-sync", "backfill", "--run-id", "migration-a",
+		newRootCommand(), "source", "raw", "backfill", "--run-id", "migration-a",
 		"--provider", "claude", "--provider", "codex", "--format", "json",
 		"--device-id", "different-device", "--allow-insecure-http",
 	)
@@ -174,7 +177,7 @@ func TestRawSyncBackfillCommandCommitsOnceAndReusesHistoricalProof(t *testing.T)
 		rawSyncBackfillPGConfig(changedRoot, codexRoot, unselectedRoot), 0o600,
 	))
 	output, err = executeCommand(
-		newRootCommand(), "raw-sync", "backfill", "--run-id", "migration-a",
+		newRootCommand(), "source", "raw", "backfill", "--run-id", "migration-a",
 		"--provider", "claude", "--provider", "codex", "--format", "json",
 		"--allow-insecure-http",
 	)
@@ -185,7 +188,7 @@ func TestRawSyncBackfillCommandCommitsOnceAndReusesHistoricalProof(t *testing.T)
 
 	interruptManifestResponse.Store(true)
 	output, err = executeCommand(
-		newRootCommand(), "raw-sync", "backfill", "--run-id", "receipt-a",
+		newRootCommand(), "source", "raw", "backfill", "--run-id", "receipt-a",
 		"--provider", "claude", "--format", "json", "--allow-insecure-http",
 	)
 	require.Error(t, err)
@@ -212,7 +215,7 @@ func TestRawSyncBackfillCommandCommitsOnceAndReusesHistoricalProof(t *testing.T)
 	makeRawSyncBackfillRetryDue(t, rawSyncCheckpointPath(dataDir))
 
 	output, err = executeCommand(
-		newRootCommand(), "raw-sync", "backfill", "--run-id", "receipt-a",
+		newRootCommand(), "source", "raw", "backfill", "--run-id", "receipt-a",
 		"--provider", "claude", "--format", "json", "--allow-insecure-http",
 	)
 	require.NoError(t, err, output)
@@ -236,7 +239,7 @@ func TestRawSyncBackfillCommandCommitsOnceAndReusesHistoricalProof(t *testing.T)
 	require.NoError(t, err)
 	require.True(t, revoked)
 	output, err = executeCommand(
-		newRootCommand(), "raw-sync", "backfill", "--run-id", "revoked-a",
+		newRootCommand(), "source", "raw", "backfill", "--run-id", "revoked-a",
 		"--provider", "claude", "--format", "json", "--allow-insecure-http",
 	)
 	require.Error(t, err)
@@ -247,7 +250,7 @@ func TestRawSyncBackfillCommandCommitsOnceAndReusesHistoricalProof(t *testing.T)
 
 	require.NoError(t, os.RemoveAll(claudeRoot))
 	output, err = executeCommand(
-		newRootCommand(), "raw-sync", "backfill", "--run-id", "migration-a",
+		newRootCommand(), "source", "raw", "backfill", "--run-id", "migration-a",
 		"--provider", "claude", "--provider", "codex", "--format", "json", "--allow-insecure-http",
 	)
 	require.NoError(t, err, output)
@@ -300,7 +303,7 @@ func TestRawSyncBackfillCommandRefusesChecksumFailure(t *testing.T) {
 	t.Setenv("AGENTSVIEW_RAW_SYNC_CREDENTIAL", enrolled.Credential)
 
 	output, err := executeCommand(
-		newRootCommand(), "raw-sync", "backfill", "--run-id", "checksum-a",
+		newRootCommand(), "source", "raw", "backfill", "--run-id", "checksum-a",
 		"--provider", "claude", "--format", "json", "--allow-insecure-http",
 	)
 
@@ -323,7 +326,7 @@ func TestRawSyncBackfillCommandRefusesChecksumFailure(t *testing.T) {
 	roots, err := checkpoint.BackfillRoots(t.Context(), "checksum-a", parser.AgentClaude)
 	require.NoError(t, err)
 	require.Len(t, roots, 1)
-	provider, ok := parser.NewProvider(parser.AgentClaude, parser.ProviderConfig{Roots: []string{claudeRoot}})
+	provider, ok := parser.NewProvider(parser.AgentClaude, parser.ProviderConfig{Roots: []string{roots[0].LocalPath}})
 	require.True(t, ok)
 	discovered, err := parser.DiscoverRawCaptureSources(t.Context(), provider)
 	require.NoError(t, err)
@@ -352,7 +355,7 @@ func makeRawSyncBackfillRetryDue(t *testing.T, checkpointPath string) {
 	t.Helper()
 	database, err := sql.Open("sqlite3", checkpointPath)
 	require.NoError(t, err)
-	result, err := database.Exec(`UPDATE outbox_generations SET retry_at='' WHERE retry_at!=''`)
+	result, err := database.ExecContext(t.Context(), `UPDATE outbox_generations SET retry_at='' WHERE retry_at!=''`)
 	require.NoError(t, err)
 	changed, err := result.RowsAffected()
 	require.NoError(t, err)

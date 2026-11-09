@@ -27,18 +27,31 @@ class EventsStore {
   private permanentlyFailed = false;
   private available = false;
   private visibilityHandlerInstalled = false;
+  private resolveStartup!: () => void;
+  private startup = new Promise<void>((resolve) => {
+    this.resolveStartup = resolve;
+  });
+  private startupTimer: ReturnType<typeof setTimeout> | undefined;
+
+  whenReady(timeoutMs: number): Promise<void> {
+    this.startupTimer ??= setTimeout(() => this.settleStartup(), timeoutMs);
+    return this.startup;
+  }
+
+  settleStartup() {
+    this.resolveStartup();
+  }
 
   /** Enable or disable the live event stream for the current backend mode. */
   setAvailable(available: boolean) {
     this.available = available;
     if (!available) {
       this.close();
-      return;
-    }
-    if (this.listeners.size > 0) {
+    } else if (this.listeners.size > 0) {
       this.ensureOpen();
       this.ensureHealTimer();
     }
+    if (this.es === null) this.settleStartup();
   }
 
   /** Subscribe to every event. Returns unsubscribe. */
@@ -85,6 +98,10 @@ class EventsStore {
 
   private ensureOpen() {
     if (!this.available) return;
+    // Hidden streams consume HTTP/1.1 connections that API reads need.
+    if (typeof document !== "undefined" && document.hidden) {
+      return;
+    }
     // Don't retry once watchEvents has told us the endpoint is
     // permanently unavailable. The safety-net polls on each view
     // still keep data fresh in that mode.
@@ -117,11 +134,17 @@ class EventsStore {
         },
       },
     );
+    const es = this.es;
+    es.addEventListener("events_ready", () => {
+      if (this.es !== es) return;
+      for (const fn of this.listeners.values()) fn({ scope: "sync" });
+      this.settleStartup();
+    });
+    es.addEventListener("error", () => this.settleStartup());
   }
 
   private close() {
-    if (this.es === null) return;
-    this.es.close();
+    this.es?.close();
     this.es = null;
     if (this.healTimer !== null) {
       clearInterval(this.healTimer);
@@ -143,6 +166,7 @@ class EventsStore {
   // permanentlyFailed so this never becomes a retry storm against
   // a known-dead endpoint like PG serve's 503.
   private ensureHealTimer() {
+    if (!this.available) return;
     if (this.healTimer !== null) return;
     if (this.permanentlyFailed) return;
     this.healTimer = setInterval(() => {
@@ -175,11 +199,12 @@ class EventsStore {
     }
     this.visibilityHandlerInstalled = true;
     document.addEventListener("visibilitychange", () => {
-      if (document.hidden) return;
-      if (!this.permanentlyFailed) return;
-      if (this.listeners.size === 0) return;
+      if (this.listeners.size === 0 || !this.available) return;
+      if (document.hidden) {
+        this.close();
+        return;
+      }
       this.permanentlyFailed = false;
-      this.es = null;
       this.ensureOpen();
       this.ensureHealTimer();
     });

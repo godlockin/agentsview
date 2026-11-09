@@ -14,6 +14,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"go.kenn.io/agentsview/internal/db"
+	"go.kenn.io/agentsview/internal/dbtest"
 	"go.kenn.io/agentsview/internal/storage"
 )
 
@@ -33,12 +34,12 @@ func fixedEncoder(vec []float32) storage.VectorQueryEncoder {
 // tables and skips when pgvector is unavailable.
 func newVectorSearchTestPG(t *testing.T, pgURL, schema string) *sql.DB {
 	t.Helper()
-	pg, err := Open(pgURL, schema, true)
+	pg, err := Open(t.Context(), pgURL, schema, true)
 	require.NoError(t, err, "Open")
 	t.Cleanup(func() { _ = pg.Close() })
 
-	ctx := context.Background()
-	_, err = pg.Exec(`DROP SCHEMA IF EXISTS ` + schema + ` CASCADE`)
+	ctx := t.Context()
+	_, err = pg.ExecContext(t.Context(), `DROP SCHEMA IF EXISTS `+schema+` CASCADE`)
 	require.NoError(t, err, "drop schema")
 	require.NoError(t, EnsureSchema(ctx, pg, schema), "EnsureSchema")
 
@@ -56,7 +57,7 @@ func insertSearchDoc(
 	offsets, content string,
 ) {
 	t.Helper()
-	_, err := pg.Exec(`
+	_, err := pg.ExecContext(t.Context(), `
 INSERT INTO vector_documents (
     doc_key, session_id, source_uuid, ordinal, ordinal_end,
     subordinate, offsets, content, content_hash)
@@ -72,7 +73,7 @@ func insertSearchChunk(
 	t.Helper()
 	literal, err := halfvecLiteral(emb)
 	require.NoError(t, err, "halfvecLiteral "+docKey)
-	_, err = pg.Exec(
+	_, err = pg.ExecContext(t.Context(),
 		`INSERT INTO `+table+` (doc_key, chunk_index, embedding)
 		 VALUES ($1, $2, $3::`+halfvecType+`)`,
 		docKey, chunkIndex, literal)
@@ -93,7 +94,7 @@ func insertSearchChunk(
 // tomb and gone must be dropped during hydration, leaving [u1, r1, u2].
 func seedVectorSearchFixture(t *testing.T, pg *sql.DB) (genID int64, table string) {
 	t.Helper()
-	ctx := context.Background()
+	ctx := t.Context()
 	genID, err := ensureVectorGeneration(ctx, pg, "fp-search", "m", 4)
 	require.NoError(t, err, "ensureVectorGeneration")
 	require.NoError(t, ensureVectorChunkTable(ctx, pg, genID, 4), "ensureVectorChunkTable")
@@ -116,7 +117,7 @@ func seedVectorSearchFixture(t *testing.T, pg *sql.DB) (genID int64, table strin
 	insertSearchChunk(t, pg, table, halfvec, "tomb", 0, []float32{0.95, 0.3122, 0, 0})
 
 	// gone's chunk stays; its document row disappears between KNN and hydrate.
-	_, err = pg.Exec(`DELETE FROM vector_documents WHERE doc_key = 'gone'`)
+	_, err = pg.ExecContext(t.Context(), `DELETE FROM vector_documents WHERE doc_key = 'gone'`)
 	require.NoError(t, err, "delete gone doc")
 	return genID, table
 }
@@ -134,14 +135,14 @@ var (
 func TestPGVectorSearcher(t *testing.T) {
 	pgURL := testPGURL(t)
 	pg := newVectorSearchTestPG(t, pgURL, "agentsview_vector_search_test")
-	ctx := context.Background()
+	ctx := t.Context()
 
 	genID, _ := seedVectorSearchFixture(t, pg)
 	searcher := NewVectorSearcher(
 		pg, genID, 4, searchMaxInputChars, fixedEncoder([]float32{1, 0, 0, 0}))
 
 	t.Run("ranking rollup hydration tombstone", func(t *testing.T) {
-		hits, err := searcher.SemanticSearch(ctx, "query", 10)
+		hits, err := dbtest.SemanticSearch(ctx, searcher, "query", 10)
 		require.NoError(t, err, "SemanticSearch")
 
 		keys := make([]string, len(hits))
@@ -172,8 +173,28 @@ func TestPGVectorSearcher(t *testing.T) {
 		}
 	})
 
+	t.Run("prepared expansion and exhaustion", func(t *testing.T) {
+		encodes := 0
+		prepared := NewVectorSearcher(pg, genID, 4, searchMaxInputChars, func(_ context.Context, query string) ([]float32, error) {
+			encodes++
+			assert.Equal(t, "query", query)
+			return []float32{1, 0, 0, 0}, nil
+		})
+		search, _, err := prepared.PrepareSemanticSearch(ctx, "query")
+		require.NoError(t, err)
+		for _, tc := range []struct {
+			k         int
+			exhausted bool
+		}{{1, false}, {200, true}} {
+			_, exhausted, err := search(ctx, tc.k)
+			require.NoError(t, err)
+			assert.Equal(t, tc.exhausted, exhausted)
+			assert.Equal(t, 1, encodes)
+		}
+	})
+
 	t.Run("limit truncates documents", func(t *testing.T) {
-		hits, err := searcher.SemanticSearch(ctx, "query", 1)
+		hits, err := dbtest.SemanticSearch(ctx, searcher, "query", 1)
 		require.NoError(t, err)
 		require.Len(t, hits, 1)
 		assert.Equal(t, 5, hits[0].Ordinal, "only top-ranked u1")
@@ -184,7 +205,7 @@ func TestPGVectorSearcher(t *testing.T) {
 			func(context.Context, string) ([]float32, error) {
 				return nil, errors.New("embeddings endpoint down")
 			})
-		_, err := bad.SemanticSearch(ctx, "query", 5)
+		_, err := dbtest.SemanticSearch(ctx, bad, "query", 5)
 		require.Error(t, err)
 		assert.True(t, errors.Is(err, db.ErrSemanticTransient),
 			"encoder failure surfaces db.ErrSemanticTransient")
@@ -193,7 +214,7 @@ func TestPGVectorSearcher(t *testing.T) {
 	t.Run("dimension mismatch is rejected", func(t *testing.T) {
 		wrongDim := NewVectorSearcher(pg, genID, 4, searchMaxInputChars,
 			fixedEncoder([]float32{1, 0, 0}))
-		_, err := wrongDim.SemanticSearch(ctx, "query", 5)
+		_, err := dbtest.SemanticSearch(ctx, wrongDim, "query", 5)
 		require.Error(t, err)
 		assert.Contains(t, err.Error(), "dimensions")
 	})
@@ -256,7 +277,7 @@ func TestPGVectorSearcher(t *testing.T) {
 func TestPGVectorSearcherExactK(t *testing.T) {
 	pgURL := testPGURL(t)
 	pg := newVectorSearchTestPG(t, pgURL, "agentsview_vector_search_exactk_test")
-	ctx := context.Background()
+	ctx := t.Context()
 
 	genID, err := ensureVectorGeneration(ctx, pg, "fp-exactk", "m", 4)
 	require.NoError(t, err, "ensureVectorGeneration")
@@ -276,7 +297,7 @@ func TestPGVectorSearcherExactK(t *testing.T) {
 
 	searcher := NewVectorSearcher(
 		pg, genID, 4, searchMaxInputChars, fixedEncoder([]float32{1, 0, 0, 0}))
-	hits, err := searcher.SemanticSearch(ctx, "query", 2)
+	hits, err := dbtest.SemanticSearch(ctx, searcher, "query", 2)
 	require.NoError(t, err, "SemanticSearch")
 	require.Len(t, hits, 1, "both top-2 chunks belong to multi -> one rolled-up doc")
 	assert.Equal(t, 1, hits[0].Ordinal, "only multi survives; outside sits beyond k")
@@ -290,7 +311,7 @@ func TestPGVectorSearcherExactK(t *testing.T) {
 func TestPGVectorSearcherEfSearchRecall(t *testing.T) {
 	pgURL := testPGURL(t)
 	pg := newVectorSearchTestPG(t, pgURL, "agentsview_vector_search_efsearch_test")
-	ctx := context.Background()
+	ctx := t.Context()
 
 	genID, err := ensureVectorGeneration(ctx, pg, "fp-efsearch", "m", 4)
 	require.NoError(t, err, "ensureVectorGeneration")
@@ -312,8 +333,51 @@ func TestPGVectorSearcherEfSearchRecall(t *testing.T) {
 
 	searcher := NewVectorSearcher(
 		pg, genID, 4, searchMaxInputChars, fixedEncoder([]float32{1, 0, 0, 0}))
-	hits, err := searcher.SemanticSearch(ctx, "query", docCount)
+	hits, err := dbtest.SemanticSearch(ctx, searcher, "query", docCount)
 	require.NoError(t, err, "SemanticSearch")
 	assert.Len(t, hits, docCount,
 		"ef_search raised to k returns all %d docs, not the ~40 default cap", docCount)
+}
+
+// TestPGVectorSearcherCappedScanIsNotExhausted pins the exhaustion signal past
+// hnsw.ef_search's 1000-row ceiling. Without iterative scan (pgvector < 0.8)
+// an HNSW index scan for k=1600 returns 1000 rows; with it, 1600. Either way
+// rows remain, so the page must not report the index exhausted. The table is
+// large enough that the planner scans the index instead of sorting rows.
+func TestPGVectorSearcherCappedScanIsNotExhausted(t *testing.T) {
+	pgURL := testPGURL(t)
+	pg := newVectorSearchTestPG(t, pgURL, "agentsview_vector_search_capped_test")
+	ctx := t.Context()
+
+	genID, err := ensureVectorGeneration(ctx, pg, "fp-capped", "m", 4)
+	require.NoError(t, err, "ensureVectorGeneration")
+	require.NoError(t, ensureVectorChunkTable(ctx, pg, genID, 4), "ensureVectorChunkTable")
+	extSchema, err := vectorExtensionSchema(ctx, pg)
+	require.NoError(t, err, "vectorExtensionSchema")
+	table := vectorChunkTable(genID)
+
+	const docCount, k = 20000, 1600
+	_, err = pg.ExecContext(ctx, `
+INSERT INTO vector_documents (
+    doc_key, session_id, source_uuid, ordinal, ordinal_end,
+    subordinate, offsets, content, content_hash)
+SELECT 'd' || i, 'S', '', i, i, FALSE, '[]', 'doc ' || i, 'h'
+  FROM generate_series(0, $1 - 1) AS i`, docCount)
+	require.NoError(t, err, "insert docs")
+	_, err = pg.ExecContext(ctx, `
+INSERT INTO `+table+` (doc_key, chunk_index, embedding)
+SELECT 'd' || i, 0, ('[1,' || (i::float8 / $1) || ',' || ((i % 97)::float8 / 97) || ',0]')::`+extSchema+`.halfvec
+  FROM generate_series(0, $1 - 1) AS i`, docCount)
+	require.NoError(t, err, "insert chunks")
+	_, err = pg.ExecContext(ctx, `ANALYZE `+table)
+	require.NoError(t, err, "analyze chunks")
+
+	searcher := NewVectorSearcher(
+		pg, genID, 4, searchMaxInputChars, fixedEncoder([]float32{1, 0, 0, 0}))
+	page, _, err := searcher.PrepareSemanticSearch(ctx, "query")
+	require.NoError(t, err, "PrepareSemanticSearch")
+	hits, exhausted, err := page(ctx, k)
+	require.NoError(t, err, "page")
+	assert.GreaterOrEqual(t, len(hits), 1000)
+	assert.False(t, exhausted, "%d of %d docs returned", len(hits), docCount)
 }

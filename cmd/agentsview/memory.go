@@ -17,6 +17,7 @@ import (
 
 	"go.kenn.io/agentsview/internal/config"
 	"go.kenn.io/agentsview/internal/postgres"
+	"go.kenn.io/agentsview/internal/requestsign"
 	"go.kenn.io/agentsview/internal/servicehttp"
 	"go.kenn.io/agentsview/internal/skills"
 	"go.kenn.io/agentsview/internal/storage"
@@ -55,8 +56,11 @@ var (
 
 func newMemoryCommand() *cobra.Command {
 	cmd := &cobra.Command{
-		Use:          "memory",
-		Short:        "Manage conversation-memory integration",
+		Use:   "memory",
+		Short: "Manage conversation-memory integration",
+		Long: "Integrate recalled conversation knowledge into an agent's session-start lifecycle. " +
+			"The session-start action selects local, hosted-contributor, or hosted-reader mode; it is intended for the configured hook or plugin integration.",
+		Example:      "  agentsview memory session-start --help",
 		GroupID:      groupMeta,
 		SilenceUsage: true,
 		Args:         cobra.NoArgs,
@@ -329,7 +333,7 @@ func checkHostedReaderAvailability(
 func resolveMemoryPGTarget(
 	targetName string,
 ) (config.Config, storage.ConfiguredReplica, error) {
-	cfg, err := config.LoadMinimal()
+	cfg, err := config.LoadMinimalFor(config.ScopePG)
 	if err != nil {
 		return config.Config{}, storage.ConfiguredReplica{},
 			fmt.Errorf("memory session-start: loading config: %w", err)
@@ -371,7 +375,7 @@ func probeHostedReaderPostgreSQL(
 }
 
 func requestLocalMemoryRefresh(ctx context.Context) error {
-	cfg, err := config.LoadMinimal()
+	cfg, err := config.LoadMinimalFor(config.ScopeLocal)
 	if err != nil {
 		return fmt.Errorf("memory session-start: loading config: %w", err)
 	}
@@ -406,7 +410,10 @@ func postMemoryRefresh(ctx context.Context, baseURL, token string) error {
 	if token != "" {
 		req.Header.Set("Authorization", "Bearer "+token)
 	}
-	client := &http.Client{Timeout: memorySessionStartTimeout}
+	client, err := requestsign.ClientFromEnvironment(baseURL, &http.Client{Timeout: memorySessionStartTimeout})
+	if err != nil {
+		return err
+	}
 	resp, err := client.Do(req)
 	if err != nil {
 		return fmt.Errorf("memory session-start: request refresh: %w", err)

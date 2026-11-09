@@ -29,6 +29,7 @@ class FakeEventSource {
 
   fireError() {
     if (this.onerror) this.onerror(new Event("error"));
+    this.fire("error", {});
   }
 
   fire(name: string, data: unknown) {
@@ -59,6 +60,122 @@ afterEach(() => {
 });
 
 describe("events store", () => {
+  it.each(["unavailable", "no subscriber", "hidden", "error", "timeout"])(
+    "settles startup readiness: %s",
+    async (scenario) => {
+      vi.useFakeTimers();
+      vi.resetModules();
+      const visibility = vi.spyOn(document, "hidden", "get").mockReturnValue(scenario === "hidden");
+      const { events } = await import("./events.svelte.js");
+      const received = vi.fn();
+      let detach = () => {};
+      let first: Promise<void> | undefined;
+      let index: ReturnType<typeof vi.spyOn> | undefined;
+      if (scenario === "timeout") {
+        const { createSessionsStore } = await import("./sessions.svelte.js");
+        const { SessionsService } = await import("../api/generated/index");
+        index = vi
+          .spyOn(SessionsService, "getApiV1SessionsSidebarIndex")
+          .mockImplementation(
+            () =>
+              new Promise((resolve) => setTimeout(() => resolve({ sessions: [], total: 0 }), 400)),
+          );
+        const sessions = createSessionsStore();
+        detach = sessions.attachSidebar();
+        first = sessions.load();
+      }
+      const unsub = scenario === "no subscriber" ? () => {} : events.subscribe(received);
+      try {
+        const settled = vi.fn();
+        const ready = events.whenReady(1000).then(settled);
+        await vi.advanceTimersByTimeAsync(0);
+        expect(settled).not.toHaveBeenCalled();
+        events.setAvailable(scenario !== "unavailable");
+        if (scenario === "error" || scenario === "timeout") {
+          await vi.advanceTimersByTimeAsync(0);
+          expect(settled).not.toHaveBeenCalled();
+        }
+        if (scenario === "error") FakeEventSource.instances[0]!.fireError();
+        else if (scenario === "timeout") {
+          await vi.advanceTimersByTimeAsync(999);
+          expect(settled).not.toHaveBeenCalled();
+          expect(index).not.toHaveBeenCalled();
+          await vi.advanceTimersByTimeAsync(1);
+        }
+        await vi.advanceTimersByTimeAsync(0);
+        expect(settled).toHaveBeenCalledTimes(1);
+        await expect(ready).resolves.toBeUndefined();
+        if (scenario === "timeout") {
+          expect(index).toHaveBeenCalledTimes(1);
+          await vi.advanceTimersByTimeAsync(400);
+          await first;
+          // A ready after the timeout still catches up on the gap.
+          FakeEventSource.instances[0]!.fire("events_ready", {});
+          await vi.advanceTimersByTimeAsync(1000);
+          expect(index).toHaveBeenCalledTimes(2);
+        }
+      } finally {
+        detach();
+        unsub();
+        vi.restoreAllMocks();
+        visibility.mockRestore();
+        vi.clearAllTimers();
+        vi.useRealTimers();
+      }
+    },
+  );
+
+  it("releases hidden streams and refreshes subscribers on return and every reconnect", async () => {
+    vi.useFakeTimers();
+    const visibility = vi.spyOn(document, "hidden", "get").mockReturnValue(true);
+    const { events, EVENTS_STORE_HEAL_INTERVAL_MS } = await import("./events.svelte.js");
+    const received = vi.fn();
+    const otherReceived = vi.fn();
+    const unsub = events.subscribe(received);
+    const otherUnsub = events.subscribe(otherReceived);
+    try {
+      expect(FakeEventSource.instances).toHaveLength(0);
+      visibility.mockReturnValue(false);
+      document.dispatchEvent(new Event("visibilitychange"));
+      const first = FakeEventSource.instances[0]!;
+      first.fire("events_ready", {});
+      expect(received).toHaveBeenCalledExactlyOnceWith({ scope: "sync" });
+      expect(otherReceived).toHaveBeenCalledExactlyOnceWith({ scope: "sync" });
+      received.mockClear();
+      otherReceived.mockClear();
+      visibility.mockReturnValue(true);
+      document.dispatchEvent(new Event("visibilitychange"));
+      expect(first.closed).toBe(true);
+      await vi.advanceTimersByTimeAsync(EVENTS_STORE_HEAL_INTERVAL_MS * 2);
+      expect(FakeEventSource.instances).toHaveLength(1);
+      expect(received).not.toHaveBeenCalled();
+      visibility.mockReturnValue(false);
+      document.dispatchEvent(new Event("visibilitychange"));
+      expect(FakeEventSource.instances).toHaveLength(2);
+      expect(received).not.toHaveBeenCalled();
+      expect(otherReceived).not.toHaveBeenCalled();
+      const reopened = FakeEventSource.instances[1]!;
+      reopened.fireOpen();
+      expect(received).not.toHaveBeenCalled();
+      reopened.fire("events_ready", {});
+      expect(received).toHaveBeenCalledTimes(1);
+      expect(otherReceived).toHaveBeenCalledTimes(1);
+      expect(received).toHaveBeenLastCalledWith({ scope: "sync" });
+      reopened.readyState = 0;
+      reopened.fireError();
+      reopened.readyState = 1;
+      reopened.fireOpen();
+      reopened.fire("events_ready", {});
+      expect(FakeEventSource.instances).toHaveLength(2);
+      expect(received).toHaveBeenCalledTimes(2);
+      expect(otherReceived).toHaveBeenCalledTimes(2);
+      expect(received).toHaveBeenLastCalledWith({ scope: "sync" });
+    } finally {
+      unsub();
+      otherUnsub();
+    }
+  });
+
   it("does not open an EventSource while live events are unavailable", async () => {
     const { events } = await import("./events.svelte.js");
     events.setAvailable(false);

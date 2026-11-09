@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { modelPickerItems } from "../../utils/model-groups.js";
   import { Card } from "@kenn-io/kit-ui";
   import { onMount, onDestroy, untrack } from "svelte";
   import RangePicker from "../shared/RangePicker.svelte";
@@ -248,7 +249,10 @@
   async function refreshAnalytics(): Promise<void> {
     cancelInitialLoad();
     const refresh = analytics.fetchAll();
-    const outcomes = outcomeWindow && !outcomeFiltersUnsupported
+    // A pull-request lookup can take minutes, so refresh keeps its totals;
+    // changing the window or filters reloads them through the outcome effect.
+    const outcomes = outcomeWindow && !outcomeFiltersUnsupported &&
+      (!outcomeTotals.includePullRequests || outcomeTotals.pullRequestLookupFailed)
       ? outcomeTotals.load(outcomeWindow)
       : undefined;
     if (!router.isRootPath && !suppressSessionDateRefresh) {
@@ -299,14 +303,12 @@
   });
 
   $effect(() => {
-    const selected = analytics.model
-      .split(",")
-      .filter((model) => model.length > 0);
+    const selected = analytics.model.split(",").filter(Boolean);
     untrack(() => mergeIntoKnownModels(selected));
   });
 
   const modelItems = $derived(
-    knownModels.map((name) => ({ name })),
+    modelPickerItems(knownModels, analytics.model, analytics.modelAliases),
   );
   function handleExportCSV() {
     exportAnalyticsCSV({
@@ -329,7 +331,7 @@
   const INITIAL_LOAD_CEILING_MS = 2000;
   let initialLoadTimer: ReturnType<typeof setTimeout> | undefined;
   // Child mount effects run before the page's first-load effect.
-  let initialLoadDeferred = $state(sessions.loading);
+  let initialLoadDeferred = $state(sessions.loading || sessions.machineFilterPending);
 
   function cancelInitialLoad() {
     clearTimeout(initialLoadTimer);
@@ -395,7 +397,7 @@
   });
 
   $effect(() => {
-    if (initialLoadDeferred && !sessions.loading) {
+    if (initialLoadDeferred && !sessions.loading && !sessions.machineFilterPending) {
       untrack(() => {
         clearTimeout(initialLoadTimer);
         initialLoadTimer = setTimeout(releaseInitialLoad, 0);
@@ -416,6 +418,7 @@
   // the sidebar filters change. Uses untrack on analytics state
   // so that local drill-downs don't re-trigger.
   $effect(() => {
+    if (sessions.machineFilterPending) return;
     const headerProject = sessions.filters.project;
     const headerMachine = sessions.filters.machine;
     const headerAgent = sessions.filters.agent;
@@ -502,6 +505,7 @@
   });
 
   $effect(() => {
+    if (sessions.machineFilterPending) return;
     const route = router.route;
     const params = router.params;
     const earliestSession = sync.stats?.earliest_session ?? undefined;
@@ -649,6 +653,7 @@
         <SessionFilterControl
           showDisplay={false}
           showStarred={false}
+          showLabelFilters={false}
           align="left"
         />
       </div>
@@ -671,8 +676,9 @@
     />
     <FilterDropdown
       label={m.analytics_model()}
+      selectedLabel={analytics.model !== analytics.displayedModels ? analytics.model : ""}
       items={modelItems}
-      excludedCsv={analytics.model}
+      excludedCsv={analytics.displayedModels}
       mode="include"
       onToggle={(name) => analytics.toggleModel(name)}
       onSelectAll={() => analytics.clearModel()}
@@ -730,7 +736,7 @@
         <SessionShape />
       </Card>
 
-      <Card level="default" padding="none" class="chart-panel">
+      <Card level="default" padding="none" class="chart-panel wide">
         <ToolUsage />
       </Card>
 
@@ -761,6 +767,9 @@
           includePullRequests={outcomeTotals.includePullRequests}
           onIncludePullRequests={() => {
             if (outcomeWindow) void outcomeTotals.loadWithPullRequests(outcomeWindow);
+          }}
+          onRetry={() => {
+            if (outcomeWindow) void outcomeTotals.retry(outcomeWindow);
           }}
         />
       </Card>
@@ -814,6 +823,9 @@
   .analytics-content {
     flex: 1;
     overflow-y: auto;
+    /* Reserve the scrollbar's width up front so right-aligned controls do not
+       shift when loaded results first make a tall pane scroll. */
+    scrollbar-gutter: stable;
     padding: 16px;
     display: flex;
     flex-direction: column;

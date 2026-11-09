@@ -103,23 +103,104 @@ func TestReplaceSessionKeepingTrashedCopy(t *testing.T) {
 	assert.Equal(t, int64(1), restored)
 }
 
+func TestReplaceSessionKeepingTrashedCopyPreservesLauncherParent(t *testing.T) {
+	for _, prior := range []string{"", "subagent"} {
+		t.Run(prior, func(t *testing.T) {
+			d := testDB(t)
+			ctx := t.Context()
+			seedReplaceSession(t, d)
+			original, err := d.GetSessionFull(ctx, "replace")
+			require.NoError(t, err)
+			original.RelationshipType = prior
+			require.NoError(t, d.UpsertSession(ctx, *original))
+			insertSession(t, d, "manager", "proj")
+			link, err := d.SetSessionExternalParent(ctx, "replace", "manager")
+			require.NoError(t, err)
+			require.True(t, link.Applied)
+
+			copyID, err := d.ReplaceSessionKeepingTrashedCopy(ctx, replaceWrite("new transcript"))
+			require.NoError(t, err)
+			for _, id := range []string{"replace", copyID} {
+				session, err := d.GetSessionFull(ctx, id)
+				require.NoError(t, err)
+				require.NotNil(t, session)
+				assert.Equal(t, Ptr("manager"), session.ParentSessionID, id)
+				assert.Equal(t, "subagent", session.RelationshipType, id)
+			}
+			_, err = d.RestoreSession(ctx, copyID)
+			require.NoError(t, err)
+			link, err = d.GetSessionExternalParent(ctx, copyID)
+			require.NoError(t, err)
+			assert.True(t, link.Applied)
+			exported, err := d.GetArtifactExportSession(ctx, copyID)
+			require.NoError(t, err)
+			assert.Nil(t, exported.ParentSessionID)
+			assert.Equal(t, prior, exported.RelationshipType)
+		})
+	}
+}
+
 func TestReplaceSessionKeepingTrashedCopyRollsBack(t *testing.T) {
+	for _, tt := range []struct {
+		name    string
+		pinLoss bool
+	}{
+		{"invalid ordinals", false},
+		{"pin loss after copy", true},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			d := testDB(t)
+			ctx := t.Context()
+			before := seedReplaceSession(t, d)
+
+			write := replaceWrite("first", "second")
+			if tt.pinLoss {
+				_, err := d.getWriter().Exec(ctx, `CREATE TRIGGER reject_replacement_copy BEFORE INSERT ON messages
+			WHEN NEW.session_id LIKE 'replace:replaced:%' AND EXISTS(SELECT 1 FROM messages WHERE session_id = 'replace' AND content = 'Changed pinned turn')
+			BEGIN SELECT RAISE(ABORT, 'replacement rejected'); END`)
+				require.NoError(t, err)
+				write = replaceWrite("Changed pinned turn", "Changed reply")
+				write.KeepTrashedCopyOnlyOnPinLoss = true
+			} else {
+				write.Messages[1].Ordinal = 0
+			}
+			_, err := d.ReplaceSessionKeepingTrashedCopy(ctx, write)
+			require.Error(t, err)
+			if tt.pinLoss {
+				require.ErrorContains(t, err, "replacement rejected")
+			}
+
+			assert.Empty(t, trashedSessionIDs(t, d))
+			after, err := d.GetAllMessages(ctx, "replace")
+			require.NoError(t, err)
+			assert.Equal(t, before, after)
+			pins, err := d.ListPinnedMessages(ctx, "replace", "")
+			require.NoError(t, err)
+			require.Len(t, pins, 2)
+			assert.Equal(t, Ptr("note"), pins[0].Note)
+		})
+	}
+}
+
+func TestReplaceSessionKeepingTrashedCopyOnlyOnPinLoss(t *testing.T) {
 	d := testDB(t)
-	ctx := t.Context()
 	before := seedReplaceSession(t, d)
-
-	write := replaceWrite("first", "second")
-	write.Messages[1].Ordinal = 0
-	_, err := d.ReplaceSessionKeepingTrashedCopy(ctx, write)
-	require.Error(t, err)
-
+	write := replaceWrite(before[0].Content, before[1].Content, "Changed unpinned turn")
+	write.Messages[0] = before[0]
+	write.Messages[1] = before[1]
+	write.KeepTrashedCopyOnlyOnPinLoss = true
+	copyID, err := d.ReplaceSessionKeepingTrashedCopy(t.Context(), write)
+	require.NoError(t, err)
+	assert.Empty(t, copyID)
 	assert.Empty(t, trashedSessionIDs(t, d))
-	after, err := d.GetAllMessages(ctx, "replace")
+	pins, err := d.ListPinnedMessages(t.Context(), "replace", "")
 	require.NoError(t, err)
-	assert.Equal(t, before, after)
-	pins, err := d.ListPinnedMessages(ctx, "replace", "")
+	require.Len(t, pins, 2)
+	assert.Equal(t, Ptr("note"), pins[0].Note)
+	stored, err := d.GetAllMessages(t.Context(), "replace")
 	require.NoError(t, err)
-	assert.Len(t, pins, 2)
+	require.Len(t, stored, 3)
+	assert.Equal(t, "Changed unpinned turn", stored[2].Content)
 }
 
 func TestReplaceSessionKeepingTrashedCopyRefusals(t *testing.T) {
@@ -139,4 +220,50 @@ func TestReplaceSessionKeepingTrashedCopyRefusals(t *testing.T) {
 		require.ErrorIs(t, err, ErrSessionTrashed)
 		assert.Equal(t, []string{"replace"}, trashedSessionIDs(t, d))
 	})
+}
+
+func TestReplaceSessionKeepingTrashedCopyPinIdentities(t *testing.T) {
+	msg := func(uuid, content string) Message {
+		return Message{SourceUUID: uuid, Role: "user", Content: content, ContentLength: len(content)}
+	}
+	d := testDB(t)
+	write := replaceWrite()
+	write.Session.Agent = "claude-ai"
+	write.Session.MessageCount = 2
+	write.Messages = []Message{msg("a", "same"), msg("", "other")}
+	for i := range write.Messages {
+		write.Messages[i].SessionID = "replace"
+		write.Messages[i].Ordinal = i
+	}
+	_, err := d.WriteSessionBatchAtomic(t.Context(), []SessionBatchWrite{write})
+	require.NoError(t, err)
+	stored, err := d.GetAllMessages(t.Context(), "replace")
+	require.NoError(t, err)
+	for _, i := range []int{0, 1} {
+		_, err := d.PinMessage(t.Context(), "replace", stored[i].ID, Ptr("saved note"))
+		require.NoError(t, err)
+	}
+	write.Messages = []Message{msg("a", "other")}
+	write.Session.MessageCount = 1
+	write.KeepTrashedCopyOnlyOnPinLoss = true
+	for i := range write.Messages {
+		write.Messages[i].SessionID = "replace"
+		write.Messages[i].Ordinal = i
+	}
+	copyID, err := d.ReplaceSessionKeepingTrashedCopy(t.Context(), write)
+	require.NoError(t, err)
+	require.NotEmpty(t, copyID)
+	pins, err := d.ListPinnedMessages(t.Context(), "replace", "")
+	require.NoError(t, err)
+	var ordinals []int
+	for _, pin := range pins {
+		ordinals = append(ordinals, pin.Ordinal)
+		assert.Equal(t, Ptr("saved note"), pin.Note)
+	}
+	assert.Equal(t, []int{0}, ordinals)
+
+	oldPins, err := d.ListPinnedMessages(t.Context(), copyID, "")
+	require.NoError(t, err)
+	require.Len(t, oldPins, 2)
+	assert.Equal(t, Ptr("saved note"), oldPins[0].Note)
 }

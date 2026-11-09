@@ -45,17 +45,25 @@ func (s *Sync) snapshotFingerprint(snapshot *db.SessionMirrorSnapshot) (string, 
 	payload := struct {
 		SessionFields  []any
 		Messages       []db.Message
+		Dialogue       []*string `json:",omitzero"`
 		Usage          string
 		ToolCalls      string
 		SecretFindings []db.SecretFinding
 		Pins           []db.PinnedMessage
+		CommitLinks    []db.CommitLinkRow `json:",omitzero"`
+		// Omitted when nil so sessions without plan usage keep the
+		// fingerprints they had before the table existed.
+		PlanUsage *db.SessionPlanUsage `json:",omitzero"`
 	}{
 		SessionFields:  sessionFingerprintFields(sess, db.MirroredSessionMachine(sess, s.machine)),
 		Messages:       snapshot.Messages,
+		Dialogue:       db.DialogueFingerprintValues(snapshot.Messages),
 		Usage:          snapshot.UsageFingerprint,
 		ToolCalls:      snapshot.ToolCallFingerprint,
 		SecretFindings: snapshot.Findings,
 		Pins:           snapshot.Pins,
+		CommitLinks:    snapshot.CommitLinks,
+		PlanUsage:      snapshot.PlanUsage,
 	}
 	data, err := json.Marshal(payload)
 	if err != nil {
@@ -92,10 +100,11 @@ func sessionFingerprintFields(sess db.Session, machine string) []any {
 		sess.MissingSuccessCriteriaCount, sess.MissingVerificationCount,
 		sess.DuplicatePromptCount, sess.NoCodeContextCount, sess.RunawayToolLoopCount,
 		sess.DataVersion,
-		sess.Cwd, sess.GitBranch, sess.SourceSessionID, sess.SourceVersion, sess.TranscriptFidelity,
+		sess.Cwd, sess.GitBranch, sess.SourceSessionID, sess.SourceVersion, sess.GroupKey, sess.TranscriptFidelity,
 		sess.ParserMalformedLines, sess.IsTruncated,
 		sess.DeletedAt, sess.DeletionCause, sess.CreatedAt, sess.TerminationStatus,
 		sess.SecretLeakCount, sess.SecretsRulesVersion,
+		db.EncodePRLinks(sess.PRLinks), db.LabelsArg(sess.Labels),
 	}
 }
 
@@ -125,10 +134,11 @@ var sessionFingerprintColumns = []string{
 	"missing_success_criteria_count", "missing_verification_count",
 	"duplicate_prompt_count", "no_code_context_count", "runaway_tool_loop_count",
 	"data_version",
-	"cwd", "git_branch", "source_session_id", "source_version", "transcript_fidelity",
+	"cwd", "git_branch", "source_session_id", "source_version", "group_key", "transcript_fidelity",
 	"parser_malformed_lines", "is_truncated",
 	"deleted_at", "deletion_cause", "created_at", "termination_status",
 	"secret_leak_count", "secrets_rules_version",
+	"pr_links", "labels",
 }
 
 // derivedSessionColumns are the sessions columns no fingerprint field
@@ -138,4 +148,18 @@ var derivedSessionColumns = map[string]string{
 	"agentsview_push_fingerprint": "the fingerprint itself",
 	"source_archive_id":           "push bookkeeping",
 	"stored_message_count":        "derived from the messages the fingerprint hashes",
+	// The full push that publishes a new dashboardFactsVersion rewrites
+	// these; otherwise they change only with the messages.
+	"dashboard_facts_version":       "push bookkeeping",
+	"fact_user_messages":            "derived from the messages the fingerprint hashes",
+	"fact_assistant_messages":       "derived from the messages the fingerprint hashes",
+	"fact_thinking_messages":        "derived from the messages the fingerprint hashes",
+	"fact_tool_use_messages":        "derived from the messages the fingerprint hashes",
+	"fact_tool_calls":               "derived from the messages the fingerprint hashes",
+	"fact_frustration_markers":      "derived from the messages the fingerprint hashes",
+	"fact_velocity_messages":        "derived from the messages the fingerprint hashes",
+	"fact_velocity_turn_cycles":     "derived from the messages the fingerprint hashes",
+	"fact_velocity_first_response":  "derived from the messages the fingerprint hashes",
+	"fact_velocity_active_seconds":  "derived from the messages the fingerprint hashes",
+	"fact_velocity_assistant_chars": "derived from the messages the fingerprint hashes",
 }

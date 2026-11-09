@@ -4,7 +4,9 @@ package postgres
 
 import (
 	"errors"
+	"fmt"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -19,15 +21,38 @@ func TestRawProjectionPreservesAbsentProviderTitleFromSameSource(t *testing.T) {
 	named := projectionOutcome("first")
 	named.Outcome.Results[0].Result.Session.SessionName = "Provider title"
 	named.Outcome.Results[0].Result.Session.SessionNamePresent = true
+	named.Outcome.Results[0].Result.Session.GroupKey = "retained group"
 	require.NoError(t, f.sink.Project(t.Context(), f.lease(t, m), m, named))
+	first, err := f.sink.Resolve(t.Context(), "codex:portable")
+	require.NoError(t, err)
+	// A replacement needs prior metadata, but must not read the old transcript.
+	// Restrict only this fixture's first captured revision; keep new rows visible.
+	var policy string
+	require.NoError(t, f.admin.QueryRowContext(t.Context(), `SELECT format('CREATE POLICY unavailable_prior_content ON %I.raw_content_revisions AS RESTRICTIVE FOR SELECT TO %I USING (session_id <> %L)', $1::text, $2::text, $3::text)`, f.schema, f.role, first.SessionID).Scan(&policy))
+	_, err = f.admin.ExecContext(t.Context(), policy)
+	require.NoError(t, err)
+	var visible int
+	require.NoError(t, f.runtime.QueryRowContext(t.Context(), `SELECT count(*) FROM raw_content_revisions WHERE session_id=$1`, first.SessionID).Scan(&visible))
+	require.Zero(t, visible)
 	next, receipt := f.accept(t, "device-a", "unnamed", accepted.Receipt)
-	require.NoError(t, f.sink.Project(t.Context(), f.lease(t, next), next, projectionOutcome("changed content")))
+	changed := projectionOutcome("changed content")
+	changed.Outcome.Results[0].Result.Session.KeepStoredGroupKey = true
+	require.NoError(t, f.sink.Project(t.Context(), f.lease(t, next), next, changed))
 	identity, err := f.sink.Resolve(t.Context(), "codex:portable")
 	require.NoError(t, err)
 	var title *string
 	require.NoError(t, f.runtime.QueryRowContext(t.Context(), `SELECT session_name FROM sessions WHERE id=$1`, identity.SessionID).Scan(&title))
 	require.NotNil(t, title)
 	assert.Equal(t, "Provider title", *title)
+	var groupKey string
+	require.NoError(t, f.runtime.QueryRowContext(t.Context(), `SELECT group_key FROM sessions WHERE id=$1`, identity.SessionID).Scan(&groupKey))
+	assert.Equal(t, "retained group", groupKey)
+	messages, err := (&Store{pg: f.runtime}).GetMessages(t.Context(), identity.SessionID, 0, 10, true)
+	require.NoError(t, err)
+	require.NotEmpty(t, messages)
+	assert.Equal(t, "changed content", messages[0].Content)
+	_, err = f.admin.ExecContext(t.Context(), fmt.Sprintf(`DROP POLICY unavailable_prior_content ON %q.raw_content_revisions`, f.schema))
+	require.NoError(t, err)
 	cleared, _ := f.accept(t, "device-a", "cleared", receipt.Receipt)
 	explicit := projectionOutcome("changed content")
 	explicit.Outcome.Results[0].Result.Session.SessionNamePresent = true
@@ -283,4 +308,32 @@ func TestRawProjectionHonorsExplicitExclusionWithoutReplacingMembership(t *testi
 	resolved, err := f.sink.Resolve(t.Context(), "codex:portable")
 	require.NoError(t, err)
 	assert.Equal(t, RawIdentityGone, resolved.State)
+}
+
+func TestRawProjectionReprocessedCronPublishesGroup(t *testing.T) {
+	f := newProjectionFixture(t)
+	manifest, _ := f.accept(t, "device-a", "ungrouped-cron", "", parser.AgentHermes)
+	outcome := projectionOutcome("same transcript")
+	session := &outcome.Outcome.Results[0].Result.Session
+	session.ID = "hermes:cron_digest_20261008_120000"
+	session.SourceSessionID = "cron_digest_20261008_120000"
+	session.Agent = parser.AgentHermes
+	session.Project = "hermes-cron"
+	require.NoError(t, f.sink.Project(t.Context(), f.lease(t, manifest), manifest, outcome))
+	first, err := f.sink.Resolve(t.Context(), session.ID)
+	require.NoError(t, err)
+	var key string
+	require.NoError(t, f.runtime.QueryRowContext(t.Context(), `SELECT group_key FROM sessions WHERE id=$1`, first.SessionID).Scan(&key))
+	assert.Empty(t, key)
+	_, err = f.sink.SelectSourceGeneration(t.Context(), manifest, "parser-2")
+	require.NoError(t, err)
+	leases, err := f.jobs.ClaimRawParseJobs(t.Context(), "reprocess-worker", 1, time.Minute)
+	require.NoError(t, err)
+	require.Len(t, leases, 1)
+	session.GroupKey = "digest"
+	require.NoError(t, f.sink.Project(t.Context(), leases[0], manifest, outcome))
+	resolved, err := f.sink.Resolve(t.Context(), session.ID)
+	require.NoError(t, err)
+	require.NoError(t, f.runtime.QueryRowContext(t.Context(), `SELECT group_key FROM sessions WHERE id=$1`, resolved.SessionID).Scan(&key))
+	assert.Equal(t, "digest", key)
 }

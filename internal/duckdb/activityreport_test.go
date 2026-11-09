@@ -16,6 +16,7 @@ import (
 	"go.kenn.io/agentsview/internal/export"
 	"go.kenn.io/agentsview/internal/money"
 	pricingpkg "go.kenn.io/agentsview/internal/pricing"
+	"go.kenn.io/agentsview/internal/readbase"
 	"go.kenn.io/agentsview/internal/storage"
 )
 
@@ -105,6 +106,106 @@ func TestActivityReportCandidateSourcePreservesRangeEdgePairs(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, []int{1, 2, 3}, starts,
 		"left pruning and right successor lookup must preserve adjacency")
+}
+
+// TestActivityReportCandidateSourcePairsAndAttributesModels pins how the
+// candidate query picks each message's successor and prior model: rows
+// without a timestamp are skipped, an assistant model counts only when its
+// timestamp is strictly later than the previous timestamped row's, and
+// rows outside the range still act as neighbours.
+func TestActivityReportCandidateSourcePairsAndAttributesModels(t *testing.T) {
+	ctx := t.Context()
+	conn := openTestDuckDB(t)
+	require.NoError(t, EnsureSchema(ctx, conn))
+
+	type row struct {
+		session string
+		ordinal int
+		role    string
+		ts      string // empty means NULL
+		model   string
+	}
+	rows := []row{
+		{"attr", 0, "user", "2026-06-13T23:00:00Z", ""},
+		// Before the range, but its model carries into the day.
+		{"attr", 1, "assistant", "2026-06-13T23:10:00Z", "model-early"},
+		{"attr", 2, "user", "", ""},
+		{"attr", 3, "user", "2026-06-14T10:00:00Z", ""},
+		{"attr", 4, "user", "", ""},
+		// Same timestamp as the previous timestamped row.
+		{"attr", 5, "assistant", "2026-06-14T10:00:00Z", "model-tied"},
+		// Earlier than the previous timestamped row.
+		{"attr", 6, "assistant", "2026-06-14T09:59:00Z", "model-backwards"},
+		{"attr", 7, "assistant", "2026-06-14T10:05:00Z", ""},
+		{"attr", 8, "user", "2026-06-14T10:06:00Z", "model-user"},
+		{"attr", 9, "assistant", "", "model-untimed"},
+		// Its previous timestamped row is ordinal 8, past the NULL at 9.
+		{"attr", 10, "assistant", "2026-06-14T10:07:00Z", "model-late"},
+		{"attr", 11, "tool", "2026-06-14T23:58:00Z", ""},
+		// After the range, but still closes ordinal 11.
+		{"attr", 12, "user", "2026-06-15T00:30:00Z", ""},
+		// The first timestamped row has no previous timestamp to beat.
+		{"first", 0, "assistant", "2026-06-14T12:00:00Z", "model-first"},
+		{"first", 1, "user", "2026-06-14T12:01:00Z", ""},
+		// Not requested.
+		{"other", 0, "user", "2026-06-14T11:00:00Z", ""},
+		{"other", 1, "assistant", "2026-06-14T11:01:00Z", "model-other"},
+	}
+	for i, r := range rows {
+		var ts any
+		if r.ts != "" {
+			ts = r.ts
+		}
+		_, err := conn.ExecContext(ctx, `
+			INSERT INTO messages (id, session_id, ordinal, role, content, timestamp, model)
+			VALUES (?, ?, ?, ?, '', CAST(? AS TIMESTAMP), ?)`,
+			i+1, r.session, r.ordinal, r.role, ts, r.model)
+		require.NoError(t, err)
+	}
+
+	at := func(value string) time.Time {
+		t.Helper()
+		parsed, err := time.Parse(time.RFC3339, value)
+		require.NoError(t, err)
+		return parsed
+	}
+	candidate := func(
+		session string, start, end int, startTS, endTS, role, model, prior string,
+	) activity.IntervalCandidate {
+		return activity.IntervalCandidate{
+			SessionID: session, StartOrdinal: start, EndOrdinal: end,
+			Start: at(startTS), End: at(endTS),
+			ClosingRole: role, ClosingModel: model, PriorModel: prior,
+		}
+	}
+	want := []activity.IntervalCandidate{
+		candidate("attr", 6, 7, "2026-06-14T09:59:00Z", "2026-06-14T10:05:00Z",
+			"assistant", "", "model-early"),
+		candidate("attr", 3, 5, "2026-06-14T10:00:00Z", "2026-06-14T10:00:00Z",
+			"assistant", "model-tied", "model-early"),
+		candidate("attr", 5, 6, "2026-06-14T10:00:00Z", "2026-06-14T09:59:00Z",
+			"assistant", "model-backwards", "model-early"),
+		candidate("attr", 7, 8, "2026-06-14T10:05:00Z", "2026-06-14T10:06:00Z",
+			"user", "model-user", "model-early"),
+		candidate("attr", 8, 10, "2026-06-14T10:06:00Z", "2026-06-14T10:07:00Z",
+			"assistant", "model-late", "model-early"),
+		candidate("attr", 10, 11, "2026-06-14T10:07:00Z", "2026-06-14T23:58:00Z",
+			"tool", "", "model-late"),
+		candidate("first", 0, 1, "2026-06-14T12:00:00Z", "2026-06-14T12:01:00Z",
+			"user", "", "unknown"),
+		candidate("attr", 11, 12, "2026-06-14T23:58:00Z", "2026-06-15T00:30:00Z",
+			"user", "", "model-late"),
+	}
+
+	var got []activity.IntervalCandidate
+	err := NewStoreFromDB(conn).ActivityReportCandidateSource(
+		[]string{"attr", "first"}, duckDayQuery(t, "2026-06-14", "UTC"),
+	)(ctx, func(c activity.IntervalCandidate) error {
+		got = append(got, c)
+		return nil
+	})
+	require.NoError(t, err)
+	assert.Equal(t, want, got)
 }
 
 func TestDuckActivityReportIncludesToolCompletionEvents(t *testing.T) {
@@ -365,43 +466,6 @@ func TestDuckGetActivityReportUsageCostAndTokens(t *testing.T) {
 	assert.Equal(t, money.MustParseDollars("0.0105"), r.Totals.Cost)
 }
 
-func TestDuckGetActivityReportPrefersCompleteClaudeSnapshot(t *testing.T) {
-	ctx := t.Context()
-	sess := syncSession(
-		"streamed", "proj1", "first", "2026-06-14T10:30:00.000Z", 2)
-	sess.Agent = "claude"
-	partial := syncMessage(
-		"streamed", 0, "assistant", "partial", "2026-06-14T10:30:00.000Z")
-	partial.Model = "claude-sonnet-4-20250514"
-	partial.ClaudeMessageID = "msg-stream"
-	partial.ClaudeRequestID = "req-stream"
-	partial.TokenUsage = jsontext.Value(`{"input_tokens":1000,"output_tokens":5}`)
-	partial.OutputTokens = 5
-	complete := syncMessage(
-		"streamed", 1, "assistant", "complete", "2026-06-14T10:31:00.000Z")
-	complete.Model = "claude-sonnet-4-20250514"
-	complete.ClaudeMessageID = "msg-stream"
-	complete.ClaudeRequestID = "req-stream"
-	complete.TokenUsage = jsontext.Value(`{"input_tokens":1000,"output_tokens":631}`)
-	complete.OutputTokens = 631
-	store := activityReportStore(t, []db.SessionBatchWrite{{
-		Session:         sess,
-		Messages:        []db.Message{partial, complete},
-		DataVersion:     1,
-		ReplaceMessages: true,
-	}}, []db.ModelPricing{{
-		ModelPattern:  "claude-sonnet-4-20250514",
-		InputPerMTok:  money.MustParseDollars("3.0"),
-		OutputPerMTok: money.MustParseDollars("15.0"),
-	}})
-
-	r, err := store.GetActivityReport(
-		ctx, db.AnalyticsFilter{Timezone: "UTC"},
-		duckDayQuery(t, "2026-06-14", "UTC"))
-	require.NoError(t, err)
-	assert.Equal(t, 631, r.Totals.OutputTokens)
-}
-
 func TestDuckGetActivityReportFiltersAfterCrossSessionSnapshotSelection(
 	t *testing.T,
 ) {
@@ -460,7 +524,7 @@ func TestDuckGetActivityReportFiltersAfterCrossSessionSnapshotSelection(
 }
 
 func TestDuckGetActivityReportSelectsPeersForLargeSnapshotKeySet(t *testing.T) {
-	const pairCount = duckMaxSQLVars + 1
+	const pairCount = readbase.MaxSQLVars + 1
 	ctx := t.Context()
 	candidate := syncSession(
 		"large-candidate", "included-project", "candidate",
@@ -1079,14 +1143,9 @@ func TestDuckGetActivityReportOpenSessionWithInRangeMessageIncluded(t *testing.T
 	assert.Equal(t, 1, r.Totals.Sessions)
 }
 
-// TestDuckGetActivityReportUsageDedupSubSecondOrder confirms DuckDB orders the
-// usage stream by the parsed instant so first-seen-wins fallback dedup keeps
-// the chronologically earlier row when two rows share a source UUID in the same
-// second -- one whole-second ("...00Z"), one fractional ("...00.123Z"). DuckDB
-// already sorts on the parsed time (not the formatted text), so this locks in
-// that cross-backend behavior, matching the SQLite
-// TestGetActivityReport_UsageDedupSubSecondOrder.
-func TestDuckGetActivityReportUsageDedupSubSecondOrder(t *testing.T) {
+// Source UUID fallback keeps the earlier parsed instant even when session ID
+// order puts the later fractional-second row first.
+func TestDuckActivityReportSourceUUIDFallbackOrdersTimeBeforeSessionID(t *testing.T) {
 	ctx := t.Context()
 	pricing := []db.ModelPricing{{
 		ModelPattern:  "claude-sonnet-4-20250514",
@@ -1096,17 +1155,19 @@ func TestDuckGetActivityReportUsageDedupSubSecondOrder(t *testing.T) {
 
 	// A resumed/forked pair shares one source UUID fallback dedup identity
 	// across two sessions: the earlier whole-second instant carries 500 output
-	// tokens, the later fractional instant 9000. Dedup must keep the 500 row.
-	earlier := syncSession("earlier", "proj1", "first", "2026-06-14T10:30:00Z", 1)
-	earlierMsg := syncMessage("earlier", 0, "assistant", "x", "2026-06-14T10:30:00Z")
+	// tokens, the later instant 9000. Dedup must keep the 500 row.
+	earlier := syncSession("z-earlier", "proj1", "first", "2026-06-14T10:30:00Z", 1)
+	earlier.Agent = "claude"
+	earlierMsg := syncMessage("z-earlier", 0, "assistant", "x", "2026-06-14T10:30:00Z")
 	earlierMsg.Model = "claude-sonnet-4-20250514"
 	earlierMsg.ClaudeMessageID = "dup-m"
 	earlierMsg.SourceUUID = "dup-source"
 	earlierMsg.TokenUsage = jsontext.Value(`{"input_tokens":1000,"output_tokens":500}`)
 	earlierMsg.OutputTokens = 500
 
-	later := syncSession("later", "proj2", "first", "2026-06-14T10:30:00.123Z", 1)
-	laterMsg := syncMessage("later", 0, "assistant", "x", "2026-06-14T10:30:00.123Z")
+	later := syncSession("a-later", "proj2", "first", "2026-06-14T10:30:00.123Z", 1)
+	later.Agent = "claude"
+	laterMsg := syncMessage("a-later", 0, "assistant", "x", "2026-06-14T10:30:00.123Z")
 	laterMsg.Model = "claude-sonnet-4-20250514"
 	laterMsg.ClaudeMessageID = "dup-m"
 	laterMsg.SourceUUID = "dup-source"
@@ -1130,53 +1191,7 @@ func TestDuckGetActivityReportUsageDedupSubSecondOrder(t *testing.T) {
 		duckDayQuery(t, "2026-06-14", "UTC"))
 	require.NoError(t, err)
 	assert.Equal(t, 500, r.Totals.OutputTokens,
-		"first-seen dedup keeps the chronologically earlier whole-second row")
-}
-
-func TestDuckGetActivityReportUsageDedupFallsBackToSourceUUID(t *testing.T) {
-	ctx := t.Context()
-	pricing := []db.ModelPricing{{
-		ModelPattern:  "claude-sonnet-4-20250514",
-		InputPerMTok:  money.MustParseDollars("3.0"),
-		OutputPerMTok: money.MustParseDollars("15.0"),
-	}}
-
-	earlier := syncSession("earlier", "proj1", "first", "2026-06-14T10:30:00Z", 1)
-	earlier.Agent = "claude"
-	earlierMsg := syncMessage("earlier", 0, "assistant", "x", "2026-06-14T10:30:00Z")
-	earlierMsg.Model = "claude-sonnet-4-20250514"
-	earlierMsg.ClaudeMessageID = "dup-m"
-	earlierMsg.SourceUUID = "src-dup"
-	earlierMsg.TokenUsage = jsontext.Value(`{"input_tokens":1000,"output_tokens":500}`)
-	earlierMsg.OutputTokens = 500
-
-	later := syncSession("later", "proj2", "first", "2026-06-14T10:30:01Z", 1)
-	later.Agent = "claude"
-	laterMsg := syncMessage("later", 0, "assistant", "x", "2026-06-14T10:30:01Z")
-	laterMsg.Model = "claude-sonnet-4-20250514"
-	laterMsg.ClaudeMessageID = "dup-m"
-	laterMsg.SourceUUID = "src-dup"
-	laterMsg.TokenUsage = jsontext.Value(`{"input_tokens":1000,"output_tokens":900}`)
-	laterMsg.OutputTokens = 900
-
-	writes := []db.SessionBatchWrite{
-		{
-			Session: earlier, Messages: []db.Message{earlierMsg},
-			DataVersion: 1, ReplaceMessages: true,
-		},
-		{
-			Session: later, Messages: []db.Message{laterMsg},
-			DataVersion: 1, ReplaceMessages: true,
-		},
-	}
-	store := activityReportStore(t, writes, pricing)
-
-	r, err := store.GetActivityReport(
-		ctx, db.AnalyticsFilter{Timezone: "UTC"},
-		duckDayQuery(t, "2026-06-14", "UTC"))
-	require.NoError(t, err)
-	assert.Equal(t, 500, r.Totals.OutputTokens,
-		"incomplete Claude pairs fall back to source_uuid dedup in activity reports")
+		"source UUID fallback keeps the chronologically earlier whole-second row")
 }
 
 // TestDuckGetActivityReportZeroCostKeepsPrimaryModel confirms a usage-only

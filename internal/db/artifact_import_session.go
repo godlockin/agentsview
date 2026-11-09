@@ -72,7 +72,10 @@ func (db *DB) applyArtifactImportedSession(
 			"artifact imported session write does not match provenance",
 		)
 	}
-	write = sanitizeSessionBatchWrite(write)
+	write, err := sanitizeSessionBatchWriteContext(ctx, write)
+	if err != nil {
+		return result, err
+	}
 	write.Messages = db.projectSessionBatchMessages(write)
 	write.Session, write.Messages = db.sessionAndMessagesForStorage(
 		write.Session, write.Messages,
@@ -127,9 +130,9 @@ func (db *DB) applyArtifactImportedSession(
 
 	var pendingRecallRevocations recallEvidenceRevocationEvents
 	ctxTx := contextTransaction{ctx: ctx, tx: tx}
-	messagesWritten, err := writeOneSessionBatchTx(
+	messagesWritten, err := db.writeOneSessionBatchTx(
 		ctx, tx, ctxTx, write, &pendingRecallRevocations,
-		db.usageOnlyStorage(),
+		db.usageOnlyStorage(), nil,
 	)
 	switch {
 	case err == nil:
@@ -141,6 +144,16 @@ func (db *DB) applyArtifactImportedSession(
 		return ArtifactImportedSessionResult{}, ErrSessionTrashed
 	default:
 		return result, err
+	}
+	if result.Written {
+		if write.ReplaceMessages {
+			if err := clearCodexForkSummaryParticipantsTx(ctx, tx, write.Session.ID); err != nil {
+				return ArtifactImportedSessionResult{}, err
+			}
+		}
+		if _, err := linkSubagentSessionsForSessionsTx(ctx, tx, []string{write.Session.ID}); err != nil {
+			return ArtifactImportedSessionResult{}, err
+		}
 	}
 	if err := recordArtifactImportedSessionTx(ctx, tx, imported); err != nil {
 		return ArtifactImportedSessionResult{}, err

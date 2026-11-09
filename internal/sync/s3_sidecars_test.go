@@ -4,20 +4,51 @@ import (
 	"encoding/json/v2"
 	"errors"
 	"io"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
 
-	"github.com/minio/minio-go/v7"
+	"github.com/aws/aws-sdk-go-v2/service/s3/types"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.kenn.io/agentsview/internal/parser"
 )
 
 func missingS3ObjectError() error {
-	return minio.ErrorResponse{
-		Code:    minio.NoSuchKey,
-		Message: "not found",
+	return &types.NoSuchKey{Message: new("not found")}
+}
+
+func TestIsMissingS3Object(t *testing.T) {
+	for _, tc := range []struct {
+		code    string
+		status  int
+		missing bool
+	}{
+		{"NoSuchKey", http.StatusNotFound, true},
+		{"AccessDenied", http.StatusForbidden, false},
+	} {
+		t.Run(tc.code, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.WriteHeader(tc.status)
+				if r.Method == http.MethodGet {
+					_, _ = io.WriteString(w, "<Error><Code>"+tc.code+"</Code></Error>")
+				}
+			}))
+			defer server.Close()
+			t.Setenv("AWS_S3_ENDPOINT", server.URL)
+			t.Setenv("AWS_REGION", "us-east-1")
+			t.Setenv("AWS_ACCESS_KEY_ID", "access-key")
+			t.Setenv("AWS_SECRET_ACCESS_KEY", "secret-key")
+
+			_, err := parser.StatS3Object("s3://bucket/sidecar.txt")
+			require.Error(t, err)
+			assert.Equal(t, tc.missing, isMissingS3Object(err), "stat")
+			_, err = parser.FetchS3Object("s3://bucket/sidecar.txt")
+			require.Error(t, err)
+			assert.Equal(t, tc.missing, isMissingS3Object(err), "fetch")
+		})
 	}
 }
 
@@ -447,7 +478,11 @@ func TestSyncSingleSessionS3ClaudeSidecarOnlyChangeReplacesPreview(
 	assert.Equal(t, sidecarContent, msgs[1].ToolCalls[0].ResultContent)
 }
 
-func TestProcessS3ClaudeMissingSidecarReplacesStoredHydratedOutput(
+// TestProcessS3ClaudeMissingSidecarKeepsStoredHydratedOutput: a sidecar that
+// has gone from the bucket leaves only the placeholder in the re-parse, which
+// must not replace the hydrated output the archive holds (the Claude-format
+// branch of ingest.ReconcileProviderHistory, internal/ingest/history.go).
+func TestProcessS3ClaudeMissingSidecarKeepsStoredHydratedOutput(
 	t *testing.T,
 ) {
 	database := openTestDB(t)
@@ -527,7 +562,7 @@ func TestProcessS3ClaudeMissingSidecarReplacesStoredHydratedOutput(
 	require.NoError(t, err)
 	require.Len(t, msgs, 2)
 	require.Len(t, msgs[1].ToolCalls, 1)
-	assert.Equal(t, persistedContent, msgs[1].ToolCalls[0].ResultContent)
+	assert.Equal(t, sidecarContent, msgs[1].ToolCalls[0].ResultContent)
 }
 
 func TestProcessS3ClaudeFetchesSidecarFromCustomProjectsRoot(t *testing.T) {
