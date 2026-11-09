@@ -58,7 +58,11 @@ jobs:
         if: matrix.crosscc == '1'
         run: |
           sudo apt-get update
-          sudo apt-get install -y gcc-aarch64-linux-gnu
+          # g++ is required alongside gcc: duckdb-go links libstdc++, and
+          # the gcc cross package alone ships no arm64 libstdc++.so.
+          sudo apt-get install -y \
+            gcc-aarch64-linux-gnu \
+            g++-aarch64-linux-gnu
 
       - name: Stage SQLite amalgamation header
         run: make sqlite-vec-header
@@ -86,6 +90,7 @@ jobs:
           GOARCH: ${{ matrix.goarch }}
           CGO_CFLAGS: ${{ matrix.cflags || '' }}
           CC: ${{ matrix.crosscc == '1' && 'aarch64-linux-gnu-gcc' || '' }}
+          CXX: ${{ matrix.crosscc == '1' && 'aarch64-linux-gnu-g++' || '' }}
         shell: bash
         run: |
           set -euo pipefail
