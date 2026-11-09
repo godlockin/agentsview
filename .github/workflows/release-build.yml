@@ -78,11 +78,14 @@ jobs:
             [ "$attempt" -lt 3 ] && sleep 10
           done
 
+      # make frontend runs npm ci/vite build AND copies frontend/dist into
+      # internal/web/dist, which is what //go:embed embeds. Calling npm
+      # directly leaves the embed dir empty and ships the placeholder page.
       - name: Build frontend
-        working-directory: frontend
+        shell: bash
         run: |
-          npm ci --no-audit --no-fund
-          npm run build
+          make frontend
+          test -f internal/web/dist/index.html
 
       - name: Build agentsview (unix)
         if: runner.os != 'Windows'
